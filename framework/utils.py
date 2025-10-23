@@ -1,6 +1,4 @@
 # utils.py
-# (精简自 Utils.pm)
-
 import subprocess
 import os
 import sys

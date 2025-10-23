@@ -1,4 +1,8 @@
-# HugeBugRepository
+<div align="center">
+  <h1>HugeBugRepository</h1>
+</div>
+
+[简体中文](README.zh-CN.md)
 
 ## Introduction
 
