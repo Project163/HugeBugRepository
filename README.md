@@ -61,7 +61,7 @@ Follow these steps to set up and run the bug mining framework.
     ```
     - Windows (PowerShell)
     ```bash
-    setx GH_TOKEN "your_github_personal_access_token"
+    set GH_TOKEN "your_github_personal_access_token"
     ```
 ### Running the Miner
 

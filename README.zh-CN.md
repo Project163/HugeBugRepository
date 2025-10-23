@@ -61,7 +61,7 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
     ```
     - Windows (PowerShell)
     ```bash
-    setx GH_TOKEN "your_github_personal_access_token"
+    set GH_TOKEN "your_github_personal_access_token"
     ```
 ### 运行挖掘器
 
