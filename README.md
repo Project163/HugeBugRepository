@@ -55,10 +55,14 @@ Follow these steps to set up and run the bug mining framework.
 
 2.  **(Optional) GitHub API Token:**
     To avoid rate-limiting issues when downloading from GitHub, it is highly recommended to set a personal access token as an environment variable.
+    - Linux
     ```sh
     export GH_TOKEN="your_github_personal_access_token"
     ```
-
+    - Windows (PowerShell)
+    ```bash
+    setx GH_TOKEN "your_github_personal_access_token"
+    ```
 ### Running the Miner
 
 Execute the main script to start the mining process. The script will read the projects from `framework/example1.txt` and process them sequentially.

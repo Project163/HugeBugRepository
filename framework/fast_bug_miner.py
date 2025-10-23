@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # framework/fast_bug_miner.py
-# (已更新，使用共享 Issues 缓存)
+# (已更新，使用 sys.executable 确保 Windows 兼容性)
 
 import os
-import sys
+import sys  # <-- (!!) 导入 sys 模块
 import subprocess
 import csv
 import utils
 import config
 
 def main():
-    input_file = os.path.join(config.SCRIPT_DIR, 'example.txt')
+    # --- (!!) 获取当前 Python 解释器的绝对路径 ---
+    PYTHON_EXECUTABLE = sys.executable
+
+    input_file = os.path.join(config.SCRIPT_DIR, 'test.txt')
     
     if not os.path.exists(input_file):
         print(f"Error: Input file not found at {input_file}", file=sys.stderr)
@@ -39,32 +42,26 @@ def main():
             print("############################################################")
 
             # --- 1. 定义路径 ---
-            
-            # (!! 已更新) 创建共享 Issue 缓存键 (例如 "jira_SLING")
             issue_cache_key = f"{issue_tracker_name}_{issue_tracker_project_id}"
-            
-            # (!! 已更新) Issues 路径现在指向共享缓存
             cache_issues_dir = os.path.join(config.SHARED_ISSUES_DIR, issue_cache_key)
             cache_issues_file = os.path.join(cache_issues_dir, 'issues.txt')
 
-            # 输出路径 (无变化, 仍然按 project_id 组织)
             output_project_dir = os.path.join(config.OUTPUT_DIR, project_id)
             output_patches_dir = os.path.join(output_project_dir, 'patches')
             output_csv_file = os.path.join(output_project_dir, 'active-bugs.csv')
             
-            # 项目特定缓存 (Repo 和 Log) (无变化)
             cache_project_dir = os.path.join(config.CACHE_DIR, project_id)
             cache_repo_dir = os.path.join(cache_project_dir, f"{project_name}.git")
             cache_gitlog_file = os.path.join(cache_project_dir, 'gitlog.txt')
             
             # --- 2. 创建目录 ---
             os.makedirs(output_patches_dir, exist_ok=True)
-            os.makedirs(cache_project_dir, exist_ok=True) # <-- 创建项目特定缓存
-            os.makedirs(cache_issues_dir, exist_ok=True) # <-- (!!) 创建共享 Issues 缓存
+            os.makedirs(cache_project_dir, exist_ok=True) 
+            os.makedirs(cache_issues_dir, exist_ok=True)
             
             # --- 3. 初始化 ---
             
-            # 3a. 克隆仓库 (无变化)
+            # 3a. 克隆仓库
             if not os.path.exists(cache_repo_dir):
                 cmd = f"git clone --bare \"{repository_url}\" \"{cache_repo_dir}\""
                 success, _ = utils.exec_cmd(cmd, f"Cloning {project_name}")
@@ -74,14 +71,14 @@ def main():
             else:
                 print(f"Repository {project_name}.git already cached.")
 
-            # 3b. (!!) 下载 Issues (已更新)
-            # 现在检查共享缓存中的 issues.txt
+            # 3b. 下载 Issues
             if not os.path.exists(cache_issues_file) or os.path.getsize(cache_issues_file) == 0:
                 print(f"Shared issues for {issue_cache_key} not found. Downloading...")
+                
+                # --- (!!) 已更改：使用 PYTHON_EXECUTABLE 替换 "python3" ---
                 cmd_dl = (
-                    f"python3 {os.path.join(config.SCRIPT_DIR, 'download_issues.py')} "
+                    f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'download_issues.py')} "
                     f"-g \"{issue_tracker_name}\" -t \"{issue_tracker_project_id}\" "
-                    # (!!) -o 和 -f 参数指向共享缓存路径
                     f"-o \"{cache_issues_dir}\" -f \"{cache_issues_file}\""
                 )
                 success, _ = utils.exec_cmd(cmd_dl, f"Downloading issues for {issue_cache_key}")
@@ -91,7 +88,7 @@ def main():
             else:
                 print(f"Shared issues for {issue_cache_key} already cached. Skipping download.")
 
-            # 3c. 获取 Git Log (无变化)
+            # 3c. 获取 Git Log
             if not os.path.exists(cache_gitlog_file):
                 cmd_log = f"git --git-dir=\"{cache_repo_dir}\" log --reverse > \"{cache_gitlog_file}\""
                 success, _ = utils.exec_cmd(cmd_log, f"Collecting git log for {project_name}")
@@ -101,7 +98,7 @@ def main():
             else:
                 print(f"Git log for {project_name} already cached.")
 
-            # 3d. 交叉引用 (如果 active-bugs.csv 不存在)
+            # 3d. 交叉引用
             if not os.path.exists(output_csv_file):
                 try:
                     with open(output_csv_file, 'w', encoding='utf-8', newline='') as f:
@@ -111,11 +108,11 @@ def main():
                     print(f"Error: Cannot write header to {output_csv_file}: {e}. Skipping.", file=sys.stderr)
                     continue
                     
+                # --- (!!) 已更改：使用 PYTHON_EXECUTABLE 替换 "python3" ---
                 cmd_xref = (
-                    f"python3 {os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py')} "
+                    f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py')} "
                     f"-e \"{bug_fix_regex}\" -l \"{cache_gitlog_file}\" "
                     f"-r \"{cache_repo_dir}\" "
-                    # (!!) -i 参数指向共享的 issues.txt
                     f"-i \"{cache_issues_file}\" "
                     f"-f \"{output_csv_file}\" "
                     f"-ru \"{repository_url}\" "

@@ -55,10 +55,14 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 
 2.  **（可选）GitHub API 令牌：**
     为避免从 GitHub 下载时出现速率限制问题，强烈建议将个人访问令牌设置为环境变量。
+    - Linux
     ```sh
     export GH_TOKEN="your_github_personal_access_token"
     ```
-
+    - Windows (PowerShell)
+    ```bash
+    setx GH_TOKEN "your_github_personal_access_token"
+    ```
 ### 运行挖掘器
 
 执行主脚本以启动挖掘过程。该脚本将从 `framework/example.txt` 读取项目并按顺序处理它们。
