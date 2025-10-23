@@ -9,12 +9,7 @@ import sys
 DEBUG = os.environ.get('D4J_DEBUG', '0') == '1'
 
 def exec_cmd(cmd, desc):
-    """
-    运行一个系统命令, 类似 Perl 脚本中的 exec_cmd。
-    :param cmd: 要执行的命令字符串
-    :param desc: 命令的描述
-    :return: (True, stdout+stderr) or (False, stdout+stderr)
-    """
+
     print(f"{desc:.<75} ", end="", flush=True, file=sys.stderr)
     
     try:

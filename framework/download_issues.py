@@ -7,12 +7,9 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urlencode, quote_plus
 
-# --- 依赖提醒 ---
 # 此脚本需要:
 # pip install requests beautifulsoup4
-# ---
 
-# 翻译自 Perl 脚本中的 %SUPPORTED_TRACKERS
 SUPPORTED_TRACKERS = {
     'google': {
         'default_tracker_uri': 'https://storage.googleapis.com/google-code-archive/v2/code.google.com/',
@@ -80,16 +77,15 @@ SUPPORTED_TRACKERS = {
 }
 
 def get_file(uri, save_to, session):
-    """ 翻译自 Perl 'get_file' sub """
     headers = {}
-    # 优先使用 GH_TOKEN 环境变量 (来自原始脚本逻辑)
+    # 优先使用 GH_TOKEN 环境变量 
     if 'api.github.com' in uri and os.environ.get('GH_TOKEN'):
         headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
     
     try:
         # 使用 retry 和 timeout 模拟 curl 参数
         response = session.get(uri, headers=headers, timeout=20)
-        response.raise_for_status() # 如果是 4xx 或 5xx 则抛出异常
+        response.raise_for_status() # 4xx 或 5xx 抛出异常
         
         with open(save_to, 'w', encoding='utf-8') as f:
             f.write(response.text)
@@ -99,7 +95,6 @@ def get_file(uri, save_to, session):
         return False
 
 def get_bugzilla_id_list(uri, project_name, session):
-    """ 翻译自 Perl 'get_id_List' sub """
     try:
         response = session.get(uri, timeout=10)
         response.raise_for_status()
@@ -164,7 +159,7 @@ def main():
     
     start = 0
     
-    # Bugzilla 的特殊处理 (来自原始脚本)
+    # Bugzilla 的特殊处理 (待更新)
     if args.tracker_name == 'bugzilla':
         list_uri = tracker['build_uri'](tracker_uri, tracker_id, query, 0, 0, organization_id)
         if debug: print(f"Fetching Bugzilla ID list from: {list_uri}")
@@ -176,7 +171,7 @@ def main():
         if debug: print(f"Found {len(id_list)} Bugzilla IDs.")
         
         all_results = []
-        # 每50个ID一组获取XML (来自原始脚本逻辑)
+        # 每50个ID一组获取XML
         for i in range(0, len(id_list), 50):
             chunk = id_list[i:i+50]
             ids_query = "&".join([f"id={bid}" for bid in chunk])
