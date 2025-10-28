@@ -23,6 +23,7 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 请按照以下步骤设置和运行错误挖掘框架。
 
 ### 先决条件
+
 *   Ubuntu（我们使用的是 24.04）
 *   Python 3（我们使用的是 3.12）
 *   Git
@@ -68,7 +69,7 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 执行主脚本以启动挖掘过程。该脚本将从 `framework/example.txt` 读取项目并按顺序处理它们。
 
 ```sh
-python3 framework/fast_bug_miner.py
+python framework/fast_bug_miner.py
 ```
 
 该脚本将处理必要的缓存和输出目录的创建。

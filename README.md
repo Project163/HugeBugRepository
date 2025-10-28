@@ -23,6 +23,7 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 Follow these steps to set up and run the bug mining framework.
 
 ### Prerequisites
+
 *   Ubuntu(We are using 24.04)
 *   Python 3(We are using 3.12)
 *   Git
@@ -68,7 +69,7 @@ Follow these steps to set up and run the bug mining framework.
 Execute the main script to start the mining process. The script will read the projects from `framework/example1.txt` and process them sequentially.
 
 ```sh
-python3 framework/fast_bug_miner.py
+python framework/fast_bug_miner.py
 ```
 
 The script will handle the creation of necessary cache and output directories.
