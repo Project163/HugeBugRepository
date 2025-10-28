@@ -3,7 +3,7 @@ import subprocess
 import os
 import sys
 
-# 从环境变量读取调试模式
+# Read debug flag from environment variable
 DEBUG = os.environ.get('D4J_DEBUG', '0') == '1'
 
 def exec_cmd(cmd, desc):
@@ -42,7 +42,7 @@ def exec_cmd(cmd, desc):
 
 def read_config_file(file_path, key_separator=','):
     """
-    读取 key,value 格式的文件, 用于 vcs_log_xref.py 读取 issues.txt。
+    Read key,value format files for vcs_log_xref.py to read issues.txt.
     """
     config_data = {}
     if not os.path.exists(file_path):

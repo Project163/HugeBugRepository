@@ -1,0 +1,424 @@
+diff --git a/tika-server/src/main/java/org/apache/tika/server/ServerStatusWatcher.java b/tika-server/src/main/java/org/apache/tika/server/ServerStatusWatcher.java
+index a00c1a5d7..fa76d1e89 100644
+--- a/tika-server/src/main/java/org/apache/tika/server/ServerStatusWatcher.java
++++ b/tika-server/src/main/java/org/apache/tika/server/ServerStatusWatcher.java
+@@ -23,8 +23,11 @@ import org.slf4j.LoggerFactory;
+ import java.io.DataInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.nio.MappedByteBuffer;
++import java.nio.Buffer;
++import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.StandardOpenOption;
+ import java.time.Duration;
+@@ -38,31 +41,27 @@ public class ServerStatusWatcher implements Runnable {
+     private final DataInputStream fromParent;
+     private final long maxFiles;
+     private final ServerTimeouts serverTimeouts;
+-    private final FileChannel childStatusChannel;
+-    private final MappedByteBuffer toParent;
++    private final Path childStatusPath;
++    private final ByteBuffer statusBuffer = ByteBuffer.allocate(16);
++
+ 
+ 
+     private volatile Instant lastPing = null;
+ 
+     public ServerStatusWatcher(ServerStatus serverStatus,
+-                               InputStream inputStream, Path childStatusFile,
++                               InputStream inputStream, Path childStatusPath,
+                                long maxFiles,
+                                ServerTimeouts serverTimeouts) throws IOException {
+         this.serverStatus = serverStatus;
+         this.maxFiles = maxFiles;
+         this.serverTimeouts = serverTimeouts;
+-        this.childStatusChannel = FileChannel.open(childStatusFile,
+-                StandardOpenOption.DSYNC, StandardOpenOption.CREATE,
+-                StandardOpenOption.WRITE, StandardOpenOption.READ,
+-                StandardOpenOption.DELETE_ON_CLOSE);
+-        this.toParent= childStatusChannel.map(FileChannel.MapMode.READ_WRITE,
+-                0, 16);//8 for timestamp long, 4 for status int, 4 for numactivetasks int
++        this.childStatusPath = childStatusPath;
+         serverStatus.setStatus(ServerStatus.STATUS.OPERATING);
+-        writeStatus();
+         this.fromParent = new DataInputStream(inputStream);
+         Thread statusWatcher = new Thread(new StatusWatcher());
+         statusWatcher.setDaemon(true);
+         statusWatcher.start();
++        writeStatus();
+ 
+     }
+ 
+@@ -107,10 +106,28 @@ public class ServerStatusWatcher implements Runnable {
+         }
+     }
+ 
+-    private void writeStatus() throws IllegalArgumentException {
+-        toParent.putLong(0, Instant.now().toEpochMilli());
+-        toParent.putInt(8, serverStatus.getStatus().getInt());
+-        toParent.putInt(12, serverStatus.getTasks().size());
++    private void writeStatus() throws IOException {
++        Instant started = Instant.now();
++        long elapsed = Duration.between(started, Instant.now()).toMillis();
++        try (FileChannel channel = FileChannel.open(childStatusPath,
++                StandardOpenOption.CREATE,
++                StandardOpenOption.WRITE)) {
++            while (elapsed < serverTimeouts.getPingTimeoutMillis()) {
++                try (FileLock lock = channel.tryLock()) {
++                    if (lock != null) {
++                        ((Buffer) statusBuffer).position(0);
++                        statusBuffer.putLong(0, Instant.now().toEpochMilli());
++                        statusBuffer.putInt(8, serverStatus.getStatus().getInt());
++                        statusBuffer.putInt(12, serverStatus.getTasks().size());
++                        channel.write(statusBuffer);
++                        channel.force(true);
++                        return;
++                    }
++                }
++                elapsed = Duration.between(started, Instant.now()).toMillis();
++            }
++        }
++        throw new FatalException("Couldn't write to status file after trying for " + elapsed + " millis.");
+     }
+ 
+     private void checkForHitMaxFiles() {
+@@ -142,20 +159,27 @@ public class ServerStatusWatcher implements Runnable {
+ 
+     private void shutdown(ServerStatus.STATUS status) {
+ 
+-        toParent.putLong(0, Instant.now().toEpochMilli());
+-        toParent.putInt(8, serverStatus.getStatus().getInt());
+-        toParent.putInt(12, 0);
+-        toParent.force();
+         try {
+-            childStatusChannel.close();
+-        } catch (IOException e) {
+-            LOG.warn("problem closing status channel", e);
++            writeStatus();
++        } catch (Exception e) {
++            LOG.warn("problem writing status before shutdown", e);
++        }
++
++        //if something went wrong with the parent,
++        //the child process should try to delete the tmp file
++        if (status == ServerStatus.STATUS.PARENT_EXCEPTION) {
++            try {
++                Files.delete(childStatusPath);
++            } catch (IOException e) {
++                //swallow
++            }
+         }
+         LOG.info("Shutting down child process with status: {}", status.name());
+         System.exit(status.getShutdownCode());
+     }
+ 
+-    //This is an internal thread that pulses every 100MS
++
++    //This is an internal thread that pulses every ServerTimeouts#pingPulseMillis
+     //within the child to see if the child should die.
+     private class StatusWatcher implements Runnable {
+ 
+@@ -184,4 +208,14 @@ public class ServerStatusWatcher implements Runnable {
+             }
+         }
+     }
++
++    private static class FatalException extends RuntimeException {
++        public FatalException() {
++            super();
++        }
++
++        public FatalException(String msg) {
++            super(msg);
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/tika-server/src/main/java/org/apache/tika/server/TikaServerWatchDog.java b/tika-server/src/main/java/org/apache/tika/server/TikaServerWatchDog.java
+index 6a57bbe11..bb4767884 100644
+--- a/tika-server/src/main/java/org/apache/tika/server/TikaServerWatchDog.java
++++ b/tika-server/src/main/java/org/apache/tika/server/TikaServerWatchDog.java
+@@ -17,7 +17,6 @@
+ 
+ package org.apache.tika.server;
+ 
+-import org.apache.tika.io.MappedBufferCleaner;
+ import org.apache.tika.utils.ProcessUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -28,19 +27,24 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.PrintStream;
+-import java.nio.MappedByteBuffer;
++import java.nio.Buffer;
++import java.nio.ByteBuffer;
+ import java.nio.channels.FileChannel;
++import java.nio.channels.FileLock;
++import java.nio.channels.OverlappingFileLockException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
+-import java.nio.file.StandardOpenOption;
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.concurrent.TimeUnit;
+ 
++import static java.nio.file.StandardOpenOption.READ;
++import static java.nio.file.StandardOpenOption.WRITE;
++
+ public class TikaServerWatchDog {
+ 
+     private enum CHILD_STATUS {
+@@ -61,7 +65,6 @@ public class TikaServerWatchDog {
+     public void execute(String[] args, ServerTimeouts serverTimeouts) throws Exception {
+         LOG.info("server watch dog is starting up");
+         startPingTimer(serverTimeouts);
+-
+         try {
+             childProcess = new ChildProcess(args, serverTimeouts);
+             setChildStatus(CHILD_STATUS.RUNNING);
+@@ -211,11 +214,11 @@ public class TikaServerWatchDog {
+         private Thread SHUTDOWN_HOOK = null;
+ 
+         private final Process process;
+-        private final FileChannel fromChildChannel;
+-        private final MappedByteBuffer fromChild;
+         private final DataOutputStream toChild;
+         private final ServerTimeouts serverTimeouts;
+         private final Path childStatusFile;
++        private final ByteBuffer statusBuffer = ByteBuffer.allocate(16);
++
+         private ChildProcess(String[] args, ServerTimeouts serverTimeouts) throws Exception {
+             String prefix = DEFAULT_CHILD_STATUS_FILE_PREFIX;
+             for (int i = 0; i < args.length; i++) {
+@@ -231,41 +234,32 @@ public class TikaServerWatchDog {
+             //wait for file to be written/initialized by child process
+             Instant start = Instant.now();
+             long elapsed = Duration.between(start, Instant.now()).toMillis();
+-            while (Files.size(childStatusFile) < 12
+-                    && elapsed < serverTimeouts.getMaxChildStartupMillis()) {
+-                if (!process.isAlive()) {
+-                    close();
+-                    throw new RuntimeException("Failed to start child process");
++            try {
++                while (process.isAlive() && Files.size(childStatusFile) < 12
++                        && elapsed < serverTimeouts.getMaxChildStartupMillis()) {
++                    Thread.sleep(50);
++                    elapsed = Duration.between(start, Instant.now()).toMillis();
+                 }
+-                Thread.sleep(50);
+-                elapsed = Duration.between(start, Instant.now()).toMillis();
++            } catch (IOException e) {
++                //the childStatusFile can be deleted by the
++                //child process if it closes...this can lead to a NoSuchFileException
++                LOG.warn("failed to start child process", e);
+             }
+ 
+             if (elapsed > serverTimeouts.getMaxChildStartupMillis()) {
+                 close();
+                 throw new RuntimeException("Child process failed to start after "+elapsed + " (ms)");
+             }
+-            this.fromChildChannel = FileChannel.open(childStatusFile,
+-                    StandardOpenOption.READ,
+-                    StandardOpenOption.DELETE_ON_CLOSE);
+-            this.fromChild = fromChildChannel.map(
+-                    FileChannel.MapMode.READ_ONLY, 0, 12);
+-
+-            this.toChild = new DataOutputStream(process.getOutputStream());
+-            elapsed = Duration.between(start, Instant.now()).toMillis();
+-            //wait for child process to write something to the file
+-            while (elapsed < serverTimeouts.getMaxChildStartupMillis()) {
+-                int status = fromChild.getInt(8);
+-                if (status == ServerStatus.STATUS.OPERATING.getInt()) {
+-                    break;
+-                }
+-                Thread.sleep(50);
+-                elapsed = Duration.between(start, Instant.now()).toMillis();
++            if (!process.isAlive()) {
++                close();
++                throw new RuntimeException("Failed to start child process -- child is not alive");
+             }
+-            if (elapsed > serverTimeouts.getMaxChildStartupMillis()) {
++            if (!Files.exists(childStatusFile)) {
+                 close();
+-                throw new RuntimeException("Child process failed to start after "+elapsed + " (ms)");
++                throw new RuntimeException("Failed to start child process -- child status file does not exist");
+             }
++
++            this.toChild = new DataOutputStream(process.getOutputStream());
+             lastPing = Instant.now();
+         }
+ 
+@@ -281,32 +275,30 @@ public class TikaServerWatchDog {
+                 LOG.warn("Exception pinging child process", e);
+                 return false;
+             }
+-            long lastUpdate = -1;
+-            int status = -1;
++            ChildStatus childStatus = null;
+             try {
+-                lastUpdate = fromChild.getLong(0);
+-                status = fromChild.getInt(8);
+-            } catch (IndexOutOfBoundsException e) {
+-                //something went wrong with the tmp file
+-                LOG.warn("Exception receiving status from child", e);
++                childStatus = readStatus();
++            } catch (Exception e) {
++                LOG.warn("Exception reading status from child", e);
+                 return false;
+             }
+ 
+-            if (status != ServerStatus.STATUS.OPERATING.getInt()) {
++            if (childStatus.status != ServerStatus.STATUS.OPERATING.getInt()) {
+                 LOG.warn("Received non-operating status from child: {}",
+-                        ServerStatus.STATUS.lookup(status));
++                        ServerStatus.STATUS.lookup(childStatus.status));
+                 return false;
+             }
+ 
+             long elapsedSinceLastUpdate =
+-                    Duration.between(Instant.ofEpochMilli(lastUpdate), Instant.now()).toMillis();
+-            LOG.trace("last update: {}, elapsed:{}, status:{}", lastUpdate, elapsedSinceLastUpdate, status);
++                    Duration.between(Instant.ofEpochMilli(childStatus.timestamp), Instant.now()).toMillis();
++            LOG.debug("last update: {}, elapsed:{}, status:{}", childStatus.timestamp, elapsedSinceLastUpdate,
++                    childStatus.status);
+ 
+             if (elapsedSinceLastUpdate >
+                     serverTimeouts.getPingTimeoutMillis()) {
+                 //child hasn't written a status update in a longer time than allowed
+                 LOG.warn("Child's last update exceeded ping timeout: {} (ms) with status {}",
+-                        elapsedSinceLastUpdate, status);
++                        elapsedSinceLastUpdate, childStatus.status);
+                 return false;
+             }
+ 
+@@ -314,6 +306,32 @@ public class TikaServerWatchDog {
+             return true;
+         }
+ 
++        private ChildStatus readStatus() throws Exception {
++            Instant started = Instant.now();
++            Long elapsed = Duration.between(started, Instant.now()).toMillis();
++            //only reading, but need to include write to allow for locking
++            try (FileChannel fc = FileChannel.open(childStatusFile, READ, WRITE)) {
++
++                while (elapsed < serverTimeouts.getPingTimeoutMillis()) {
++                    try (FileLock lock = fc.tryLock(0, 16, true)) {
++                        if (lock != null) {
++                            ((Buffer)statusBuffer).position(0);
++                            fc.read(statusBuffer);
++                            long timestamp = statusBuffer.getLong(0);
++                            int status = statusBuffer.getInt(8);
++                            int numTasks = statusBuffer.getInt(12);
++                            return new ChildStatus(timestamp, status, numTasks);
++                        }
++                    } catch (OverlappingFileLockException e) {
++                        //swallow
++                    }
++                    elapsed = Duration.between(started, Instant.now()).toMillis();
++                }
++            }
++            throw new RuntimeException("couldn't read from status file after "+elapsed +" millis");
++        }
++
++
+         private void close() {
+ 
+             try {
+@@ -333,23 +351,13 @@ public class TikaServerWatchDog {
+                 LOG.debug("Problem shutting down writer to child", e);
+             }
+             destroyChildForcibly(process);
+-            try {
+-                MappedBufferCleaner.freeBuffer(fromChild);
+-            } catch (IOException e) {
+-                LOG.warn("problem freeing buffer");
+-            }
+-            try {
+-                if (fromChildChannel != null) {
+-                    fromChildChannel.close();
+-                }
+-            } catch (IOException e) {
+-                LOG.debug("Problem closing child channel", e);
+-            }
++
+             if (childStatusFile != null) {
+                 try {
+                     if (Files.isRegularFile(childStatusFile)) {
+                         Files.delete(childStatusFile);
+                     }
++                    LOG.debug("deleted "+childStatusFile);
+                 } catch (IOException e) {
+                     LOG.warn("problem deleting child status file", e);
+                 }
+@@ -430,4 +438,25 @@ public class TikaServerWatchDog {
+         }
+     }
+ 
++    private static class ChildStatus {
++        private final long timestamp;
++        private final int status;
++        private final int numTasks;
++
++        public ChildStatus(long timestamp, int status, int numTasks) {
++            this.timestamp = timestamp;
++            this.status = status;
++            this.numTasks = numTasks;
++        }
++
++        @Override
++        public String toString() {
++            return "ChildStatus{" +
++                    "timestamp=" + timestamp +
++                    ", status=" + status +
++                    ", numTasks=" + numTasks +
++                    '}';
++        }
++    }
++
+ }
+diff --git a/tika-server/src/test/java/org/apache/tika/server/TikaServerIntegrationTest.java b/tika-server/src/test/java/org/apache/tika/server/TikaServerIntegrationTest.java
+index c78610c78..633c7ec30 100644
+--- a/tika-server/src/test/java/org/apache/tika/server/TikaServerIntegrationTest.java
++++ b/tika-server/src/test/java/org/apache/tika/server/TikaServerIntegrationTest.java
+@@ -251,7 +251,7 @@ public class TikaServerIntegrationTest extends TikaTest {
+         }
+     }
+ 
+-    @Test
++    @Test(timeout = 60000)
+     public void testTimeout() throws Exception {
+ 
+         Thread serverThread = new Thread() {
+@@ -260,7 +260,7 @@ public class TikaServerIntegrationTest extends TikaTest {
+                 TikaServerCli.main(
+                         new String[]{
+                                 "-spawnChild", "-p", INTEGRATION_TEST_PORT,
+-                                "-taskTimeoutMillis", "5000", "-taskPulseMillis", "100",
++                                "-taskTimeoutMillis", "10000", "-taskPulseMillis", "100",
+                                 "-pingPulseMillis", "100",
+                                 "-tmpFilePrefix", "tika-server-timeout"
+ 
+@@ -426,12 +426,10 @@ public class TikaServerIntegrationTest extends TikaTest {
+ 
+         Instant started = Instant.now();
+         long elapsed = Duration.between(started, Instant.now()).toMillis();
++        WebClient client = WebClient.create(endPoint+"/tika").accept("text/plain");
+         while (elapsed < 30000) {
+             try {
+-                Response response = WebClient
+-                        .create(endPoint + "/tika")
+-                        .accept("text/plain")
+-                        .get();
++                Response response = client.get();
+                 if (response.getStatus() == 200) {
+                     return;
+                 }

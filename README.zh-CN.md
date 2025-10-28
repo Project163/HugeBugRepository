@@ -23,7 +23,7 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
 请按照以下步骤设置和运行错误挖掘框架。
 
 ### 先决条件
-
+*   Ubuntu（我们使用的是 24.04）
 *   Python 3（我们使用的是 3.12）
 *   Git
 

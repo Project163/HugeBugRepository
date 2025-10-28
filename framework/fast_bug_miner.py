@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # framework/fast_bug_miner.py
-# (已更新，使用 sys.executable 确保 Windows 兼容性)
 
 import os
 import sys  # <-- (!!) 导入 sys 模块
@@ -10,7 +9,6 @@ import utils
 import config
 
 def main():
-    # --- (!!) 获取当前 Python 解释器的绝对路径 ---
     PYTHON_EXECUTABLE = sys.executable
 
     input_file = os.path.join(config.SCRIPT_DIR, 'test.txt')
@@ -33,6 +31,12 @@ def main():
                 issue_tracker_name = parts[3]
                 issue_tracker_project_id = parts[4]
                 bug_fix_regex = parts[5]
+                
+                sub_project_path = "."
+                if len(parts) > 6 and parts[6].strip() and parts[6].strip() != ".":
+                    sub_project_path = parts[6].strip()
+                    
+
             except IndexError:
                 print(f"Skipping malformed line (expected at least 6 tab-separated parts): {line}", file=sys.stderr)
                 continue
@@ -41,7 +45,7 @@ def main():
             print(f"Processing project: {project_id} ({project_name})")
             print("############################################################")
 
-            # --- 1. 定义路径 ---
+            # 1. define paths
             issue_cache_key = f"{issue_tracker_name}_{issue_tracker_project_id}"
             cache_issues_dir = os.path.join(config.SHARED_ISSUES_DIR, issue_cache_key)
             cache_issues_file = os.path.join(cache_issues_dir, 'issues.txt')
@@ -54,14 +58,14 @@ def main():
             cache_repo_dir = os.path.join(cache_project_dir, f"{project_name}.git")
             cache_gitlog_file = os.path.join(cache_project_dir, 'gitlog.txt')
             
-            # --- 2. 创建目录 ---
+            # 2. create necessary directories
             os.makedirs(output_patches_dir, exist_ok=True)
             os.makedirs(cache_project_dir, exist_ok=True) 
             os.makedirs(cache_issues_dir, exist_ok=True)
             
-            # --- 3. 初始化 ---
+            # 3. initialize git repository if not already done
             
-            # 3a. 克隆仓库
+            # 3a. cloning repository
             if not os.path.exists(cache_repo_dir):
                 cmd = f"git clone --bare \"{repository_url}\" \"{cache_repo_dir}\""
                 success, _ = utils.exec_cmd(cmd, f"Cloning {project_name}")
@@ -71,11 +75,10 @@ def main():
             else:
                 print(f"Repository {project_name}.git already cached.")
 
-            # 3b. 下载 Issues
+            # 3b. downloading shared issues
             if not os.path.exists(cache_issues_file) or os.path.getsize(cache_issues_file) == 0:
                 print(f"Shared issues for {issue_cache_key} not found. Downloading...")
                 
-                # --- (!!) 已更改：使用 PYTHON_EXECUTABLE 替换 "python3" ---
                 cmd_dl = (
                     f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'download_issues.py')} "
                     f"-g \"{issue_tracker_name}\" -t \"{issue_tracker_project_id}\" "
@@ -88,9 +91,9 @@ def main():
             else:
                 print(f"Shared issues for {issue_cache_key} already cached. Skipping download.")
 
-            # 3c. 获取 Git Log
+            # 3c. getting git log
             if not os.path.exists(cache_gitlog_file):
-                cmd_log = f"git --git-dir=\"{cache_repo_dir}\" log --reverse > \"{cache_gitlog_file}\""
+                cmd_log = f"git --git-dir=\"{cache_repo_dir}\" log --reverse -- \"{sub_project_path}\" > \"{cache_gitlog_file}\""
                 success, _ = utils.exec_cmd(cmd_log, f"Collecting git log for {project_name}")
                 if not success:
                     print(f"Error: Failed to get git log for {project_name}. Skipping.", file=sys.stderr)
@@ -98,7 +101,7 @@ def main():
             else:
                 print(f"Git log for {project_name} already cached.")
 
-            # 3d. 交叉引用
+            # 3d. cross-referencing git log with issues
             if not os.path.exists(output_csv_file):
                 try:
                     with open(output_csv_file, 'w', encoding='utf-8', newline='') as f:
@@ -107,8 +110,9 @@ def main():
                 except IOError as e:
                     print(f"Error: Cannot write header to {output_csv_file}: {e}. Skipping.", file=sys.stderr)
                     continue
-                    
-                # --- (!!) 已更改：使用 PYTHON_EXECUTABLE 替换 "python3" ---
+
+                print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
+
                 cmd_xref = (
                     f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py')} "
                     f"-e \"{bug_fix_regex}\" -l \"{cache_gitlog_file}\" "
@@ -125,8 +129,7 @@ def main():
             else:
                 print(f"Bugs file {output_csv_file} already exists.")
 
-            # --- 4. 生成 Patches ---
-            # (此部分无变化)
+            # generating patches
             print(f"Generating patches from {output_csv_file}...")
             
             try:
@@ -159,9 +162,9 @@ def main():
                             continue 
 
                         print(f"  -> Generating patch for bug {bug_id} ({commit_buggy} -> {commit_fixed})")
-                        
-                        cmd_diff = f"git --git-dir=\"{cache_repo_dir}\" diff \"{commit_buggy}\" \"{commit_fixed}\" > \"{patch_file}\""
-                        
+
+                        cmd_diff = f"git --git-dir=\"{cache_repo_dir}\" diff \"{commit_buggy}\" \"{commit_fixed}\" -- \"{sub_project_path}\" > \"{patch_file}\""
+
                         try:
                             subprocess.run(cmd_diff, shell=True, check=True, capture_output=True)
                             

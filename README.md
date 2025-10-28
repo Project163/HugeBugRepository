@@ -23,7 +23,7 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 Follow these steps to set up and run the bug mining framework.
 
 ### Prerequisites
-
+*   Ubuntu(We are using 24.04)
 *   Python 3(We are using 3.12)
 *   Git
 

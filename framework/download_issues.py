@@ -7,7 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urlencode, quote_plus
 
-# 此脚本需要:
+# Required packages:
 # pip install requests beautifulsoup4
 
 SUPPORTED_TRACKERS = {
@@ -78,14 +78,13 @@ SUPPORTED_TRACKERS = {
 
 def get_file(uri, save_to, session):
     headers = {}
-    # 优先使用 GH_TOKEN 环境变量 
+    # use GH_TOKEN if available for GitHub API requests
     if 'api.github.com' in uri and os.environ.get('GH_TOKEN'):
         headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
     
     try:
-        # 使用 retry 和 timeout 模拟 curl 参数
         response = session.get(uri, headers=headers, timeout=20)
-        response.raise_for_status() # 4xx 或 5xx 抛出异常
+        response.raise_for_status() 
         
         with open(save_to, 'w', encoding='utf-8') as f:
             f.write(response.text)
@@ -147,8 +146,8 @@ def main():
     debug = args.debug
 
     os.makedirs(output_dir, exist_ok=True)
-    
-    # 设置带重试的 Session
+
+    # Set up a session with retries
     session = requests.Session()
     adapter = requests.adapters.HTTPAdapter(max_retries=5)
     session.mount('http://', adapter)
@@ -158,8 +157,8 @@ def main():
     print("----------------------------------------------")
     
     start = 0
-    
-    # Bugzilla 的特殊处理 (待更新)
+
+    # Bugzilla special handling (to be updated)
     if args.tracker_name == 'bugzilla':
         list_uri = tracker['build_uri'](tracker_uri, tracker_id, query, 0, 0, organization_id)
         if debug: print(f"Fetching Bugzilla ID list from: {list_uri}")
@@ -171,7 +170,6 @@ def main():
         if debug: print(f"Found {len(id_list)} Bugzilla IDs.")
         
         all_results = []
-        # 每50个ID一组获取XML
         for i in range(0, len(id_list), 50):
             chunk = id_list[i:i+50]
             ids_query = "&".join([f"id={bid}" for bid in chunk])
@@ -187,7 +185,6 @@ def main():
             results = tracker['results'](out_file, tracker_id)
             all_results.extend(results)
             
-        # 批量写入文件
         try:
             with open(issues_file, 'w', encoding='utf-8') as f:
                 for issue_id, issue_url in all_results:
@@ -198,8 +195,8 @@ def main():
         print(f"Bugzilla processing complete. Wrote {len(all_results)} issues.")
         sys.exit(0)
 
-    # 其他 tracker 的标准分页逻辑
-    give_up = False # 针对 google tracker 的特殊逻辑
+    # other trackers's processing
+    give_up = False # special logic for Google tracker
     while True:
         uri = tracker['build_uri'](tracker_uri, tracker_id, query, start, limit, organization_id)
         project_in_file = tracker_id.replace('/', '-')
@@ -208,7 +205,7 @@ def main():
         if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
             if debug: print(f"Downloading {uri} to {out_file}")
             if not get_file(uri, out_file, session):
-                if give_up: # Google tracker 逻辑
+                if give_up: # Google tracker special logic
                     break
                 else:
                     print(f"Error: Could not download {uri}", file=sys.stderr)
@@ -224,7 +221,7 @@ def main():
 
         if results:
             try:
-                # 使用 'a' (附加) 模式
+                # use 'a' (append) mode
                 with open(issues_file, 'a', encoding='utf-8') as f:
                     for issue_id, issue_url in results:
                         f.write(f"{issue_id},{issue_url}\n")
@@ -233,12 +230,12 @@ def main():
                 sys.exit(1)
             
             if args.tracker_name == 'google':
-                give_up = True # 成功下载过至少一页
+                give_up = True # special logic for Google tracker
             
-            start += limit # 准备下一页
+            start += limit 
         else:
             if debug: print("No more results found. Stopping.")
-            break # 结束循环
+            break 
 
 if __name__ == "__main__":
     main()

@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # framework/vcs_log_xref.py
-# (已更新，添加了 URL 构建逻辑和新列)
 
 import argparse
 import sys
 import os
 import re
 import subprocess
-import csv # 导入 csv 模块
+import csv 
 import utils
 import config
 
-# --- (get_git_parent 函数保持不变) ---
 def get_git_parent(commit_hash, repo_dir):
     """
     获取一个 commit 的父 commit。只支持单个父 commit。
@@ -23,7 +21,6 @@ def get_git_parent(commit_hash, repo_dir):
         
         if len(parts) > 1:
             if len(parts) > 2:
-                # 跳过 merge commits
                 return None
             return parts[1] # 返回第一个父 commit
         else:
@@ -33,7 +30,6 @@ def get_git_parent(commit_hash, repo_dir):
         print(f"Warning: Error getting parent for {commit_hash}: {e}", file=sys.stderr)
         return None
 
-# --- 新增辅助函数：构建 Commit URL ---
 def construct_commit_url(repo_url, commit_hash):
     """
     根据仓库URL和commit hash构建一个可访问的URL。
@@ -56,7 +52,6 @@ def construct_commit_url(repo_url, commit_hash):
         return f"{base_url}/tree/{commit_hash}"
     return "NA"
 
-# --- 新增辅助函数：构建 Compare URL ---
 def construct_compare_url(repo_url, buggy_hash, fixed_hash):
     """
     根据仓库URL和两个commit hash构建一个 diff 比较 URL。
@@ -70,7 +65,6 @@ def construct_compare_url(repo_url, buggy_hash, fixed_hash):
     if 'gitlab.com' in repo_url:
         return f"{base_url}/-/compare/{buggy_hash}...{fixed_hash}"
     if 'bitbucket.org' in repo_url:
-        # Bitbucket 顺序是 new..old
         return f"{base_url}/compare/{fixed_hash}..{buggy_hash}#diff"
     if 'gitbox.apache.org' in repo_url:
         base_url = base_url.replace('gitbox.apache.org/repos/asf', 'github.com/apache')
@@ -84,13 +78,13 @@ def main():
     parser.add_argument('-r', dest='repo_dir', required=True, help="Path to the .git repository directory")
     parser.add_argument('-i', dest='issues_file', required=True, help="Path to the issues.txt file (id,url)")
     parser.add_argument('-f', dest='output_file', required=True, help="Output file for active-bugs.csv (will append)")
-    # --- 新增参数 ---
+    # added arguments
     parser.add_argument('-ru', dest='repo_url', required=True, help="Public repository URL (e.g., https://github.com/org/repo.git)")
     parser.add_argument('-pid', dest='project_id', required=True, help="Project ID (e.g., 'core' or '.')")
 
     args = parser.parse_args()
 
-    # 1. 加载 issues.txt 到内存
+    # 1. Load issues.txt into memory
     issues_db = utils.read_config_file(args.issues_file, key_separator=',')
     if not issues_db:
         print(f"Error: Could not read or issues file is empty: {args.issues_file}", file=sys.stderr)
@@ -98,7 +92,7 @@ def main():
         
     issues_db_lower = {k.lower(): v for k, v in issues_db.items()}
 
-    # 2. 解析 Perl 正则表达式
+    # 2. compile the regex
     try:
         pattern_str = args.regexp.strip('/ \t\n\r')
         flags_str = ""
@@ -118,7 +112,7 @@ def main():
         print(f"Error: Invalid regex provided: {args.regexp}. Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 3. 逐行读取 git log 文件
+    # 3. read the log file and cross-reference
     results = {}
     version_id = 1
     current_commit = None
@@ -151,7 +145,7 @@ def main():
                 elif current_commit and line.startswith('    '):
                     commit_message_lines.append(line.strip())
 
-        # 处理文件中的最后一条 commit
+        # handle the last commit
         if current_commit and commit_message_lines:
             commit_message = "\n".join(commit_message_lines)
             match = bug_regex.search(commit_message)
@@ -175,28 +169,24 @@ def main():
     if not results:
         print("Warning: No commit matching the regex was found.", file=sys.stderr)
 
-    # 4. 将结果附加到 output_file (active-bugs.csv)
+    # 4. Append the results to the output_file (active-bugs.csv)
     try:
-        # 'a' (append) 模式, 并且使用 csv.writer 确保格式正确
+        # 'a' (append) mode, and use csv.writer to ensure correct formatting
         with open(args.output_file, 'a', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
             for vid in sorted(results.keys()):
                 row = results[vid]
                 
-                # --- (已更新) 构建新数据 ---
                 project_id = args.project_id
                 buggy_hash = row['p']
                 fixed_hash = row['c']
                 issue_id = row['issue_id']
                 issue_url = row['issue_url']
                 
-                # 调用辅助函数
                 buggy_url = construct_commit_url(args.repo_url, buggy_hash)
                 fixed_url = construct_commit_url(args.repo_url, fixed_hash)
                 compare_url = construct_compare_url(args.repo_url, buggy_hash, fixed_hash)
                 
-                # --- (已更新) 写入新行 (9 列) ---
-                # 顺序必须匹配 config.py 中的 ACTIVE_BUGS_HEADER
                 writer.writerow([
                     vid,
                     project_id,
