@@ -41,11 +41,15 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
     ```sh
     pip install -r framework/requirements.txt
     ```
+    除此之外，您还可以手动安装它们：
+    ```sh
+    pip install requests beautifulsoup4
+    ```
 
 ### 配置
 
 1.  **定义目标项目：**
-    编辑 `framework/example.txt` 文件以指定要挖掘的项目。每行代表一个项目，应为以下格式的制表符分隔列表：
+    编辑 `framework/example.txt` 文件（若文件不存在，您可以手动创建它）以指定要挖掘的项目。每行代表一个项目，应为以下格式的制表符分隔列表：
     `project_id	project_name	repository_url	issue_tracker_name	issue_tracker_project_id	bug_fix_regex`
 
     示例行：
@@ -60,7 +64,7 @@ HugeBugRepository（基于 defects4j）是一个旨在自动化从各种软件�
     ```sh
     export GH_TOKEN="your_github_personal_access_token"
     ```
-    - Windows (PowerShell)
+    - Windows (仍待更新)
     ```bash
     set GH_TOKEN "your_github_personal_access_token"
     ```

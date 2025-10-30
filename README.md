@@ -41,11 +41,15 @@ Follow these steps to set up and run the bug mining framework.
     ```sh
     pip install -r framework/requirements.txt
     ```
+    Alternatively, you can install them manually:
+    ```sh
+    pip install requests beautifulsoup4
+    ```
 
 ### Configuration
 
 1.  **Define Target Projects:**
-    Edit the `framework/example1.txt` file to specify the projects you want to mine. Each line represents a project and should be a tab-separated list with the following format:
+    Edit the `framework/example.txt` file(if it not exists, you can create it manually) to specify the projects you want to mine. Each line represents a project and should be a **tab-separated** list with the following format:
     `project_id	project_name	repository_url	issue_tracker_name	issue_tracker_project_id	bug_fix_regex`
 
     Example line:
@@ -60,7 +64,7 @@ Follow these steps to set up and run the bug mining framework.
     ```sh
     export GH_TOKEN="your_github_personal_access_token"
     ```
-    - Windows (PowerShell)
+    - Windows(Still waiting for update)
     ```bash
     set GH_TOKEN "your_github_personal_access_token"
     ```
