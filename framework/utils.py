@@ -1,10 +1,106 @@
-# utils.py
+#!/usr/bin/env python3
+# framework/utils.py
+
 import subprocess
 import os
 import sys
+import requests  # (!!) 导入
+import requests.adapters # (!!) 导入
+from urllib.parse import urlparse, urlunparse # (!!) 导入
 
 # Read debug flag from environment variable
 DEBUG = os.environ.get('D4J_DEBUG', '0') == '1'
+
+# (!!) NEW: Global session for HTTP requests
+_session = None
+
+def get_http_session():
+    """
+    Initializes and returns a reusable requests.Session.
+    """
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=5)
+        _session.mount('http://', adapter)
+        _session.mount('https://', adapter)
+        _session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    return _session
+
+# (!!) NEW: 智能下载 Bug Report 的函数
+def download_report_data(uri, save_to):
+    """
+    Downloads a specific report file from a "browse" URI.
+    It intelligently converts browse URLs to raw data API URLs.
+    Returns True on success, False on failure.
+    """
+    session = get_http_session()
+    headers = {}
+    api_uri = uri # 默认 API URI 就是传入的 URI
+    
+    try:
+        # 1. 检查 JIRA (e.g., https://issues.apache.org/jira/browse/BSF-45)
+        if 'issues.apache.org/jira/' in uri:
+            issue_key = uri.split('/')[-1].split('?')[0] # 移除可能的查询参数
+            api_uri = f"https://issues.apache.org/jira/si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
+            print(f"  -> [JIRA] Remapped to XML view")
+
+        # 2. 检查 GitHub (e.g., https://github.com/google/gson/issues/2892)
+        elif 'github.com/' in uri and '/issues/' in uri and 'api.github.com' not in uri:
+            parts = urlparse(uri).path.split('/')
+            if len(parts) >= 5:
+                org = parts[1]
+                repo = parts[2]
+                issue_num = parts[4]
+                api_uri = f"https://api.github.com/repos/{org}/{repo}/issues/{issue_num}"
+                print(f"  -> [GitHub] Remapped to API view", end="")
+                if os.environ.get('GH_TOKEN'):
+                    headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
+
+        # 3. 检查 Bugzilla (e.g., https://bz.apache.org/bugzilla/show_bug.cgi?id=123)
+        elif 'bugzilla' in uri and 'show_bug.cgi?id=' in uri:
+            # 转换为XML视图
+            parsed_url = urlparse(uri)
+            api_uri = urlunparse(parsed_url._replace(query=f"ctype=xml&{parsed_url.query}"))
+            print(f"  -> [Bugzilla] Remapped to XML view", end="")
+
+        # 4. 检查 SourceForge (e.g., https://sourceforge.net/p/project/bugs/123/)
+        elif 'sourceforge.net/p/' in uri and '/bugs/' in uri:
+            # 转换为 REST API: http://sourceforge.net/rest/p/project/bugs/123/
+            api_uri = uri.replace('/p/', '/rest/p/')
+            if not api_uri.endswith('/'):
+                api_uri += '/'
+            print(f"  -> [SourceForge] Remapped to REST API", end="")
+        
+        # 5. 检查 Google Code (e.g., .../issue-123.json)
+        elif 'storage.googleapis.com/google-code-archive' in uri and uri.endswith('.json'):
+            print(f"  -> [Google Code] Using direct JSON URL", end="")
+            # api_uri is already correct
+        
+        else:
+            print(f"  -> [Unknown] Attempting direct download", end="")
+
+        
+        response = session.get(api_uri, headers=headers, timeout=20)
+        response.raise_for_status()
+        
+        with open(save_to, 'w', encoding='utf-8') as f:
+            f.write(response.text)
+        print("OK", file=sys.stderr)
+        return True
+    except requests.exceptions.RequestException as e:
+        print("FAIL", file=sys.stderr)
+        print(f"  -> Error downloading {api_uri}: {e}", file=sys.stderr)
+        if os.path.exists(save_to):
+            os.remove(save_to) # 移除不完整的文件
+        return False
+    except Exception as e:
+        print("FAIL", file=sys.stderr)
+        print(f"  -> An unexpected error occurred: {e}", file=sys.stderr)
+        if os.path.exists(save_to):
+            os.remove(save_to)
+        return False
+
 
 def exec_cmd(cmd_list, desc, output_file=None):
     """

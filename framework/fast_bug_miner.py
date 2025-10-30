@@ -53,6 +53,7 @@ def main():
 
             output_project_dir = os.path.join(config.OUTPUT_DIR, project_id)
             output_patches_dir = os.path.join(output_project_dir, 'patches')
+            output_reports_dir = os.path.join(output_project_dir, 'reports')   
             output_csv_file = os.path.join(output_project_dir, 'active-bugs.csv')
             
             cache_project_dir = os.path.join(config.CACHE_DIR, project_id)
@@ -63,7 +64,8 @@ def main():
             os.makedirs(output_patches_dir, exist_ok=True)
             os.makedirs(cache_project_dir, exist_ok=True) 
             os.makedirs(cache_issues_dir, exist_ok=True)
-            
+            os.makedirs(output_reports_dir, exist_ok=True)
+
             # 3. initialize git repository if not already done
             
             # 3a. cloning repository
@@ -174,6 +176,8 @@ def main():
                         idx_bug_id = header.index(config.BUGS_CSV_BUGID)
                         idx_commit_buggy = header.index(config.BUGS_CSV_COMMIT_BUGGY)
                         idx_commit_fixed = header.index(config.BUGS_CSV_COMMIT_FIXED)
+                        idx_report_url = header.index(config.BUGS_CSV_ISSUE_URL)
+
                     except (StopIteration, ValueError) as e:
                         print(f"Error: Invalid or empty CSV file: {output_csv_file}. {e}", file=sys.stderr)
                         continue
@@ -183,8 +187,25 @@ def main():
                             bug_id = row[idx_bug_id]
                             commit_buggy = row[idx_commit_buggy]
                             commit_fixed = row[idx_commit_fixed]
+                            report_url = row[idx_report_url]
                         except IndexError:
                             continue 
+
+                        if not report_url:
+                            print(f"  -> Skipping bug {bug_id} (missing report URL).")
+                            continue
+                        else:
+                            ext = '.json'
+                            if 'issues.apache.org' in report_url:
+                                ext = '.xml'
+
+                            report_file = os.path.join(output_reports_dir, f"{bug_id}{ext}")
+
+                            if os.path.exists(report_file):
+                                pass
+                            else:
+                                print(f"  -> Downloading report for bug {bug_id}.")
+                                utils.download_report_data(report_url, report_file)
 
                         if not commit_buggy or not commit_fixed:
                             print(f"  -> Skipping bug {bug_id} (missing commit hash).")
