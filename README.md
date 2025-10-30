@@ -17,6 +17,7 @@ The primary goal of this project is to build a comprehensive bug repository. It 
 3.  Cross-referencing Git commit logs with bug reports to identify bug-fixing commits.
 4.  Generating patch files (`.diff` or `.patch`) that represent the code changes for each bug fix.
 5.  Consolidating this information into a structured format, including a CSV file (`active-bugs.csv`) that links bug reports to their corresponding fixing commits.
+6.  Gathering the bug reports and associated data.
 
 ## Getting Started
 
@@ -88,5 +89,8 @@ bug-mining/
     ├── active-bugs.csv      # CSV file mapping bug IDs to fixing commits
     └── patches/             # Directory containing patch files for each bug
         ├── 1.src.patch
+        └── ...
+    └── reports/            # Directory containing downloaded report files for each bug
+        ├── 1.report.xxx
         └── ...
 ```

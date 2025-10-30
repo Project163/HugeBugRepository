@@ -4,19 +4,18 @@
 import subprocess
 import os
 import sys
-import requests  # (!!) 导入
-import requests.adapters # (!!) 导入
-from urllib.parse import urlparse, urlunparse # (!!) 导入
+import requests  
+import requests.adapters 
+from urllib.parse import urlparse, urlunparse 
 
 # Read debug flag from environment variable
 DEBUG = os.environ.get('D4J_DEBUG', '0') == '1'
 
-# (!!) NEW: Global session for HTTP requests
 _session = None
 
 def get_http_session():
     """
-    Initializes and returns a reusable requests.Session.
+    初始化并返回一个带有重试机制的 HTTP 会话。
     """
     global _session
     if _session is None:
@@ -27,25 +26,22 @@ def get_http_session():
         _session.headers.update({'User-Agent': 'Mozilla/5.0'})
     return _session
 
-# (!!) NEW: 智能下载 Bug Report 的函数
+
 def download_report_data(uri, save_to):
     """
-    Downloads a specific report file from a "browse" URI.
-    It intelligently converts browse URLs to raw data API URLs.
-    Returns True on success, False on failure.
+    从指定的 URI 下载报告数据并保存到本地文件。
     """
     session = get_http_session()
     headers = {}
-    api_uri = uri # 默认 API URI 就是传入的 URI
+    api_uri = uri
     
     try:
-        # 1. 检查 JIRA (e.g., https://issues.apache.org/jira/browse/BSF-45)
+        # check and convert known issue tracker URLs to API/raw data URLs
         if 'issues.apache.org/jira/' in uri:
             issue_key = uri.split('/')[-1].split('?')[0] # 移除可能的查询参数
             api_uri = f"https://issues.apache.org/jira/si/jira.issueviews:issue-xml/{issue_key}/{issue_key}.xml"
-            print(f"  -> [JIRA] Remapped to XML view")
+            print(f"  -> [JIRA] Remapped to XML view", end="")
 
-        # 2. 检查 GitHub (e.g., https://github.com/google/gson/issues/2892)
         elif 'github.com/' in uri and '/issues/' in uri and 'api.github.com' not in uri:
             parts = urlparse(uri).path.split('/')
             if len(parts) >= 5:
@@ -57,25 +53,19 @@ def download_report_data(uri, save_to):
                 if os.environ.get('GH_TOKEN'):
                     headers['Authorization'] = f"token {os.environ['GH_TOKEN']}"
 
-        # 3. 检查 Bugzilla (e.g., https://bz.apache.org/bugzilla/show_bug.cgi?id=123)
         elif 'bugzilla' in uri and 'show_bug.cgi?id=' in uri:
-            # 转换为XML视图
             parsed_url = urlparse(uri)
             api_uri = urlunparse(parsed_url._replace(query=f"ctype=xml&{parsed_url.query}"))
             print(f"  -> [Bugzilla] Remapped to XML view", end="")
 
-        # 4. 检查 SourceForge (e.g., https://sourceforge.net/p/project/bugs/123/)
         elif 'sourceforge.net/p/' in uri and '/bugs/' in uri:
-            # 转换为 REST API: http://sourceforge.net/rest/p/project/bugs/123/
             api_uri = uri.replace('/p/', '/rest/p/')
             if not api_uri.endswith('/'):
                 api_uri += '/'
             print(f"  -> [SourceForge] Remapped to REST API", end="")
         
-        # 5. 检查 Google Code (e.g., .../issue-123.json)
         elif 'storage.googleapis.com/google-code-archive' in uri and uri.endswith('.json'):
             print(f"  -> [Google Code] Using direct JSON URL", end="")
-            # api_uri is already correct
         
         else:
             print(f"  -> [Unknown] Attempting direct download", end="")
@@ -92,7 +82,7 @@ def download_report_data(uri, save_to):
         print("FAIL", file=sys.stderr)
         print(f"  -> Error downloading {api_uri}: {e}", file=sys.stderr)
         if os.path.exists(save_to):
-            os.remove(save_to) # 移除不完整的文件
+            os.remove(save_to) 
         return False
     except Exception as e:
         print("FAIL", file=sys.stderr)
@@ -119,15 +109,14 @@ def exec_cmd(cmd_list, desc, output_file=None):
         stdout_handle = None
         
         if output_file:
-            # --- (!!) 逻辑 1: output_file 已提供 ---
-            # 我们将 stdout 重定向到文件, 并捕获 stderr
+            # if output_file is specified, redirect stdout to that file
             try:
                 stdout_handle = open(output_file, 'w', encoding='utf-8', errors='ignore')
                 result = subprocess.run(
                     cmd_list,
                     shell=False,
-                    stdout=stdout_handle,  # (!!) stdout 写入文件
-                    stderr=subprocess.PIPE,  # (!!) stderr 正常捕获
+                    stdout=stdout_handle, 
+                    stderr=subprocess.PIPE, 
                     text=True,
                     encoding='utf-8',
                     errors='ignore'
@@ -141,24 +130,23 @@ def exec_cmd(cmd_list, desc, output_file=None):
                     stdout_handle.close()
         
         else:
-            # --- (!!) 逻辑 2: output_file 为 None ---
-            # 我们使用 capture_output 来捕获 stdout 和 stderr
+            # if no output_file, capture stdout and stderr normally
             result = subprocess.run(
                 cmd_list,
                 shell=False,
-                capture_output=True, # (!!) 关键: 让 subprocess 自己处理捕获
+                capture_output=True, 
                 text=True,
                 encoding='utf-8',
                 errors='ignore'
             )
             log = (result.stdout or "") + (result.stderr or "")
         
-        # --- (!!) 统一的错误处理 ---
+        # wrote log output
         if result.returncode != 0:
             print("FAIL", file=sys.stderr)
             print(f"Executed command: {cmd_list}", file=sys.stderr)
             print(log, file=sys.stderr)
-            # 如果失败, 删除可能不完整的输出文件
+            # if output_file was used, ensure partial file is removed
             if output_file and os.path.exists(output_file):
                 try: os.remove(output_file)
                 except OSError: pass
@@ -175,10 +163,10 @@ def exec_cmd(cmd_list, desc, output_file=None):
         print(f"Exception while running command: {cmd_list}", file=sys.stderr)
         print(str(e), file=sys.stderr)
         
-        # (!!) 确保句柄被关闭 (如果存在)
+        # ensure file handle is closed
         if output_file and stdout_handle:
             stdout_handle.close()
-        # (!!) 确保部分写入的文件被删除
+        # ensure partial output file is removed
         if output_file and os.path.exists(output_file):
             try: os.remove(output_file)
             except OSError: pass
@@ -186,7 +174,7 @@ def exec_cmd(cmd_list, desc, output_file=None):
 
 def read_config_file(file_path, key_separator=','):
     """
-    Read key,value format files for vcs_log_xref.py to read issues.txt.
+    读取配置文件，返回键值对字典。
     """
     config_data = {}
     if not os.path.exists(file_path):
