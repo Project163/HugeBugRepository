@@ -15,8 +15,26 @@ def get_git_parent(commit_hash, repo_dir):
     获取一个 commit 的父 commit。只支持单个父 commit。
     """
     try:
-        cmd = f"git --git-dir=\"{repo_dir}\" rev-list --parents -n 1 {commit_hash}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
+        # (!!) 更改为列表
+        cmd_list = [
+            'git',
+            f'--git-dir={repo_dir}', # (!!) 移除不必要的引号
+            'rev-list',
+            '--parents',
+            '-n', '1',
+            commit_hash
+        ]
+        
+        # (!!) 更改为 shell=False
+        result = subprocess.run(
+            cmd_list, 
+            shell=False, # (!!) 关键: 关闭 shell
+            capture_output=True, 
+            text=True, 
+            check=True, 
+            encoding='utf-8', 
+            errors='ignore'
+        )
         parts = result.stdout.strip().split()
         
         if len(parts) > 1:
@@ -29,6 +47,8 @@ def get_git_parent(commit_hash, repo_dir):
     except subprocess.CalledProcessError as e:
         print(f"Warning: Error getting parent for {commit_hash}: {e}", file=sys.stderr)
         return None
+
+# ... (construct_commit_url 和 construct_compare_url 无需更改) ...
 
 def construct_commit_url(repo_url, commit_hash):
     """
@@ -72,6 +92,7 @@ def construct_compare_url(repo_url, buggy_hash, fixed_hash):
     return "NA"
 
 def main():
+    # ... (argparse, 1. Load issues.txt, 2. compile regex, 3. read log, 4. append results ... 都无需更改) ...
     parser = argparse.ArgumentParser(description="Cross-reference VCS log with issue tracker data.")
     parser.add_argument('-e', dest='regexp', required=True, help="Perl-compatible regex to match issue IDs")
     parser.add_argument('-l', dest='log_file', required=True, help="Path to the commit log file (from git log)")

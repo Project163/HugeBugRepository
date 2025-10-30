@@ -7,6 +7,7 @@ import subprocess
 import csv
 import utils
 import config
+import codecs
 
 def main():
     PYTHON_EXECUTABLE = sys.executable
@@ -67,8 +68,15 @@ def main():
             
             # 3a. cloning repository
             if not os.path.exists(cache_repo_dir):
-                cmd = f"git clone --bare \"{repository_url}\" \"{cache_repo_dir}\""
-                success, _ = utils.exec_cmd(cmd, f"Cloning {project_name}")
+                # (!!) 更改为列表
+                cmd_list = [
+                    'git', 
+                    'clone', 
+                    '--bare', 
+                    repository_url, 
+                    cache_repo_dir
+                ]
+                success, _ = utils.exec_cmd(cmd_list, f"Cloning {project_name}")
                 if not success:
                     print(f"Error: Failed to clone {repository_url}. Skipping.", file=sys.stderr)
                     continue
@@ -79,12 +87,16 @@ def main():
             if not os.path.exists(cache_issues_file) or os.path.getsize(cache_issues_file) == 0:
                 print(f"Shared issues for {issue_cache_key} not found. Downloading...")
                 
-                cmd_dl = (
-                    f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'download_issues.py')} "
-                    f"-g \"{issue_tracker_name}\" -t \"{issue_tracker_project_id}\" "
-                    f"-o \"{cache_issues_dir}\" -f \"{cache_issues_file}\""
-                )
-                success, _ = utils.exec_cmd(cmd_dl, f"Downloading issues for {issue_cache_key}")
+                # (!!) 更改为列表
+                cmd_dl_list = [
+                    PYTHON_EXECUTABLE,
+                    os.path.join(config.SCRIPT_DIR, 'download_issues.py'),
+                    '-g', issue_tracker_name,
+                    '-t', issue_tracker_project_id,
+                    '-o', cache_issues_dir,
+                    '-f', cache_issues_file
+                ]
+                success, _ = utils.exec_cmd(cmd_dl_list, f"Downloading issues for {issue_cache_key}")
                 if not success:
                     print(f"Error: Failed to download issues for {issue_cache_key}. Skipping.", file=sys.stderr)
                     continue
@@ -93,8 +105,21 @@ def main():
 
             # 3c. getting git log
             if not os.path.exists(cache_gitlog_file):
-                cmd_log = f"git --git-dir=\"{cache_repo_dir}\" log --reverse -- \"{sub_project_path}\" > \"{cache_gitlog_file}\""
-                success, _ = utils.exec_cmd(cmd_log, f"Collecting git log for {project_name}")
+                # (!!) 更改为列表, 移除 '>'
+                cmd_log_list = [
+                    'git',
+                    f'--git-dir={cache_repo_dir}',
+                    'log',
+                    '--reverse',
+                    '--', # (!!) 添加 '--' 以安全地处理子路径
+                    sub_project_path
+                ]
+                # (!!) 使用 output_file 参数将 stdout 写入文件
+                success, _ = utils.exec_cmd(
+                    cmd_log_list, 
+                    f"Collecting git log for {project_name}",
+                    output_file=cache_gitlog_file # (!!) 关键: 传递输出文件
+                )
                 if not success:
                     print(f"Error: Failed to get git log for {project_name}. Skipping.", file=sys.stderr)
                     continue
@@ -113,16 +138,25 @@ def main():
 
                 print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
 
-                cmd_xref = (
-                    f"\"{PYTHON_EXECUTABLE}\" {os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py')} "
-                    f"-e \"{bug_fix_regex}\" -l \"{cache_gitlog_file}\" "
-                    f"-r \"{cache_repo_dir}\" "
-                    f"-i \"{cache_issues_file}\" "
-                    f"-f \"{output_csv_file}\" "
-                    f"-ru \"{repository_url}\" "
-                    f"-pid \"{project_id}\""
-                )
-                success, _ = utils.exec_cmd(cmd_xref, f"Cross-referencing log for {project_id}")
+                try:
+                    processed_regex = codecs.decode(bug_fix_regex, 'unicode_escape')
+                except Exception:
+                    print(f"  -> Warning: Could not unescape regex: {bug_fix_regex!r}. Using raw value.", file=sys.stderr)
+                    processed_regex = bug_fix_regex
+                
+                # (!!) 更改为列表
+                cmd_xref_list = [
+                    PYTHON_EXECUTABLE,
+                    os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'),
+                    '-e', processed_regex,
+                    '-l', cache_gitlog_file,
+                    '-r', cache_repo_dir,
+                    '-i', cache_issues_file,
+                    '-f', output_csv_file,
+                    '-ru', repository_url,
+                    '-pid', project_id
+                ]
+                success, _ = utils.exec_cmd(cmd_xref_list, f"Cross-referencing log for {project_id}")
                 if not success:
                     print(f"Error: Failed to cross-reference log for {project_id}. Skipping.", file=sys.stderr)
                     continue
@@ -163,10 +197,32 @@ def main():
 
                         print(f"  -> Generating patch for bug {bug_id} ({commit_buggy} -> {commit_fixed})")
 
-                        cmd_diff = f"git --git-dir=\"{cache_repo_dir}\" diff \"{commit_buggy}\" \"{commit_fixed}\" -- \"{sub_project_path}\" > \"{patch_file}\""
+                        # (!!) 更改为列表, 移除 '>'
+                        cmd_diff_list = [
+                            'git',
+                            f'--git-dir={cache_repo_dir}',
+                            'diff',
+                            commit_buggy,
+                            commit_fixed,
+                            '--', # (!!) 添加 '--' 以安全地处理子路径
+                            sub_project_path
+                        ]
 
                         try:
-                            subprocess.run(cmd_diff, shell=True, check=True, capture_output=True)
+                            # (!!) 直接调用 subprocess.run (不使用 utils.exec_cmd)
+                            result = subprocess.run(
+                                cmd_diff_list, 
+                                shell=False, # (!!) 关键: 关闭 shell
+                                check=True, 
+                                capture_output=True, # (!!) 捕获 stdout
+                                text=True,
+                                encoding='utf-8',
+                                errors='ignore'
+                            )
+                            
+                            # (!!) 手动将 stdout 写入 patch 文件
+                            with open(patch_file, 'w', encoding='utf-8') as f:
+                                f.write(result.stdout)
                             
                             if os.path.getsize(patch_file) == 0:
                                 print(f"  -> Warning: Generated patch for bug {bug_id} is empty.", file=sys.stderr)
