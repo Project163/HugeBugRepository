@@ -10,6 +10,7 @@ import config
 import multiprocessing 
 import contextlib 
 
+# Not suit for Windows due to multiprocessing and redirection issues.
 
 def process_project(line):
     """

@@ -38,7 +38,7 @@ SUPPORTED_TRACKERS = {
     },
     'github': {
         'default_tracker_uri': 'https://api.github.com/repos/',
-        'default_query': '',
+        'default_query': 'label=bug,defect',
         'default_limit': 100,
         'build_uri': lambda tracker, project, query, start, limit, org: (
             f"{tracker}{f'{org}/' if '/' not in project and org else ''}{project}/issues?"
@@ -47,6 +47,7 @@ SUPPORTED_TRACKERS = {
         'results': lambda path, project: [
             (issue['number'], issue['html_url'])
             for issue in json.load(open(path))
+            if 'pull_request' not in issue
         ]
     },
     'sourceforge': {

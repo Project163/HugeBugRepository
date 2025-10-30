@@ -12,7 +12,7 @@ import codecs
 def main():
     PYTHON_EXECUTABLE = sys.executable
 
-    input_file = os.path.join(config.SCRIPT_DIR, 'test.txt')
+    input_file = os.path.join(config.SCRIPT_DIR, 'example.txt')
     
     if not os.path.exists(input_file):
         print(f"Error: Input file not found at {input_file}", file=sys.stderr)
