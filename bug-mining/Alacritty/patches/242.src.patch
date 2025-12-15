@@ -1,0 +1,405 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9f58f63a..31696c54 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -31,6 +31,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ - Crash while typing on Wayland
+ - Multi-line semantic bracket selection
+ - Reduced GPU memory usage
++- Low frame rate when multiple windows render at the same time
++- Redraw hanging until a keypress on X11 in rare cases
+ 
+ ## 0.11.0
+ 
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+index ba6eeae0..605ac3f2 100644
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -6,14 +6,14 @@ use std::fmt::{self, Formatter};
+ use std::mem::{self, ManuallyDrop};
+ use std::num::NonZeroU32;
+ use std::ops::{Deref, DerefMut};
+-#[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+ use std::sync::atomic::Ordering;
++use std::time::{Duration, Instant};
+ 
+ use glutin::context::{NotCurrentContext, PossiblyCurrentContext};
+ use glutin::prelude::*;
+ use glutin::surface::{Rect as DamageRect, Surface, SwapInterval, WindowSurface};
+ 
+-use log::{debug, info, warn};
++use log::{debug, info};
+ use parking_lot::MutexGuard;
+ use serde::{Deserialize, Serialize};
+ use winit::dpi::PhysicalSize;
+@@ -46,10 +46,11 @@ use crate::display::damage::RenderDamageIterator;
+ use crate::display::hint::{HintMatch, HintState};
+ use crate::display::meter::Meter;
+ use crate::display::window::Window;
+-use crate::event::{Mouse, SearchState};
++use crate::event::{Event, EventType, Mouse, SearchState};
+ use crate::message_bar::{MessageBuffer, MessageType};
+ use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
+ use crate::renderer::{self, GlyphCache, Renderer};
++use crate::scheduler::{Scheduler, TimerId, Topic};
+ use crate::string::{ShortenDirection, StrShortener};
+ 
+ pub mod content;
+@@ -367,6 +368,9 @@ pub struct Display {
+     /// The ime on the given display.
+     pub ime: Ime,
+ 
++    /// The state of the timer for frame scheduling.
++    pub frame_timer: FrameTimer,
++
+     // Mouse point position when highlighting hints.
+     hint_mouse_point: Option<Point>,
+ 
+@@ -487,13 +491,9 @@ impl Display {
+             (Vec::new(), Vec::new())
+         };
+ 
+-        // We use vsync everywhere except wayland.
+-        if !is_wayland {
+-            if let Err(err) =
+-                surface.set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()))
+-            {
+-                warn!("Error setting vsync: {:?}", err);
+-            }
++        // Disable vsync.
++        if let Err(err) = surface.set_swap_interval(&context, SwapInterval::DontWait) {
++            info!("Failed to disable vsync: {}", err);
+         }
+ 
+         Ok(Self {
+@@ -510,6 +510,7 @@ impl Display {
+             vi_highlighted_hint: None,
+             is_wayland,
+             cursor_hidden: false,
++            frame_timer: FrameTimer::new(),
+             visual_bell: VisualBell::from(&config.bell),
+             colors: List::from(&config.colors),
+             pending_update: Default::default(),
+@@ -751,6 +752,7 @@ impl Display {
+     pub fn draw<T: EventListener>(
+         &mut self,
+         mut terminal: MutexGuard<'_, Term<T>>,
++        scheduler: &mut Scheduler,
+         message_buffer: &MessageBuffer,
+         config: &UiConfig,
+         search_state: &SearchState,
+@@ -966,10 +968,11 @@ impl Display {
+             self.draw_hyperlink_preview(config, cursor_point, display_offset);
+         }
+ 
+-        // Frame event should be requested before swaping buffers, since it requires surface
+-        // `commit`, which is done by swap buffers under the hood.
+-        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+-        self.request_frame(&self.window);
++        // Frame event should be requested before swapping buffers on Wayland, since it requires
++        // surface `commit`, which is done by swap buffers under the hood.
++        if self.is_wayland {
++            self.request_frame(scheduler);
++        }
+ 
+         // Clearing debug highlights from the previous frame requires full redraw.
+         self.swap_buffers();
+@@ -982,6 +985,12 @@ impl Display {
+             self.renderer.finish();
+         }
+ 
++        // XXX: Request the new frame after swapping buffers, so the
++        // time to finish OpenGL operations is accounted for in the timeout.
++        if !self.is_wayland {
++            self.request_frame(scheduler);
++        }
++
+         self.damage_rects.clear();
+ 
+         // Append damage rects we've enqueued for the next frame.
+@@ -1376,23 +1385,40 @@ impl Display {
+     }
+ 
+     /// Requst a new frame for a window on Wayland.
+-    #[inline]
+-    #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+-    fn request_frame(&self, window: &Window) {
+-        let surface = match window.wayland_surface() {
+-            Some(surface) => surface,
+-            None => return,
+-        };
++    fn request_frame(&mut self, scheduler: &mut Scheduler) {
++        // Mark that we've used a frame.
++        self.window.has_frame.store(false, Ordering::Relaxed);
+ 
+-        let should_draw = self.window.should_draw.clone();
++        #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
++        if let Some(surface) = self.window.wayland_surface() {
++            let has_frame = self.window.has_frame.clone();
++            // Request a new frame.
++            surface.frame().quick_assign(move |_, _, _| {
++                has_frame.store(true, Ordering::Relaxed);
++            });
+ 
+-        // Mark that window was drawn.
+-        should_draw.store(false, Ordering::Relaxed);
++            return;
++        }
+ 
+-        // Request a new frame.
+-        surface.frame().quick_assign(move |_, _, _| {
+-            should_draw.store(true, Ordering::Relaxed);
+-        });
++        // Get the display vblank interval.
++        let monitor_vblank_interval = 1_000_000.
++            / self
++                .window
++                .current_monitor()
++                .and_then(|monitor| monitor.refresh_rate_millihertz())
++                .unwrap_or(60_000) as f64;
++
++        // Now convert it to micro seconds.
++        let monitor_vblank_interval =
++            Duration::from_micros((1000. * monitor_vblank_interval) as u64);
++
++        let swap_timeout = self.frame_timer.compute_timeout(monitor_vblank_interval);
++
++        let window_id = self.window.id();
++        let timer_id = TimerId::new(Topic::Frame, window_id);
++        let event = Event::new(EventType::Frame, window_id);
++
++        scheduler.schedule(event, swap_timeout, false, timer_id);
+     }
+ }
+ 
+@@ -1534,6 +1560,54 @@ impl<T> DerefMut for Replaceable<T> {
+     }
+ }
+ 
++/// The frame timer state.
++pub struct FrameTimer {
++    /// Base timestamp used to compute sync points.
++    base: Instant,
++
++    /// The last timestamp we synced to.
++    last_synced_timestamp: Instant,
++
++    /// The refresh rate we've used to compute sync timestamps.
++    refresh_interval: Duration,
++}
++
++impl FrameTimer {
++    pub fn new() -> Self {
++        let now = Instant::now();
++        Self { base: now, last_synced_timestamp: now, refresh_interval: Duration::ZERO }
++    }
++
++    /// Compute the delay that we should use to achieve the target frame
++    /// rate.
++    pub fn compute_timeout(&mut self, refresh_interval: Duration) -> Duration {
++        let now = Instant::now();
++
++        // Handle refresh rate change.
++        if self.refresh_interval != refresh_interval {
++            self.base = now;
++            self.last_synced_timestamp = now;
++            self.refresh_interval = refresh_interval;
++            return refresh_interval;
++        }
++
++        let next_frame = self.last_synced_timestamp + self.refresh_interval;
++
++        if next_frame < now {
++            // Redraw immediately if we haven't drawn in over `refresh_interval` microseconds.
++            let elapsed_micros = (now - self.base).as_micros() as u64;
++            let refresh_micros = self.refresh_interval.as_micros() as u64;
++            self.last_synced_timestamp =
++                now - Duration::from_micros(elapsed_micros % refresh_micros);
++            Duration::ZERO
++        } else {
++            // Redraw on the next `refresh_interval` clock tick.
++            self.last_synced_timestamp = next_frame;
++            next_frame - now
++        }
++    }
++}
++
+ /// Calculate the cell dimensions based on font metrics.
+ ///
+ /// This will return a tuple of the cell width and height.
+diff --git a/alacritty/src/display/window.rs b/alacritty/src/display/window.rs
+index 93e83677..97329d70 100644
+--- a/alacritty/src/display/window.rs
++++ b/alacritty/src/display/window.rs
+@@ -1,11 +1,5 @@
+-#[rustfmt::skip]
+ #[cfg(not(any(target_os = "macos", windows)))]
+-use {
+-    std::sync::atomic::AtomicBool,
+-    std::sync::Arc,
+-
+-    winit::platform::unix::{WindowBuilderExtUnix, WindowExtUnix},
+-};
++use winit::platform::unix::{WindowBuilderExtUnix, WindowExtUnix};
+ 
+ #[rustfmt::skip]
+ #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+@@ -28,6 +22,8 @@ use {
+ };
+ 
+ use std::fmt::{self, Display, Formatter};
++use std::sync::atomic::AtomicBool;
++use std::sync::Arc;
+ 
+ #[cfg(target_os = "macos")]
+ use cocoa::base::{id, NO, YES};
+@@ -37,6 +33,7 @@ use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+ 
+ use winit::dpi::{PhysicalPosition, PhysicalSize};
+ use winit::event_loop::EventLoopWindowTarget;
++use winit::monitor::MonitorHandle;
+ #[cfg(target_os = "macos")]
+ use winit::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
+ #[cfg(windows)]
+@@ -106,9 +103,8 @@ impl From<crossfont::Error> for Error {
+ ///
+ /// Wraps the underlying windowing library to provide a stable API in Alacritty.
+ pub struct Window {
+-    /// Flag tracking frame redraw requests from Wayland compositor.
+-    #[cfg(not(any(target_os = "macos", windows)))]
+-    pub should_draw: Arc<AtomicBool>,
++    /// Flag tracking that we have a frame we can draw.
++    pub has_frame: Arc<AtomicBool>,
+ 
+     /// Attached Wayland surface to request new frame events.
+     #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+@@ -194,8 +190,7 @@ impl Window {
+             mouse_visible: true,
+             window,
+             title: identity.title,
+-            #[cfg(not(any(target_os = "macos", windows)))]
+-            should_draw: Arc::new(AtomicBool::new(true)),
++            has_frame: Arc::new(AtomicBool::new(true)),
+             #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+             wayland_surface,
+             scale_factor,
+@@ -388,6 +383,10 @@ impl Window {
+         }
+     }
+ 
++    pub fn current_monitor(&self) -> Option<MonitorHandle> {
++        self.window.current_monitor()
++    }
++
+     #[cfg(target_os = "macos")]
+     pub fn set_simple_fullscreen(&self, simple_fullscreen: bool) {
+         self.window.set_simple_fullscreen(simple_fullscreen);
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 25d52e56..2fb60b2a 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -10,6 +10,7 @@ use std::fmt::Debug;
+ use std::os::unix::io::RawFd;
+ use std::path::PathBuf;
+ use std::rc::Rc;
++use std::sync::atomic::Ordering;
+ use std::time::{Duration, Instant};
+ use std::{env, f32, mem};
+ 
+@@ -101,6 +102,7 @@ pub enum EventType {
+     BlinkCursor,
+     BlinkCursorTimeout,
+     SearchNext,
++    Frame,
+ }
+ 
+ impl From<TerminalEvent> for EventType {
+@@ -1096,6 +1098,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+ 
+                     self.ctx.window().scale_factor = scale_factor;
+                 },
++                EventType::Frame => {
++                    self.ctx.display.window.has_frame.store(true, Ordering::Relaxed);
++                },
+                 EventType::SearchNext => self.ctx.goto_match(None),
+                 EventType::Scroll(scroll) => self.ctx.scroll(scroll),
+                 EventType::BlinkCursor => {
+@@ -1450,11 +1455,6 @@ impl Processor {
+                 },
+                 // Process all pending events.
+                 WinitEvent::RedrawEventsCleared => {
+-                    *control_flow = match scheduler.update() {
+-                        Some(instant) => ControlFlow::WaitUntil(instant),
+-                        None => ControlFlow::Wait,
+-                    };
+-
+                     // Check for pending frame callbacks on Wayland.
+                     #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
+                     if let Some(wayland_event_queue) = self.wayland_event_queue.as_mut() {
+@@ -1473,6 +1473,13 @@ impl Processor {
+                             WinitEvent::RedrawEventsCleared,
+                         );
+                     }
++
++                    // Update the scheduler after event processing to ensure
++                    // the event loop deadline is as accurate as possible.
++                    *control_flow = match scheduler.update() {
++                        Some(instant) => ControlFlow::WaitUntil(instant),
++                        None => ControlFlow::Wait,
++                    };
+                 },
+                 // Process config update.
+                 WinitEvent::UserEvent(Event { payload: EventType::ConfigReload(path), .. }) => {
+diff --git a/alacritty/src/scheduler.rs b/alacritty/src/scheduler.rs
+index 3a26322f..ea8e6271 100644
+--- a/alacritty/src/scheduler.rs
++++ b/alacritty/src/scheduler.rs
+@@ -28,6 +28,7 @@ pub enum Topic {
+     DelayedSearch,
+     BlinkCursor,
+     BlinkTimeout,
++    Frame,
+ }
+ 
+ /// Event scheduled to be emitted at a specific time.
+diff --git a/alacritty/src/window_context.rs b/alacritty/src/window_context.rs
+index 833586ea..79bc918b 100644
+--- a/alacritty/src/window_context.rs
++++ b/alacritty/src/window_context.rs
+@@ -7,7 +7,6 @@ use std::mem;
+ #[cfg(not(windows))]
+ use std::os::unix::io::{AsRawFd, RawFd};
+ use std::rc::Rc;
+-#[cfg(not(any(target_os = "macos", windows)))]
+ use std::sync::atomic::Ordering;
+ use std::sync::Arc;
+ 
+@@ -478,9 +477,8 @@ impl WindowContext {
+             self.mouse.hint_highlight_dirty = false;
+         }
+ 
+-        // Skip rendering on Wayland until we get frame event from compositor.
+-        #[cfg(not(any(target_os = "macos", windows)))]
+-        if self.display.is_wayland && !self.display.window.should_draw.load(Ordering::Relaxed) {
++        // Skip rendering until we get a new frame.
++        if !self.display.window.has_frame.load(Ordering::Relaxed) {
+             return;
+         }
+ 
+@@ -495,8 +493,14 @@ impl WindowContext {
+                 self.display.window.request_redraw();
+             }
+ 
+-            // Redraw screen.
+-            self.display.draw(terminal, &self.message_buffer, &self.config, &self.search_state);
++            // Redraw the window.
++            self.display.draw(
++                terminal,
++                scheduler,
++                &self.message_buffer,
++                &self.config,
++                &self.search_state,
++            );
+         }
+     }
+ 

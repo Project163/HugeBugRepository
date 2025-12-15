@@ -1,0 +1,138 @@
+diff --git a/src/yb/docdb/wait_queue.cc b/src/yb/docdb/wait_queue.cc
+index dff4ad9b34..921874e375 100644
+--- a/src/yb/docdb/wait_queue.cc
++++ b/src/yb/docdb/wait_queue.cc
+@@ -458,11 +458,13 @@ class WaitQueue::Impl {
+       } else {
+         waiter_status_[waiter_txn_id] = waiter_data;
+       }
+-    }
+ 
+-    DCHECK(waiter_data);
+-    for (auto [blocker, _] : waiter_data->blockers) {
+-      blocker->AddWaiter(waiter_data);
++      // We must add waiters to blockers while holding the wait queue mutex. Otherwise, we may
++      // end up removing blockers from blocker_status_ during Poll() after we've already added them
++      // to waiter_data.
++      for (auto [blocker, _] : waiter_data->blockers) {
++        blocker->AddWaiter(waiter_data);
++      }
+     }
+ 
+     return Status::OK();
+@@ -745,22 +747,29 @@ class WaitQueue::Impl {
+       return;
+     }
+ 
+-    auto res = 0ul;
+-
++    // We cannot use the passed in waiter_data here as it may have been replaced in waiter_status_
++    // by a new WaiterData instance for the same transaction. Such a situation would indicate that
++    // the previous request had returned to the caller and a new request for the same transaction
++    // was now waiting. In this situation, we would want to signal the new waiter.
++    WaiterDataPtr found_waiter = nullptr;
+     {
+       UniqueLock<decltype(mutex_)> l(mutex_);
+-      res = waiter_status_.erase(waiter_data->id);
++      auto it = waiter_status_.find(waiter_data->id);
++      if (it != waiter_status_.end()) {
++        found_waiter = it->second;
++        waiter_status_.erase(it);
++      }
+     }
+ 
+-    LOG_IF(WARNING, res != 1)
++    LOG_IF(WARNING, !found_waiter)
+       << "Tried to invoke callback on waiter which has already been removed. "
+       << "This should be rare but is not an error otherwise.";
+ 
+     // Note -- it's important that we remove the waiter from waiter_status_ before invoking it's
+     // callback. Otherwise, the callback will re-run conflict resolution, end up back in the wait
+     // queue, and attempt to reuse the WaiterData still present in waiter_status_.
+-    if (res == 1) {
+-      waiter_data->InvokeCallback(status);
++    if (found_waiter) {
++      found_waiter->InvokeCallback(status);
+     }
+   }
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+index 6261b68737..279559f2ca 100644
+--- a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
++++ b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+@@ -45,8 +45,10 @@ DECLARE_bool(TEST_select_all_status_tablets);
+ DECLARE_string(ysql_pg_conf_csv);
+ DECLARE_bool(enable_automatic_tablet_splitting);
+ DECLARE_int32(cleanup_split_tablets_interval_sec);
+-DECLARE_uint64(rpc_connection_timeout_ms);
++DECLARE_int32(wait_queue_poll_interval_ms);
+ DECLARE_uint64(force_single_shard_waiter_retry_ms);
++DECLARE_uint64(rpc_connection_timeout_ms);
++DECLARE_uint64(transactions_status_poll_interval_ms);
+ 
+ using namespace std::literals;
+ 
+@@ -639,6 +641,7 @@ class ConcurrentBlockedWaitersTest {
+   CountDownLatch finished_waiter_ = CountDownLatch(0);
+ };
+ 
++
+ class PgConcurrentBlockedWaitersTest : public PgWaitQueuesTest,
+                                        public ConcurrentBlockedWaitersTest {
+   Result<PGConn> GetDbConn() const override { return Connect(); }
+@@ -746,5 +749,55 @@ TEST_F(PgTabletSplittingWaitQueuesTest, YB_DISABLE_TEST_IN_TSAN(SplitTablet)) {
+   UnblockWaitersAndValidate(&conn, kNumWaiters);
+ }
+ 
++class PgWaitQueueContentionStressTest : public PgMiniTestBase {
++  static constexpr int kClientStatementTimeoutSeconds = 60;
++
++  void SetUp() override {
++    FLAGS_ysql_pg_conf_csv = Format(
++        "statement_timeout=$0", kClientStatementTimeoutSeconds * 1ms / 1s);
++    FLAGS_enable_wait_queues = true;
++    FLAGS_wait_queue_poll_interval_ms = 2;
++    FLAGS_transactions_status_poll_interval_ms = 5;
++    PgMiniTestBase::SetUp();
++  }
++
++  size_t NumTabletServers() override {
++    return 1;
++  }
++};
++
++TEST_F(PgWaitQueueContentionStressTest, YB_DISABLE_TEST_IN_TSAN(ConcurrentReaders)) {
++  constexpr int kNumReaders = 8;
++  constexpr int kNumTxnsPerReader = 100;
++
++  auto setup_conn = ASSERT_RESULT(Connect());
++
++  ASSERT_OK(setup_conn.Execute("CREATE TABLE foo (k INT PRIMARY KEY, v INT)"));
++  ASSERT_OK(setup_conn.Execute("INSERT INTO foo VALUES (1, 1)"));
++  TestThreadHolder thread_holder;
++  CountDownLatch finished_readers{kNumReaders};
++
++  for (int reader_idx = 0; reader_idx < kNumReaders; ++reader_idx) {
++    thread_holder.AddThreadFunctor([this, &finished_readers, &stop = thread_holder.stop_flag()] {
++      auto conn = ASSERT_RESULT(Connect());
++      for (int i = 0; i < kNumTxnsPerReader; ++i) {
++        if (stop) {
++          EXPECT_FALSE(true) << "Only completed " << i << " reads";
++          return;
++        }
++        ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
++        ASSERT_OK(conn.Fetch("SELECT * FROM foo WHERE k=1 FOR UPDATE"));
++        ASSERT_OK(conn.CommitTransaction());
++      }
++      finished_readers.CountDown();
++      finished_readers.Wait();
++    });
++  }
++
++  finished_readers.WaitFor(60s * kTimeMultiplier);
++  finished_readers.Reset(0);
++  thread_holder.Stop();
++}
++
+ } // namespace pgwrapper
+ } // namespace yb

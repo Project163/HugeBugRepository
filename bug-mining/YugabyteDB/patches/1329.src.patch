@@ -1,0 +1,695 @@
+diff --git a/src/yb/docdb/doc_vector_index.cc b/src/yb/docdb/doc_vector_index.cc
+index ba50330e33..f73af9438b 100644
+--- a/src/yb/docdb/doc_vector_index.cc
++++ b/src/yb/docdb/doc_vector_index.cc
+@@ -236,14 +236,14 @@ class DocVectorIndexImpl : public DocVectorIndex {
+ 
+   Status Insert(
+       const DocVectorIndexInsertEntries& entries,
+-      const rocksdb::UserFrontiers* frontiers) override {
++      const rocksdb::UserFrontiers& frontiers) override {
+     typename LSM::InsertEntries lsm_entries;
+     lsm_entries.reserve(entries.size());
+     for (const auto& entry : entries) {
+       lsm_entries.push_back(VERIFY_RESULT(ConvertEntry<Vector>(entry)));
+     }
+     vector_index::VectorLSMInsertContext context {
+-      .frontiers = frontiers,
++      .frontiers = &frontiers,
+     };
+     return lsm_.Insert(lsm_entries, context);
+   }
+diff --git a/src/yb/docdb/doc_vector_index.h b/src/yb/docdb/doc_vector_index.h
+index 254fa4b405..f034c7a05c 100644
+--- a/src/yb/docdb/doc_vector_index.h
++++ b/src/yb/docdb/doc_vector_index.h
+@@ -58,7 +58,7 @@ class DocVectorIndex {
+   virtual HybridTime hybrid_time() const = 0;
+ 
+   virtual Status Insert(
+-      const DocVectorIndexInsertEntries& entries, const rocksdb::UserFrontiers* frontiers) = 0;
++      const DocVectorIndexInsertEntries& entries, const rocksdb::UserFrontiers& frontiers) = 0;
+   virtual Result<DocVectorIndexSearchResult> Search(
+       Slice vector, const vector_index::SearchOptions& options) = 0;
+   virtual Result<EncodedDistance> Distance(Slice lhs, Slice rhs) = 0;
+diff --git a/src/yb/docdb/non_transactional_batch_writer-test.cc b/src/yb/docdb/non_transactional_batch_writer-test.cc
+index 622d5dd2d1..374a70a9bc 100644
+--- a/src/yb/docdb/non_transactional_batch_writer-test.cc
++++ b/src/yb/docdb/non_transactional_batch_writer-test.cc
+@@ -40,11 +40,13 @@ class NonTransactionalBatchWriterTest : public DocDBTestBase {
+ 
+   Status SendWriteBatch(
+       const docdb::LWKeyValueWriteBatchPB& put_batch, HybridTime write_ht, HybridTime batch_ht) {
++    ConsensusFrontiers frontiers;
+     rocksdb::WriteBatch intents_write_batch;
+     NonTransactionalBatchWriter batcher(
+-        put_batch, write_ht, batch_ht, intents_db(), &intents_write_batch, nullptr);
++        put_batch, write_ht, batch_ht, intents_db(), &intents_write_batch, *this, frontiers);
+ 
+     rocksdb::WriteBatch regular_write_batch;
++    regular_write_batch.SetFrontiers(&frontiers);
+     regular_write_batch.SetDirectWriter(&batcher);
+     RETURN_NOT_OK(regular_db_->Write(write_options(), &regular_write_batch));
+ 
+diff --git a/src/yb/docdb/rocksdb_writer.cc b/src/yb/docdb/rocksdb_writer.cc
+index 6a9da5ff94..06db6767eb 100644
+--- a/src/yb/docdb/rocksdb_writer.cc
++++ b/src/yb/docdb/rocksdb_writer.cc
+@@ -551,7 +551,7 @@ Status IntentsWriter::Apply(rocksdb::DirectWriteHandler& handler) {
+     }
+ 
+     if (VERIFY_RESULT(context_.Entry(key_slice, reverse_index_value, metadata, handler))) {
+-      return Status::OK();
++      return context_.Complete(handler, /* transaction_finished= */ false);
+     }
+ 
+     // The first lock specified by key_to_apply_ was found and processed.
+@@ -562,7 +562,7 @@ Status IntentsWriter::Apply(rocksdb::DirectWriteHandler& handler) {
+   }
+   RETURN_NOT_OK(reverse_index_iter_.status());
+ 
+-  return context_.Complete(handler);
++  return context_.Complete(handler, /* transaction_finished= */ true);
+ }
+ 
+ ApplyIntentsContext::ApplyIntentsContext(
+@@ -575,12 +575,13 @@ ApplyIntentsContext::ApplyIntentsContext(
+     HybridTime file_filter_ht,
+     const OpId& apply_op_id,
+     const KeyBounds* key_bounds,
+-    SchemaPackingProvider* schema_packing_provider,
++    SchemaPackingProvider& schema_packing_provider,
++    ConsensusFrontiers& frontiers,
+     rocksdb::DB* intents_db,
+     const DocVectorIndexesPtr& vector_indexes,
+     const docdb::StorageSet& apply_to_storages)
+     : IntentsWriterContext(transaction_id),
+-      FrontierSchemaVersionUpdater(schema_packing_provider),
++      FrontierSchemaVersionUpdater(schema_packing_provider, frontiers),
+       tablet_id_(tablet_id),
+       apply_state_(apply_state),
+       // In case we have passed in a non-null apply_state, its aborted set will have been loaded
+@@ -797,9 +798,9 @@ Status ApplyIntentsContext::ProcessVectorIndexesForPackedRow(
+   if (schema_packing_version_ != schema_version ||
+       schema_packing_table_prefix_.AsSlice() != table_key_prefix) {
+     auto packing = VERIFY_RESULT(prefix_size
+-        ? schema_packing_provider()->ColocationPacking(
++        ? schema_packing_provider_.ColocationPacking(
+               BigEndian::Load32(key.data() + 1), schema_version, HybridTime::kMax)
+-        : schema_packing_provider()->CotablePacking(
++        : schema_packing_provider_.CotablePacking(
+               Uuid::Nil(), schema_version, HybridTime::kMax));
+     schema_packing_ = packing.schema_packing;
+     schema_packing_version_ = schema_version;
+@@ -841,17 +842,20 @@ Status ApplyIntentsContext::ProcessVectorIndexesForPackedRow(
+   return Status::OK();
+ }
+ 
+-Status ApplyIntentsContext::Complete(rocksdb::DirectWriteHandler& handler) {
+-  if (apply_state_) {
+-    char tombstone_value_type = ValueEntryTypeAsChar::kTombstone;
+-    std::array<Slice, 1> value_parts = {{Slice(&tombstone_value_type, 1)}};
+-    PutApplyState(transaction_id().AsSlice(), commit_ht_, write_id_, value_parts, handler);
++Status ApplyIntentsContext::Complete(
++    rocksdb::DirectWriteHandler& handler, bool transaction_finished) {
++  if (transaction_finished) {
++    if (apply_state_) {
++      char tombstone_value_type = ValueEntryTypeAsChar::kTombstone;
++      std::array<Slice, 1> value_parts = {{Slice(&tombstone_value_type, 1)}};
++      PutApplyState(transaction_id().AsSlice(), commit_ht_, write_id_, value_parts, handler);
++    }
+   }
+   if (vector_indexes_) {
+     DocHybridTime write_time { commit_ht_, write_id_ };
+     for (size_t i = 0; i != vector_index_batches_.size(); ++i) {
+       if (!vector_index_batches_[i].empty()) {
+-        RETURN_NOT_OK((*vector_indexes_)[i]->Insert(vector_index_batches_[i], frontiers()));
++        RETURN_NOT_OK((*vector_indexes_)[i]->Insert(vector_index_batches_[i], frontiers_));
+       }
+     }
+   }
+@@ -877,9 +881,6 @@ Status ApplyIntentsContext::DeleteVectorIds(
+ }
+ 
+ Status FrontierSchemaVersionUpdater::UpdateSchemaVersion(Slice key, Slice value) {
+-  if (!frontiers_) {
+-    return Status::OK();
+-  }
+   RETURN_NOT_OK(dockv::ValueControlFields::Decode(&value));
+   if (!IsPackedRow(dockv::DecodeValueEntryType(value))) {
+     return Status::OK();
+@@ -892,7 +893,7 @@ Status FrontierSchemaVersionUpdater::UpdateSchemaVersion(Slice key, Slice value)
+   if (VERIFY_RESULT(decoder.DecodeCotableId(&cotable_id))) {
+     schema_version_colocation_id_ = 0;
+     if (cotable_id != schema_version_table_) {
+-      Status s = schema_packing_provider_->CheckCotablePacking(
++      Status s = schema_packing_provider_.CheckCotablePacking(
+           cotable_id, schema_version, HybridTime::kMax);
+       if (PREDICT_FALSE(!s.ok())) {
+         LOG_WITH_FUNC(DFATAL)
+@@ -907,7 +908,7 @@ Status FrontierSchemaVersionUpdater::UpdateSchemaVersion(Slice key, Slice value)
+     ColocationId colocation_id = 0;
+     if (VERIFY_RESULT(decoder.DecodeColocationId(&colocation_id))) {
+       if (colocation_id != schema_version_colocation_id_) {
+-        Status s = schema_packing_provider_->CheckColocationPacking(
++        Status s = schema_packing_provider_.CheckColocationPacking(
+             colocation_id, schema_version, HybridTime::kMax);
+         if (PREDICT_FALSE(!s.ok())) {
+           LOG_WITH_FUNC(DFATAL)
+@@ -916,7 +917,7 @@ Status FrontierSchemaVersionUpdater::UpdateSchemaVersion(Slice key, Slice value)
+                       colocation_id, schema_version, s);
+         }
+         FlushSchemaVersion();
+-        auto packing = schema_packing_provider_->ColocationPacking(
++        auto packing = schema_packing_provider_.ColocationPacking(
+             colocation_id, kLatestSchemaVersion, HybridTime::kMax);
+         if (packing.ok()) {
+           cotable_id = packing->cotable_id;
+@@ -943,9 +944,9 @@ void FrontierSchemaVersionUpdater::FlushSchemaVersion() {
+   if (min_schema_version_ > max_schema_version_) {
+     return;
+   }
+-  frontiers_->Smallest().UpdateSchemaVersion(
++  frontiers_.Smallest().UpdateSchemaVersion(
+       schema_version_table_, min_schema_version_, rocksdb::UpdateUserValueType::kSmallest);
+-  frontiers_->Largest().UpdateSchemaVersion(
++  frontiers_.Largest().UpdateSchemaVersion(
+       schema_version_table_, max_schema_version_, rocksdb::UpdateUserValueType::kLargest);
+   min_schema_version_ = std::numeric_limits<SchemaVersion>::max();
+   max_schema_version_ = std::numeric_limits<SchemaVersion>::min();
+@@ -974,7 +975,8 @@ Result<bool> RemoveIntentsContext::Entry(
+   return false;
+ }
+ 
+-Status RemoveIntentsContext::Complete(rocksdb::DirectWriteHandler& handler) {
++Status RemoveIntentsContext::Complete(
++    rocksdb::DirectWriteHandler& handler, bool transaction_finished) {
+   return Status::OK();
+ }
+ 
+@@ -989,8 +991,8 @@ Status RemoveIntentsContext::DeleteVectorIds(
+ NonTransactionalBatchWriter::NonTransactionalBatchWriter(
+     std::reference_wrapper<const LWKeyValueWriteBatchPB> put_batch, HybridTime write_hybrid_time,
+     HybridTime batch_hybrid_time, rocksdb::DB* intents_db, rocksdb::WriteBatch* intents_write_batch,
+-    SchemaPackingProvider* schema_packing_provider)
+-    : FrontierSchemaVersionUpdater(schema_packing_provider),
++    SchemaPackingProvider& schema_packing_provider, ConsensusFrontiers& frontiers)
++    : FrontierSchemaVersionUpdater(schema_packing_provider, frontiers),
+       put_batch_(put_batch),
+       write_hybrid_time_(write_hybrid_time),
+       batch_hybrid_time_(batch_hybrid_time),
+diff --git a/src/yb/docdb/rocksdb_writer.h b/src/yb/docdb/rocksdb_writer.h
+index 01baa536e6..f8253d8e78 100644
+--- a/src/yb/docdb/rocksdb_writer.h
++++ b/src/yb/docdb/rocksdb_writer.h
+@@ -147,7 +147,7 @@ class IntentsWriterContext {
+ 
+   virtual Status DeleteVectorIds(Slice key, Slice ids, rocksdb::DirectWriteHandler& handler) = 0;
+ 
+-  virtual Status Complete(rocksdb::DirectWriteHandler& handler) = 0;
++  virtual Status Complete(rocksdb::DirectWriteHandler& handler, bool transaction_finished) = 0;
+ 
+   const TransactionId& transaction_id() const {
+     return transaction_id_;
+@@ -210,29 +210,26 @@ class IntentsWriter : public rocksdb::DirectWriter {
+ 
+ class FrontierSchemaVersionUpdater {
+  public:
+-  explicit FrontierSchemaVersionUpdater(SchemaPackingProvider* schema_packing_provider)
+-      : schema_packing_provider_(schema_packing_provider) {}
++  FrontierSchemaVersionUpdater(
++      SchemaPackingProvider& schema_packing_provider, ConsensusFrontiers& frontiers)
++      : schema_packing_provider_(schema_packing_provider), frontiers_(frontiers) {}
+ 
+-  void SetFrontiers(ConsensusFrontiers* frontiers) { frontiers_ = frontiers; }
+-
+-  SchemaPackingProvider* schema_packing_provider() const {
++  SchemaPackingProvider& schema_packing_provider() const {
+     return schema_packing_provider_;
+   }
+ 
+  protected:
+   Status UpdateSchemaVersion(Slice key, Slice value);
+   void FlushSchemaVersion();
+-  ConsensusFrontiers* frontiers() const {
+-    return frontiers_;
+-  }
++
++  SchemaPackingProvider& schema_packing_provider_;
++  ConsensusFrontiers& frontiers_;
+ 
+  private:
+-  SchemaPackingProvider* const schema_packing_provider_;
+   Uuid schema_version_table_ = Uuid::Nil();
+   ColocationId schema_version_colocation_id_ = 0;
+   SchemaVersion min_schema_version_ = std::numeric_limits<SchemaVersion>::max();
+   SchemaVersion max_schema_version_ = std::numeric_limits<SchemaVersion>::min();
+-  ConsensusFrontiers* frontiers_ = nullptr;
+ };
+ 
+ class ApplyIntentsContext : public IntentsWriterContext, public FrontierSchemaVersionUpdater {
+@@ -247,7 +244,8 @@ class ApplyIntentsContext : public IntentsWriterContext, public FrontierSchemaVe
+       HybridTime file_filter_ht,
+       const OpId& apply_op_id,
+       const KeyBounds* key_bounds,
+-      SchemaPackingProvider* schema_packing_provider,
++      SchemaPackingProvider& schema_packing_provider,
++      ConsensusFrontiers& frontiers,
+       rocksdb::DB* intents_db,
+       const DocVectorIndexesPtr& vector_indexes,
+       const StorageSet& apply_to_storages);
+@@ -258,7 +256,7 @@ class ApplyIntentsContext : public IntentsWriterContext, public FrontierSchemaVe
+       const Slice& key, const Slice& value, bool metadata,
+       rocksdb::DirectWriteHandler& handler) override;
+ 
+-  Status Complete(rocksdb::DirectWriteHandler& handler) override;
++  Status Complete(rocksdb::DirectWriteHandler& handler, bool finished) override;
+ 
+   Status DeleteVectorIds(Slice key, Slice ids, rocksdb::DirectWriteHandler& handler) override;
+ 
+@@ -304,7 +302,7 @@ class RemoveIntentsContext : public IntentsWriterContext {
+       const Slice& key, const Slice& value, bool metadata,
+       rocksdb::DirectWriteHandler& handler) override;
+ 
+-  Status Complete(rocksdb::DirectWriteHandler& handler) override;
++  Status Complete(rocksdb::DirectWriteHandler& handler, bool finished) override;
+ 
+   Status DeleteVectorIds(Slice key, Slice ids, rocksdb::DirectWriteHandler& handler) override;
+ 
+@@ -335,7 +333,8 @@ class NonTransactionalBatchWriter : public rocksdb::DirectWriter,
+   NonTransactionalBatchWriter(
+       std::reference_wrapper<const LWKeyValueWriteBatchPB> put_batch, HybridTime write_hybrid_time,
+       HybridTime batch_hybrid_time, rocksdb::DB* intents_db,
+-      rocksdb::WriteBatch* intents_write_batch, SchemaPackingProvider* schema_packing_provider);
++      rocksdb::WriteBatch* intents_write_batch, SchemaPackingProvider& schema_packing_provider,
++      ConsensusFrontiers& frontiers);
+   bool Empty() const;
+ 
+   Status Apply(rocksdb::DirectWriteHandler& handler) override;
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 32700e3157..1b2cfdfe76 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -981,6 +981,25 @@ std::unordered_set<string> ListActiveTabletIdsForTable(
+   return tablet_ids;
+ }
+ 
++bool PeerMatchesFilter(const tablet::TabletPeerPtr& peer, ListPeersFilter filter) {
++  switch (filter) {
++    case ListPeersFilter::kAll:
++      return true;
++    case ListPeersFilter::kLeaders: {
++      auto consensus_result = peer->GetConsensus();
++      return consensus_result &&
++             consensus_result.get()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER;
++    }
++    case ListPeersFilter::kNonLeaders: {
++      auto consensus_result = peer->GetConsensus();
++      return consensus_result &&
++             consensus_result.get()->GetLeaderStatus() == consensus::LeaderStatus::NOT_LEADER;
++    }
++  }
++
++  FATAL_INVALID_ENUM_VALUE(ListPeersFilter, filter);
++}
++
+ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+     MiniCluster* cluster, ListPeersFilter filter,
+     IncludeTransactionStatusTablets include_transaction_status_tablets) {
+@@ -992,32 +1011,9 @@ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+     return tablet && tablet->table_type() != TableType::TRANSACTION_STATUS_TABLE_TYPE;
+   };
+ 
+-  switch (filter) {
+-    case ListPeersFilter::kAll:
+-      return ListTabletPeers(cluster, [filter_transaction_status_tablets](const auto& peer) {
+-        return filter_transaction_status_tablets(peer);
+-      });
+-    case ListPeersFilter::kLeaders:
+-      return ListTabletPeers(cluster, [filter_transaction_status_tablets](const auto& peer) {
+-        if (!filter_transaction_status_tablets(peer)) {
+-          return false;
+-        }
+-        auto consensus_result = peer->GetConsensus();
+-        return consensus_result &&
+-               consensus_result.get()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER;
+-      });
+-    case ListPeersFilter::kNonLeaders:
+-      return ListTabletPeers(cluster, [filter_transaction_status_tablets](const auto& peer) {
+-        if (!filter_transaction_status_tablets(peer)) {
+-          return false;
+-        }
+-        auto consensus_result = peer->GetConsensus();
+-        return consensus_result &&
+-               consensus_result.get()->GetLeaderStatus() == consensus::LeaderStatus::NOT_LEADER;
+-      });
+-  }
+-
+-  FATAL_INVALID_ENUM_VALUE(ListPeersFilter, filter);
++  return ListTabletPeers(cluster, [filter, &filter_transaction_status_tablets](const auto& peer) {
++    return filter_transaction_status_tablets(peer) && PeerMatchesFilter(peer, filter);
++  });
+ }
+ 
+ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+@@ -1094,20 +1090,21 @@ std::vector<tablet::TabletPeerPtr> ListTableActiveTabletLeadersPeers(
+ }
+ 
+ std::vector<tablet::TabletPeerPtr> ListTableTabletPeers(
+-      MiniCluster* cluster, const TableId& table_id) {
+-  return ListTabletPeers(cluster, [&table_id](const tablet::TabletPeerPtr& peer) {
+-    return IsForTable(*peer, table_id);
++      MiniCluster* cluster, const TableId& table_id, ListPeersFilter filter) {
++  return ListTabletPeers(cluster, [&table_id, filter](const tablet::TabletPeerPtr& peer) {
++    return IsForTable(*peer, table_id) && PeerMatchesFilter(peer, filter);
+   });
+ }
+ 
+ Result<std::vector<tablet::TabletPeerPtr>> ListTabletPeersForTableName(
+-    MiniCluster* cluster, const std::string& table_name) {
+-  return ListTableTabletPeers(cluster, VERIFY_RESULT(FindTableId(cluster, table_name)));
++    MiniCluster* cluster, const std::string& table_name, ListPeersFilter filter) {
++  return ListTableTabletPeers(
++      cluster, VERIFY_RESULT(FindTableId(cluster, table_name)), filter);
+ }
+ 
+ Result<std::vector<tablet::TabletPtr>> ListTabletsForTableName(
+-    MiniCluster* cluster, const std::string& table_name) {
+-  return PeersToTablets(VERIFY_RESULT(ListTabletPeersForTableName(cluster, table_name)));
++    MiniCluster* cluster, const std::string& table_name, ListPeersFilter filter) {
++  return PeersToTablets(VERIFY_RESULT(ListTabletPeersForTableName(cluster, table_name, filter)));
+ }
+ 
+ std::vector<tablet::TabletPtr> PeersToTablets(const std::vector<tablet::TabletPeerPtr>& peers) {
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 91acf1ce2a..7e30e48b53 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -357,13 +357,15 @@ Result<std::vector<tablet::TabletPeerPtr>> ListTabletActivePeers(
+     MiniCluster* cluster, const TabletId& tablet_id);
+ 
+ std::vector<tablet::TabletPeerPtr> ListTableTabletPeers(
+-    MiniCluster* cluster, const TableId& table_id);
++    MiniCluster* cluster, const TableId& table_id, ListPeersFilter filter = ListPeersFilter::kAll);
+ 
+ Result<std::vector<tablet::TabletPeerPtr>> ListTabletPeersForTableName(
+-    MiniCluster* cluster, const std::string& table_name);
++    MiniCluster* cluster, const std::string& table_name,
++    ListPeersFilter filter = ListPeersFilter::kAll);
+ 
+ Result<std::vector<tablet::TabletPtr>> ListTabletsForTableName(
+-    MiniCluster* cluster, const std::string& table_name);
++    MiniCluster* cluster, const std::string& table_name,
++    ListPeersFilter filter = ListPeersFilter::kAll);
+ 
+ std::vector<tablet::TabletPtr> PeersToTablets(const std::vector<tablet::TabletPeerPtr>& peers);
+ 
+diff --git a/src/yb/rocksdb/db/compaction_job.cc b/src/yb/rocksdb/db/compaction_job.cc
+index 8b4174879a..5946723c81 100644
+--- a/src/yb/rocksdb/db/compaction_job.cc
++++ b/src/yb/rocksdb/db/compaction_job.cc
+@@ -1057,7 +1057,7 @@ Status CompactionJob::InstallCompactionResults(
+     }
+   }
+   if (largest_user_frontier_) {
+-    LOG(INFO) << "Updating flushed frontier to " << largest_user_frontier_->ToString();
++    LOG_WITH_PREFIX(INFO) << "Updating flushed frontier to " << largest_user_frontier_->ToString();
+     compaction->edit()->UpdateFlushedFrontier(largest_user_frontier_);
+   }
+   return versions_->LogAndApply(compaction->column_family_data(),
+@@ -1329,4 +1329,8 @@ void CompactionJob::LogCompaction() {
+   }
+ }
+ 
++const std::string& CompactionJob::LogPrefix() const {
++  return db_options_.info_log->Prefix();
++}
++
+ }  // namespace rocksdb
+diff --git a/src/yb/rocksdb/db/compaction_job.h b/src/yb/rocksdb/db/compaction_job.h
+index 96cf5c483a..cda967b992 100644
+--- a/src/yb/rocksdb/db/compaction_job.h
++++ b/src/yb/rocksdb/db/compaction_job.h
+@@ -139,6 +139,8 @@ class CompactionJob {
+ 
+   void CloseFile(Status* status, std::unique_ptr<WritableFileWriter>* writer);
+ 
++  const std::string& LogPrefix() const;
++
+   int job_id_;
+ 
+   // CompactionJob state
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 7bb967620a..0dfc355ea0 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -563,6 +563,17 @@ class Tablet::RegularRocksDbListener : public Tablet::RocksDbListener {
+ 
+     FillMinXClusterSchemaVersion(&table_id_to_min_schema_version);
+     ERROR_NOT_OK(tablet_.metadata()->OldSchemaGC(table_id_to_min_schema_version), log_prefix_);
++
++    if (VLOG_IS_ON(2)) {
++      VLOG_WITH_PREFIX_AND_FUNC(2) << AsString(table_id_to_min_schema_version);
++      if (tablet_.regular_db_) {
++        for (const auto& file : tablet_.regular_db_->GetLiveFilesMetaData()) {
++          VLOG_WITH_PREFIX_AND_FUNC(2)
++              << "file: " << file.name_id << ", smallest: "
++              << AsString(file.smallest.user_frontier);
++        }
++      }
++    }
+   }
+ 
+   // Checks XCluster config to determine the min schema version at which to expect rows.
+@@ -1753,8 +1764,7 @@ Status Tablet::ApplyKeyValueRowOperations(
+     rocksdb::WriteBatch intents_write_batch;
+     docdb::NonTransactionalBatchWriter batcher(
+         put_batch, write_hybrid_time, batch_hybrid_time, intents_db_.get(), &intents_write_batch,
+-        &GetSchemaPackingProvider());
+-    batcher.SetFrontiers(&frontiers);
++        GetSchemaPackingProvider(), frontiers);
+ 
+     rocksdb::WriteBatch regular_write_batch;
+     regular_write_batch.SetDirectWriter(&batcher);
+@@ -2310,11 +2320,13 @@ docdb::ApplyTransactionState Tablet::ApplyIntents(const TransactionApplyData& da
+   // transaction is done properly in the rare situation where the committed transaction's intents
+   // are still in intents db and not yet in regular db.
+   AtomicFlagSleepMs(&FLAGS_TEST_inject_sleep_before_applying_intents_ms);
++  docdb::ConsensusFrontiers frontiers;
++  InitFrontiers(data, frontiers);
+   auto vector_indexes = vector_indexes_->List();
+   docdb::ApplyIntentsContext context(
+       tablet_id(), data.transaction_id, data.apply_state, data.aborted, data.commit_ht, data.log_ht,
+-      min_running_ht, data.op_id, &key_bounds_, metadata_.get(), intents_db_.get(), vector_indexes,
+-      data.apply_to_storages);
++      min_running_ht, data.op_id, &key_bounds_, *metadata_, frontiers, intents_db_.get(),
++      vector_indexes, data.apply_to_storages);
+   docdb::IntentsWriter intents_writer(
+       data.apply_state ? data.apply_state->key : Slice(), min_running_ht,
+       intents_db_.get(), &context);
+@@ -2322,9 +2334,6 @@ docdb::ApplyTransactionState Tablet::ApplyIntents(const TransactionApplyData& da
+   regular_write_batch.SetDirectWriter(&intents_writer);
+   // data.hybrid_time contains transaction commit time.
+   // We don't set transaction field of put_batch, otherwise we would write another bunch of intents.
+-  docdb::ConsensusFrontiers frontiers;
+-  InitFrontiers(data, frontiers);
+-  context.SetFrontiers(&frontiers);
+   WriteToRocksDB(frontiers, &regular_write_batch, StorageDbType::kRegular);
+   return context.apply_state();
+ }
+diff --git a/src/yb/tablet/tablet_metadata.cc b/src/yb/tablet/tablet_metadata.cc
+index 806afee361..81e378ffa5 100644
+--- a/src/yb/tablet/tablet_metadata.cc
++++ b/src/yb/tablet/tablet_metadata.cc
+@@ -2028,24 +2028,28 @@ Result<RaftGroupMetadataPtr> RaftGroupMetadata::CreateSubtabletMetadata(
+     const NO_THREAD_SAFETY_ANALYSIS {
+   RaftGroupReplicaSuperBlockPB superblock;
+   ToSuperBlock(&superblock);
++
++  superblock.set_raft_group_id(raft_group_id);
++  superblock.set_wal_dir(GetSubRaftGroupWalDir(raft_group_id));
++  superblock.set_tablet_data_state(TABLET_DATA_INIT_STARTED);
++  superblock.clear_split_op_id();
++
++  auto& kv_store = *superblock.mutable_kv_store();
++  kv_store.set_kv_store_id(KvStoreId(raft_group_id).ToString());
++  kv_store.set_lower_bound_key(lower_bound_key);
++  kv_store.set_upper_bound_key(upper_bound_key);
++  kv_store.set_rocksdb_dir(GetSubRaftGroupDataDir(raft_group_id));
++  kv_store.set_parent_data_compacted(false);
++  kv_store.set_last_full_compaction_time(kNoLastFullCompactionTime);
++  kv_store.clear_post_split_compaction_file_number_upper_bound();
++
++  partition.ToPB(superblock.mutable_partition());
++
+   fs_manager_->SetTabletPathByDataPath(raft_group_id,
+-                                         DirName(DirName(DirName(kv_store_.rocksdb_dir))));
+-  RaftGroupMetadataPtr metadata(new RaftGroupMetadata(fs_manager_, raft_group_id_));
++                                       DirName(DirName(DirName(kv_store_.rocksdb_dir))));
++  RaftGroupMetadataPtr metadata(new RaftGroupMetadata(fs_manager_, raft_group_id));
+   RETURN_NOT_OK(metadata->LoadFromSuperBlock(superblock, /* local_superblock = */ true));
+-  metadata->raft_group_id_ = raft_group_id;
+-  metadata->log_prefix_ = consensus::MakeTabletLogPrefix(raft_group_id, fs_manager_->uuid());
+-  metadata->wal_dir_ = GetSubRaftGroupWalDir(raft_group_id);
+-  metadata->kv_store_.kv_store_id = KvStoreId(raft_group_id);
+-  metadata->kv_store_.lower_bound_key = lower_bound_key;
+-  metadata->kv_store_.upper_bound_key = upper_bound_key;
+-  metadata->kv_store_.rocksdb_dir = GetSubRaftGroupDataDir(raft_group_id);
+-  metadata->kv_store_.parent_data_compacted = false;
+-  metadata->kv_store_.last_full_compaction_time = kNoLastFullCompactionTime;
+-  metadata->kv_store_.post_split_compaction_file_number_upper_bound.reset();
+-  *metadata->partition_ = partition;
+   metadata->state_ = kInitialized;
+-  metadata->tablet_data_state_ = TABLET_DATA_INIT_STARTED;
+-  metadata->split_op_id_ = OpId();
+   RETURN_NOT_OK(metadata->Flush());
+   return metadata;
+ }
+diff --git a/src/yb/tablet/tablet_vector_indexes.cc b/src/yb/tablet/tablet_vector_indexes.cc
+index 14b469d64d..9816bd231e 100644
+--- a/src/yb/tablet/tablet_vector_indexes.cc
++++ b/src/yb/tablet/tablet_vector_indexes.cc
+@@ -221,7 +221,7 @@ class VectorIndexBackfillHelper : public rocksdb::DirectWriter {
+     } else {
+       frontiers.Largest().SetBackfillPosition(next_ybctid);
+     }
+-    RETURN_NOT_OK_PREPEND(index.Insert(entries_, &frontiers), "Insert entries");
++    RETURN_NOT_OK_PREPEND(index.Insert(entries_, frontiers), "Insert entries");
+     if (!next_ybctid.empty()) {
+       entries_.clear();
+       ybctids_.clear();
+diff --git a/src/yb/yql/pgwrapper/pg_txn-test.cc b/src/yb/yql/pgwrapper/pg_txn-test.cc
+index 3ef64d831e..cb16e86e13 100644
+--- a/src/yb/yql/pgwrapper/pg_txn-test.cc
++++ b/src/yb/yql/pgwrapper/pg_txn-test.cc
+@@ -13,34 +13,45 @@
+ 
+ #include <gtest/gtest.h>
+ 
+-#include "yb/yql/pgwrapper/pg_mini_test_base.h"
++#include "yb/rocksdb/db.h"
+ 
+ #include "yb/tablet/tablet.h"
+ 
+ #include "yb/tserver/mini_tablet_server.h"
+ #include "yb/tserver/tablet_server.h"
+ 
++#include "yb/util/backoff_waiter.h"
+ #include "yb/util/scope_exit.h"
+ #include "yb/util/sync_point.h"
+ #include "yb/util/test_macros.h"
+ #include "yb/util/test_thread_holder.h"
+ #include "yb/util/tsan_util.h"
+ 
++#include "yb/yql/pgwrapper/pg_mini_test_base.h"
++
+ using std::string;
+ 
+ using namespace std::literals;
+ 
+ DECLARE_bool(TEST_fail_in_apply_if_no_metadata);
+-DECLARE_bool(yb_enable_read_committed_isolation);
++DECLARE_bool(TEST_running_test);
+ DECLARE_bool(enable_wait_queues);
+-DECLARE_string(time_source);
++DECLARE_bool(ysql_enable_packed_row);
++DECLARE_bool(yb_enable_read_committed_isolation);
+ DECLARE_int32(replication_factor);
+-DECLARE_bool(TEST_running_test);
++DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
++DECLARE_int32(rocksdb_universal_compaction_min_merge_width);
++DECLARE_int32(rocksdb_universal_compaction_size_ratio);
++DECLARE_int32(timestamp_history_retention_interval_sec);
++DECLARE_int32(txn_max_apply_batch_records);
++DECLARE_int64(db_filter_block_size_bytes);
++DECLARE_int64(db_write_buffer_size);
++DECLARE_string(time_source);
++DECLARE_uint64(rocksdb_universal_compaction_always_include_size_threshold);
+ 
+ namespace yb::pgwrapper {
+ 
+ class PgTxnTest : public PgMiniTestBase {
+-
+  protected:
+   void AssertEffectiveIsolationLevel(PGConn* conn, const string& expected) {
+     auto value_from_deprecated_guc = ASSERT_RESULT(
+@@ -598,4 +609,79 @@ TEST_F(PgTxnTest, CleanupIntentsDuringShutdown) {
+   ASSERT_EQ(sum, kExpectedSum);
+ }
+ 
++TEST_F(PgTxnTest, FlushLargeTransaction) {
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_txn_max_apply_batch_records) = 14;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_filter_block_size_bytes) = 1_KB;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_write_buffer_size) = 128_KB;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_file_num_compaction_trigger) = 2;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_universal_compaction_size_ratio) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_universal_compaction_always_include_size_threshold) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_universal_compaction_min_merge_width) = 2;
++
++  constexpr auto kTxnRows = 15;
++  constexpr auto kValueLen = 16_KB;
++  constexpr auto kExtraRows = 1;
++  constexpr auto kExtraValueLen = 16_KB;
++
++  auto random_string_expr = Format(
++      "array_to_string(ARRAY("
++          "SELECT chr((97 + round(random() * 25))::INT) FROM generate_series(1, $0)), '')",
++      kValueLen);
++
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.Execute(
++      "CREATE TABLE test (id INT PRIMARY KEY, value TEXT) SPLIT INTO 1 TABLETS"));
++  ASSERT_OK(conn.ExecuteFormat(
++      "INSERT INTO test SELECT generate_series(1, $0), $1", kTxnRows, random_string_expr));
++  ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
++  // At this point we should have single SST file with primary_schema_version 0
++  // (before fix for GHI #25106 primary_schema_version was empty).
++
++  // This flush is not necessary to reproduce the bug, but there is some logic to check
++  // that test itself is not broken and verifies desired behaviour.
++  ASSERT_OK(cluster_->FlushTablets(tablet::FlushMode::kSync, tablet::FlushFlags::kRegular));
++
++  auto tablets = ASSERT_RESULT(ListTabletsForTableName(
++      cluster_.get(), "test", ListPeersFilter::kLeaders));
++  ASSERT_EQ(tablets.size(), 1);
++  auto leader = tablets[0];
++  std::set<uint64_t> name_ids;
++  auto two_files_waiter = [leader, &name_ids]() -> Result<bool> {
++    auto files = leader->doc_db().regular->GetLiveFilesMetaData();
++    LOG(INFO) << leader->LogPrefix() << "Files: " << AsString(files);
++    if (files.size() != 2) {
++      return false;
++    }
++    name_ids.clear();
++    for (const auto& file : files) {
++      name_ids.insert(file.name_id);
++    }
++    return true;
++  };
++  ASSERT_OK(WaitFor(two_files_waiter, 10s, "Wait for second SST file to flush"));
++  ASSERT_OK(conn.Execute("ALTER TABLE test ADD COLUMN v2 TEXT"));
++
++  for (int i = kTxnRows; i++ <= kTxnRows + kExtraRows; ++i) {
++    ASSERT_OK(conn.ExecuteFormat(
++        "INSERT INTO test VALUES($0, '$1', '$1')", i, RandomHumanReadableString(kExtraValueLen)));
++    ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
++    ASSERT_OK(cluster_->FlushTablets(tablet::FlushMode::kSync, tablet::FlushFlags::kRegular));
++  }
++
++  auto old_name_ids = name_ids;
++  // This logic ensures the tserver's behavior remains unchanged and validates that the test
++  // still confirms the expected functionality.
++  ASSERT_OK(WaitFor(two_files_waiter, 10s, "Wait for compaction"));
++  // Check that the first file (before fix w/o primary_schema_version) still there.
++  ASSERT_EQ(*old_name_ids.begin(), *name_ids.begin());
++  // Check that other files were compacted.
++  // Since we have 0 retention, this file will contain only rows with most recent schema version.
++  ASSERT_NE(*(++old_name_ids.begin()), *(++name_ids.begin()));
++
++  auto res = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT SUM(LENGTH(value)) FROM test"));
++  ASSERT_EQ(res, kValueLen * kTxnRows + kExtraValueLen * kExtraRows);
++}
++
+ } // namespace yb::pgwrapper

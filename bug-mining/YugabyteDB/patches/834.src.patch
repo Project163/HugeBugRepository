@@ -1,0 +1,256 @@
+diff --git a/ent/src/yb/cdc/cdc_util.h b/ent/src/yb/cdc/cdc_util.h
+index d5de5898b1..499a0ed6eb 100644
+--- a/ent/src/yb/cdc/cdc_util.h
++++ b/ent/src/yb/cdc/cdc_util.h
+@@ -76,6 +76,8 @@ struct ProducerTabletInfo {
+ struct XClusterTabletInfo {
+   ProducerTabletInfo producer_tablet_info;
+   ConsumerTabletInfo consumer_tablet_info;
++  // Whether or not replication has been paused for this tablet.
++  bool disable_stream;
+ 
+   const std::string& producer_tablet_id() const {
+     return producer_tablet_info.tablet_id;
+diff --git a/ent/src/yb/integration-tests/twodc_ysql-test.cc b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+index e5e50bedb7..c1e4e3efa1 100644
+--- a/ent/src/yb/integration-tests/twodc_ysql-test.cc
++++ b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+@@ -872,6 +872,26 @@ TEST_F(TwoDCYSqlTestConsistentTransactionsTest, TransactionsSpanningConsensusMax
+   ASSERT_OK(DeleteUniverseReplication(kUniverseId));
+ }
+ 
++TEST_F(TwoDCYSqlTestConsistentTransactionsTest, ReplicationPause) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++  auto producer_table = tables_pair.first;
++  auto consumer_table = tables_pair.second;
++
++  auto duration = MonoDelta::FromSeconds(kTransactionalConsistencyTestDurationSecs);
++  auto test_thread_holder = TestThreadHolder();
++  ASSERT_NO_FATALS(AsyncTransactionConsistencyTest(
++      producer_table->name(), consumer_table->name(), &test_thread_holder, duration));
++  SleepFor(duration/2);
++  // Pause replication here for half the duration of the workload.
++  ASSERT_OK(ToggleUniverseReplication(consumer_cluster(), consumer_client(), kUniverseId, false));
++  SleepFor(duration/2);
++  // Resume replication.
++  ASSERT_OK(ToggleUniverseReplication(consumer_cluster(), consumer_client(), kUniverseId, true));
++  test_thread_holder.JoinAll();
++  ASSERT_OK(VerifyWrittenRecords(producer_table->name(), consumer_table->name()));
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
+ TEST_P(TwoDCYsqlTestToggleBatching, GenerateSeriesMultipleTransactions) {
+   // Use a 4 -> 1 mapping to ensure that multiple transactions are processed by the same tablet.
+   auto tables = ASSERT_RESULT(SetUpWithParams({1}, {4}, 3, 1));
+diff --git a/ent/src/yb/master/catalog_manager.h b/ent/src/yb/master/catalog_manager.h
+index a691774e68..756abb657f 100644
+--- a/ent/src/yb/master/catalog_manager.h
++++ b/ent/src/yb/master/catalog_manager.h
+@@ -715,6 +715,15 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
+     const std::string& stream_id,
+     const std::vector<ReplicationErrorPb>& replication_error_codes) REQUIRES_SHARED(mutex_);
+ 
++  // Update the UniverseReplicationInfo object when toggling replication.
++  Status SetUniverseReplicationInfoEnabled(const std::string& producer_id,
++                                           bool is_enabled) EXCLUDES(mutex_);
++
++  // Update the cluster config and consumer registry objects when toggling replication.
++  Status SetConsumerRegistryEnabled(const std::string& producer_id,
++                                    bool is_enabled,
++                                    ClusterConfigInfo::WriteLock* l);
++
+   // Snapshot map: snapshot-id -> SnapshotInfo.
+   typedef std::unordered_map<SnapshotId, scoped_refptr<SnapshotInfo>> SnapshotInfoMap;
+   SnapshotInfoMap non_txn_snapshot_ids_map_;
+diff --git a/ent/src/yb/master/catalog_manager_ent.cc b/ent/src/yb/master/catalog_manager_ent.cc
+index 390490d1e1..9f38640f29 100644
+--- a/ent/src/yb/master/catalog_manager_ent.cc
++++ b/ent/src/yb/master/catalog_manager_ent.cc
+@@ -6226,31 +6226,16 @@ Status CatalogManager::ChangeXClusterRole(const ChangeXClusterRoleRequestPB* req
+   return Status::OK();
+ }
+ 
+-Status CatalogManager::SetUniverseReplicationEnabled(
+-    const SetUniverseReplicationEnabledRequestPB* req,
+-    SetUniverseReplicationEnabledResponsePB* resp,
+-    rpc::RpcContext* rpc) {
+-  LOG(INFO) << "Servicing SetUniverseReplicationEnabled request from " << RequestorString(rpc)
+-            << ": " << req->ShortDebugString();
+-
+-  // Sanity Checking Cluster State and Input.
+-  if (!req->has_producer_id()) {
+-    return STATUS(InvalidArgument, "Producer universe ID must be provided",
+-                  req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
+-  }
+-  if (!req->has_is_enabled()) {
+-    return STATUS(InvalidArgument, "Must explicitly set whether to enable",
+-                  req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
+-  }
+-
++Status CatalogManager::SetUniverseReplicationInfoEnabled(const std::string& producer_id,
++                                                         bool is_enabled) {
+   scoped_refptr<UniverseReplicationInfo> universe;
+   {
+     SharedLock lock(mutex_);
+ 
+-    universe = FindPtrOrNull(universe_replication_map_, req->producer_id());
++    universe = FindPtrOrNull(universe_replication_map_, producer_id);
+     if (universe == nullptr) {
+       return STATUS(NotFound, "Could not find CDC producer universe",
+-                    req->ShortDebugString(), MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
++                    producer_id, MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
+     }
+   }
+ 
+@@ -6261,40 +6246,83 @@ Status CatalogManager::SetUniverseReplicationEnabled(
+         l->pb.state() != SysUniverseReplicationEntryPB::ACTIVE) {
+       return STATUS(
+           InvalidArgument,
+-          Format("Universe Replication in invalid state: $0.  Retry or Delete.",
++          Format("Universe Replication in invalid state: $0. Retry or Delete.",
+               SysUniverseReplicationEntryPB::State_Name(l->pb.state())),
+-          req->ShortDebugString(),
++          producer_id,
+           MasterError(MasterErrorPB::INVALID_REQUEST));
+     }
+-    if (req->is_enabled()) {
+-        l.mutable_data()->pb.set_state(SysUniverseReplicationEntryPB::ACTIVE);
+-    } else { // DISABLE.
+-        l.mutable_data()->pb.set_state(SysUniverseReplicationEntryPB::DISABLED);
++    if (is_enabled) {
++      l.mutable_data()->pb.set_state(SysUniverseReplicationEntryPB::ACTIVE);
++    } else {
++      // DISABLE.
++      l.mutable_data()->pb.set_state(SysUniverseReplicationEntryPB::DISABLED);
+     }
+     RETURN_NOT_OK(CheckStatus(
+         sys_catalog_->Upsert(leader_ready_term(), universe),
+         "updating universe replication info in sys-catalog"));
+     l.Commit();
+   }
++  return Status::OK();
++}
+ 
++Status CatalogManager::SetConsumerRegistryEnabled(const std::string& producer_id,
++                                                  bool is_enabled,
++                                                  ClusterConfigInfo::WriteLock* l) {
+   // Modify the Consumer Registry, which will fan out this info to all TServers on heartbeat.
+   {
+-    auto cluster_config = ClusterConfig();
+-    auto l = cluster_config->LockForWrite();
+-    auto producer_map = l.mutable_data()->pb.mutable_consumer_registry()->mutable_producer_map();
+-    auto it = producer_map->find(req->producer_id());
+-    if (it == producer_map->end()) {
+-      LOG(WARNING) << "Valid Producer Universe not in Consumer Registry: " << req->producer_id();
+-      return STATUS(NotFound, "Could not find CDC producer universe",
+-                    req->ShortDebugString(), MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
++    auto producer_map = l->mutable_data()->pb.mutable_consumer_registry()->mutable_producer_map();
++    {
++      auto it = producer_map->find(producer_id);
++      if (it == producer_map->end()) {
++        LOG(WARNING) << "Valid Producer Universe not in Consumer Registry: " << producer_id;
++        return STATUS(NotFound, "Could not find CDC producer universe",
++                      producer_id, MasterError(MasterErrorPB::OBJECT_NOT_FOUND));
++      }
++      (*it).second.set_disable_stream(!is_enabled);
+     }
+-    (*it).second.set_disable_stream(!req->is_enabled());
+-    l.mutable_data()->pb.set_version(l.mutable_data()->pb.version() + 1);
+-    RETURN_NOT_OK(CheckStatus(
+-        sys_catalog_->Upsert(leader_ready_term(), cluster_config.get()),
+-        "updating cluster config in sys-catalog"));
+-    l.Commit();
+   }
++  return Status::OK();
++}
++
++Status CatalogManager::SetUniverseReplicationEnabled(
++    const SetUniverseReplicationEnabledRequestPB* req,
++    SetUniverseReplicationEnabledResponsePB* resp,
++    rpc::RpcContext* rpc) {
++  LOG(INFO) << "Servicing SetUniverseReplicationEnabled request from " << RequestorString(rpc)
++            << ": " << req->ShortDebugString();
++
++  // Sanity Checking Cluster State and Input.
++  if (!req->has_producer_id()) {
++    return STATUS(InvalidArgument, "Producer universe ID must be provided",
++                  req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
++  }
++  if (!req->has_is_enabled()) {
++    return STATUS(InvalidArgument, "Must explicitly set whether to enable",
++                  req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
++  }
++
++  const auto is_enabled = req->is_enabled();
++  const auto is_replicating_transaction_status_table =
++      FindPtrOrNull(universe_replication_map_, kSystemXClusterReplicationId) != nullptr;
++  RETURN_NOT_OK(SetUniverseReplicationInfoEnabled(req->producer_id(), is_enabled));
++  if (is_replicating_transaction_status_table) {
++    RETURN_NOT_OK(SetUniverseReplicationInfoEnabled(kSystemXClusterReplicationId, is_enabled));
++  }
++
++  // When updating the cluster config, make sure that the change to the user replication and
++  // system replication commit atomically by using the same lock.
++  auto cluster_config = ClusterConfig();
++  auto l = cluster_config->LockForWrite();
++  RETURN_NOT_OK(SetConsumerRegistryEnabled(req->producer_id(), is_enabled, &l));
++  if (is_replicating_transaction_status_table) {
++    RETURN_NOT_OK(SetConsumerRegistryEnabled(kSystemXClusterReplicationId, is_enabled, &l));
++  }
++
++  l.mutable_data()->pb.set_version(l.mutable_data()->pb.version() + 1);
++  RETURN_NOT_OK(CheckStatus(
++      sys_catalog_->Upsert(leader_ready_term(), cluster_config.get()),
++      "updating cluster config in sys-catalog"));
++  l.Commit();
+ 
+   CreateXClusterSafeTimeTableAndStartService();
+ 
+diff --git a/ent/src/yb/tserver/cdc_consumer.cc b/ent/src/yb/tserver/cdc_consumer.cc
+index 7cc7fffab6..c61f3297a6 100644
+--- a/ent/src/yb/tserver/cdc_consumer.cc
++++ b/ent/src/yb/tserver/cdc_consumer.cc
+@@ -309,9 +309,6 @@ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_re
+ 
+   for (const auto& producer_map : DCHECK_NOTNULL(consumer_registry)->producer_map()) {
+     const auto& producer_entry_pb = producer_map.second;
+-    if (producer_entry_pb.disable_stream()) {
+-      continue;
+-    }
+     // recreate the UUID connection information
+     if (!ContainsKey(uuid_master_addrs_, producer_map.first)) {
+       std::vector<HostPort> hp;
+@@ -346,7 +343,8 @@ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_re
+               {consumer_tablet_id, stream_entry_pb.consumer_table_id()});
+           auto xCluster_tablet_info = cdc::XClusterTabletInfo {
+             .producer_tablet_info = producer_tablet_info,
+-            .consumer_tablet_info = consumer_tablet_info
++            .consumer_tablet_info = consumer_tablet_info,
++            .disable_stream = producer_entry_pb.disable_stream()
+           };
+           producer_consumer_tablet_map_from_master_.emplace(xCluster_tablet_info);
+         }
+@@ -382,6 +380,11 @@ void CDCConsumer::TriggerPollForNewTablets() {
+   std::lock_guard<rw_spinlock> write_lock_master(master_data_mutex_);
+ 
+   for (const auto& entry : producer_consumer_tablet_map_from_master_) {
++    if (entry.disable_stream) {
++      // Replication for this stream has been paused/disabled, do not create a poller for this
++      // tablet.
++      continue;
++    }
+     const auto& producer_tablet_info = entry.producer_tablet_info;
+     const auto& consumer_tablet_info = entry.consumer_tablet_info;
+     auto uuid = producer_tablet_info.universe_uuid;
+@@ -540,8 +543,9 @@ bool CDCConsumer::ShouldContinuePolling(
+   // We either no longer need to poll for this tablet, or a different tablet should be polling
+   // for it now instead of this one (due to a local tablet split).
+   if (it == producer_consumer_tablet_map_from_master_.end() ||
+-      it->consumer_tablet_info.tablet_id != consumer_tablet_info.tablet_id) {
+-    // We no longer care about this tablet, abort the cycle.
++      it->consumer_tablet_info.tablet_id != consumer_tablet_info.tablet_id ||
++      it->disable_stream) {
++    // We no longer want to poll for this tablet, abort the cycle.
+     return false;
+   }
+   return is_leader_for_tablet_(it->consumer_tablet_info.tablet_id);

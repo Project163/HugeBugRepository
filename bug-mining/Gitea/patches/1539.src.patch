@@ -1,0 +1,929 @@
+diff --git a/models/db/engine.go b/models/db/engine.go
+index 25f4066ea1..847ba58c26 100755
+--- a/models/db/engine.go
++++ b/models/db/engine.go
+@@ -57,6 +57,7 @@ type Engine interface {
+ 	SumInt(bean any, columnName string) (res int64, err error)
+ 	Sync(...any) error
+ 	Select(string) *xorm.Session
++	SetExpr(string, any) *xorm.Session
+ 	NotIn(string, ...any) *xorm.Session
+ 	OrderBy(any, ...any) *xorm.Session
+ 	Exist(...any) (bool, error)
+diff --git a/models/issues/issue_project.go b/models/issues/issue_project.go
+index 907a5a17b9..e31d2ef151 100644
+--- a/models/issues/issue_project.go
++++ b/models/issues/issue_project.go
+@@ -5,11 +5,11 @@ package issues
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	project_model "code.gitea.io/gitea/models/project"
+ 	user_model "code.gitea.io/gitea/models/user"
++	"code.gitea.io/gitea/modules/util"
+ )
+ 
+ // LoadProject load the project the issue was assigned to
+@@ -90,58 +90,73 @@ func LoadIssuesFromBoardList(ctx context.Context, bs project_model.BoardList) (m
+ 	return issuesMap, nil
+ }
+ 
+-// ChangeProjectAssign changes the project associated with an issue
+-func ChangeProjectAssign(ctx context.Context, issue *Issue, doer *user_model.User, newProjectID int64) error {
+-	ctx, committer, err := db.TxContext(ctx)
+-	if err != nil {
+-		return err
+-	}
+-	defer committer.Close()
+-
+-	if err := addUpdateIssueProject(ctx, issue, doer, newProjectID); err != nil {
+-		return err
+-	}
+-
+-	return committer.Commit()
+-}
++// IssueAssignOrRemoveProject changes the project associated with an issue
++// If newProjectID is 0, the issue is removed from the project
++func IssueAssignOrRemoveProject(ctx context.Context, issue *Issue, doer *user_model.User, newProjectID, newColumnID int64) error {
++	return db.WithTx(ctx, func(ctx context.Context) error {
++		oldProjectID := issue.projectID(ctx)
+ 
+-func addUpdateIssueProject(ctx context.Context, issue *Issue, doer *user_model.User, newProjectID int64) error {
+-	oldProjectID := issue.projectID(ctx)
++		if err := issue.LoadRepo(ctx); err != nil {
++			return err
++		}
+ 
+-	if err := issue.LoadRepo(ctx); err != nil {
+-		return err
+-	}
++		// Only check if we add a new project and not remove it.
++		if newProjectID > 0 {
++			newProject, err := project_model.GetProjectByID(ctx, newProjectID)
++			if err != nil {
++				return err
++			}
++			if !newProject.CanBeAccessedByOwnerRepo(issue.Repo.OwnerID, issue.Repo) {
++				return util.NewPermissionDeniedErrorf("issue %d can't be accessed by project %d", issue.ID, newProject.ID)
++			}
++			if newColumnID == 0 {
++				newDefaultColumn, err := newProject.GetDefaultBoard(ctx)
++				if err != nil {
++					return err
++				}
++				newColumnID = newDefaultColumn.ID
++			}
++		}
+ 
+-	// Only check if we add a new project and not remove it.
+-	if newProjectID > 0 {
+-		newProject, err := project_model.GetProjectByID(ctx, newProjectID)
+-		if err != nil {
++		if _, err := db.GetEngine(ctx).Where("project_issue.issue_id=?", issue.ID).Delete(&project_model.ProjectIssue{}); err != nil {
+ 			return err
+ 		}
+-		if newProject.RepoID != issue.RepoID && newProject.OwnerID != issue.Repo.OwnerID {
+-			return fmt.Errorf("issue's repository is not the same as project's repository")
+-		}
+-	}
+ 
+-	if _, err := db.GetEngine(ctx).Where("project_issue.issue_id=?", issue.ID).Delete(&project_model.ProjectIssue{}); err != nil {
+-		return err
+-	}
++		if oldProjectID > 0 || newProjectID > 0 {
++			if _, err := CreateComment(ctx, &CreateCommentOptions{
++				Type:         CommentTypeProject,
++				Doer:         doer,
++				Repo:         issue.Repo,
++				Issue:        issue,
++				OldProjectID: oldProjectID,
++				ProjectID:    newProjectID,
++			}); err != nil {
++				return err
++			}
++		}
++		if newProjectID == 0 {
++			return nil
++		}
++		if newColumnID == 0 {
++			panic("newColumnID must not be zero") // shouldn't happen
++		}
+ 
+-	if oldProjectID > 0 || newProjectID > 0 {
+-		if _, err := CreateComment(ctx, &CreateCommentOptions{
+-			Type:         CommentTypeProject,
+-			Doer:         doer,
+-			Repo:         issue.Repo,
+-			Issue:        issue,
+-			OldProjectID: oldProjectID,
+-			ProjectID:    newProjectID,
+-		}); err != nil {
++		res := struct {
++			MaxSorting int64
++			IssueCount int64
++		}{}
++		if _, err := db.GetEngine(ctx).Select("max(sorting) as max_sorting, count(*) as issue_count").Table("project_issue").
++			Where("project_id=?", newProjectID).
++			And("project_board_id=?", newColumnID).
++			Get(&res); err != nil {
+ 			return err
+ 		}
+-	}
+-
+-	return db.Insert(ctx, &project_model.ProjectIssue{
+-		IssueID:   issue.ID,
+-		ProjectID: newProjectID,
++		newSorting := util.Iif(res.IssueCount > 0, res.MaxSorting+1, 0)
++		return db.Insert(ctx, &project_model.ProjectIssue{
++			IssueID:        issue.ID,
++			ProjectID:      newProjectID,
++			ProjectBoardID: newColumnID,
++			Sorting:        newSorting,
++		})
+ 	})
+ }
+diff --git a/models/project/board.go b/models/project/board.go
+index 7faabc52c5..a52baa0c18 100644
+--- a/models/project/board.go
++++ b/models/project/board.go
+@@ -5,12 +5,14 @@ package project
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"regexp"
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	"code.gitea.io/gitea/modules/setting"
+ 	"code.gitea.io/gitea/modules/timeutil"
++	"code.gitea.io/gitea/modules/util"
+ 
+ 	"xorm.io/builder"
+ )
+@@ -82,6 +84,17 @@ func (b *Board) NumIssues(ctx context.Context) int {
+ 	return int(c)
+ }
+ 
++func (b *Board) GetIssues(ctx context.Context) ([]*ProjectIssue, error) {
++	issues := make([]*ProjectIssue, 0, 5)
++	if err := db.GetEngine(ctx).Where("project_id=?", b.ProjectID).
++		And("project_board_id=?", b.ID).
++		OrderBy("sorting, id").
++		Find(&issues); err != nil {
++		return nil, err
++	}
++	return issues, nil
++}
++
+ func init() {
+ 	db.RegisterModel(new(Board))
+ }
+@@ -150,12 +163,27 @@ func createBoardsForProjectsType(ctx context.Context, project *Project) error {
+ 	return db.Insert(ctx, boards)
+ }
+ 
++// maxProjectColumns max columns allowed in a project, this should not bigger than 127
++// because sorting is int8 in database
++const maxProjectColumns = 20
++
+ // NewBoard adds a new project board to a given project
+ func NewBoard(ctx context.Context, board *Board) error {
+ 	if len(board.Color) != 0 && !BoardColorPattern.MatchString(board.Color) {
+ 		return fmt.Errorf("bad color code: %s", board.Color)
+ 	}
+-
++	res := struct {
++		MaxSorting  int64
++		ColumnCount int64
++	}{}
++	if _, err := db.GetEngine(ctx).Select("max(sorting) as max_sorting, count(*) as column_count").Table("project_board").
++		Where("project_id=?", board.ProjectID).Get(&res); err != nil {
++		return err
++	}
++	if res.ColumnCount >= maxProjectColumns {
++		return fmt.Errorf("NewBoard: maximum number of columns reached")
++	}
++	board.Sorting = int8(util.Iif(res.ColumnCount > 0, res.MaxSorting+1, 0))
+ 	_, err := db.GetEngine(ctx).Insert(board)
+ 	return err
+ }
+@@ -189,7 +217,17 @@ func deleteBoardByID(ctx context.Context, boardID int64) error {
+ 		return fmt.Errorf("deleteBoardByID: cannot delete default board")
+ 	}
+ 
+-	if err = board.removeIssues(ctx); err != nil {
++	// move all issues to the default column
++	project, err := GetProjectByID(ctx, board.ProjectID)
++	if err != nil {
++		return err
++	}
++	defaultColumn, err := project.GetDefaultBoard(ctx)
++	if err != nil {
++		return err
++	}
++
++	if err = board.moveIssuesToAnotherColumn(ctx, defaultColumn); err != nil {
+ 		return err
+ 	}
+ 
+@@ -242,21 +280,15 @@ func UpdateBoard(ctx context.Context, board *Board) error {
+ // GetBoards fetches all boards related to a project
+ func (p *Project) GetBoards(ctx context.Context) (BoardList, error) {
+ 	boards := make([]*Board, 0, 5)
+-
+-	if err := db.GetEngine(ctx).Where("project_id=? AND `default`=?", p.ID, false).OrderBy("sorting").Find(&boards); err != nil {
++	if err := db.GetEngine(ctx).Where("project_id=?", p.ID).OrderBy("sorting, id").Find(&boards); err != nil {
+ 		return nil, err
+ 	}
+ 
+-	defaultB, err := p.getDefaultBoard(ctx)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return append([]*Board{defaultB}, boards...), nil
++	return boards, nil
+ }
+ 
+-// getDefaultBoard return default board and ensure only one exists
+-func (p *Project) getDefaultBoard(ctx context.Context) (*Board, error) {
++// GetDefaultBoard return default board and ensure only one exists
++func (p *Project) GetDefaultBoard(ctx context.Context) (*Board, error) {
+ 	var board Board
+ 	has, err := db.GetEngine(ctx).
+ 		Where("project_id=? AND `default` = ?", p.ID, true).
+@@ -316,3 +348,42 @@ func UpdateBoardSorting(ctx context.Context, bs BoardList) error {
+ 		return nil
+ 	})
+ }
++
++func GetColumnsByIDs(ctx context.Context, projectID int64, columnsIDs []int64) (BoardList, error) {
++	columns := make([]*Board, 0, 5)
++	if err := db.GetEngine(ctx).
++		Where("project_id =?", projectID).
++		In("id", columnsIDs).
++		OrderBy("sorting").Find(&columns); err != nil {
++		return nil, err
++	}
++	return columns, nil
++}
++
++// MoveColumnsOnProject sorts columns in a project
++func MoveColumnsOnProject(ctx context.Context, project *Project, sortedColumnIDs map[int64]int64) error {
++	return db.WithTx(ctx, func(ctx context.Context) error {
++		sess := db.GetEngine(ctx)
++		columnIDs := util.ValuesOfMap(sortedColumnIDs)
++		movedColumns, err := GetColumnsByIDs(ctx, project.ID, columnIDs)
++		if err != nil {
++			return err
++		}
++		if len(movedColumns) != len(sortedColumnIDs) {
++			return errors.New("some columns do not exist")
++		}
++
++		for _, column := range movedColumns {
++			if column.ProjectID != project.ID {
++				return fmt.Errorf("column[%d]'s projectID is not equal to project's ID [%d]", column.ProjectID, project.ID)
++			}
++		}
++
++		for sorting, columnID := range sortedColumnIDs {
++			if _, err := sess.Exec("UPDATE `project_board` SET sorting=? WHERE id=?", sorting, columnID); err != nil {
++				return err
++			}
++		}
++		return nil
++	})
++}
+diff --git a/models/project/board_test.go b/models/project/board_test.go
+index 71ba29a589..da922ff7ad 100644
+--- a/models/project/board_test.go
++++ b/models/project/board_test.go
+@@ -4,6 +4,8 @@
+ package project
+ 
+ import (
++	"fmt"
++	"strings"
+ 	"testing"
+ 
+ 	"code.gitea.io/gitea/models/db"
+@@ -19,7 +21,7 @@ func TestGetDefaultBoard(t *testing.T) {
+ 	assert.NoError(t, err)
+ 
+ 	// check if default board was added
+-	board, err := projectWithoutDefault.getDefaultBoard(db.DefaultContext)
++	board, err := projectWithoutDefault.GetDefaultBoard(db.DefaultContext)
+ 	assert.NoError(t, err)
+ 	assert.Equal(t, int64(5), board.ProjectID)
+ 	assert.Equal(t, "Uncategorized", board.Title)
+@@ -28,7 +30,7 @@ func TestGetDefaultBoard(t *testing.T) {
+ 	assert.NoError(t, err)
+ 
+ 	// check if multiple defaults were removed
+-	board, err = projectWithMultipleDefaults.getDefaultBoard(db.DefaultContext)
++	board, err = projectWithMultipleDefaults.GetDefaultBoard(db.DefaultContext)
+ 	assert.NoError(t, err)
+ 	assert.Equal(t, int64(6), board.ProjectID)
+ 	assert.Equal(t, int64(9), board.ID)
+@@ -42,3 +44,84 @@ func TestGetDefaultBoard(t *testing.T) {
+ 	assert.Equal(t, int64(6), board.ProjectID)
+ 	assert.False(t, board.Default)
+ }
++
++func Test_moveIssuesToAnotherColumn(t *testing.T) {
++	assert.NoError(t, unittest.PrepareTestDatabase())
++
++	column1 := unittest.AssertExistsAndLoadBean(t, &Board{ID: 1, ProjectID: 1})
++
++	issues, err := column1.GetIssues(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, issues, 1)
++	assert.EqualValues(t, 1, issues[0].ID)
++
++	column2 := unittest.AssertExistsAndLoadBean(t, &Board{ID: 2, ProjectID: 1})
++	issues, err = column2.GetIssues(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, issues, 1)
++	assert.EqualValues(t, 3, issues[0].ID)
++
++	err = column1.moveIssuesToAnotherColumn(db.DefaultContext, column2)
++	assert.NoError(t, err)
++
++	issues, err = column1.GetIssues(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, issues, 0)
++
++	issues, err = column2.GetIssues(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, issues, 2)
++	assert.EqualValues(t, 3, issues[0].ID)
++	assert.EqualValues(t, 0, issues[0].Sorting)
++	assert.EqualValues(t, 1, issues[1].ID)
++	assert.EqualValues(t, 1, issues[1].Sorting)
++}
++
++func Test_MoveColumnsOnProject(t *testing.T) {
++	assert.NoError(t, unittest.PrepareTestDatabase())
++
++	project1 := unittest.AssertExistsAndLoadBean(t, &Project{ID: 1})
++	columns, err := project1.GetBoards(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, columns, 3)
++	assert.EqualValues(t, 0, columns[0].Sorting) // even if there is no default sorting, the code should also work
++	assert.EqualValues(t, 0, columns[1].Sorting)
++	assert.EqualValues(t, 0, columns[2].Sorting)
++
++	err = MoveColumnsOnProject(db.DefaultContext, project1, map[int64]int64{
++		0: columns[1].ID,
++		1: columns[2].ID,
++		2: columns[0].ID,
++	})
++	assert.NoError(t, err)
++
++	columnsAfter, err := project1.GetBoards(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, columnsAfter, 3)
++	assert.EqualValues(t, columns[1].ID, columnsAfter[0].ID)
++	assert.EqualValues(t, columns[2].ID, columnsAfter[1].ID)
++	assert.EqualValues(t, columns[0].ID, columnsAfter[2].ID)
++}
++
++func Test_NewBoard(t *testing.T) {
++	assert.NoError(t, unittest.PrepareTestDatabase())
++
++	project1 := unittest.AssertExistsAndLoadBean(t, &Project{ID: 1})
++	columns, err := project1.GetBoards(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, columns, 3)
++
++	for i := 0; i < maxProjectColumns-3; i++ {
++		err := NewBoard(db.DefaultContext, &Board{
++			Title:     fmt.Sprintf("board-%d", i+4),
++			ProjectID: project1.ID,
++		})
++		assert.NoError(t, err)
++	}
++	err = NewBoard(db.DefaultContext, &Board{
++		Title:     "board-21",
++		ProjectID: project1.ID,
++	})
++	assert.Error(t, err)
++	assert.True(t, strings.Contains(err.Error(), "maximum number of columns reached"))
++}
+diff --git a/models/project/issue.go b/models/project/issue.go
+index ebc9719de5..32e72e909d 100644
+--- a/models/project/issue.go
++++ b/models/project/issue.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	"code.gitea.io/gitea/modules/log"
++	"code.gitea.io/gitea/modules/util"
+ )
+ 
+ // ProjectIssue saves relation from issue to a project
+@@ -17,7 +18,7 @@ type ProjectIssue struct { //revive:disable-line:exported
+ 	IssueID   int64 `xorm:"INDEX"`
+ 	ProjectID int64 `xorm:"INDEX"`
+ 
+-	// If 0, then it has not been added to a specific board in the project
++	// ProjectBoardID should not be zero since 1.22. If it's zero, the issue will not be displayed on UI and it might result in errors.
+ 	ProjectBoardID int64 `xorm:"INDEX"`
+ 
+ 	// the sorting order on the board
+@@ -79,11 +80,8 @@ func (p *Project) NumOpenIssues(ctx context.Context) int {
+ func MoveIssuesOnProjectBoard(ctx context.Context, board *Board, sortedIssueIDs map[int64]int64) error {
+ 	return db.WithTx(ctx, func(ctx context.Context) error {
+ 		sess := db.GetEngine(ctx)
++		issueIDs := util.ValuesOfMap(sortedIssueIDs)
+ 
+-		issueIDs := make([]int64, 0, len(sortedIssueIDs))
+-		for _, issueID := range sortedIssueIDs {
+-			issueIDs = append(issueIDs, issueID)
+-		}
+ 		count, err := sess.Table(new(ProjectIssue)).Where("project_id=?", board.ProjectID).In("issue_id", issueIDs).Count()
+ 		if err != nil {
+ 			return err
+@@ -102,7 +100,44 @@ func MoveIssuesOnProjectBoard(ctx context.Context, board *Board, sortedIssueIDs
+ 	})
+ }
+ 
+-func (b *Board) removeIssues(ctx context.Context) error {
+-	_, err := db.GetEngine(ctx).Exec("UPDATE `project_issue` SET project_board_id = 0 WHERE project_board_id = ? ", b.ID)
+-	return err
++func (b *Board) moveIssuesToAnotherColumn(ctx context.Context, newColumn *Board) error {
++	if b.ProjectID != newColumn.ProjectID {
++		return fmt.Errorf("columns have to be in the same project")
++	}
++
++	if b.ID == newColumn.ID {
++		return nil
++	}
++
++	res := struct {
++		MaxSorting int64
++		IssueCount int64
++	}{}
++	if _, err := db.GetEngine(ctx).Select("max(sorting) as max_sorting, count(*) as issue_count").
++		Table("project_issue").
++		Where("project_id=?", newColumn.ProjectID).
++		And("project_board_id=?", newColumn.ID).
++		Get(&res); err != nil {
++		return err
++	}
++
++	issues, err := b.GetIssues(ctx)
++	if err != nil {
++		return err
++	}
++	if len(issues) == 0 {
++		return nil
++	}
++
++	nextSorting := util.Iif(res.IssueCount > 0, res.MaxSorting+1, 0)
++	return db.WithTx(ctx, func(ctx context.Context) error {
++		for i, issue := range issues {
++			issue.ProjectBoardID = newColumn.ID
++			issue.Sorting = nextSorting + int64(i)
++			if _, err := db.GetEngine(ctx).ID(issue.ID).Cols("project_board_id", "sorting").Update(issue); err != nil {
++				return err
++			}
++		}
++		return nil
++	})
+ }
+diff --git a/models/project/project.go b/models/project/project.go
+index 8f9ee2a99e..8be38694c5 100644
+--- a/models/project/project.go
++++ b/models/project/project.go
+@@ -161,6 +161,13 @@ func (p *Project) IsRepositoryProject() bool {
+ 	return p.Type == TypeRepository
+ }
+ 
++func (p *Project) CanBeAccessedByOwnerRepo(ownerID int64, repo *repo_model.Repository) bool {
++	if p.Type == TypeRepository {
++		return repo != nil && p.RepoID == repo.ID // if a project belongs to a repository, then its OwnerID is 0 and can be ignored
++	}
++	return p.OwnerID == ownerID && p.RepoID == 0
++}
++
+ func init() {
+ 	db.RegisterModel(new(Project))
+ }
+diff --git a/routers/web/org/projects.go b/routers/web/org/projects.go
+index 7f78d1c830..50effbe963 100644
+--- a/routers/web/org/projects.go
++++ b/routers/web/org/projects.go
+@@ -7,7 +7,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
+-	"strconv"
+ 	"strings"
+ 
+ 	"code.gitea.io/gitea/models/db"
+@@ -390,74 +389,6 @@ func ViewProject(ctx *context.Context) {
+ 	ctx.HTML(http.StatusOK, tplProjectsView)
+ }
+ 
+-func getActionIssues(ctx *context.Context) issues_model.IssueList {
+-	commaSeparatedIssueIDs := ctx.FormString("issue_ids")
+-	if len(commaSeparatedIssueIDs) == 0 {
+-		return nil
+-	}
+-	issueIDs := make([]int64, 0, 10)
+-	for _, stringIssueID := range strings.Split(commaSeparatedIssueIDs, ",") {
+-		issueID, err := strconv.ParseInt(stringIssueID, 10, 64)
+-		if err != nil {
+-			ctx.ServerError("ParseInt", err)
+-			return nil
+-		}
+-		issueIDs = append(issueIDs, issueID)
+-	}
+-	issues, err := issues_model.GetIssuesByIDs(ctx, issueIDs)
+-	if err != nil {
+-		ctx.ServerError("GetIssuesByIDs", err)
+-		return nil
+-	}
+-	// Check access rights for all issues
+-	issueUnitEnabled := ctx.Repo.CanRead(unit.TypeIssues)
+-	prUnitEnabled := ctx.Repo.CanRead(unit.TypePullRequests)
+-	for _, issue := range issues {
+-		if issue.RepoID != ctx.Repo.Repository.ID {
+-			ctx.NotFound("some issue's RepoID is incorrect", errors.New("some issue's RepoID is incorrect"))
+-			return nil
+-		}
+-		if issue.IsPull && !prUnitEnabled || !issue.IsPull && !issueUnitEnabled {
+-			ctx.NotFound("IssueOrPullRequestUnitNotAllowed", nil)
+-			return nil
+-		}
+-		if err = issue.LoadAttributes(ctx); err != nil {
+-			ctx.ServerError("LoadAttributes", err)
+-			return nil
+-		}
+-	}
+-	return issues
+-}
+-
+-// UpdateIssueProject change an issue's project
+-func UpdateIssueProject(ctx *context.Context) {
+-	issues := getActionIssues(ctx)
+-	if ctx.Written() {
+-		return
+-	}
+-
+-	if err := issues.LoadProjects(ctx); err != nil {
+-		ctx.ServerError("LoadProjects", err)
+-		return
+-	}
+-
+-	projectID := ctx.FormInt64("id")
+-	for _, issue := range issues {
+-		if issue.Project != nil {
+-			if issue.Project.ID == projectID {
+-				continue
+-			}
+-		}
+-
+-		if err := issues_model.ChangeProjectAssign(ctx, issue, ctx.Doer, projectID); err != nil {
+-			ctx.ServerError("ChangeProjectAssign", err)
+-			return
+-		}
+-	}
+-
+-	ctx.JSONOK()
+-}
+-
+ // DeleteProjectBoard allows for the deletion of a project board
+ func DeleteProjectBoard(ctx *context.Context) {
+ 	if ctx.Doer == nil {
+diff --git a/routers/web/repo/projects.go b/routers/web/repo/projects.go
+index 9b765e89e8..6186ee150c 100644
+--- a/routers/web/repo/projects.go
++++ b/routers/web/repo/projects.go
+@@ -21,6 +21,7 @@ import (
+ 	"code.gitea.io/gitea/modules/markup/markdown"
+ 	"code.gitea.io/gitea/modules/optional"
+ 	"code.gitea.io/gitea/modules/setting"
++	"code.gitea.io/gitea/modules/util"
+ 	"code.gitea.io/gitea/modules/web"
+ 	"code.gitea.io/gitea/services/context"
+ 	"code.gitea.io/gitea/services/forms"
+@@ -383,17 +384,21 @@ func UpdateIssueProject(ctx *context.Context) {
+ 		ctx.ServerError("LoadProjects", err)
+ 		return
+ 	}
++	if _, err := issues.LoadRepositories(ctx); err != nil {
++		ctx.ServerError("LoadProjects", err)
++		return
++	}
+ 
+ 	projectID := ctx.FormInt64("id")
+ 	for _, issue := range issues {
+-		if issue.Project != nil {
+-			if issue.Project.ID == projectID {
++		if issue.Project != nil && issue.Project.ID == projectID {
++			continue
++		}
++		if err := issues_model.IssueAssignOrRemoveProject(ctx, issue, ctx.Doer, projectID, 0); err != nil {
++			if errors.Is(err, util.ErrPermissionDenied) {
+ 				continue
+ 			}
+-		}
+-
+-		if err := issues_model.ChangeProjectAssign(ctx, issue, ctx.Doer, projectID); err != nil {
+-			ctx.ServerError("ChangeProjectAssign", err)
++			ctx.ServerError("IssueAssignOrRemoveProject", err)
+ 			return
+ 		}
+ 	}
+diff --git a/routers/web/repo/pull.go b/routers/web/repo/pull.go
+index 7f131f2e98..7041175d9a 100644
+--- a/routers/web/repo/pull.go
++++ b/routers/web/repo/pull.go
+@@ -1329,14 +1329,12 @@ func CompareAndPullRequestPost(ctx *context.Context) {
+ 		return
+ 	}
+ 
+-	if projectID > 0 {
+-		if !ctx.Repo.CanWrite(unit.TypeProjects) {
+-			ctx.Error(http.StatusBadRequest, "user hasn't the permission to write to projects")
+-			return
+-		}
+-		if err := issues_model.ChangeProjectAssign(ctx, pullIssue, ctx.Doer, projectID); err != nil {
+-			ctx.ServerError("ChangeProjectAssign", err)
+-			return
++	if projectID > 0 && ctx.Repo.CanWrite(unit.TypeProjects) {
++		if err := issues_model.IssueAssignOrRemoveProject(ctx, pullIssue, ctx.Doer, projectID, 0); err != nil {
++			if !errors.Is(err, util.ErrPermissionDenied) {
++				ctx.ServerError("IssueAssignOrRemoveProject", err)
++				return
++			}
+ 		}
+ 	}
+ 
+diff --git a/routers/web/shared/project/column.go b/routers/web/shared/project/column.go
+new file mode 100644
+index 0000000000..599842ea9e
+--- /dev/null
++++ b/routers/web/shared/project/column.go
+@@ -0,0 +1,48 @@
++// Copyright 2024 The Gitea Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package project
++
++import (
++	project_model "code.gitea.io/gitea/models/project"
++	"code.gitea.io/gitea/modules/json"
++	"code.gitea.io/gitea/services/context"
++)
++
++// MoveColumns moves or keeps columns in a project and sorts them inside that project
++func MoveColumns(ctx *context.Context) {
++	project, err := project_model.GetProjectByID(ctx, ctx.ParamsInt64(":id"))
++	if err != nil {
++		ctx.NotFoundOrServerError("GetProjectByID", project_model.IsErrProjectNotExist, err)
++		return
++	}
++	if !project.CanBeAccessedByOwnerRepo(ctx.ContextUser.ID, ctx.Repo.Repository) {
++		ctx.NotFound("CanBeAccessedByOwnerRepo", nil)
++		return
++	}
++
++	type movedColumnsForm struct {
++		Columns []struct {
++			ColumnID int64 `json:"columnID"`
++			Sorting  int64 `json:"sorting"`
++		} `json:"columns"`
++	}
++
++	form := &movedColumnsForm{}
++	if err = json.NewDecoder(ctx.Req.Body).Decode(&form); err != nil {
++		ctx.ServerError("DecodeMovedColumnsForm", err)
++		return
++	}
++
++	sortedColumnIDs := make(map[int64]int64)
++	for _, column := range form.Columns {
++		sortedColumnIDs[column.Sorting] = column.ColumnID
++	}
++
++	if err = project_model.MoveColumnsOnProject(ctx, project, sortedColumnIDs); err != nil {
++		ctx.ServerError("MoveColumnsOnProject", err)
++		return
++	}
++
++	ctx.JSONOK()
++}
+diff --git a/routers/web/web.go b/routers/web/web.go
+index 91ab378d97..e1482c1e4a 100644
+--- a/routers/web/web.go
++++ b/routers/web/web.go
+@@ -37,6 +37,7 @@ import (
+ 	"code.gitea.io/gitea/routers/web/repo"
+ 	"code.gitea.io/gitea/routers/web/repo/actions"
+ 	repo_setting "code.gitea.io/gitea/routers/web/repo/setting"
++	"code.gitea.io/gitea/routers/web/shared/project"
+ 	"code.gitea.io/gitea/routers/web/user"
+ 	user_setting "code.gitea.io/gitea/routers/web/user/setting"
+ 	"code.gitea.io/gitea/routers/web/user/setting/security"
+@@ -999,6 +1000,7 @@ func registerRoutes(m *web.Route) {
+ 				m.Post("/new", web.Bind(forms.CreateProjectForm{}), org.NewProjectPost)
+ 				m.Group("/{id}", func() {
+ 					m.Post("", web.Bind(forms.EditProjectBoardForm{}), org.AddBoardToProjectPost)
++					m.Post("/move", project.MoveColumns)
+ 					m.Post("/delete", org.DeleteProject)
+ 
+ 					m.Get("/edit", org.RenderEditProject)
+@@ -1354,6 +1356,7 @@ func registerRoutes(m *web.Route) {
+ 			m.Post("/new", web.Bind(forms.CreateProjectForm{}), repo.NewProjectPost)
+ 			m.Group("/{id}", func() {
+ 				m.Post("", web.Bind(forms.EditProjectBoardForm{}), repo.AddBoardToProjectPost)
++				m.Post("/move", project.MoveColumns)
+ 				m.Post("/delete", repo.DeleteProject)
+ 
+ 				m.Get("/edit", repo.RenderEditProject)
+diff --git a/services/issue/issue.go b/services/issue/issue.go
+index b0e50f2b89..72ea66c8d9 100644
+--- a/services/issue/issue.go
++++ b/services/issue/issue.go
+@@ -42,7 +42,7 @@ func NewIssue(ctx context.Context, repo *repo_model.Repository, issue *issues_mo
+ 			}
+ 		}
+ 		if projectID > 0 {
+-			if err := issues_model.ChangeProjectAssign(ctx, issue, issue.Poster, projectID); err != nil {
++			if err := issues_model.IssueAssignOrRemoveProject(ctx, issue, issue.Poster, projectID, 0); err != nil {
+ 				return err
+ 			}
+ 		}
+diff --git a/templates/projects/view.tmpl b/templates/projects/view.tmpl
+index 3e000660e2..47f214a44e 100644
+--- a/templates/projects/view.tmpl
++++ b/templates/projects/view.tmpl
+@@ -64,7 +64,7 @@
+ </div>
+ 
+ <div id="project-board">
+-	<div class="board {{if .CanWriteProjects}}sortable{{end}}">
++	<div class="board {{if .CanWriteProjects}}sortable{{end}}"{{if .CanWriteProjects}} data-url="{{$.Link}}/move"{{end}}>
+ 		{{range .Columns}}
+ 			<div class="ui segment project-column"{{if .Color}} style="background: {{.Color}} !important; color: {{ContrastColor .Color}} !important"{{end}} data-id="{{.ID}}" data-sorting="{{.Sorting}}" data-url="{{$.Link}}/{{.ID}}">
+ 				<div class="project-column-header{{if $canWriteProject}} tw-cursor-grab{{end}}">
+diff --git a/tests/integration/org_project_test.go b/tests/integration/org_project_test.go
+index a14004f6b0..ca39cf5130 100644
+--- a/tests/integration/org_project_test.go
++++ b/tests/integration/org_project_test.go
+@@ -5,17 +5,17 @@ package integration
+ 
+ import (
+ 	"net/http"
++	"slices"
+ 	"testing"
+ 
+ 	unit_model "code.gitea.io/gitea/models/unit"
++	"code.gitea.io/gitea/modules/test"
+ 	"code.gitea.io/gitea/tests"
+ )
+ 
+ func TestOrgProjectAccess(t *testing.T) {
+ 	defer tests.PrepareTestEnv(t)()
+-
+-	// disable repo project unit
+-	unit_model.DisabledRepoUnits = []unit_model.Type{unit_model.TypeProjects}
++	defer test.MockVariableValue(&unit_model.DisabledRepoUnits, append(slices.Clone(unit_model.DisabledRepoUnits), unit_model.TypeProjects))()
+ 
+ 	// repo project, 404
+ 	req := NewRequest(t, "GET", "/user2/repo1/projects")
+diff --git a/tests/integration/project_test.go b/tests/integration/project_test.go
+index 45061c5b24..1d9c3aae53 100644
+--- a/tests/integration/project_test.go
++++ b/tests/integration/project_test.go
+@@ -4,10 +4,18 @@
+ package integration
+ 
+ import (
++	"fmt"
+ 	"net/http"
+ 	"testing"
+ 
++	"code.gitea.io/gitea/models/db"
++	project_model "code.gitea.io/gitea/models/project"
++	repo_model "code.gitea.io/gitea/models/repo"
++	"code.gitea.io/gitea/models/unit"
++	"code.gitea.io/gitea/models/unittest"
+ 	"code.gitea.io/gitea/tests"
++
++	"github.com/stretchr/testify/assert"
+ )
+ 
+ func TestPrivateRepoProject(t *testing.T) {
+@@ -21,3 +29,59 @@ func TestPrivateRepoProject(t *testing.T) {
+ 	req = NewRequest(t, "GET", "/user31/-/projects")
+ 	sess.MakeRequest(t, req, http.StatusOK)
+ }
++
++func TestMoveRepoProjectColumns(t *testing.T) {
++	defer tests.PrepareTestEnv(t)()
++
++	repo2 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 2})
++
++	projectsUnit := repo2.MustGetUnit(db.DefaultContext, unit.TypeProjects)
++	assert.True(t, projectsUnit.ProjectsConfig().IsProjectsAllowed(repo_model.ProjectsModeRepo))
++
++	project1 := project_model.Project{
++		Title:     "new created project",
++		RepoID:    repo2.ID,
++		Type:      project_model.TypeRepository,
++		BoardType: project_model.BoardTypeNone,
++	}
++	err := project_model.NewProject(db.DefaultContext, &project1)
++	assert.NoError(t, err)
++
++	for i := 0; i < 3; i++ {
++		err = project_model.NewBoard(db.DefaultContext, &project_model.Board{
++			Title:     fmt.Sprintf("column %d", i+1),
++			ProjectID: project1.ID,
++		})
++		assert.NoError(t, err)
++	}
++
++	columns, err := project1.GetBoards(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, columns, 3)
++	assert.EqualValues(t, 0, columns[0].Sorting)
++	assert.EqualValues(t, 1, columns[1].Sorting)
++	assert.EqualValues(t, 2, columns[2].Sorting)
++
++	sess := loginUser(t, "user1")
++	req := NewRequest(t, "GET", fmt.Sprintf("/%s/projects/%d", repo2.FullName(), project1.ID))
++	resp := sess.MakeRequest(t, req, http.StatusOK)
++	htmlDoc := NewHTMLParser(t, resp.Body)
++
++	req = NewRequestWithJSON(t, "POST", fmt.Sprintf("/%s/projects/%d/move?_csrf="+htmlDoc.GetCSRF(), repo2.FullName(), project1.ID), map[string]any{
++		"columns": []map[string]any{
++			{"columnID": columns[1].ID, "sorting": 0},
++			{"columnID": columns[2].ID, "sorting": 1},
++			{"columnID": columns[0].ID, "sorting": 2},
++		},
++	})
++	sess.MakeRequest(t, req, http.StatusOK)
++
++	columnsAfter, err := project1.GetBoards(db.DefaultContext)
++	assert.NoError(t, err)
++	assert.Len(t, columns, 3)
++	assert.EqualValues(t, columns[1].ID, columnsAfter[0].ID)
++	assert.EqualValues(t, columns[2].ID, columnsAfter[1].ID)
++	assert.EqualValues(t, columns[0].ID, columnsAfter[2].ID)
++
++	assert.NoError(t, project_model.DeleteProjectByID(db.DefaultContext, project1.ID))
++}
+diff --git a/web_src/js/features/repo-projects.js b/web_src/js/features/repo-projects.js
+index a869c24c82..a1cc4b346b 100644
+--- a/web_src/js/features/repo-projects.js
++++ b/web_src/js/features/repo-projects.js
+@@ -2,7 +2,6 @@ import $ from 'jquery';
+ import {contrastColor} from '../utils/color.js';
+ import {createSortable} from '../modules/sortable.js';
+ import {POST, DELETE, PUT} from '../modules/fetch.js';
+-import tinycolor from 'tinycolor2';
+ 
+ function updateIssueCount(cards) {
+   const parent = cards.parentElement;
+@@ -63,17 +62,20 @@ async function initRepoProjectSortable() {
+     delay: 500,
+     onSort: async () => {
+       boardColumns = mainBoard.getElementsByClassName('project-column');
+-      for (let i = 0; i < boardColumns.length; i++) {
+-        const column = boardColumns[i];
+-        if (parseInt(column.getAttribute('data-sorting')) !== i) {
+-          try {
+-            const bgColor = column.style.backgroundColor; // will be rgb() string
+-            const color = bgColor ? tinycolor(bgColor).toHexString() : '';
+-            await PUT(column.getAttribute('data-url'), {data: {sorting: i, color}});
+-          } catch (error) {
+-            console.error(error);
+-          }
+-        }
++
++      const columnSorting = {
++        columns: Array.from(boardColumns, (column, i) => ({
++          columnID: parseInt(column.getAttribute('data-id')),
++          sorting: i,
++        })),
++      };
++
++      try {
++        await POST(mainBoard.getAttribute('data-url'), {
++          data: columnSorting,
++        });
++      } catch (error) {
++        console.error(error);
+       }
+     },
+   });

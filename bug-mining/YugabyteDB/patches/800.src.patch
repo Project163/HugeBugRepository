@@ -1,0 +1,1634 @@
+diff --git a/ent/src/yb/cdc/cdc_producer.cc b/ent/src/yb/cdc/cdc_producer.cc
+index bcb3af059e..6cc07c5b0b 100644
+--- a/ent/src/yb/cdc/cdc_producer.cc
++++ b/ent/src/yb/cdc/cdc_producer.cc
+@@ -370,9 +370,11 @@ Status PopulateWriteRecord(const ReplicateMsgPtr& msg,
+           // If we're not replicating intents, set record time using the transaction map.
+           RETURN_NOT_OK(SetRecordTime(txn_id, txn_map, record));
+         } else {
+-          record->mutable_transaction_state()->set_transaction_id(
+-              batch.transaction().transaction_id().ToBuffer());
+-          record->mutable_transaction_state()->add_tablets(tablet_peer->tablet_id());
++          auto* transaction_state = record->mutable_transaction_state();
++          transaction_state->set_transaction_id(batch.transaction().transaction_id().ToBuffer());
++          transaction_state->add_tablets(tablet_peer->tablet_id());
++          transaction_state->set_external_status_tablet_id(
++              batch.transaction().status_tablet().ToBuffer());
+         }
+       }
+     }
+@@ -405,19 +407,55 @@ Status PopulateWriteRecord(const ReplicateMsgPtr& msg,
+ Status PopulateTransactionRecord(const ReplicateMsgPtr& msg,
+                                  const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+                                  ReplicateIntents replicate_intents,
+-                                 CDCRecordPB* record) {
++                                 GetChangesResponsePB* resp) {
+   SCHECK(msg->has_transaction_state(), InvalidArgument,
+-         Format("Update transaction message requires transaction_state: $0",
+-                msg->ShortDebugString()));
+-  record->set_operation(CDCRecordPB_OperationType_WRITE);
+-  record->set_time(replicate_intents ?
+-      msg->hybrid_time() : msg->transaction_state().commit_hybrid_time());
+-  msg->transaction_state().ToGoogleProtobuf(record->mutable_transaction_state());
+-  if (replicate_intents && msg->transaction_state().status() == TransactionStatus::APPLYING) {
+-    // Add the partition metadata so the consumer knows which tablets to apply the transaction
+-    // to.
+-    auto shared_tablet = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
+-    shared_tablet->metadata()->partition()->ToPB(record->mutable_partition());
++      Format("Update transaction message requires transaction_state: $0",
++            msg->ShortDebugString()));
++  if (!replicate_intents) {
++    auto* record = resp->add_records();
++    record->set_operation(CDCRecordPB_OperationType_WRITE);
++    record->set_time(msg->transaction_state().commit_hybrid_time());
++    msg->transaction_state().ToGoogleProtobuf(record->mutable_transaction_state());
++    return Status::OK();
++  }
++
++  const auto& transaction_state = msg->transaction_state();
++  const auto& transaction_status = transaction_state.status();
++  if (transaction_status != TransactionStatus::APPLYING &&
++      transaction_status != TransactionStatus::COMMITTED &&
++      transaction_status != TransactionStatus::CREATED) {
++    // This is an unsupported transaction status.
++    return Status::OK();
++  }
++
++  auto* record = resp->add_records();
++  record->set_time(msg->hybrid_time());
++  auto* txn_state = record->mutable_transaction_state();
++  txn_state->set_transaction_id(transaction_state.transaction_id().ToBuffer());
++
++  switch (transaction_status) {
++    case TransactionStatus::APPLYING: {
++      record->set_operation(CDCRecordPB::APPLY);
++      txn_state->set_commit_hybrid_time(transaction_state.commit_hybrid_time());
++      auto shared_tablet = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
++      shared_tablet->metadata()->partition()->ToPB(record->mutable_partition());
++      break;
++    }
++    case TransactionStatus::COMMITTED: {
++      record->set_operation(CDCRecordPB::TRANSACTION_COMMITTED);
++      for (const auto& tablet : msg->transaction_state().tablets()) {
++        txn_state->mutable_tablets()->Add(tablet.ToBuffer());
++      }
++      break;
++    }
++    case TransactionStatus::CREATED: {
++      record->set_operation(CDCRecordPB::TRANSACTION_CREATED);
++      break;
++    }
++    default: {
++      return STATUS(IllegalState, Format("Processing unexpected op type $0",
++                                          msg->transaction_state().status()));
++    }
+   }
+   return Status::OK();
+ }
+@@ -510,28 +548,7 @@ Status GetChangesForXCluster(const std::string& stream_id,
+     const auto msg = messages[i];
+     switch (msg->op_type()) {
+       case consensus::OperationType::UPDATE_TRANSACTION_OP:
+-        if (!replicate_intents) {
+-          RETURN_NOT_OK(PopulateTransactionRecord(
+-              msg, tablet_peer, replicate_intents, resp->add_records()));
+-        } else if (msg->transaction_state().status() == TransactionStatus::APPLYING) {
+-          auto record = resp->add_records();
+-          record->set_operation(CDCRecordPB::APPLY);
+-          record->set_time(msg->hybrid_time());
+-          auto* txn_state = record->mutable_transaction_state();
+-          txn_state->set_transaction_id(msg->transaction_state().transaction_id().ToBuffer());
+-          txn_state->set_commit_hybrid_time(msg->transaction_state().commit_hybrid_time());
+-          auto shared_tablet = VERIFY_RESULT(tablet_peer->shared_tablet_safe());
+-          shared_tablet->metadata()->partition()->ToPB(record->mutable_partition());
+-        } else if (msg->transaction_state().status() == TransactionStatus::COMMITTED) {
+-          auto* record = resp->add_records();
+-          record->set_operation(CDCRecordPB::COMMITTED);
+-          record->set_time(msg->hybrid_time());
+-          auto* txn_state = record->mutable_transaction_state();
+-          txn_state->set_transaction_id(msg->transaction_state().transaction_id().ToBuffer());
+-          for (const auto& tablet : msg->transaction_state().tablets()) {
+-            txn_state->mutable_tablets()->Add(tablet.ToBuffer());
+-          }
+-        }
++        RETURN_NOT_OK(PopulateTransactionRecord(msg, tablet_peer, replicate_intents, resp));
+         break;
+       case consensus::OperationType::WRITE_OP:
+         RETURN_NOT_OK(PopulateWriteRecord(msg, txn_map, stream_metadata, tablet_peer,
+diff --git a/ent/src/yb/integration-tests/twodc-test.cc b/ent/src/yb/integration-tests/twodc-test.cc
+index 613199275b..df3e92ca69 100644
+--- a/ent/src/yb/integration-tests/twodc-test.cc
++++ b/ent/src/yb/integration-tests/twodc-test.cc
+@@ -1558,11 +1558,14 @@ TEST_P(TwoDCTestTransactionalOnly, OnlyApplyTransactionOnCaughtUpTablet) {
+   master::GetUniverseReplicationResponsePB resp;
+   ASSERT_OK(VerifyUniverseReplication(consumer_cluster(), consumer_client(),
+                                       kUniverseId, &resp));
++
++  ASSERT_OK(ChangeXClusterRole(cdc::XClusterRole::STANDBY));
+   auto txn = ASSERT_RESULT(CreateSessionWithTransaction(producer_client(), producer_txn_mgr()));
+   WriteIntents(1, 5, producer_client(), txn.first, tables[0]->name(), false);
+   ASSERT_OK(txn.second->CommitFuture().get());
+   auto txn_id = txn.second->id();
+   ASSERT_RESULT(GetCommitTimeOfTransaction(consumer_client(), txn_id));
++  ASSERT_OK(VerifyWrittenRecords(tables[0]->name(), tables[1]->name()));
+   FLAGS_TEST_disable_apply_committed_transactions = false;
+   ASSERT_OK(WaitForTransactionCleanedUp(consumer_client(), txn_id));
+   ASSERT_OK(VerifyWrittenRecords(tables[0]->name(), tables[1]->name()));
+@@ -1579,6 +1582,10 @@ TEST_P(TwoDCTestTransactionalOnly, TransactionsWithoutApply) {
+   auto consumer_table = tables[1];
+   ASSERT_OK(SetupUniverseReplication(
+       producer_cluster(), consumer_cluster(), consumer_client(), kUniverseId, {producer_table}));
++  master::GetUniverseReplicationResponsePB resp;
++  ASSERT_OK(VerifyUniverseReplication(consumer_cluster(), consumer_client(),
++                                      kUniverseId, &resp));
++  ASSERT_OK(ChangeXClusterRole(cdc::XClusterRole::STANDBY));
+   auto txn = ASSERT_RESULT(CreateSessionWithTransaction(producer_client(), producer_txn_mgr()));
+   WriteIntents(1, 5, producer_client(), txn.first, tables[0]->name(), false);
+   ASSERT_OK(txn.second->CommitFuture().get());
+diff --git a/ent/src/yb/integration-tests/twodc_test_base.cc b/ent/src/yb/integration-tests/twodc_test_base.cc
+index 9a5257542c..b47a7c0c08 100644
+--- a/ent/src/yb/integration-tests/twodc_test_base.cc
++++ b/ent/src/yb/integration-tests/twodc_test_base.cc
+@@ -659,5 +659,23 @@ Status TwoDCTestBase::WaitForSetupUniverseReplicationCleanUp(string producer_uui
+   }, MonoDelta::FromSeconds(kRpcTimeout), "Waiting for universe to delete");
+ }
+ 
++Status TwoDCTestBase::WaitForValidSafeTimeOnAllTServers(const NamespaceId& namespace_id) {
++  for (auto& tserver : consumer_cluster()->mini_tablet_servers()) {
++    RETURN_NOT_OK(WaitFor(
++        [&]() -> Result<bool> {
++          auto safe_time =
++              tserver->server()->GetXClusterSafeTimeMap().GetSafeTime(namespace_id);
++          if (!safe_time) {
++            return false;
++          }
++          CHECK(safe_time->is_valid());
++          return true;
++        }, safe_time_propagation_timeout_,
++        Format("Wait for safe_time of namespace $0 to be valid", namespace_id)));
++    }
++
++    return Status::OK();
++  }
++
+ } // namespace enterprise
+ } // namespace yb
+diff --git a/ent/src/yb/integration-tests/twodc_test_base.h b/ent/src/yb/integration-tests/twodc_test_base.h
+index b4aa5b9cdb..ef897c0270 100644
+--- a/ent/src/yb/integration-tests/twodc_test_base.h
++++ b/ent/src/yb/integration-tests/twodc_test_base.h
+@@ -35,6 +35,7 @@ DECLARE_int32(cdc_read_rpc_timeout_ms);
+ DECLARE_int32(cdc_write_rpc_timeout_ms);
+ DECLARE_bool(TEST_check_broadcast_address);
+ DECLARE_bool(flush_rocksdb_on_shutdown);
++DECLARE_int32(xcluster_safe_time_update_interval_secs);
+ 
+ namespace yb {
+ 
+@@ -79,6 +80,8 @@ class TwoDCTestBase : public YBTest {
+     // Not a useful test for us. It's testing Public+Private IP NW errors and we're only public
+     FLAGS_TEST_check_broadcast_address = false;
+     FLAGS_flush_rocksdb_on_shutdown = false;
++    FLAGS_xcluster_safe_time_update_interval_secs = 1;
++    safe_time_propagation_timeout_ = MonoDelta::FromSeconds(30);
+   }
+ 
+   Status InitClusters(const MiniClusterOptions& opts, bool init_postgres = false);
+@@ -183,6 +186,8 @@ class TwoDCTestBase : public YBTest {
+ 
+   Status WaitForSetupUniverseReplicationCleanUp(std::string producer_uuid);
+ 
++  Status WaitForValidSafeTimeOnAllTServers(const NamespaceId& namespace_id);
++
+   YBClient* producer_client() {
+     return producer_cluster_.client_.get();
+   }
+@@ -232,6 +237,7 @@ class TwoDCTestBase : public YBTest {
+  protected:
+   Cluster producer_cluster_;
+   Cluster consumer_cluster_;
++  MonoDelta safe_time_propagation_timeout_;
+ 
+  private:
+   // Not thread safe. FLAGS_pgsql_proxy_webserver_port is modified each time this is called so this
+diff --git a/ent/src/yb/integration-tests/twodc_ysql-test.cc b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+index 403571375f..2cbb50148c 100644
+--- a/ent/src/yb/integration-tests/twodc_ysql-test.cc
++++ b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+@@ -81,6 +81,7 @@
+ #include "yb/util/result.h"
+ #include "yb/util/stopwatch.h"
+ #include "yb/util/test_macros.h"
++#include "yb/util/test_thread_holder.h"
+ #include "yb/yql/pgwrapper/libpq_utils.h"
+ #include "yb/yql/pgwrapper/pg_wrapper.h"
+ 
+@@ -106,6 +107,7 @@ DECLARE_bool(ysql_enable_packed_row);
+ DECLARE_uint64(ysql_packed_row_size_limit);
+ DECLARE_bool(xcluster_wait_on_ddl_alter);
+ DECLARE_bool(enable_replicate_transaction_status_table);
++DECLARE_bool(TEST_disable_apply_committed_transactions);
+ 
+ namespace yb {
+ 
+@@ -154,8 +156,13 @@ class TwoDCYsqlTest : public TwoDCTestBase
+                                       bool enable_cdc_sdk_in_producer = false,
+                                       bool do_explict_transaction = false);
+ 
+-  Status Initialize(uint32_t replication_factor, uint32_t num_masters = 1) {
+-    FLAGS_cdc_max_apply_batch_num_records = GetParam().batch_size;
++  Status Initialize(uint32_t replication_factor, uint32_t num_masters = 1,
++                    boost::optional<uint32_t> batch_size = boost::none) {
++    if (batch_size) {
++      FLAGS_cdc_max_apply_batch_num_records = *batch_size;
++    } else {
++      FLAGS_cdc_max_apply_batch_num_records = GetParam().batch_size;
++    }
+ 
+     // In this test, the tservers in each cluster share the same postgres proxy. As each tserver
+     // initializes, it will overwrite the auth key for the "postgres" user. Force an identical key
+@@ -177,8 +184,9 @@ class TwoDCYsqlTest : public TwoDCTestBase
+                       uint32_t replication_factor,
+                       uint32_t num_masters = 1,
+                       bool colocated = false,
+-                      boost::optional<std::string> tablegroup_name = boost::none) {
+-    RETURN_NOT_OK(Initialize(replication_factor, num_masters));
++                      boost::optional<std::string> tablegroup_name = boost::none,
++                      boost::optional<uint32_t> batch_size = boost::none) {
++    RETURN_NOT_OK(Initialize(replication_factor, num_masters, batch_size));
+ 
+     if (num_consumer_tablets.size() != num_producer_tablets.size()) {
+       return STATUS(IllegalState,
+@@ -355,7 +363,7 @@ class TwoDCYsqlTest : public TwoDCTestBase
+   }
+ 
+   void WriteTransactionalWorkload(uint32_t start, uint32_t end, Cluster* cluster,
+-                                  const YBTableName& table) {
++                                  const YBTableName& table, bool commit_transaction = true) {
+     auto conn = EXPECT_RESULT(cluster->ConnectToDB(table.namespace_name()));
+     std::string table_name_str = GetCompleteTableName(table);
+     EXPECT_OK(conn.Execute("BEGIN"));
+@@ -363,7 +371,11 @@ class TwoDCYsqlTest : public TwoDCTestBase
+       EXPECT_OK(conn.ExecuteFormat("INSERT INTO $0($1) VALUES ($2) ON CONFLICT DO NOTHING",
+                                    table_name_str, kKeyColumnName, i));
+     }
+-    EXPECT_OK(conn.Execute("COMMIT"));
++    if (commit_transaction) {
++      EXPECT_OK(conn.Execute("COMMIT"));
++    } else {
++      EXPECT_OK(conn.Execute("ABORT"));
++    }
+   }
+ 
+   void DeleteWorkload(uint32_t start, uint32_t end, Cluster* cluster, const YBTableName& table) {
+@@ -449,6 +461,125 @@ TEST_P(TwoDCYsqlTestToggleBatching, GenerateSeries) {
+   ASSERT_OK(VerifyWrittenRecords(producer_table->name(), consumer_table->name()));
+ }
+ 
++class TwoDCYSqlTestConsistentTransationsTest : public TwoDCYsqlTest {
++ public:
++  void MultiTransactionConsistencyTest(
++      uint32_t transaction_size, uint32_t num_transactions, const YBTableName& producer_table,
++      const YBTableName& consumer_table, bool commit_all_transactions) {
++    // Have one writer thread and one reader thread. For each read, assert
++    // - atomicity: that the total number of records read mod the transaction size is 0 to ensure
++    // that we have no half transactional cuts.
++    // - ordering: that the records returned are always [0, num_records_reads] to ensure that no
++    // later transaction is readable before an earlier one.
++    auto total_intent_records = transaction_size * num_transactions;
++    auto total_committed_records =
++        commit_all_transactions ? total_intent_records : total_intent_records / 2;
++    auto test_thread_holder = TestThreadHolder();
++    test_thread_holder.AddThread([&]() {
++      auto commit_transaction = true;
++      for (uint32_t i = 0; i < total_intent_records; i += transaction_size) {
++        ASSERT_NO_FATALS(WriteTransactionalWorkload(
++            i, i + transaction_size, &producer_cluster_, producer_table,
++            commit_all_transactions || commit_transaction));
++        commit_transaction = !commit_transaction;
++        LOG(INFO) << "Wrote records: " << i + transaction_size;
++      }
++    });
++
++    test_thread_holder.AddThread([&]() {
++      ASSERT_OK(WaitForValidSafeTimeOnAllTServers(consumer_table.namespace_id()));
++      SleepFor(MonoDelta::FromSeconds(5));
++      uint32_t num_read_records = 0;
++      while (num_read_records < total_committed_records) {
++        auto consumer_results = ScanToStrings(consumer_table, &consumer_cluster_);
++        num_read_records = PQntuples(consumer_results.get());
++        ASSERT_EQ(num_read_records % transaction_size, 0);
++        LOG(INFO) << "Read records: " << num_read_records;
++        if (commit_all_transactions) {
++          for (uint32_t i = 0; i < num_read_records; ++i) {
++            auto val = ASSERT_RESULT(GetInt32(consumer_results.get(), i, 0));
++            ASSERT_EQ(val, i);
++          }
++        }
++      }
++      ASSERT_EQ(num_read_records, total_committed_records);
++    });
++
++    test_thread_holder.JoinAll();
++  }
++
++  Result<std::pair<client::YBTablePtr, client::YBTablePtr>> CreateTableAndSetupReplication() {
++    FLAGS_enable_replicate_transaction_status_table = true;
++    auto tables = VERIFY_RESULT(SetUpWithParams({4}, {4}, 3, 1, false /* colocated */,
++                                                boost::none /* tablegroup_name */,
++                                                0 /* batch_size */));
++    auto producer_table = tables[0];
++    auto consumer_table = tables[1];
++    const string kUniverseId = VERIFY_RESULT(GetUniverseId(&producer_cluster_));
++    RETURN_NOT_OK(SetupUniverseReplication(kUniverseId, {producer_table}));
++    // Verify that universe was setup on consumer.
++    master::GetUniverseReplicationResponsePB resp;
++    RETURN_NOT_OK(VerifyUniverseReplication(kUniverseId, &resp));
++
++    RETURN_NOT_OK(ChangeXClusterRole(cdc::XClusterRole::STANDBY));
++
++    return std::make_pair(producer_table, consumer_table);
++  }
++};
++
++constexpr uint32_t kTransactionSize = 50;
++constexpr uint32_t kNumTransactions = 100;
++
++TEST_F(TwoDCYSqlTestConsistentTransationsTest, ConsistentTransactions) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++
++  ASSERT_NO_FATALS(MultiTransactionConsistencyTest(
++      kTransactionSize, kNumTransactions, tables_pair.first->name(), tables_pair.second->name(),
++      true /* commit_all_transactions */));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
++TEST_F(TwoDCYSqlTestConsistentTransationsTest, ConsistentTransactionsWithApplyDisabled) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++
++  ASSERT_NO_FATALS(MultiTransactionConsistencyTest(
++      kTransactionSize, kNumTransactions, tables_pair.first->name(), tables_pair.second->name(),
++      true /* commit_all_transactions */));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
++TEST_F(TwoDCYSqlTestConsistentTransationsTest, LargeTransaction) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++
++  ASSERT_NO_FATALS(MultiTransactionConsistencyTest(
++      10000, 1, tables_pair.first->name(), tables_pair.second->name(),
++      true /* commit_all_transactions */));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
++TEST_F(TwoDCYSqlTestConsistentTransationsTest, ManySmallTransactions) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++
++  ASSERT_NO_FATALS(MultiTransactionConsistencyTest(
++      2, 500, tables_pair.first->name(), tables_pair.second->name(),
++      true /* commit_all_transactions */));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
++TEST_F(TwoDCYSqlTestConsistentTransationsTest, UncommittedTransactions) {
++  auto tables_pair = ASSERT_RESULT(CreateTableAndSetupReplication());
++
++  ASSERT_NO_FATALS(MultiTransactionConsistencyTest(
++      kTransactionSize, kNumTransactions, tables_pair.first->name(), tables_pair.second->name(),
++      false /* commit_all_transactions */));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
+ TEST_P(TwoDCYsqlTestToggleBatching, GenerateSeriesMultipleTransactions) {
+   // Use a 4 -> 1 mapping to ensure that multiple transactions are processed by the same tablet.
+   auto tables = ASSERT_RESULT(SetUpWithParams({1}, {4}, 3, 1));
+diff --git a/ent/src/yb/integration-tests/xcluster_safe_time-itest.cc b/ent/src/yb/integration-tests/xcluster_safe_time-itest.cc
+index fc59380355..168e567a78 100644
+--- a/ent/src/yb/integration-tests/xcluster_safe_time-itest.cc
++++ b/ent/src/yb/integration-tests/xcluster_safe_time-itest.cc
+@@ -70,10 +70,6 @@ class XClusterSafeTimeTest : public TwoDCTestBase {
+     FLAGS_enable_load_balancing = false;
+     FLAGS_enable_replicate_transaction_status_table = true;
+ 
+-    FLAGS_xcluster_safe_time_update_interval_secs = 1;
+-    safe_time_propagation_timeout_ =
+-        FLAGS_xcluster_safe_time_update_interval_secs * 5s * kTimeMultiplier;
+-
+     TwoDCTestBase::SetUp();
+     MiniClusterOptions opts;
+     opts.num_masters = kMasterCount;
+@@ -203,7 +199,6 @@ class XClusterSafeTimeTest : public TwoDCTestBase {
+   }
+ 
+  protected:
+-  MonoDelta safe_time_propagation_timeout_;
+   YBTableName producer_table_name_;
+   YBTableName consumer_table_name_;
+   std::shared_ptr<YBTable> producer_table_;
+@@ -286,9 +281,6 @@ class XClusterConsistencyTest : public TwoDCTestBase {
+ 
+     // Disable LB as we dont want tablets moving during the test.
+     FLAGS_enable_load_balancing = false;
+-    FLAGS_xcluster_safe_time_update_interval_secs = 1;
+-    safe_time_propagation_timeout_ =
+-        FLAGS_xcluster_safe_time_update_interval_secs * 5s * kTimeMultiplier;
+     FLAGS_ysql_yb_xcluster_consistency_level = "database";
+     FLAGS_transaction_table_num_tablets = 1;
+     FLAGS_enable_replicate_transaction_status_table = true;
+@@ -455,21 +447,7 @@ class XClusterConsistencyTest : public TwoDCTestBase {
+ 
+   virtual Status PostReplicationSetup() {
+     // Wait till we have a valid safe time on all tservers.
+-    for (auto& tserver : consumer_cluster()->mini_tablet_servers()) {
+-      RETURN_NOT_OK(WaitFor(
+-          [&]() -> Result<bool> {
+-            auto safe_time = tserver->server()->GetXClusterSafeTimeMap().GetSafeTime(namespace_id_);
+-            if (!safe_time) {
+-              return false;
+-            }
+-            CHECK(safe_time->is_valid());
+-            return true;
+-          },
+-          safe_time_propagation_timeout_,
+-          Format("Wait for safe_time of namespace $0 to be valid", namespace_id_)));
+-    }
+-
+-    return OK();
++    return WaitForValidSafeTimeOnAllTServers(namespace_id_);
+   }
+ 
+   Status WaitForRowCount(
+@@ -584,7 +562,6 @@ class XClusterConsistencyTest : public TwoDCTestBase {
+   }
+ 
+  protected:
+-  MonoDelta safe_time_propagation_timeout_;
+   std::vector<string> stream_ids_;
+   std::shared_ptr<client::YBTable> producer_table1_, producer_table2_, producer_tran_table_;
+   std::shared_ptr<client::YBTable> consumer_table1_, consumer_table2_;
+diff --git a/ent/src/yb/master/catalog_manager_ent.cc b/ent/src/yb/master/catalog_manager_ent.cc
+index a9a64976ea..ece1ea74f7 100644
+--- a/ent/src/yb/master/catalog_manager_ent.cc
++++ b/ent/src/yb/master/catalog_manager_ent.cc
+@@ -3222,7 +3222,6 @@ Status CatalogManager::FillHeartbeatResponseCDC(const SysClusterConfigEntryPB& c
+   if (cdc_enabled_.load(std::memory_order_acquire)) {
+     resp->set_xcluster_enabled_on_producer(true);
+   }
+-  resp->set_cluster_config_version(cluster_config.version());
+   if (cluster_config.has_consumer_registry()) {
+     {
+       auto l = xcluster_safe_time_info_.LockForRead();
+@@ -3230,7 +3229,17 @@ Status CatalogManager::FillHeartbeatResponseCDC(const SysClusterConfigEntryPB& c
+     }
+ 
+     if (req->cluster_config_version() < cluster_config.version()) {
+-      *resp->mutable_consumer_registry() = cluster_config.consumer_registry();
++      const auto& consumer_registry = cluster_config.consumer_registry();
++      if (consumer_registry.enable_replicate_transaction_status_table()) {
++        auto producer_map = consumer_registry.producer_map();
++        if ((!producer_map.empty() &&
++             producer_map.count(kSystemXClusterReplicationId) == 0) ||
++             producer_map.size() == 1) {
++          return Status::OK();
++        }
++      }
++      resp->set_cluster_config_version(cluster_config.version());
++      *resp->mutable_consumer_registry() = consumer_registry;
+     }
+   }
+ 
+diff --git a/ent/src/yb/tserver/cdc_consumer.cc b/ent/src/yb/tserver/cdc_consumer.cc
+index 0e077bfc27..7cc7fffab6 100644
+--- a/ent/src/yb/tserver/cdc_consumer.cc
++++ b/ent/src/yb/tserver/cdc_consumer.cc
+@@ -259,7 +259,13 @@ std::vector<std::shared_ptr<CDCPoller>> CDCConsumer::TEST_ListPollers() {
+ 
+ // NOTE: This happens on TS.heartbeat, so it needs to finish quickly
+ void CDCConsumer::UpdateInMemoryState(const cdc::ConsumerRegistryPB* consumer_registry,
+-    int32_t cluster_config_version) {
++                                      int32_t cluster_config_version) {
++  {
++    std::lock_guard<std::mutex> l(should_run_mutex_);
++    if(!should_run_) {
++      return;
++    }
++  }
+   std::lock_guard<rw_spinlock> write_lock_master(master_data_mutex_);
+ 
+   // Only update it if the version is newer.
+diff --git a/ent/src/yb/tserver/twodc_output_client.cc b/ent/src/yb/tserver/twodc_output_client.cc
+index 1257ff72a9..35aec1e5c0 100644
+--- a/ent/src/yb/tserver/twodc_output_client.cc
++++ b/ent/src/yb/tserver/twodc_output_client.cc
+@@ -20,6 +20,7 @@
+ #include "yb/client/client.h"
+ #include "yb/client/client_error.h"
+ #include "yb/client/client_utils.h"
++#include "yb/client/external_transaction.h"
+ #include "yb/client/meta_cache.h"
+ #include "yb/client/table.h"
+ #include "yb/client/transaction.h"
+@@ -140,17 +141,23 @@ class TwoDCOutputClient : public cdc::CDCOutputClient {
+   Result<bool> ProcessMetaOp(const cdc::CDCRecordPB& record);
+ 
+   // Processes the Record and sends the CDCWrite for it.
+-  Status ProcessRecord(const std::vector<std::string>& tablet_ids, const cdc::CDCRecordPB& record);
++  Status ProcessRecord(const std::vector<std::string>& tablet_ids, const cdc::CDCRecordPB& record)
++      EXCLUDES(lock_);
++
++  Status ProcessCreateRecord(const std::string& status_tablet, const cdc::CDCRecordPB& record)
++      EXCLUDES(lock_);
+ 
+   Status ProcessCommitRecord(
+       const std::string& status_tablet,
+       const std::vector<std::string>& involved_target_tablet_ids,
+-      const cdc::CDCRecordPB& record);
++      const cdc::CDCRecordPB& record) EXCLUDES(lock_);
+ 
+   Result<std::vector<TabletId>> GetInvolvedTargetTabletsFromCommitRecord(
+       const cdc::CDCRecordPB& record);
+ 
+-  Status SendTransactionCommits();
++  Result<TabletId> GetTargetTabletIdFromProducerTablet(const TabletId& producer_tablet_id);
++
++  Status SendTransactionUpdates();
+ 
+   Status SendUserTableWrites();
+ 
+@@ -304,7 +311,7 @@ Status TwoDCOutputClient::ProcessChangesStartingFromIndex(int start) {
+     if (IsValidMetaOp(record)) {
+       if (processed_write_record) {
+         // We have existing write operations, so flush them first (see WriteCDCRecordDone and
+-        // SendTransactionCommits).
++        // SendTransactionUpdates).
+         break;
+       }
+       // No other records to process, so we can process the meta ops.
+@@ -323,7 +330,7 @@ Status TwoDCOutputClient::ProcessChangesStartingFromIndex(int start) {
+         case cdc::CDCRecordPB::APPLY:
+           RETURN_NOT_OK(ProcessRecordForTabletRange(record, all_tablets_result_));
+           break;
+-        case cdc::CDCRecordPB::COMMITTED:
++        case cdc::CDCRecordPB::TRANSACTION_COMMITTED:
+           // TODO(Rahul): Handle the non 1:1 case for the transaction status table.
+           return STATUS(IllegalState, "Cannot currently handle COMMIT records when there is not a "
+                                       "1 to 1 tablet mapping for the transaction status table.");
+@@ -343,7 +350,7 @@ Status TwoDCOutputClient::ProcessChangesStartingFromIndex(int start) {
+ 
+   if (processed_write_record) {
+     if (table_->table_type() == client::YBTableType::TRANSACTION_STATUS_TABLE_TYPE) {
+-      return SendTransactionCommits();
++      return SendTransactionUpdates();
+     } else {
+       return SendUserTableWrites();
+     }
+@@ -351,6 +358,13 @@ Status TwoDCOutputClient::ProcessChangesStartingFromIndex(int start) {
+   return Status::OK();
+ }
+ 
++Result<TabletId> TwoDCOutputClient::GetTargetTabletIdFromProducerTablet(
++    const TabletId& producer_tablet_id) {
++  auto consumer_tablet_info = VERIFY_RESULT(
++      cdc_consumer_->GetConsumerTableInfo(producer_tablet_id));
++  return consumer_tablet_info.tablet_id;
++}
++
+ Result<std::vector<TabletId>> TwoDCOutputClient::GetInvolvedTargetTabletsFromCommitRecord(
+     const cdc::CDCRecordPB& record) {
+   std::unordered_set<TabletId> involved_target_tablets;
+@@ -377,29 +391,55 @@ Result<std::vector<TabletId>> TwoDCOutputClient::GetInvolvedTargetTabletsFromCom
+   return std::vector<TabletId>(involved_target_tablets.begin(), involved_target_tablets.end());
+ }
+ 
+-Status TwoDCOutputClient::SendTransactionCommits() {
++Status TwoDCOutputClient::SendTransactionUpdates() {
+   std::vector<client::ExternalTransactionMetadata> transaction_metadatas;
+   {
+     std::lock_guard<decltype(lock_)> l(lock_);
+     transaction_metadatas = std::move(write_strategy_->GetTransactionMetadatas());
+   }
+-  std::vector<std::future<Status>> transaction_commit_futures;
+-  for (const auto& transaction_metadata : transaction_metadatas) {
+-    // Create the ExternalTransactions and COMMIT them locally.
+-    auto* transaction_manager = cdc_consumer_->TransactionManager();
+-    if (!transaction_manager) {
+-      return STATUS(InvalidArgument, "Could not commit transactions");
++  std::vector<std::future<Status>> transaction_update_futures;
++  // Send all CREATEs to the coordinatory, wait till we've replicated all of them, then send all
++  // the COMMITs. This avoids a situation where the COMMMIT is processed by the coordinator before
++  // the CREATE.
++  for (const auto& operation_type : {client::ExternalTransactionMetadata::OperationType::CREATE,
++                                     client::ExternalTransactionMetadata::OperationType::COMMIT}) {
++    for (const auto& transaction_metadata : transaction_metadatas) {
++      if (transaction_metadata.operation_type != operation_type) {
++        continue;
++      }
++      // Create the ExternalTransactions and COMMIT them locally.
++      auto* transaction_manager = cdc_consumer_->TransactionManager();
++      if (!transaction_manager) {
++        return STATUS(InvalidArgument, "Could not commit transactions");
++      }
++      auto external_transaction =
++          std::make_shared<client::ExternalTransaction>(transaction_manager);
++      external_transactions_.push_back(external_transaction);
++
++      switch (operation_type) {
++        case client::ExternalTransactionMetadata::OperationType::CREATE: {
++          transaction_update_futures.push_back(external_transaction->CreateFuture(
++              transaction_metadata));
++          break;
++        }
++        case client::ExternalTransactionMetadata::OperationType::COMMIT: {
++          transaction_update_futures.push_back(external_transaction->CommitFuture(
++              transaction_metadata));
++          break;
++        }
++        default: {
++          return STATUS(IllegalState, Format("Unsupported OperationType $0",
++                                             transaction_metadata.OperationTypeToString()));
++        }
++      }
+     }
+-    auto external_tran =
+-        std::make_shared<client::ExternalTransaction>(transaction_manager, transaction_metadata);
+-    external_transactions_.push_back(external_tran);
+-    transaction_commit_futures.push_back(external_tran->CommitFuture());
+-  }
+-  for (auto& future : transaction_commit_futures) {
+-    DCHECK(future.valid());
+-    RETURN_NOT_OK(future.get());
++    for (auto& future : transaction_update_futures) {
++      DCHECK(future.valid());
++      RETURN_NOT_OK(future.get());
++    }
++    transaction_update_futures.clear();
++    external_transactions_.clear();
+   }
+-  external_transactions_.clear();
+ 
+   int next_record = 0;
+   {
+@@ -443,6 +483,13 @@ bool TwoDCOutputClient::UseLocalTserver() {
+   return use_local_tserver_ && !FLAGS_cdc_force_remote_tserver;
+ }
+ 
++Status TwoDCOutputClient::ProcessCreateRecord(
++    const std::string& status_tablet,
++    const cdc::CDCRecordPB& record) {
++  std::lock_guard<decltype(lock_)> l(lock_);
++  return write_strategy_->ProcessCreateRecord(status_tablet, record);
++}
++
+ Status TwoDCOutputClient::ProcessCommitRecord(
+     const std::string& status_tablet,
+     const std::vector<std::string>& involved_target_tablet_ids,
+@@ -459,12 +506,12 @@ Status TwoDCOutputClient::ProcessRecord(const std::vector<std::string>& tablet_i
+     if (enable_replicate_transaction_status_table_ && record.has_transaction_state()) {
+       // This is an intent record and we want to use the txn status table, so get the status tablet
+       // for this txn id.
+-      auto deadline = CoarseMonoClock::Now() +
+-                      MonoDelta::FromMilliseconds(FLAGS_cdc_write_rpc_timeout_ms);
+-      status_tablet_id = VERIFY_RESULT(local_client_->client->LookupTabletByKeyFuture(
+-          global_transaction_status_table_,
+-          record.transaction_state().transaction_id(),
+-          deadline).get())->tablet_id();
++      auto producer_status_tablet_id = record.transaction_state().external_status_tablet_id();
++      if (!producer_status_tablet_id.empty()) {
++        status_tablet_id = VERIFY_RESULT(GetTargetTabletIdFromProducerTablet(
++            producer_status_tablet_id));
++      }
++
+     }
+     auto status = write_strategy_->ProcessRecord(ProcessRecordInfo {
+       .tablet_id = tablet_id,
+@@ -508,9 +555,14 @@ Status TwoDCOutputClient::ProcessRecordForTabletRange(
+ }
+ 
+ Status TwoDCOutputClient::ProcessRecordForLocalTablet(const cdc::CDCRecordPB& record) {
+-  if (record.operation() == cdc::CDCRecordPB::COMMITTED) {
++  const auto& operation = record.operation();
++  if (operation == cdc::CDCRecordPB::TRANSACTION_COMMITTED) {
+     auto target_tablet_ids = VERIFY_RESULT(GetInvolvedTargetTabletsFromCommitRecord(record));
+-    RETURN_NOT_OK(ProcessCommitRecord(consumer_tablet_info_.tablet_id, target_tablet_ids, record));
++    return ProcessCommitRecord(consumer_tablet_info_.tablet_id, target_tablet_ids, record);
++  }
++
++  if (operation == cdc::CDCRecordPB::TRANSACTION_CREATED) {
++    return ProcessCreateRecord(consumer_tablet_info_.tablet_id, record);
+   }
+ 
+   return ProcessRecord({consumer_tablet_info_.tablet_id}, record);
+diff --git a/ent/src/yb/tserver/twodc_write_implementations.cc b/ent/src/yb/tserver/twodc_write_implementations.cc
+index f4cc94b579..1a9d014b70 100644
+--- a/ent/src/yb/tserver/twodc_write_implementations.cc
++++ b/ent/src/yb/tserver/twodc_write_implementations.cc
+@@ -264,17 +264,34 @@ class BatchedWriteImplementation : public TwoDCWriteInterface {
+     return AddRecord(process_record_info, record, write_request->mutable_write_batch());
+   }
+ 
++  Status ProcessCreateRecord(
++      const std::string& status_tablet, const cdc::CDCRecordPB& record) override {
++    SCHECK_EQ(record.operation(), cdc::CDCRecordPB::TRANSACTION_CREATED, IllegalState,
++              Format("Invalid operation type $0", record.operation()));
++    transaction_metadatas_.push_back(client::ExternalTransactionMetadata {
++        .transaction_id = VERIFY_RESULT(
++            FullyDecodeTransactionId(record.transaction_state().transaction_id())),
++        .status_tablet = status_tablet,
++        .operation_type = client::ExternalTransactionMetadata::OperationType::CREATE,
++        .hybrid_time = record.time(),
++        .involved_tablet_ids = {}
++    });
++    return Status::OK();
++  }
++
+   Status ProcessCommitRecord(
+       const std::string& status_tablet,
+       const std::vector<std::string>& involved_target_tablet_ids,
+       const cdc::CDCRecordPB& record) override {
+-    DCHECK(record.operation() == cdc::CDCRecordPB::COMMITTED);
++    SCHECK_EQ(record.operation(), cdc::CDCRecordPB::TRANSACTION_COMMITTED, IllegalState,
++              Format("Invalid operation type $0", record.operation()));
+     transaction_metadatas_.push_back(client::ExternalTransactionMetadata {
+-      .transaction_id = VERIFY_RESULT(
+-          FullyDecodeTransactionId(record.transaction_state().transaction_id())),
+-      .status_tablet = status_tablet,
+-      .commit_ht = record.time(),
+-      .involved_tablet_ids = involved_target_tablet_ids
++        .transaction_id = VERIFY_RESULT(
++            FullyDecodeTransactionId(record.transaction_state().transaction_id())),
++        .status_tablet = status_tablet,
++        .operation_type = client::ExternalTransactionMetadata::OperationType::COMMIT,
++        .hybrid_time = record.time(),
++        .involved_tablet_ids = involved_target_tablet_ids
+     });
+     return Status::OK();
+   }
+diff --git a/ent/src/yb/tserver/twodc_write_interface.h b/ent/src/yb/tserver/twodc_write_interface.h
+index a323f3f678..0f87b9aa63 100644
+--- a/ent/src/yb/tserver/twodc_write_interface.h
++++ b/ent/src/yb/tserver/twodc_write_interface.h
+@@ -46,6 +46,9 @@ class TwoDCWriteInterface {
+   virtual std::unique_ptr<WriteRequestPB> GetNextWriteRequest() = 0;
+   virtual Status ProcessRecord(
+       const ProcessRecordInfo& process_record_info, const cdc::CDCRecordPB& record) = 0;
++  virtual Status ProcessCreateRecord(
++      const std::string& status_tablet,
++      const cdc::CDCRecordPB& record) = 0;
+   virtual Status ProcessCommitRecord(
+       const std::string& status_tablet,
+       const std::vector<std::string>& involved_target_tablet_ids,
+diff --git a/src/yb/cdc/cdc_service.proto b/src/yb/cdc/cdc_service.proto
+index 3bc0126375..56dbd5c049 100644
+--- a/src/yb/cdc/cdc_service.proto
++++ b/src/yb/cdc/cdc_service.proto
+@@ -220,7 +220,8 @@ message CDCRecordPB {
+     APPLY = 3;
+     SPLIT_OP = 4;
+     CHANGE_METADATA = 5;
+-    COMMITTED = 6;
++    TRANSACTION_COMMITTED = 6;
++    TRANSACTION_CREATED = 7;
+   }
+   optional uint64 time = 1;
+   optional OperationType operation = 2;
+diff --git a/src/yb/client/client_fwd.h b/src/yb/client/client_fwd.h
+index 02a2c1fa7e..e98b4de497 100644
+--- a/src/yb/client/client_fwd.h
++++ b/src/yb/client/client_fwd.h
+@@ -68,6 +68,7 @@ typedef std::shared_ptr<YBSession> YBSessionPtr;
+ struct FlushStatus;
+ using FlushCallback = boost::function<void(FlushStatus*)>;
+ using CommitCallback = boost::function<void(const Status&)>;
++using CreateCallback = boost::function<void(const Status&)>;
+ 
+ class YBTable;
+ typedef std::shared_ptr<YBTable> YBTablePtr;
+diff --git a/src/yb/client/external_transaction.cc b/src/yb/client/external_transaction.cc
+index f57436687b..b3426ae619 100644
+--- a/src/yb/client/external_transaction.cc
++++ b/src/yb/client/external_transaction.cc
+@@ -29,51 +29,87 @@ namespace yb {
+ 
+ namespace client {
+ 
+-ExternalTransaction::ExternalTransaction(TransactionManager* transaction_manager,
+-                                         const ExternalTransactionMetadata& metadata)
++ExternalTransaction::ExternalTransaction(TransactionManager* transaction_manager)
+     : transaction_manager_(transaction_manager),
+-      metadata_(metadata),
+-      commit_handle_(transaction_manager_->rpcs().InvalidHandle()) {
++      handle_(transaction_manager_->rpcs().InvalidHandle()) {
+ }
+ 
+ ExternalTransaction::~ExternalTransaction() {
+-  transaction_manager_->rpcs().Abort({&commit_handle_});
++  transaction_manager_->rpcs().Abort({&handle_});
+ }
+ 
+-void ExternalTransaction::Commit(CommitCallback commit_callback) {
++void ExternalTransaction::Create(const ExternalTransactionMetadata& metadata,
++                                 CreateCallback create_callback) {
++  LOG(INFO) << "Create for " << metadata.transaction_id;
+   tserver::UpdateTransactionRequestPB req;
+-  req.set_tablet_id(metadata_.status_tablet);
++  req.set_tablet_id(metadata.status_tablet);
+   req.set_propagated_hybrid_time(transaction_manager_->Now().ToUint64());
+   req.set_is_external(true);
+   auto& state = *req.mutable_state();
+-  state.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());
++  state.set_transaction_id(metadata.transaction_id.data(), metadata.transaction_id.size());
++  state.set_status(TransactionStatus::CREATED);
++  state.set_external_hybrid_time(metadata.hybrid_time);
++  transaction_manager_->rpcs().RegisterAndStart(
++      UpdateTransaction(
++          TransactionRpcDeadline(),
++          nullptr /* tablet */,
++          transaction_manager_->client(),
++          &req,
++          [this, create_callback](const auto& status, const auto& req, const auto& resp) {
++            this->CreateDone(status, resp, create_callback);
++          }),
++      &handle_);
++}
++
++std::future<Status> ExternalTransaction::CreateFuture(const ExternalTransactionMetadata& metadata) {
++  return MakeFuture<Status>([&](auto callback) {
++    Create(metadata, std::move(callback));
++  });
++}
++
++void ExternalTransaction::CreateDone(const Status& status,
++                                     const tserver::UpdateTransactionResponsePB& response,
++                                     CreateCallback create_callback) {
++  transaction_manager_->rpcs().Unregister(&handle_);
++  create_callback(status);
++}
++
++void ExternalTransaction::Commit(const ExternalTransactionMetadata& metadata,
++                                 CommitCallback commit_callback) {
++  LOG(INFO) << "Commit for " << metadata.transaction_id;
++  tserver::UpdateTransactionRequestPB req;
++  req.set_tablet_id(metadata.status_tablet);
++  req.set_propagated_hybrid_time(transaction_manager_->Now().ToUint64());
++  req.set_is_external(true);
++  auto& state = *req.mutable_state();
++  state.set_transaction_id(metadata.transaction_id.data(), metadata.transaction_id.size());
+   state.set_status(TransactionStatus::COMMITTED);
+-  state.set_external_commit_ht(metadata_.commit_ht);
+-  for (const auto& involved_tablet_id : metadata_.involved_tablet_ids) {
++  state.set_external_hybrid_time(metadata.hybrid_time);
++  for (const auto& involved_tablet_id : metadata.involved_tablet_ids) {
+     *state.add_tablets() = involved_tablet_id;
+   }
+   transaction_manager_->rpcs().RegisterAndStart(
+       UpdateTransaction(
+           TransactionRpcDeadline(),
+-          nullptr,
++          nullptr /* tablet */,
+           transaction_manager_->client(),
+           &req,
+           [this, commit_callback](const auto& status, const auto& req, const auto& resp) {
+             this->CommitDone(status, resp, commit_callback);
+           }),
+-      &commit_handle_);
++      &handle_);
+ }
+ 
+-std::future<Status> ExternalTransaction::CommitFuture() {
+-  return MakeFuture<Status>([this](auto callback) {
+-    Commit(std::move(callback));
++std::future<Status> ExternalTransaction::CommitFuture(const ExternalTransactionMetadata& metadata) {
++  return MakeFuture<Status>([&](auto callback) {
++    Commit(metadata, std::move(callback));
+   });
+ }
+ 
+ void ExternalTransaction::CommitDone(const Status& status,
+                                      const tserver::UpdateTransactionResponsePB& response,
+                                      CommitCallback commit_callback) {
+-  transaction_manager_->rpcs().Unregister(&commit_handle_);
++  transaction_manager_->rpcs().Unregister(&handle_);
+   commit_callback(status);
+ }
+ 
+diff --git a/src/yb/client/external_transaction.h b/src/yb/client/external_transaction.h
+index 3df4682870..3e81241433 100644
+--- a/src/yb/client/external_transaction.h
++++ b/src/yb/client/external_transaction.h
+@@ -36,21 +36,37 @@ namespace yb {
+ namespace client {
+ 
+ struct ExternalTransactionMetadata {
+-  TransactionId transaction_id = TransactionId::Nil();
++  enum class OperationType {
++    CREATE = 0,
++    COMMIT = 1
++  };
++  TransactionId transaction_id;
+   TabletId status_tablet;
+-  uint64_t commit_ht;
++  OperationType operation_type;
++  uint64_t hybrid_time;
+   std::vector<TabletId> involved_tablet_ids;
++
++  std::string OperationTypeToString() const {
++    switch (operation_type) {
++      case OperationType::CREATE:
++        return "CREATE";
++      case OperationType::COMMIT:
++        return "COMMIT";
++      default:
++        return "UNKNOWN";
++    }
++  }
+ };
+ 
+ class ExternalTransaction {
+  public:
+-  ExternalTransaction() {}
+-  explicit ExternalTransaction(TransactionManager* transaction_manager_,
+-                               const ExternalTransactionMetadata& metadata);
++  explicit ExternalTransaction(TransactionManager* transaction_manager_);
+   ~ExternalTransaction();
+-  void Commit(CommitCallback commit_callback);
++  void Create(const ExternalTransactionMetadata& metadata, CreateCallback create_callback);
++  void Commit(const ExternalTransactionMetadata& metadata, CommitCallback commit_callback);
+     // Utility function for Commit.
+-  std::future<Status> CommitFuture();
++  std::future<Status> CommitFuture(const ExternalTransactionMetadata& metadata);
++  std::future<Status> CreateFuture(const ExternalTransactionMetadata& metadata);
+ 
+  private:
+   CoarseTimePoint TransactionRpcDeadline();
+@@ -58,9 +74,12 @@ class ExternalTransaction {
+                   const tserver::UpdateTransactionResponsePB& response,
+                   CommitCallback commit_callback);
+ 
++  void CreateDone(const Status& status,
++                  const tserver::UpdateTransactionResponsePB& response,
++                  CreateCallback create_callback);
++
+   TransactionManager* transaction_manager_;
+-  ExternalTransactionMetadata metadata_;
+-  rpc::Rpcs::Handle commit_handle_;
++  rpc::Rpcs::Handle handle_;
+ };
+ 
+ } // namespace client
+diff --git a/src/yb/client/transaction_rpc.cc b/src/yb/client/transaction_rpc.cc
+index 906cef2032..13bfe678d0 100644
+--- a/src/yb/client/transaction_rpc.cc
++++ b/src/yb/client/transaction_rpc.cc
+@@ -139,9 +139,15 @@ class TransactionRpc : public TransactionRpcBase {
+ void PrepareRequest(...) {}
+ 
+ void PrepareRequest(tserver::UpdateTransactionRequestPB* req) {
+-  if (req->state().status() == TransactionStatus::CREATED) {
++  // If this is an external transaction, the transaction id should already be set so don't create
++  // a new one.
++  const auto& state = req->state();
++  if (!state.has_external_hybrid_time() &&
++      state.status() == TransactionStatus::CREATED) {
+     auto id = TransactionId::GenerateRandom();
+     req->mutable_state()->set_transaction_id(id.data(), id.size());
++  } else {
++    DCHECK(state.has_transaction_id());
+   }
+ }
+ 
+diff --git a/src/yb/common/transaction.h b/src/yb/common/transaction.h
+index dd8d1b8415..f7ce37a321 100644
+--- a/src/yb/common/transaction.h
++++ b/src/yb/common/transaction.h
+@@ -337,7 +337,7 @@ struct TransactionMetadata {
+   std::string ToString() const {
+     return Format(
+         "{ transaction_id: $0 isolation: $1 status_tablet: $2 priority: $3 start_time: $4"
+-        " locality: $5 old_status_tablet: $6}",
++        " locality: $5 old_status_tablet: $6 external_transaction: $7}",
+         transaction_id, IsolationLevel_Name(isolation), status_tablet, priority, start_time,
+         TransactionLocality_Name(locality), old_status_tablet);
+   }
+diff --git a/src/yb/master/xcluster/xcluster_safe_time_service.cc b/src/yb/master/xcluster/xcluster_safe_time_service.cc
+index b39bef0ccb..33c623ca14 100644
+--- a/src/yb/master/xcluster/xcluster_safe_time_service.cc
++++ b/src/yb/master/xcluster/xcluster_safe_time_service.cc
+@@ -264,11 +264,16 @@ XClusterNamespaceToSafeTimeMap ComputeSafeTimeMap(
+         GetNewSafeTime(previous_safe_time_map, kSystemNamespaceId, *sys_namespace_it);
+   }
+ 
+-  for (auto [namespace_id, safe_time] : namespace_safe_time) {
++  for (auto[namespace_id, safe_time] : namespace_safe_time) {
+     if (namespace_id == kSystemNamespaceId) {
+       continue;
+     }
+ 
++    if (safe_time.is_special()) {
++      new_safe_time_map[namespace_id] = safe_time;
++      continue;
++    }
++
+     if (sys_namespace_it && (sys_safe_time.is_special() || sys_safe_time < safe_time)) {
+       safe_time = sys_safe_time;
+     }
+diff --git a/src/yb/tablet/operations.proto b/src/yb/tablet/operations.proto
+index 86ff5c263a..bf3770c4ca 100644
+--- a/src/yb/tablet/operations.proto
++++ b/src/yb/tablet/operations.proto
+@@ -48,8 +48,10 @@ message TransactionStatePB {
+   // Set of subtransaction IDs which are aborted.
+   optional AbortedSubTransactionSetPB aborted = 7;
+ 
+-  // For xcluster writes, the propagated commit ht from the source.
+-  optional fixed64 external_commit_ht = 8;
++  // For xcluster writes, the propagated created/commit ht from the source.
++  optional fixed64 external_hybrid_time = 8;
++  // For xcluster writes, the producer side status tablet for the transaction.
++  optional string external_status_tablet_id = 9;
+ }
+ 
+ message TruncatePB {
+diff --git a/src/yb/tablet/operations/update_txn_operation.cc b/src/yb/tablet/operations/update_txn_operation.cc
+index 4076849593..0adb72c8b6 100644
+--- a/src/yb/tablet/operations/update_txn_operation.cc
++++ b/src/yb/tablet/operations/update_txn_operation.cc
+@@ -58,8 +58,8 @@ Status UpdateTxnOperation::DoReplicated(int64_t leader_term, Status* complete_st
+         .leader_term = leader_term,
+         .state = *request(),
+         .op_id = op_id(),
+-        .hybrid_time = request()->has_external_commit_ht() ?
+-            HybridTime(request()->external_commit_ht()) : hybrid_time(),
++        .hybrid_time = request()->has_external_hybrid_time() ?
++            HybridTime(request()->external_hybrid_time()) : hybrid_time(),
+         .sealed = request()->sealed(),
+         .already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse
+     };
+@@ -69,8 +69,8 @@ Status UpdateTxnOperation::DoReplicated(int64_t leader_term, Status* complete_st
+         .leader_term = leader_term,
+         .state = *request(),
+         .op_id = op_id(),
+-        .hybrid_time = request()->has_external_commit_ht() ?
+-            HybridTime(request()->external_commit_ht()) : hybrid_time()
++        .hybrid_time = request()->has_external_hybrid_time() ?
++            HybridTime(request()->external_hybrid_time()) : hybrid_time()
+     };
+     return transaction_coordinator().ProcessReplicated(data);
+   }
+diff --git a/src/yb/tablet/running_transaction.cc b/src/yb/tablet/running_transaction.cc
+index cebe4f7305..ed29801d83 100644
+--- a/src/yb/tablet/running_transaction.cc
++++ b/src/yb/tablet/running_transaction.cc
+@@ -100,7 +100,8 @@ void RunningTransaction::RequestStatusAt(const StatusRequest& request,
+ 
+   if (last_known_status_hybrid_time_ > HybridTime::kMin) {
+     auto transaction_status =
+-        GetStatusAt(request.global_limit_ht, last_known_status_hybrid_time_, last_known_status_);
++        GetStatusAt(request.global_limit_ht, last_known_status_hybrid_time_, last_known_status_,
++                    external_transaction());
+     // If we don't have status at global_limit_ht, then we should request updated status.
+     if (transaction_status) {
+       HybridTime last_known_status_hybrid_time = last_known_status_hybrid_time_;
+@@ -194,10 +195,15 @@ void RunningTransaction::ScheduleRemoveIntents(
+ boost::optional<TransactionStatus> RunningTransaction::GetStatusAt(
+     HybridTime time,
+     HybridTime last_known_status_hybrid_time,
+-    TransactionStatus last_known_status) {
++    TransactionStatus last_known_status,
++    bool external_transaction) {
+   switch (last_known_status) {
+-    case TransactionStatus::ABORTED:
+-      return TransactionStatus::ABORTED;
++    case TransactionStatus::ABORTED: {
++      if (!external_transaction || last_known_status_hybrid_time >= time) {
++        return TransactionStatus::ABORTED;
++      }
++      return boost::none;
++    }
+     case TransactionStatus::COMMITTED:
+       return last_known_status_hybrid_time > time
+           ? TransactionStatus::PENDING
+@@ -371,7 +377,8 @@ std::vector<StatusRequest> RunningTransaction::ExtractFinishedStatusWaitersUnloc
+   auto w = status_waiters_.begin();
+   for (auto it = status_waiters_.begin(); it != status_waiters_.end(); ++it) {
+     if (it->serial_no <= serial_no ||
+-        GetStatusAt(it->global_limit_ht, time_of_status, transaction_status) ||
++        GetStatusAt(
++            it->global_limit_ht, time_of_status, transaction_status, external_transaction()) ||
+         time_of_status < it->read_ht) {
+       result.push_back(std::move(*it));
+     } else {
+@@ -391,15 +398,22 @@ void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_sta
+                                        const std::vector<StatusRequest>& status_waiters) {
+   for (const auto& waiter : status_waiters) {
+     auto status_for_waiter = GetStatusAt(
+-        waiter.global_limit_ht, time_of_status, transaction_status);
++        waiter.global_limit_ht, time_of_status, transaction_status, external_transaction());
+     if (status_for_waiter) {
+-      // We know status at global_limit_ht, so could notify waiter.
+-      auto result = TransactionStatusResult{*status_for_waiter, time_of_status};
+-      if (result.status == TransactionStatus::COMMITTED ||
+-          result.status == TransactionStatus::PENDING) {
+-        result.aborted_subtxn_set = aborted_subtxn_set;
++      if (external_transaction() && *status_for_waiter == TransactionStatus::PENDING) {
++        last_known_status_hybrid_time_ = waiter.read_ht;
++        last_known_status_ = TransactionStatus::PENDING;
++        waiter.callback(TransactionStatusResult{
++            TransactionStatus::PENDING, waiter.read_ht, aborted_subtxn_set});
++      } else {
++        // We know status at global_limit_ht, so could notify waiter.
++        auto result = TransactionStatusResult{*status_for_waiter, time_of_status};
++        if (result.status == TransactionStatus::COMMITTED ||
++            result.status == TransactionStatus::PENDING) {
++          result.aborted_subtxn_set = aborted_subtxn_set;
++        }
++        waiter.callback(std::move(result));
+       }
+-      waiter.callback(std::move(result));
+     } else if (time_of_status >= waiter.read_ht) {
+       // It means that between read_ht and global_limit_ht transaction was pending.
+       // It implies that transaction was not committed before request was sent.
+diff --git a/src/yb/tablet/running_transaction.h b/src/yb/tablet/running_transaction.h
+index 30ec092dd9..40892ac15d 100644
+--- a/src/yb/tablet/running_transaction.h
++++ b/src/yb/tablet/running_transaction.h
+@@ -85,6 +85,10 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+     return last_known_aborted_subtxn_set_;
+   }
+ 
++  const bool external_transaction() const {
++    return metadata_.external_transaction;
++  }
++
+   void SetLocalCommitData(HybridTime time, const AbortedSubTransactionSet& aborted_subtxn_set);
+   void AddReplicatedBatch(
+       size_t batch_idx, boost::container::small_vector_base<uint8_t>* encoded_replicated_batches);
+@@ -127,7 +131,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+   static boost::optional<TransactionStatus> GetStatusAt(
+       HybridTime time,
+       HybridTime last_known_status_hybrid_time,
+-      TransactionStatus last_known_status);
++      TransactionStatus last_known_status,
++      bool external_transaction);
+ 
+   void SendStatusRequest(int64_t serial_no, const RunningTransactionPtr& shared_self);
+ 
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 76da619d91..0a38191453 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -1249,7 +1249,7 @@ Status Tablet::WriteTransactionalBatch(
+   }
+   boost::container::small_vector<uint8_t, 16> encoded_replicated_batch_idx_set;
+   auto prepare_batch_data = transaction_participant()->PrepareBatchData(
+-      transaction_id, batch_idx, &encoded_replicated_batch_idx_set, external_transaction);
++      transaction_id, batch_idx, &encoded_replicated_batch_idx_set);
+   if (!prepare_batch_data) {
+     // If metadata is missing it could be caused by aborted and removed transaction.
+     // In this case we should not add new intents for it.
+@@ -1340,12 +1340,16 @@ Status Tablet::ApplyKeyValueRowOperations(
+ 
+     // See comments for PrepareExternalWriteBatch.
+     if (put_batch.enable_replicate_transaction_status_table()) {
++      if (!metadata_->is_under_twodc_replication()) {
++        RETURN_NOT_OK(metadata_->SetIsUnderTwodcReplicationAndFlush(true));
++      }
+       Arena arena;
+       auto batches_by_transaction = SplitWriteBatchByTransaction(put_batch, &arena);
+       for (const auto& write_batch : batches_by_transaction) {
+         RETURN_NOT_OK(WriteTransactionalBatch(
+             batch_idx, *write_batch, hybrid_time, frontiers, true /* external_transaction */));
+       }
++      return Status::OK();
+     }
+     rocksdb::WriteBatch intents_write_batch;
+     auto* intents_write_batch_ptr = !put_batch.enable_replicate_transaction_status_table() ?
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index 1d0f21dab9..22a7c48eb2 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -1135,9 +1135,19 @@ Result<NamespaceId> TabletPeer::GetNamespaceId() {
+   auto tablet = VERIFY_RESULT(shared_tablet_safe());
+   auto* metadata = tablet->metadata();
+   auto namespace_name = metadata->namespace_name();
+-  RETURN_NOT_OK(client->GetNamespaceInfo({} /* namesapce_id */,
+-                                         namespace_name,
+-                                         boost::none /* database_type */, &resp));
++  auto db_type = YQL_DATABASE_CQL;
++  switch (metadata->table_type()) {
++    case PGSQL_TABLE_TYPE:
++      db_type = YQL_DATABASE_PGSQL;
++      break;
++    case REDIS_TABLE_TYPE:
++      db_type = YQL_DATABASE_REDIS;
++      break;
++    default:
++      db_type = YQL_DATABASE_CQL;
++  }
++
++  RETURN_NOT_OK(client->GetNamespaceInfo({} /* namesapce_id */, namespace_name, db_type, &resp));
+   namespace_id = resp.namespace_().id();
+   if (namespace_id.empty()) {
+     return STATUS(IllegalState, Format("Could not get namespace id for $0",
+diff --git a/src/yb/tablet/transaction_coordinator.cc b/src/yb/tablet/transaction_coordinator.cc
+index 9e27eb5ae3..d14e324ecf 100644
+--- a/src/yb/tablet/transaction_coordinator.cc
++++ b/src/yb/tablet/transaction_coordinator.cc
+@@ -194,8 +194,7 @@ class TransactionState {
+       : context_(*context),
+         id_(id),
+         log_prefix_(BuildLogPrefix(parent_log_prefix, id)),
+-        last_touch_(last_touch),
+-        is_external_(false) {
++        last_touch_(last_touch) {
+   }
+ 
+   ~TransactionState() {
+@@ -225,6 +224,11 @@ class TransactionState {
+     return first_entry_raft_index_;
+   }
+ 
++  bool is_external() const {
++    return is_external_;
++  }
++
++
+   std::string ToString() const {
+     return Format("{ id: $0 last_touch: $1 status: $2 involved_tablets: $3 replicating: $4 "
+                       " request_queue: $5 first_entry_raft_index: $6 }",
+@@ -234,6 +238,9 @@ class TransactionState {
+ 
+   // Whether this transaction expired at specified time.
+   bool ExpiredAt(HybridTime now) const {
++    if (is_external()) {
++      return false;
++    }
+     if (ShouldBeCommitted() || ShouldBeInStatus(TransactionStatus::SEALED)) {
+       return false;
+     }
+@@ -354,7 +361,9 @@ class TransactionState {
+ 
+     // If transaction was sealed, then its commit time is max of seal record time and intent
+     // replication times from all participating tablets.
+-    commit_time_ = std::max(commit_time_, last_time);
++    if (!is_external()) {
++      commit_time_ = std::max(commit_time_, last_time);
++    }
+     --tablets_with_not_replicated_batches_;
+     it->second.all_batches_replicated = true;
+ 
+@@ -492,7 +501,7 @@ class TransactionState {
+                 .aborted = aborted_,
+                 .commit_time = commit_time_,
+                 .sealed = status_ == TransactionStatus::SEALED ,
+-                .is_external = is_external_ });
++                .is_external = is_external() });
+           }
+         }
+       }
+@@ -734,11 +743,13 @@ class TransactionState {
+       return status;
+     }
+ 
++
+     last_touch_ = data.hybrid_time;
+     commit_time_ = data.hybrid_time;
+     // TODO(dtxn) Not yet implemented
+     next_abort_after_sealing_ = CoarseMonoClock::now() + FLAGS_avoid_abort_after_sealing_ms * 1ms;
+-    is_external_ = data.state.has_external_commit_ht();
++    is_external_ = data.state.has_external_hybrid_time();
++
+     // TODO(savepoints) Savepoints with sealed transactions is not yet tested
+     data.state.aborted().ToGoogleProtobuf(&aborted_);
+     VLOG_WITH_PREFIX(4) << "Seal time: " << commit_time_;
+@@ -779,7 +790,7 @@ class TransactionState {
+     commit_time_ = data.hybrid_time;
+     first_entry_raft_index_ = data.op_id.index;
+     data.state.aborted().ToGoogleProtobuf(&aborted_);
+-    is_external_ = data.state.has_external_commit_ht();
++    is_external_ = data.state.has_external_hybrid_time();
+ 
+     involved_tablets_.reserve(data.state.tablets().size());
+     for (const auto& tablet : data.state.tablets()) {
+@@ -809,6 +820,7 @@ class TransactionState {
+     VLOG_WITH_PREFIX(4) << __func__ << ", status: " << TransactionStatus_Name(status_)
+                         << ", leader: " << context_.leader();
+     last_touch_ = data.hybrid_time;
++    is_external_ = data.state.has_external_hybrid_time();
+     status_ = TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS;
+ 
+     YB_TRANSACTION_DUMP(Applied, id_, data.hybrid_time);
+@@ -831,6 +843,7 @@ class TransactionState {
+     }
+     last_touch_ = data.hybrid_time;
+     first_entry_raft_index_ = data.op_id.index;
++    is_external_ = data.state.has_external_hybrid_time();
+ 
+     // TODO(savepoints) -- consider swapping instead of copying here.
+     // Asynchronous heartbeats don't include aborted sub-txn set (and hence the set is empty), so
+@@ -863,7 +876,7 @@ class TransactionState {
+             .aborted = aborted_,
+             .commit_time = commit_time_,
+             .sealed = status_ == TransactionStatus::SEALED,
+-            .is_external = is_external_});
++            .is_external = is_external()});
+       }
+     }
+     NotifyAbortWaiters(TransactionStatusResult(TransactionStatus::COMMITTED, commit_time_));
+@@ -893,12 +906,10 @@ class TransactionState {
+   // It should match last_touch_, but it is possible that because of some code errors it
+   // would not be so. To add stability we introduce a separate field for it.
+   HybridTime commit_time_;
+-
+   // If transaction was only sealed, we will try to abort it not earlier than this time.
+   CoarseTimePoint next_abort_after_sealing_;
+-
+-  bool is_external_;
+-
++  // Is the transaction from xcluster.
++  bool is_external_ = false;
+   struct InvolvedTabletState {
+     // How many batches should be replicated at this tablet.
+     size_t required_replicated_batches = 0;
+@@ -1318,7 +1329,7 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+         1us * FLAGS_transaction_check_interval_usec * kTimeMultiplier);
+   }
+ 
+-  void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term, bool is_external) {
++  void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term) {
+     auto& state = *request->request();
+     auto id = FullyDecodeTransactionId(state.transaction_id());
+     if (!id.ok()) {
+@@ -1331,13 +1342,9 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+     {
+       std::unique_lock<std::mutex> lock(managed_mutex_);
+       postponed_leader_actions_.leader_term = term;
+-      if (is_external) {
+-        managed_transactions_.emplace(
+-              this, *id, context_.clock().Now(), log_prefix_);
+-      }
+       auto it = managed_transactions_.find(*id);
+       if (it == managed_transactions_.end()) {
+-        auto status = HandleTransactionNotFound(*id, state, is_external);
++        auto status = HandleTransactionNotFound(*id, state);
+         if (status.ok()) {
+           it = managed_transactions_.emplace(
+               this, *id, context_.clock().Now(), log_prefix_).first;
+@@ -1460,7 +1467,7 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+     state.set_sealed(action.sealed);
+     if (action.is_external) {
+       req.set_is_external(true);
+-      state.set_external_commit_ht(action.commit_time.ToUint64());
++      state.set_external_hybrid_time(action.commit_time.ToUint64());
+     }
+     *state.mutable_aborted() = action.aborted;
+ 
+@@ -1567,10 +1574,8 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+   }
+ 
+   Status HandleTransactionNotFound(const TransactionId& id,
+-                                   const LWTransactionStatePB& state,
+-                                   bool is_external) {
+-    if (!is_external &&
+-        state.status() != TransactionStatus::CREATED &&
++                                   const LWTransactionStatePB& state) {
++    if (state.status() != TransactionStatus::CREATED &&
+         state.status() != TransactionStatus::PROMOTED) {
+       YB_LOG_WITH_PREFIX_HIGHER_SEVERITY_WHEN_TOO_MANY(INFO, WARNING, 1s, 50)
+           << "Request to unknown transaction " << id << ": "
+@@ -1744,8 +1749,8 @@ size_t TransactionCoordinator::test_count_transactions() const {
+ }
+ 
+ void TransactionCoordinator::Handle(
+-    std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term, bool is_external) {
+-  impl_->Handle(std::move(request), term, is_external);
++    std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term) {
++  impl_->Handle(std::move(request), term);
+ }
+ 
+ void TransactionCoordinator::Start() {
+@@ -1778,8 +1783,9 @@ std::string TransactionCoordinator::DumpTransactions() {
+ }
+ 
+ std::string TransactionCoordinator::ReplicatedData::ToString() const {
+-  return Format("{ leader_term: $0 state: $1 op_id: $2 hybrid_time: $3 }",
+-                leader_term, state, op_id, hybrid_time);
++  return Format("{ leader_term: $0 state: $1 op_id: $2 hybrid_time: $3 txn_id: $4 }",
++                leader_term, state, op_id, hybrid_time,
++                FullyDecodeTransactionId(state.transaction_id()));
+ }
+ 
+ void TransactionCoordinator::ProcessWaitForReport(
+diff --git a/src/yb/tablet/transaction_coordinator.h b/src/yb/tablet/transaction_coordinator.h
+index fb0c4c710b..d6a99c8735 100644
+--- a/src/yb/tablet/transaction_coordinator.h
++++ b/src/yb/tablet/transaction_coordinator.h
+@@ -116,7 +116,7 @@ class TransactionCoordinator {
+   // Process transaction state replication aborted.
+   void ProcessAborted(const AbortedData& data);
+   // Handles new request for transaction update.
+-  void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term, bool is_external);
++  void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term);
+ 
+   // Prepares log garbage collection. Return min index that should be preserved.
+   int64_t PrepareGC(std::string* details = nullptr);
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index af8c2373b5..b6d7e9828c 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -217,6 +217,10 @@ class TransactionParticipant::Impl
+       return status.CloneAndAddErrorCode(TransactionError(TransactionErrorCode::kAborted));
+     }
+     VLOG_WITH_PREFIX(4) << "Create new transaction: " << metadata.transaction_id;
++    if (metadata.external_transaction && metadata.status_tablet.empty()) {
++      return STATUS(InvalidArgument, Format("For external transaction $0, status tablet is empty",
++                                            metadata.transaction_id));
++    }
+     transactions_.insert(std::make_shared<RunningTransaction>(
+         metadata, TransactionalBatchData(), OneWayBitmap(), metadata.start_time, this));
+     TransactionsModifiedUnlocked(&min_running_notifier);
+@@ -312,13 +316,11 @@ class TransactionParticipant::Impl
+ 
+   boost::optional<std::pair<IsolationLevel, TransactionalBatchData>> PrepareBatchData(
+       const TransactionId& id, size_t batch_idx,
+-      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches,
+-      bool external_transaction) {
++      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches) {
+     // We are not trying to cleanup intents here because we don't know whether this transaction
+     // has intents of not.
+     auto lock_and_iterator = LockAndFind(
+-        id, "metadata with write id"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist},
+-        external_transaction);
++        id, "metadata with write id"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});
+     if (!lock_and_iterator.found()) {
+       return boost::none;
+     }
+@@ -339,7 +341,8 @@ class TransactionParticipant::Impl
+   }
+ 
+   void RequestStatusAt(const StatusRequest& request) {
+-    auto lock_and_iterator = LockAndFind(*request.id, *request.reason, request.flags);
++    auto lock_and_iterator = LockAndFind(
++        *request.id, *request.reason, request.flags);
+     if (!lock_and_iterator.found()) {
+       request.callback(
+           STATUS_FORMAT(NotFound, "Request status of unknown transaction: $0", *request.id));
+@@ -638,8 +641,7 @@ class TransactionParticipant::Impl
+       // We are not trying to cleanup intents here because we don't know whether this transaction
+       // has intents of not.
+       auto lock_and_iterator = LockAndFind(
+-          data.transaction_id, "pre apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist},
+-          data.is_external);
++          data.transaction_id, "pre apply"s, TransactionLoadFlags{TransactionLoadFlag::kMustExist});
+       if (!lock_and_iterator.found()) {
+         // This situation is normal and could be caused by 2 scenarios:
+         // 1) Write batch failed, but originator doesn't know that.
+@@ -662,10 +664,11 @@ class TransactionParticipant::Impl
+         CHECK(transactions_.modify(lock_and_iterator.iterator, [&data](auto& txn) {
+           txn->SetLocalCommitData(data.commit_ht, data.aborted);
+         }));
+-
+-        LOG_IF_WITH_PREFIX(DFATAL, data.log_ht < last_safe_time_)
+-            << "Apply transaction before last safe time " << data.transaction_id
+-            << ": " << data.log_ht << " vs " << last_safe_time_;
++        if (!lock_and_iterator.transaction().external_transaction()) {
++          LOG_IF_WITH_PREFIX(DFATAL, data.log_ht < last_safe_time_)
++              << "Apply transaction before last safe time " << data.transaction_id
++              << ": " << data.log_ht << " vs " << last_safe_time_;
++        }
+       }
+     }
+ 
+@@ -1263,11 +1266,16 @@ class TransactionParticipant::Impl
+       while (!remove_queue_.empty()) {
+         auto& front = remove_queue_.front();
+         auto it = transactions_.find(front.id);
+-        if (it == transactions_.end() || (**it).local_commit_time().is_valid()) {
+-          // It is regular case, since the coordinator returns ABORTED for already applied
+-          // transaction. But this particular tablet could not yet apply it, so
+-          // it would add such transaction to remove queue.
+-          // And it is the main reason why we are waiting for safe time, before removing intents.
++        if (it == transactions_.end() ||
++            (**it).local_commit_time().is_valid() ||
++            (**it).external_transaction()) {
++          // A couple possibilities:
++          // 1. This is an xcluster transaction so we want to skip the remove path for ABORTED
++          // transactions.
++          // 2. Since the coordinator returns ABORTED for already applied transaction. But this
++          // particular tablet could not yet apply it, so it would add such transaction to remove
++          // queue. And it is the main reason why we are waiting for safe time, before removing
++          // intents.
+           VLOG_WITH_PREFIX(4) << "Evicting txn from remove queue, w/o removing intents: "
+                               << front.ToString();
+           remove_queue_.pop_front();
+@@ -1348,15 +1356,15 @@ class TransactionParticipant::Impl
+   };
+ 
+   LockAndFindResult LockAndFind(
+-      const TransactionId& id, const std::string& reason, TransactionLoadFlags flags,
+-      bool external_transaction = false) {
++      const TransactionId& id, const std::string& reason, TransactionLoadFlags flags) {
+     loader_.WaitLoaded(id);
+     bool recently_removed;
+     {
+       std::unique_lock<std::mutex> lock(mutex_);
+       auto it = transactions_.find(id);
+       if (it != transactions_.end()) {
+-        if (!external_transaction && (**it).start_ht() <= ignore_all_transactions_started_before_) {
++        if (!(**it).external_transaction() &&
++            (**it).start_ht() <= ignore_all_transactions_started_before_) {
+           YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1)
+               << "Ignore transaction for '" << reason << "' because of limit: "
+               << ignore_all_transactions_started_before_ << ", txn: " << AsString(**it);
+@@ -1553,7 +1561,7 @@ class TransactionParticipant::Impl
+       .log_ht = data.hybrid_time,
+       .sealed = data.sealed,
+       .status_tablet = data.state.tablets().front().ToBuffer(),
+-      .is_external = data.state.has_external_commit_ht()
++      .is_external = data.state.has_external_hybrid_time()
+     };
+     if (!data.already_applied_to_regular_db) {
+       return ProcessApply(apply_data);
+@@ -1611,6 +1619,9 @@ class TransactionParticipant::Impl
+     TransactionStatusResolver* resolver = nullptr;
+     for (;;) {
+       auto& txn = **index.begin();
++      if (txn.external_transaction()) {
++        break;
++      }
+       if (txn.abort_check_ht() > now) {
+         break;
+       }
+@@ -1783,9 +1794,8 @@ Result<TransactionMetadata> TransactionParticipant::PrepareMetadata(
+ boost::optional<std::pair<IsolationLevel, TransactionalBatchData>>
+     TransactionParticipant::PrepareBatchData(
+     const TransactionId& id, size_t batch_idx,
+-    boost::container::small_vector_base<uint8_t>* encoded_replicated_batches,
+-    bool external_transaction) {
+-  return impl_->PrepareBatchData(id, batch_idx, encoded_replicated_batches, external_transaction);
++    boost::container::small_vector_base<uint8_t>* encoded_replicated_batches) {
++  return impl_->PrepareBatchData(id, batch_idx, encoded_replicated_batches);
+ }
+ 
+ void TransactionParticipant::BatchReplicated(
+diff --git a/src/yb/tablet/transaction_participant.h b/src/yb/tablet/transaction_participant.h
+index c7c0d4b302..ca07a61f3a 100644
+--- a/src/yb/tablet/transaction_participant.h
++++ b/src/yb/tablet/transaction_participant.h
+@@ -136,8 +136,7 @@ class TransactionParticipant : public TransactionStatusManager {
+   // out of order.
+   boost::optional<std::pair<IsolationLevel, TransactionalBatchData>> PrepareBatchData(
+       const TransactionId& id, size_t batch_idx,
+-      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches,
+-      bool external_transaction = false);
++      boost::container::small_vector_base<uint8_t>* encoded_replicated_batches);
+ 
+   void BatchReplicated(const TransactionId& id, const TransactionalBatchData& data);
+ 
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 3b89e95189..9847ee7fc9 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1074,7 +1074,7 @@ void TabletServiceImpl::UpdateTransaction(const UpdateTransactionRequestPB* req,
+     auto namespace_name = tablet.peer->tablet_metadata()->namespace_name();
+     auto namespace_id_result = tablet.peer->GetNamespaceId();
+     if (!namespace_id_result.ok()) {
+-      state->CompleteWithStatus(namespace_id_result.status());
++      state->CompleteWithStatus(STATUS(TryAgain, namespace_id_result.status().message()));
+       return;
+     }
+     auto commit_ht = HybridTime(req->state().commit_hybrid_time());
+@@ -1082,7 +1082,7 @@ void TabletServiceImpl::UpdateTransaction(const UpdateTransactionRequestPB* req,
+         server_->tablet_manager()->server()->XClusterSafeTimeCaughtUpToCommitHt(
+             *namespace_id_result, commit_ht);
+     if (!tablet_caught_up_result.ok()) {
+-      state->CompleteWithStatus(tablet_caught_up_result.status());
++      state->CompleteWithStatus(STATUS(TryAgain, tablet_caught_up_result.status().message()));
+       return;
+     }
+     if (!*tablet_caught_up_result) {
+@@ -1104,7 +1104,7 @@ void TabletServiceImpl::UpdateTransaction(const UpdateTransactionRequestPB* req,
+   } else {
+     auto* coordinator = tablet.tablet->transaction_coordinator();
+     if (coordinator) {
+-      coordinator->Handle(std::move(state), tablet.leader_term, req->is_external());
++      coordinator->Handle(std::move(state), tablet.leader_term);
+     } else {
+       state->CompleteWithStatus(STATUS_FORMAT(
+           InvalidArgument, "Does not have transaction coordinator to process $0",
+diff --git a/src/yb/tserver/tserver_service.proto b/src/yb/tserver/tserver_service.proto
+index 8982bb5413..8654595b93 100644
+--- a/src/yb/tserver/tserver_service.proto
++++ b/src/yb/tserver/tserver_service.proto
+@@ -166,6 +166,7 @@ message GetTransactionStatusRequestPB {
+   optional bytes tablet_id = 1;
+   repeated bytes transaction_id = 2;
+   optional fixed64 propagated_hybrid_time = 3;
++  optional fixed64 external_hybrid_time = 4;
+ }
+ 
+ message GetTransactionStatusResponsePB {

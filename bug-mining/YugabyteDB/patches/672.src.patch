@@ -1,0 +1,943 @@
+diff --git a/ent/src/yb/master/restore_sys_catalog_state.cc b/ent/src/yb/master/restore_sys_catalog_state.cc
+index 36d1955a3d..e9b343ced3 100644
+--- a/ent/src/yb/master/restore_sys_catalog_state.cc
++++ b/ent/src/yb/master/restore_sys_catalog_state.cc
+@@ -149,6 +149,120 @@ Status ValidateSysCatalogTables(
+   return Status::OK();
+ }
+ 
++struct PgCatalogTableData {
++  std::array<uint8_t, kUuidSize + 1> prefix;
++  const TableName* name;
++  uint32_t pg_table_oid;
++
++  Status SetTableId(const TableId& table_id) {
++    Uuid cotable_id = VERIFY_RESULT(Uuid::FromHexString(table_id));
++    prefix[0] = docdb::KeyEntryTypeAsChar::kTableId;
++    cotable_id.EncodeToComparable(&prefix[1]);
++    pg_table_oid = VERIFY_RESULT(GetPgsqlTableOid(table_id));
++    return Status::OK();
++  }
++
++  bool IsPgYbCatalogMeta() const {
++    // We reset name to nullptr for pg_yb_catalog_meta table.
++    return name == nullptr;
++  }
++};
++
++class PgCatalogRestorePatch : public RestorePatch {
++ public:
++  PgCatalogRestorePatch(
++      FetchState* existing_state, FetchState* restoring_state,
++      docdb::DocWriteBatch* doc_batch, const PgCatalogTableData& table,
++      tablet::TableInfo* pg_yb_catalog_meta)
++      : RestorePatch(existing_state, restoring_state, doc_batch),
++        table_(table), pg_yb_catalog_meta_(pg_yb_catalog_meta) {}
++
++  Status Finish() {
++    if (!catalog_version_doc_path_) {
++      return Status::OK();
++    }
++    QLValuePB value_pb;
++    value_pb.set_int64_value(catalog_version_);
++    LOG(INFO) << "PITR: Incrementing pg_yb_catalog version to " << catalog_version_;
++    return DocBatch()->SetPrimitive(
++        *catalog_version_doc_path_, docdb::ValueRef(value_pb, SortingType::kNotSpecified));
++  }
++
++ private:
++  Status ProcessCommonEntry(
++      const Slice& key, const Slice& existing_value, const Slice& restoring_value) override {
++    if (!table_.IsPgYbCatalogMeta()) {
++      return RestorePatch::ProcessCommonEntry(key, existing_value, restoring_value);
++    }
++    return ProcessCatalogVersionEntry(key, existing_value);
++  }
++
++  Status ProcessExistingOnlyEntry(
++      const Slice& existing_key, const Slice& existing_value) override {
++    if (!table_.IsPgYbCatalogMeta()) {
++      return RestorePatch::ProcessExistingOnlyEntry(existing_key, existing_value);
++    }
++    return ProcessCatalogVersionEntry(existing_key, existing_value);
++  }
++
++  Result<bool> ShouldSkipEntry(const Slice& key, const Slice& value) override {
++    return false;
++  }
++
++  Status HandleSchemaVersionValue(
++      const docdb::DocKey& doc_key, ColumnId column_id, const Slice& existing_value) {
++    docdb::Value value;
++    RETURN_NOT_OK(value.Decode(existing_value));
++    auto new_version = value.primitive_value().GetInt64() + 1;
++    if (!catalog_version_doc_path_ || catalog_version_ < new_version) {
++      catalog_version_doc_path_.emplace(
++          doc_key.Encode(), docdb::KeyEntryValue::MakeColumnId(column_id));
++      catalog_version_ = new_version;
++    }
++    return Status::OK();
++  }
++
++  Status ProcessCatalogVersionEntry(const Slice& key, const Slice& full_value) {
++    docdb::SubDocKey sub_doc_key;
++    RETURN_NOT_OK(sub_doc_key.FullyDecodeFrom(key, docdb::HybridTimeRequired::kFalse));
++    if (sub_doc_key.subkeys().empty()) {
++      auto value_slice = full_value;
++      RETURN_NOT_OK(docdb::ValueControlFields::Decode(&value_slice));
++      SCHECK(value_slice.TryConsumeByte(docdb::ValueEntryTypeAsChar::kPackedRow),
++             Corruption, "Packed row expected: $0", full_value.ToDebugHexString());
++      const docdb::SchemaPacking& packing = VERIFY_RESULT(
++          pg_yb_catalog_meta_->doc_read_context->schema_packing_storage.GetPacking(&value_slice));
++      auto column_id = VERIFY_RESULT(
++          pg_yb_catalog_meta_->schema().ColumnIdByName(kCurrentVersionColumnName));
++      auto value = packing.GetValue(column_id, value_slice);
++      if (!value) {
++        return STATUS_FORMAT(
++            Corruption, "$0 missing in $1", kCurrentVersionColumnName,
++            full_value.ToDebugHexString());
++      }
++      return HandleSchemaVersionValue(sub_doc_key.doc_key(), column_id, *value);
++    }
++    SCHECK_EQ(sub_doc_key.subkeys().size(), 1U, Corruption, "Wrong number of subdoc keys");
++    const auto& first_subkey = sub_doc_key.subkeys()[0];
++    if (first_subkey.type() == docdb::KeyEntryType::kColumnId) {
++      auto column_id = first_subkey.GetColumnId();
++      const ColumnSchema& column = VERIFY_RESULT(pg_yb_catalog_meta_->schema().column_by_id(
++          column_id));
++      if (column.name() == kCurrentVersionColumnName) {
++        return HandleSchemaVersionValue(sub_doc_key.doc_key(), column_id, full_value);
++      }
++    }
++    return Status::OK();
++  }
++
++  // Should be alive while this object is alive.
++  const PgCatalogTableData& table_;
++  // Should be alive while this object is alive.
++  tablet::TableInfo* pg_yb_catalog_meta_;
++  std::optional<docdb::DocPath> catalog_version_doc_path_;
++  int64_t catalog_version_;
++};
++
+ } // namespace
+ 
+ RestoreSysCatalogState::RestoreSysCatalogState(SnapshotScheduleRestoration* restoration)
+@@ -625,20 +739,6 @@ void RestoreSysCatalogState::WriteToRocksDB(
+   yb::WriteToRocksDB(write_batch, write_time, op_id, tablet, restore_kv);
+ }
+ 
+-struct PgCatalogTableData {
+-  std::array<uint8_t, kUuidSize + 1> prefix;
+-  const TableName* name;
+-  uint32_t pg_table_oid;
+-
+-  Status SetTableId(const TableId& table_id) {
+-    Uuid cotable_id = VERIFY_RESULT(Uuid::FromHexString(table_id));
+-    prefix[0] = docdb::KeyEntryTypeAsChar::kTableId;
+-    cotable_id.EncodeToComparable(&prefix[1]);
+-    pg_table_oid = VERIFY_RESULT(GetPgsqlTableOid(table_id));
+-    return Status::OK();
+-  }
+-};
+-
+ Status RestoreSysCatalogState::IncrementLegacyCatalogVersion(
+     const docdb::DocReadContext& doc_read_context, const docdb::DocDB& doc_db,
+     docdb::DocWriteBatch* write_batch) {
+@@ -728,17 +828,22 @@ Status RestoreSysCatalogState::ProcessPgCatalogRestores(
+ 
+     RETURN_NOT_OK(restore_patch.PatchCurrentStateFromRestoringState());
+ 
++    RETURN_NOT_OK(restore_patch.Finish());
++
+     size_t total_changes = restore_patch.TotalTickerCount();
+ 
+-    if (total_changes != 0 || VLOG_IS_ON(3)) {
+-      LOG(INFO) << "PITR: Pg system table: " << AsString(table.name) << ", "
+-                << restore_patch.TickersToString();
+-    }
+-    if (table.pg_table_oid == kPgYbMigrationTableOid && total_changes != 0) {
+-      LOG(INFO) << "PITR: YSQL upgrade was performed since the restore time"
+-                << ", total changes: " << total_changes;
++    LOG_IF(INFO, total_changes || VLOG_IS_ON(3))
++        << "PITR: Pg system table " << AsString(table.name) << ": "
++        << restore_patch.TickersToString();
++
++    // During migration we insert a new row to migration table, so it is enough to check number of
++    // rows in this table to understand whether it was modified or not.
++    if (table.pg_table_oid == kPgYbMigrationTableOid &&
++        restoring_state.num_rows() != existing_state.num_rows()) {
++      LOG(INFO) << "PITR: YSQL upgrade was performed since the restore time, restoring rows: "
++                << restoring_state.num_rows() << ", existing rows: " << existing_state.num_rows();
+       return STATUS(
+-          NotSupported, "Unable to restore as YSQL upgrade was performed since the restore time.");
++          NotSupported, "Unable to restore as YSQL upgrade was performed since the restore time");
+     }
+   }
+ 
+@@ -756,42 +861,5 @@ bool RestoreSysCatalogState::IsYsqlRestoration() {
+   return false;
+ }
+ 
+-Status PgCatalogRestorePatch::ProcessEqualEntries(
+-    const Slice& existing_key, const Slice& existing_value,
+-    const Slice& restoring_key, const Slice& restoring_value) {
+-  if (table_.name != nullptr) {
+-    if (restoring_value.compare(existing_value)) {
+-      IncrementTicker(RestoreTicker::kUpdates);
+-      AddKeyValue(restoring_key, restoring_value, DocBatch());
+-    }
+-  } else {
+-    docdb::SubDocKey sub_doc_key;
+-    RETURN_NOT_OK(sub_doc_key.FullyDecodeFrom(
+-        restoring_key, docdb::HybridTimeRequired::kFalse));
+-    SCHECK_EQ(sub_doc_key.subkeys().size(), 1U, Corruption, "Wrong number of subdoc keys");
+-    if (sub_doc_key.subkeys()[0].type() == docdb::KeyEntryType::kColumnId) {
+-      auto column_id = sub_doc_key.subkeys()[0].GetColumnId();
+-      const ColumnSchema& column = VERIFY_RESULT(pg_yb_catalog_meta_->schema().column_by_id(
+-          column_id));
+-      if (column.name() == "current_version") {
+-        docdb::Value value;
+-        RETURN_NOT_OK(value.Decode(existing_value));
+-        docdb::DocPath path(sub_doc_key.doc_key().Encode(), sub_doc_key.subkeys());
+-        QLValuePB value_pb;
+-        value_pb.set_int64_value(value.primitive_value().GetInt64() + 1);
+-        LOG(INFO) << "PITR: Incrementing pg_yb_catalog version to "
+-                  << value.primitive_value().GetInt64() + 1;
+-        RETURN_NOT_OK(DocBatch()->SetPrimitive(
+-            path, docdb::ValueRef(value_pb, SortingType::kNotSpecified)));
+-      }
+-    }
+-  }
+-  return Status::OK();
+-}
+-
+-Result<bool> PgCatalogRestorePatch::ShouldSkipEntry(const Slice& key, const Slice& value) {
+-  return false;
+-}
+-
+ }  // namespace master
+ }  // namespace yb
+diff --git a/ent/src/yb/master/restore_sys_catalog_state.h b/ent/src/yb/master/restore_sys_catalog_state.h
+index 2bccfe5b37..686b758c5f 100644
+--- a/ent/src/yb/master/restore_sys_catalog_state.h
++++ b/ent/src/yb/master/restore_sys_catalog_state.h
+@@ -32,8 +32,6 @@
+ namespace yb {
+ namespace master {
+ 
+-struct PgCatalogTableData;
+-
+ // Utility class to restore sys catalog.
+ // Initially we load tables and tablets into it, then match schedule filter.
+ class RestoreSysCatalogState {
+@@ -163,26 +161,6 @@ class RestoreSysCatalogState {
+   RetainedExistingTables retained_existing_tables_;
+ };
+ 
+-class PgCatalogRestorePatch : public RestorePatch {
+- public:
+-  PgCatalogRestorePatch(
+-      FetchState* existing_state, FetchState* restoring_state,
+-      docdb::DocWriteBatch* doc_batch, const PgCatalogTableData& table,
+-      tablet::TableInfo* pg_yb_catalog_meta)
+-      : RestorePatch(existing_state, restoring_state, doc_batch),
+-        table_(table), pg_yb_catalog_meta_(pg_yb_catalog_meta) {}
+-
+- private:
+-  Status ProcessEqualEntries(
+-      const Slice& existing_key, const Slice& existing_value,
+-      const Slice& restoring_key, const Slice& restoring_value) override;
+-
+-  Result<bool> ShouldSkipEntry(const Slice& key, const Slice& value) override;
+-
+-  const PgCatalogTableData& table_;
+-  tablet::TableInfo* pg_yb_catalog_meta_;
+-};
+-
+ }  // namespace master
+ }  // namespace yb
+ 
+diff --git a/src/yb/docdb/doc_reader.cc b/src/yb/docdb/doc_reader.cc
+index e9db4af179..65e18663a1 100644
+--- a/src/yb/docdb/doc_reader.cc
++++ b/src/yb/docdb/doc_reader.cc
+@@ -144,7 +144,8 @@ Result<boost::optional<SubDocument>> TEST_GetSubDocument(
+                   iter->read_time().ToString());
+   iter->SeekToLastDocKey();
+   SchemaPackingStorage schema_packing_storage;
+-  DocDBTableReader doc_reader(iter.get(), deadline, projection, schema_packing_storage);
++  DocDBTableReader doc_reader(
++      iter.get(), deadline, projection, TableType::YQL_TABLE_TYPE, schema_packing_storage);
+   RETURN_NOT_OK(doc_reader.UpdateTableTombstoneTime(sub_doc_key));
+ 
+   iter->Seek(sub_doc_key);
+@@ -158,10 +159,12 @@ Result<boost::optional<SubDocument>> TEST_GetSubDocument(
+ DocDBTableReader::DocDBTableReader(
+     IntentAwareIterator* iter, CoarseTimePoint deadline,
+     const std::vector<KeyEntryValue>* projection,
++    TableType table_type,
+     std::reference_wrapper<const SchemaPackingStorage> schema_packing_storage)
+     : iter_(iter),
+       deadline_info_(deadline),
+       projection_(projection),
++      table_type_(table_type),
+       schema_packing_storage_(schema_packing_storage) {
+   if (projection_) {
+     auto projection_size = projection_->size();
+@@ -355,9 +358,8 @@ class DocDBTableReader::GetHelper {
+       }
+     }
+ 
+-    if (!packed_column_data_ || packed_column_data_.row->doc_ht < key_result.write_time) {
+-      RETURN_NOT_OK(ProcessEntry(
+-         subkeys, reader_.iter_->value(), key_result.write_time, check_exist_only));
++    if (VERIFY_RESULT(ProcessEntry(
++            subkeys, reader_.iter_->value(), key_result.write_time, check_exist_only))) {
+       packed_column_data_.row = nullptr;
+     }
+     if (check_exist_only && Found()) {
+@@ -382,14 +384,15 @@ class DocDBTableReader::GetHelper {
+   }
+ 
+   // Process DB entry.
+-  Status ProcessEntry(
++  // Return true if entry value was accepted.
++  Result<bool> ProcessEntry(
+       Slice subkeys, Slice value_slice, const DocHybridTime& write_time,
+       CheckExistOnly check_exist_only) {
+     subkeys = CleanupState(subkeys);
+     if (state_.back().write_time >= write_time) {
+       VLOG_WITH_PREFIX_AND_FUNC(4)
+           << "State: " << AsString(state_) << ", write_time: " << write_time;
+-      return Status::OK();
++      return false;
+     }
+     auto control_fields = VERIFY_RESULT(ValueControlFields::Decode(&value_slice));
+     RETURN_NOT_OK(AllocateNewStateEntries(
+@@ -427,21 +430,31 @@ class DocDBTableReader::GetHelper {
+     return Status::OK();
+   }
+ 
+-  Status ApplyEntryValue(
++  // Return true if entry value was accepted.
++  Result<bool> ApplyEntryValue(
+       const Slice& value_slice, const ValueControlFields& control_fields,
+       CheckExistOnly check_exist_only) {
+-    VLOG_WITH_FUNC(4)
++    VLOG_WITH_PREFIX_AND_FUNC(4)
+         << "State: " << AsString(state_) << ", value: " << value_slice.ToDebugHexString();
+     auto& current = state_.back();
+-    if (!IsObsolete(current.expiration, reader_.iter_->read_time().read) &&
+-        VERIFY_RESULT(TryDecodeValue(
+-            reader_.iter_->read_time().read, control_fields, current.write_time.hybrid_time(),
+-            current.expiration, value_slice, current.out))) {
+-      last_found_ = column_index_;
+-    } else if (!check_exist_only && state_.size() > (reader_.projection_ ? 2 : 1)) {
++    if (!IsObsolete(current.expiration, reader_.iter_->read_time().read)) {
++      if (VERIFY_RESULT(TryDecodeValue(
++              reader_.iter_->read_time().read, control_fields, current.write_time.hybrid_time(),
++              current.expiration, value_slice, current.out))) {
++        last_found_ = column_index_;
++        return true;
++      }
++      if (reader_.table_type_ == TableType::PGSQL_TABLE_TYPE) {
++        return false;
++      }
++    }
++
++    // When projection is specified we should always report projection columns, even when they are
++    // nulls.
++    if (!check_exist_only && state_.size() > (reader_.projection_ ? 2 : 1)) {
+       state_[state_.size() - 2].out->DeleteChild(current.key_value);
+     }
+-    return Status::OK();
++    return true;
+   }
+ 
+   Result<bool> NextColumn() {
+@@ -541,7 +554,7 @@ class DocDBTableReader::GetHelper {
+       return PackedColumnData();
+     }
+ 
+-    VLOG_WITH_PREFIX_AND_FUNC(4) << "Packed row: " << slice->ToDebugHexString();
++    VLOG_WITH_PREFIX_AND_FUNC(4) << "Packed row " << column_id << ": " << slice->ToDebugHexString();
+     return PackedColumnData {
+       .row = &packed_row_data_,
+       .encoded_value = slice->empty() ? NullSlice() : *slice,
+diff --git a/src/yb/docdb/doc_reader.h b/src/yb/docdb/doc_reader.h
+index b388546544..3f08713177 100644
+--- a/src/yb/docdb/doc_reader.h
++++ b/src/yb/docdb/doc_reader.h
+@@ -20,6 +20,7 @@
+ #include "yb/docdb/docdb_fwd.h"
+ #include "yb/rocksdb/cache.h"
+ 
++#include "yb/common/common_types.pb.h"
+ #include "yb/common/doc_hybrid_time.h"
+ #include "yb/common/read_hybrid_time.h"
+ #include "yb/common/transaction.h"
+@@ -76,6 +77,7 @@ class DocDBTableReader {
+   DocDBTableReader(
+       IntentAwareIterator* iter, CoarseTimePoint deadline,
+       const std::vector<KeyEntryValue>* projection,
++      TableType table_type,
+       std::reference_wrapper<const SchemaPackingStorage> schema_packing_storage);
+ 
+   // Updates expiration/overwrite data based on table tombstone time. If the table is not a
+@@ -102,6 +104,7 @@ class DocDBTableReader {
+   IntentAwareIterator* iter_;
+   DeadlineInfo deadline_info_;
+   const std::vector<KeyEntryValue>* projection_;
++  const TableType table_type_;
+   const SchemaPackingStorage& schema_packing_storage_;
+ 
+   std::vector<KeyBytes> encoded_projection_;
+diff --git a/src/yb/docdb/doc_rowwise_iterator.cc b/src/yb/docdb/doc_rowwise_iterator.cc
+index 6316bef4ef..cea5f7aa81 100644
+--- a/src/yb/docdb/doc_rowwise_iterator.cc
++++ b/src/yb/docdb/doc_rowwise_iterator.cc
+@@ -1212,6 +1212,7 @@ Status DocRowwiseIterator::Init(TableType table_type, const Slice& sub_doc_key)
+   db_iter_->Seek(row_key_);
+   row_ready_ = false;
+   has_bound_key_ = false;
++  table_type_ = table_type;
+   if (table_type == TableType::PGSQL_TABLE_TYPE) {
+     ignore_ttl_ = true;
+   }
+@@ -1329,12 +1330,14 @@ Status DocRowwiseIterator::DoInit(const T& doc_spec) {
+ }
+ 
+ Status DocRowwiseIterator::Init(const QLScanSpec& spec) {
+-  return DoInit(dynamic_cast<const DocQLScanSpec&>(spec));
++  table_type_ = TableType::YQL_TABLE_TYPE;
++  return DoInit(down_cast<const DocQLScanSpec&>(spec));
+ }
+ 
+ Status DocRowwiseIterator::Init(const PgsqlScanSpec& spec) {
++  table_type_ = TableType::PGSQL_TABLE_TYPE;
+   ignore_ttl_ = true;
+-  return DoInit(dynamic_cast<const DocPgsqlScanSpec&>(spec));
++  return DoInit(down_cast<const DocPgsqlScanSpec&>(spec));
+ }
+ 
+ Status DocRowwiseIterator::AdvanceIteratorToNextDesiredRow() const {
+@@ -1443,7 +1446,7 @@ Result<bool> DocRowwiseIterator::HasNext() const {
+     }
+     if (doc_reader_ == nullptr) {
+       doc_reader_ = std::make_unique<DocDBTableReader>(
+-          db_iter_.get(), deadline_, &projection_subkeys_,
++          db_iter_.get(), deadline_, &projection_subkeys_, table_type_,
+           doc_read_context_.schema_packing_storage);
+       RETURN_NOT_OK(doc_reader_->UpdateTableTombstoneTime(doc_key));
+       if (!ignore_ttl_) {
+diff --git a/src/yb/docdb/doc_rowwise_iterator.h b/src/yb/docdb/doc_rowwise_iterator.h
+index af9c79efa3..1a43e2ee70 100644
+--- a/src/yb/docdb/doc_rowwise_iterator.h
++++ b/src/yb/docdb/doc_rowwise_iterator.h
+@@ -226,6 +226,7 @@ class DocRowwiseIterator : public YQLRowwiseIteratorIf {
+ 
+   mutable std::unique_ptr<DocDBTableReader> doc_reader_ = nullptr;
+ 
++  TableType table_type_;
+   mutable bool ignore_ttl_ = false;
+ 
+   bool debug_dump_ = false;
+diff --git a/src/yb/docdb/docdb_compaction_context.cc b/src/yb/docdb/docdb_compaction_context.cc
+index 74eddb220b..e793e584e7 100644
+--- a/src/yb/docdb/docdb_compaction_context.cc
++++ b/src/yb/docdb/docdb_compaction_context.cc
+@@ -164,7 +164,7 @@ class PackedRowData {
+         sizeof(last_internal_component_));
+   }
+ 
+-  // Returns true if column was processed.
++  // Returns true if column was processed. Otherwise caller should handle this column.
+   Result<bool> ProcessColumn(
+       ColumnId column_id, const Slice& value, const DocHybridTime& column_doc_ht) {
+     if (!packing_started_) {
+@@ -195,6 +195,13 @@ class PackedRowData {
+       }
+     }
+ 
++    if (!value.empty() && value[0] == ValueEntryTypeAsChar::kTombstone &&
++        new_packing_.table_type == TableType::PGSQL_TABLE_TYPE) {
++      // In a YSQL table, a tombstone for a specific column could be added only during PITR,
++      // and we should just ignore all column updates for it.
++      // Do not forget that we see only most recent entry to specified key.
++      return true;
++    }
+     // TODO(packed_row) update control fields
+     VLOG(4) << "Update value: " << column_id << ", " << value.ToDebugHexString() << ", tail size: "
+             << tail_size;
+diff --git a/src/yb/integration-tests/external_mini_cluster.cc b/src/yb/integration-tests/external_mini_cluster.cc
+index f9ccfaf138..c30b4e221c 100644
+--- a/src/yb/integration-tests/external_mini_cluster.cc
++++ b/src/yb/integration-tests/external_mini_cluster.cc
+@@ -2711,4 +2711,32 @@ Status RestartAllMasters(ExternalMiniCluster* cluster) {
+   return Status::OK();
+ }
+ 
++Status CompactTablets(ExternalMiniCluster* cluster) {
++  for (auto* daemon : cluster->master_daemons()) {
++    master::CompactSysCatalogRequestPB req;
++    master::CompactSysCatalogResponsePB resp;
++    rpc::RpcController controller;
++    controller.set_timeout(60s * kTimeMultiplier);
++
++    auto proxy = cluster->GetProxy<master::MasterAdminProxy>(daemon);
++    RETURN_NOT_OK(proxy.CompactSysCatalog(req, &resp, &controller));
++  }
++
++  for (auto* daemon : cluster->tserver_daemons()) {
++    tserver::FlushTabletsRequestPB req;
++    tserver::FlushTabletsResponsePB resp;
++    rpc::RpcController controller;
++    controller.set_timeout(10s * kTimeMultiplier);
++
++    req.set_dest_uuid(daemon->uuid());
++    req.set_operation(tserver::FlushTabletsRequestPB::COMPACT);
++    req.set_all_tablets(true);
++
++    auto proxy = cluster->GetProxy<tserver::TabletServerAdminServiceProxy>(daemon);
++    RETURN_NOT_OK(proxy.FlushTablets(req, &resp, &controller));
++  }
++
++  return Status::OK();
++}
++
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/external_mini_cluster.h b/src/yb/integration-tests/external_mini_cluster.h
+index d0856715cd..0312aba0f4 100644
+--- a/src/yb/integration-tests/external_mini_cluster.h
++++ b/src/yb/integration-tests/external_mini_cluster.h
+@@ -29,8 +29,8 @@
+ // or implied.  See the License for the specific language governing permissions and limitations
+ // under the License.
+ //
+-#ifndef YB_INTEGRATION_TESTS_EXTERNAL_MINI_CLUSTER_H_
+-#define YB_INTEGRATION_TESTS_EXTERNAL_MINI_CLUSTER_H_
++
++#pragma once
+ 
+ #include <string.h>
+ #include <sys/types.h>
+@@ -854,5 +854,6 @@ T ExternalMiniCluster::GetProxy(ExternalDaemon* daemon) {
+ 
+ Status RestartAllMasters(ExternalMiniCluster* cluster);
+ 
++Status CompactTablets(ExternalMiniCluster* cluster);
++
+ }  // namespace yb
+-#endif  // YB_INTEGRATION_TESTS_EXTERNAL_MINI_CLUSTER_H_
+diff --git a/src/yb/master/sys_catalog.cc b/src/yb/master/sys_catalog.cc
+index 4cf81ee6db..1249ea4cdb 100644
+--- a/src/yb/master/sys_catalog.cc
++++ b/src/yb/master/sys_catalog.cc
+@@ -818,7 +818,7 @@ Status SysCatalogTable::ReadYsqlCatalogVersion(TableId ysql_catalog_table_id,
+                                                    {} /* read_hybrid_time */,
+                                                    ysql_catalog_table_id));
+   QLTableRow source_row;
+-  ColumnId version_col_id = VERIFY_RESULT(schema.ColumnIdByName("current_version"));
++  ColumnId version_col_id = VERIFY_RESULT(schema.ColumnIdByName(kCurrentVersionColumnName));
+   ColumnId last_breaking_version_col_id =
+       VERIFY_RESULT(schema.ColumnIdByName("last_breaking_version"));
+ 
+diff --git a/src/yb/master/sys_catalog_constants.h b/src/yb/master/sys_catalog_constants.h
+index 2787eabd7d..f16c50a29c 100644
+--- a/src/yb/master/sys_catalog_constants.h
++++ b/src/yb/master/sys_catalog_constants.h
+@@ -44,6 +44,8 @@ static const char* const kSysCatalogTableColType = "entry_type";
+ static const char* const kSysCatalogTableColId = "entry_id";
+ static const char* const kSysCatalogTableColMetadata = "metadata";
+ 
++static const char* const kCurrentVersionColumnName = "current_version";
++
+ static const char* const kDefaultCassandraUsername = "cassandra";
+ static const char* const kDefaultCassandraPassword = "cassandra";
+ 
+diff --git a/src/yb/tablet/restore_util.cc b/src/yb/tablet/restore_util.cc
+index 876e9da679..b9b5ac05c3 100644
+--- a/src/yb/tablet/restore_util.cc
++++ b/src/yb/tablet/restore_util.cc
+@@ -22,84 +22,99 @@ Status FetchState::SetPrefix(const Slice& prefix) {
+   }
+   prefix_ = prefix;
+   finished_ = false;
+-  last_deleted_key_bytes_.clear();
+-  last_deleted_key_write_time_ = DocHybridTime::kInvalid;
+-  RETURN_NOT_OK(Update());
+-  return NextNonDeletedEntry();
++  key_write_stack_.clear();
++  num_rows_ = 0;
++  return Next(MoveForward::kFalse);
+ }
+ 
+-Result<bool> FetchState::IsDeletedRowEntry() {
+-  // Because Postgres doesn't have a concept of frozen types, kGroupEnd will only demarcate the
+-  // end of hashed and range components. It is reasonable to assume then that if the last byte
+-  // is kGroupEnd then it does not have any subkeys.
+-  bool no_subkey =
+-      key()[key().size() - 1] == docdb::KeyEntryTypeAsChar::kGroupEnd;
+-
+-  return no_subkey && VERIFY_RESULT(IsDeletedEntry());
+-}
+-
+-Result<bool> FetchState::IsDeletedEntry() {
+-  return VERIFY_RESULT(docdb::Value::IsTombstoned(value()));
+-}
+-
+-bool FetchState::IsDeletedSinceInsertion() {
+-  if (last_deleted_key_bytes_.size() == 0) {
+-    return false;
+-  }
+-  return key().starts_with(last_deleted_key_bytes_.AsSlice()) &&
+-          FullKey().write_time < last_deleted_key_write_time_;
+-}
+-
+-Status FetchState::Update() {
++Result<bool> FetchState::Update() {
+   if (!iterator_->valid()) {
+     finished_ = true;
+-    return Status::OK();
++    return true;
+   }
+   key_ = VERIFY_RESULT(iterator_->FetchKey());
+-  if (VERIFY_RESULT(IsDeletedRowEntry())) {
+-    last_deleted_key_write_time_ = key_.write_time;
+-    last_deleted_key_bytes_ = key_.key;
+-  }
+-  if (!key_.key.starts_with(prefix_)) {
++  auto rest_of_key = key_.key;
++  if (!rest_of_key.starts_with(prefix_)) {
+     finished_ = true;
+-    return Status::OK();
++    return true;
+   }
+ 
+-  return Status::OK();
++  rest_of_key.remove_prefix(prefix_.size());
++  for (auto i = key_write_stack_.begin(); i != key_write_stack_.end(); ++i) {
++    if (!rest_of_key.starts_with(i->key.AsSlice())) {
++      key_write_stack_.erase(i, key_write_stack_.end());
++      break;
++    }
++    if (i->time > key_.write_time) {
++      // This key-value entry is outdated and we should pick the next one.
++      return false;
++    }
++    rest_of_key.remove_prefix(i->key.size());
++  }
++
++  auto alive_row = !VERIFY_RESULT(docdb::Value::IsTombstoned(value()));
++  if (key_write_stack_.empty()) {
++    // Empty stack means new row, i.e. doc key. So rest_of_key is not updated and matches
++    // full key, that contains doc key.
++    if (alive_row) {
++      ++num_rows_;
++    }
++    auto doc_key_size = VERIFY_RESULT(
++        docdb::DocKey::EncodedHashPartAndDocKeySizes(rest_of_key)).doc_key_size;
++    key_write_stack_.push_back(KeyWriteEntry {
++      .key = KeyBuffer(rest_of_key.Prefix(doc_key_size)),
++      // If doc key does not have its own write time, then we use min time to avoid ignoring
++      // updates for other columns.
++      .time = doc_key_size == rest_of_key.size() ? key_.write_time : DocHybridTime::kMin,
++    });
++    rest_of_key.remove_prefix(doc_key_size);
++  }
++
++  // See comment for key_write_stack_ field.
++  if (!rest_of_key.empty()) {
++    // If we have multiple subkeys in rest_of_key, it is NOT necessary to split them.
++    // Since complete subkey cannot be prefix of another subkey.
++    key_write_stack_.push_back(KeyWriteEntry {
++      .key = KeyBuffer(rest_of_key),
++      .time = key_.write_time,
++    });
++  }
++
++  return alive_row;
+ }
+ 
+-Status FetchState::NextNonDeletedEntry() {
++Status FetchState::Next(MoveForward move_forward) {
+   while (!finished()) {
+-    if (VERIFY_RESULT(IsDeletedEntry()) || IsDeletedSinceInsertion()) {
+-      RETURN_NOT_OK(NextEntry());
+-      continue;
++    if (move_forward) {
++      iterator_->SeekPastSubKey(key_.key);
++    } else {
++      move_forward = MoveForward::kTrue;
++    }
++    if (VERIFY_RESULT(Update())) {
++      break;
+     }
+-    break;
+   }
+   return Status::OK();
+ }
+ 
+-Status RestorePatch::ProcessEqualEntries(
+-    const Slice& existing_key, const Slice& existing_value,
+-    const Slice& restoring_key, const Slice& restoring_value) {
++Status RestorePatch::ProcessCommonEntry(
++    const Slice& key, const Slice& existing_value, const Slice& restoring_value) {
+   if (restoring_value.compare(existing_value)) {
+     IncrementTicker(RestoreTicker::kUpdates);
+-    AddKeyValue(restoring_key, restoring_value, doc_batch_);
++    AddKeyValue(key, restoring_value, doc_batch_);
+   }
+   return Status::OK();
+ }
+ 
+-Status RestorePatch::ProcessRestoringLessThanExisting(
+-    const Slice& existing_key, const Slice& existing_value,
++Status RestorePatch::ProcessRestoringOnlyEntry(
+     const Slice& restoring_key, const Slice& restoring_value) {
+   IncrementTicker(RestoreTicker::kInserts);
+   AddKeyValue(restoring_key, restoring_value, doc_batch_);
+   return Status::OK();
+ }
+ 
+-Status RestorePatch::ProcessRestoringGreaterThanExisting(
+-    const Slice& existing_key, const Slice& existing_value,
+-    const Slice& restoring_key, const Slice& restoring_value) {
++Status RestorePatch::ProcessExistingOnlyEntry(
++    const Slice& existing_key, const Slice& existing_value) {
+   char tombstone_char = docdb::ValueEntryTypeAsChar::kTombstone;
+   Slice tombstone(&tombstone_char, 1);
+   IncrementTicker(RestoreTicker::kDeletes);
+@@ -119,19 +134,17 @@ Status RestorePatch::PatchCurrentStateFromRestoringState() {
+     }
+     auto compare_result = restoring_state_->key().compare(existing_state_->key());
+     if (compare_result == 0) {
+-      RETURN_NOT_OK(ProcessEqualEntries(existing_state_->key(), existing_state_->value(),
+-                                        restoring_state_->key(), restoring_state_->value()));
++      RETURN_NOT_OK(ProcessCommonEntry(
++          existing_state_->key(), existing_state_->value(), restoring_state_->value()));
+       RETURN_NOT_OK(restoring_state_->Next());
+       RETURN_NOT_OK(existing_state_->Next());
+     } else if (compare_result < 0) {
+-      RETURN_NOT_OK(ProcessRestoringLessThanExisting(
+-          existing_state_->key(), existing_state_->value(),
++      RETURN_NOT_OK(ProcessRestoringOnlyEntry(
+           restoring_state_->key(), restoring_state_->value()));
+       RETURN_NOT_OK(restoring_state_->Next());
+     } else {
+-      RETURN_NOT_OK(ProcessRestoringGreaterThanExisting(
+-          existing_state_->key(), existing_state_->value(),
+-          restoring_state_->key(), restoring_state_->value()));
++      RETURN_NOT_OK(ProcessExistingOnlyEntry(
++          existing_state_->key(), existing_state_->value()));
+       RETURN_NOT_OK(existing_state_->Next());
+     }
+   }
+@@ -141,8 +154,8 @@ Status RestorePatch::PatchCurrentStateFromRestoringState() {
+       RETURN_NOT_OK(restoring_state_->Next());
+       continue;
+     }
+-    RETURN_NOT_OK(ProcessRestoringLessThanExisting(
+-        Slice(), Slice(), restoring_state_->key(), restoring_state_->value()));
++    RETURN_NOT_OK(ProcessRestoringOnlyEntry(
++        restoring_state_->key(), restoring_state_->value()));
+     RETURN_NOT_OK(restoring_state_->Next());
+   }
+ 
+@@ -151,8 +164,8 @@ Status RestorePatch::PatchCurrentStateFromRestoringState() {
+       RETURN_NOT_OK(existing_state_->Next());
+       continue;
+     }
+-    RETURN_NOT_OK(ProcessRestoringGreaterThanExisting(
+-        existing_state_->key(), existing_state_->value(), Slice(), Slice()));
++    RETURN_NOT_OK(ProcessExistingOnlyEntry(
++        existing_state_->key(), existing_state_->value()));
+     RETURN_NOT_OK(existing_state_->Next());
+   }
+ 
+diff --git a/src/yb/tablet/restore_util.h b/src/yb/tablet/restore_util.h
+index 050eb81121..69be098417 100644
+--- a/src/yb/tablet/restore_util.h
++++ b/src/yb/tablet/restore_util.h
+@@ -27,17 +27,19 @@
+ 
+ namespace yb {
+ 
++YB_STRONGLY_TYPED_BOOL(MoveForward);
++
+ class FetchState {
+  public:
+   explicit FetchState(const docdb::DocDB& doc_db, const ReadHybridTime& read_time)
+       : iterator_(CreateIntentAwareIterator(
+-          doc_db,
+-          docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,
+-          boost::none,
+-          rocksdb::kDefaultQueryId,
+-          TransactionOperationContext(),
+-          CoarseTimePoint::max(),
+-          read_time)) {
++            doc_db,
++            docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,
++            boost::none,
++            rocksdb::kDefaultQueryId,
++            TransactionOperationContext(),
++            CoarseTimePoint::max(),
++            read_time)) {
+   }
+ 
+   Status SetPrefix(const Slice& prefix);
+@@ -54,37 +56,37 @@ class FetchState {
+     return iterator_->value();
+   }
+ 
+-  docdb::FetchKeyResult FullKey() const {
+-    return key_;
++  size_t num_rows() const {
++    return num_rows_;
+   }
+ 
+-  Status NextEntry() {
+-    iterator_->SeekPastSubKey(key_.key);
+-    return Update();
+-  }
+-
+-  Status Next() {
+-    RETURN_NOT_OK(NextEntry());
+-    return NextNonDeletedEntry();
++  const docdb::FetchKeyResult& FullKey() const {
++    return key_;
+   }
+ 
+-  // Returns true if the entry corresponds to a deleted row
+-  // in rocksdb.
+-  Result<bool> IsDeletedRowEntry();
+-
+-  // Returns true if it has been deleted since the time it was inserted.
+-  bool IsDeletedSinceInsertion();
++  // Fetch next valid key-value entry.
++  // When step is true, always move from the current entry.
++  Status Next(MoveForward move_forward = MoveForward::kTrue);
+ 
+  private:
+-  Status Update();
+-  Status NextNonDeletedEntry();
+-  Result<bool> IsDeletedEntry();
++  // Updates internal state in accordance to new key-value entry.
++  // Returns false if current key-value entry should be ignored, true otherwise.
++  Result<bool> Update();
++
++  struct KeyWriteEntry {
++    KeyBuffer key; // Contains key part that corresponds to this entry.
++    DocHybridTime time;
++  };
+ 
+   std::unique_ptr<docdb::IntentAwareIterator> iterator_;
+   Slice prefix_;
+   docdb::FetchKeyResult key_;
+-  KeyBuffer last_deleted_key_bytes_;
+-  DocHybridTime last_deleted_key_write_time_;
++  size_t num_rows_ = 0;
++  // Store stack of subkeys for the current row.
++  // I.e. the first entry is related to row, the second is related to column in this row.
++  // And so on.
++  // Hybrid times in the stack should be in nondecreasing order.
++  boost::container::small_vector<KeyWriteEntry, 8> key_write_stack_;
+   bool finished_ = false;
+ };
+ 
+@@ -124,24 +126,21 @@ class RestorePatch {
+  protected:
+   void IncrementTicker(RestoreTicker ticker) { tickers_[static_cast<size_t>(ticker)]++; }
+ 
++  virtual Status ProcessCommonEntry(
++      const Slice& key, const Slice& existing_value, const Slice& restoring_value);
++
++  Status ProcessRestoringOnlyEntry(
++      const Slice& restoring_key, const Slice& restoring_value);
++
++  virtual Status ProcessExistingOnlyEntry(
++      const Slice& existing_key, const Slice& existing_value);
++
+  private:
+   FetchState* existing_state_;
+   FetchState* restoring_state_;
+   docdb::DocWriteBatch* doc_batch_;
+   std::array<size_t, kRestoreTickerMapSize> tickers_ = { 0, 0, 0 };
+ 
+-  virtual Status ProcessEqualEntries(
+-      const Slice& existing_key, const Slice& existing_value,
+-      const Slice& restoring_key, const Slice& restoring_value);
+-
+-  Status ProcessRestoringLessThanExisting(
+-      const Slice& existing_key, const Slice& existing_value,
+-      const Slice& restoring_key, const Slice& restoring_value);
+-
+-  Status ProcessRestoringGreaterThanExisting(
+-      const Slice& existing_key, const Slice& existing_value,
+-      const Slice& restoring_key, const Slice& restoring_value);
+-
+   virtual Result<bool> ShouldSkipEntry(const Slice& key, const Slice& value) = 0;
+ };
+ 
+diff --git a/src/yb/tools/yb-admin-snapshot-schedule-test.cc b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+index 5d377a5998..4beb958326 100644
+--- a/src/yb/tools/yb-admin-snapshot-schedule-test.cc
++++ b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+@@ -241,7 +241,9 @@ class YbAdminSnapshotScheduleTest : public AdminTestBase {
+ 
+   Result<std::string> PreparePg(
+       bool colocated = false, MonoDelta interval = kInterval, MonoDelta retention = kRetention) {
+-    RETURN_NOT_OK(PrepareCommon());
++    if (!cluster_) {
++      RETURN_NOT_OK(PrepareCommon());
++    }
+ 
+     auto conn = VERIFY_RESULT(PgConnect());
+     if (colocated) {
+@@ -401,6 +403,18 @@ class YbAdminSnapshotScheduleTestWithYsql : public YbAdminSnapshotScheduleTest {
+     SleepFor(MonoDelta::FromSeconds(4 * kTimeMultiplier));
+     return Timestamp(VERIFY_RESULT(WallClock()->Now()).time_point);
+   }
++
++  void TestPgsqlDropDefault();
++};
++
++class YbAdminSnapshotScheduleTestWithYsqlAndPackedRow : public YbAdminSnapshotScheduleTestWithYsql {
++ public:
++  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
++    YbAdminSnapshotScheduleTestWithYsql::UpdateMiniClusterOptions(opts);
++    opts->extra_tserver_flags.emplace_back("--ysql_enable_packed_row=true");
++    opts->extra_master_flags.emplace_back("--ysql_enable_packed_row=true");
++    opts->extra_master_flags.emplace_back("--timestamp_history_retention_interval_sec=0");
++  }
+ };
+ 
+ TEST_F(YbAdminSnapshotScheduleTest, BadArguments) {
+@@ -1038,6 +1052,26 @@ TEST_F_EX(YbAdminSnapshotScheduleTest, YB_DISABLE_TEST_IN_TSAN(PgsqlSetDefault),
+ 
+ TEST_F_EX(YbAdminSnapshotScheduleTest, YB_DISABLE_TEST_IN_TSAN(PgsqlDropDefault),
+           YbAdminSnapshotScheduleTestWithYsql) {
++  TestPgsqlDropDefault();
++}
++
++// Check that postgres sys catalog schema is correctly restored during PITR.
++TEST_F_EX(YbAdminSnapshotScheduleTest, YB_DISABLE_TEST_IN_TSAN(PgsqlDropDefaultWithPackedRow),
++          YbAdminSnapshotScheduleTestWithYsqlAndPackedRow) {
++  ASSERT_OK(PrepareCommon());
++  ASSERT_OK(CompactTablets(cluster_.get()));
++  TestPgsqlDropDefault();
++  ASSERT_OK(CompactTablets(cluster_.get()));
++
++  auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));
++  ASSERT_OK(conn.Execute("ALTER TABLE test_table ADD COLUMN v2 TEXT DEFAULT 'v2_default'"));
++  ASSERT_OK(conn.Execute("INSERT INTO test_table VALUES (100500)"));
++  auto value = ASSERT_RESULT(
++      conn.FetchRowAsString("SELECT value, v2 FROM test_table WHERE key=100500"));
++  ASSERT_EQ(value, "default_value, v2_default");
++}
++
++void YbAdminSnapshotScheduleTestWithYsql::TestPgsqlDropDefault() {
+   auto schedule_id = ASSERT_RESULT(PreparePg());
+ 
+   auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));

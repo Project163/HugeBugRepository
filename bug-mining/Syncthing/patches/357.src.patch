@@ -1,0 +1,514 @@
+diff --git a/cmd/syncthing/main.go b/cmd/syncthing/main.go
+index 0c013abe1..7cef1e543 100644
+--- a/cmd/syncthing/main.go
++++ b/cmd/syncthing/main.go
+@@ -663,6 +663,13 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
+ 		}
+ 	}
+ 
++	if cfg.Raw().OriginalVersion == 15 {
++		// The config version 15->16 migration is about handling ignores and
++		// delta indexes and requires that we drop existing indexes that
++		// have been incorrectly ignore filtered.
++		ldb.DropDeltaIndexIDs()
++	}
++
+ 	m := model.NewModel(cfg, myID, myDeviceName(cfg), "syncthing", Version, ldb, protectedFiles)
+ 	cfg.Subscribe(m)
+ 
+diff --git a/lib/config/config.go b/lib/config/config.go
+index 4a2a9f3a0..1059020f7 100644
+--- a/lib/config/config.go
++++ b/lib/config/config.go
+@@ -26,7 +26,7 @@ import (
+ 
+ const (
+ 	OldestHandledVersion = 10
+-	CurrentVersion       = 15
++	CurrentVersion       = 16
+ 	MaxRescanIntervalS   = 365 * 24 * 60 * 60
+ )
+ 
+@@ -218,6 +218,9 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
+ 	if cfg.Version == 14 {
+ 		convertV14V15(cfg)
+ 	}
++	if cfg.Version == 15 {
++		convertV15V16(cfg)
++	}
+ 
+ 	// Build a list of available devices
+ 	existingDevices := make(map[protocol.DeviceID]bool)
+@@ -288,6 +291,11 @@ func convertV14V15(cfg *Configuration) {
+ 	cfg.Version = 15
+ }
+ 
++func convertV15V16(cfg *Configuration) {
++	// Triggers a database tweak
++	cfg.Version = 16
++}
++
+ func convertV13V14(cfg *Configuration) {
+ 	// Not using the ignore cache is the new default. Disable it on existing
+ 	// configurations.
+diff --git a/lib/config/testdata/v16.xml b/lib/config/testdata/v16.xml
+new file mode 100644
+index 000000000..4c18e0d10
+--- /dev/null
++++ b/lib/config/testdata/v16.xml
+@@ -0,0 +1,14 @@
++<configuration version="16">
++    <folder id="test" path="testdata" type="readonly" ignorePerms="false" rescanIntervalS="600" autoNormalize="true">
++        <device id="AIR6LPZ-7K4PTTV-UXQSMUU-CPQ5YWH-OEDFIIQ-JUG777G-2YQXXR5-YD6AWQR"></device>
++        <device id="P56IOI7-MZJNU2Y-IQGDREY-DM2MGTI-MGL3BXN-PQ6W5BM-TBBZ4TJ-XZWICQ2"></device>
++        <minDiskFreePct>1</minDiskFreePct>
++        <maxConflicts>-1</maxConflicts>
++    </folder>
++    <device id="AIR6LPZ-7K4PTTV-UXQSMUU-CPQ5YWH-OEDFIIQ-JUG777G-2YQXXR5-YD6AWQR" name="node one" compression="metadata">
++        <address>tcp://a</address>
++    </device>
++    <device id="P56IOI7-MZJNU2Y-IQGDREY-DM2MGTI-MGL3BXN-PQ6W5BM-TBBZ4TJ-XZWICQ2" name="node two" compression="metadata">
++        <address>tcp://b</address>
++    </device>
++</configuration>
+diff --git a/lib/db/leveldb_dbinstance.go b/lib/db/leveldb_dbinstance.go
+index 7cd4e389e..e20437d2a 100644
+--- a/lib/db/leveldb_dbinstance.go
++++ b/lib/db/leveldb_dbinstance.go
+@@ -719,6 +719,20 @@ func (db *Instance) indexIDKey(device, folder []byte) []byte {
+ 	return k
+ }
+ 
++// DropDeltaIndexIDs removes all index IDs from the database. This will
++// cause a full index transmission on the next connection.
++func (db *Instance) DropDeltaIndexIDs() {
++	t := db.newReadWriteTransaction()
++	defer t.close()
++
++	dbi := t.NewIterator(util.BytesPrefix([]byte{KeyTypeIndexID}), nil)
++	defer dbi.Release()
++
++	for dbi.Next() {
++		t.Delete(dbi.Key())
++	}
++}
++
+ func unmarshalTrunc(bs []byte, truncate bool) (FileIntf, error) {
+ 	if truncate {
+ 		var tf FileInfoTruncated
+diff --git a/lib/model/model.go b/lib/model/model.go
+index 7b386a819..d4eed5df6 100644
+--- a/lib/model/model.go
++++ b/lib/model/model.go
+@@ -114,6 +114,8 @@ var (
+ 	errFolderMarkerMissing = errors.New("folder marker missing")
+ 	errHomeDiskNoSpace     = errors.New("home disk has insufficient free space")
+ 	errFolderNoSpace       = errors.New("folder has insufficient free space")
++	errUnsupportedSymlink  = errors.New("symlink not supported")
++	errInvalidFilename     = errors.New("filename is invalid")
+ )
+ 
+ // NewModel creates and starts a new model. The model starts in read-only mode,
+@@ -466,7 +468,13 @@ func (m *Model) NeedSize(folder string) (nfiles int, bytes int64) {
+ 	m.fmut.RLock()
+ 	defer m.fmut.RUnlock()
+ 	if rf, ok := m.folderFiles[folder]; ok {
++		ignores := m.folderIgnores[folder]
++		cfg := m.folderCfgs[folder]
+ 		rf.WithNeedTruncated(protocol.LocalDeviceID, func(f db.FileIntf) bool {
++			if shouldIgnore(f, ignores, cfg.IgnoreDelete) {
++				return true
++			}
++
+ 			fs, de, by := sizeOfFile(f)
+ 			nfiles += fs + de
+ 			bytes += by
+@@ -526,7 +534,13 @@ func (m *Model) NeedFolderFiles(folder string, page, perpage int) ([]db.FileInfo
+ 	}
+ 
+ 	rest = make([]db.FileInfoTruncated, 0, perpage)
++	ignores := m.folderIgnores[folder]
++	cfg := m.folderCfgs[folder]
+ 	rf.WithNeedTruncated(protocol.LocalDeviceID, func(f db.FileIntf) bool {
++		if shouldIgnore(f, ignores, cfg.IgnoreDelete) {
++			return true
++		}
++
+ 		total++
+ 		if skip > 0 {
+ 			skip--
+@@ -556,10 +570,8 @@ func (m *Model) Index(deviceID protocol.DeviceID, folder string, fs []protocol.F
+ 	}
+ 
+ 	m.fmut.RLock()
+-	cfg := m.folderCfgs[folder]
+ 	files, ok := m.folderFiles[folder]
+ 	runner := m.folderRunners[folder]
+-	ignores := m.folderIgnores[folder]
+ 	m.fmut.RUnlock()
+ 
+ 	if runner != nil {
+@@ -576,7 +588,6 @@ func (m *Model) Index(deviceID protocol.DeviceID, folder string, fs []protocol.F
+ 	m.deviceDownloads[deviceID].Update(folder, makeForgetUpdate(fs))
+ 	m.pmut.RUnlock()
+ 
+-	fs = filterIndex(folder, fs, cfg.IgnoreDelete, ignores)
+ 	files.Replace(deviceID, fs)
+ 
+ 	events.Default.Log(events.RemoteIndexUpdated, map[string]interface{}{
+@@ -599,9 +610,7 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
+ 
+ 	m.fmut.RLock()
+ 	files := m.folderFiles[folder]
+-	cfg := m.folderCfgs[folder]
+ 	runner, ok := m.folderRunners[folder]
+-	ignores := m.folderIgnores[folder]
+ 	m.fmut.RUnlock()
+ 
+ 	if !ok {
+@@ -612,7 +621,6 @@ func (m *Model) IndexUpdate(deviceID protocol.DeviceID, folder string, fs []prot
+ 	m.deviceDownloads[deviceID].Update(folder, makeForgetUpdate(fs))
+ 	m.pmut.RUnlock()
+ 
+-	fs = filterIndex(folder, fs, cfg.IgnoreDelete, ignores)
+ 	files.Update(deviceID, fs)
+ 
+ 	events.Default.Log(events.RemoteIndexUpdated, map[string]interface{}{
+@@ -1278,11 +1286,6 @@ func sendIndexTo(minSequence int64, conn protocol.Connection, folder string, fs
+ 			maxSequence = f.Sequence
+ 		}
+ 
+-		if ignores.Match(f.Name).IsIgnored() || symlinkInvalid(folder, f) {
+-			l.Debugln("not sending update for ignored/unsupported symlink", f)
+-			return true
+-		}
+-
+ 		sorter.Append(f)
+ 		return true
+ 	})
+@@ -1513,6 +1516,18 @@ func (m *Model) internalScanFolderSubdirs(folder string, subDirs []string) error
+ 	runner, ok := m.folderRunners[folder]
+ 	m.fmut.Unlock()
+ 
++	// Check if the ignore patterns changed as part of scanning this folder.
++	// If they did we should schedule a pull of the folder so that we
++	// request things we might have suddenly become unignored and so on.
++
++	oldHash := ignores.Hash()
++	defer func() {
++		if ignores.Hash() != oldHash {
++			l.Debugln("Folder", folder, "ignore patterns changed; triggering puller")
++			runner.IndexUpdated()
++		}
++	}()
++
+ 	// Folders are added to folderRunners only when they are started. We can't
+ 	// scan them before they have started, so that's what we need to check for
+ 	// here.
+@@ -2236,27 +2251,6 @@ func mapDeviceCfgs(devices []config.DeviceConfiguration) map[protocol.DeviceID]s
+ 	return m
+ }
+ 
+-func filterIndex(folder string, fs []protocol.FileInfo, dropDeletes bool, ignores *ignore.Matcher) []protocol.FileInfo {
+-	for i := 0; i < len(fs); {
+-		if fs[i].IsDeleted() && dropDeletes {
+-			l.Debugln("dropping update for undesired delete", fs[i])
+-			fs[i] = fs[len(fs)-1]
+-			fs = fs[:len(fs)-1]
+-		} else if symlinkInvalid(folder, fs[i]) {
+-			l.Debugln("dropping update for unsupported symlink", fs[i])
+-			fs[i] = fs[len(fs)-1]
+-			fs = fs[:len(fs)-1]
+-		} else if ignores != nil && ignores.Match(fs[i].Name).IsIgnored() {
+-			l.Debugln("dropping update for ignored item", fs[i])
+-			fs[i] = fs[len(fs)-1]
+-			fs = fs[:len(fs)-1]
+-		} else {
+-			i++
+-		}
+-	}
+-	return fs
+-}
+-
+ func symlinkInvalid(folder string, fi db.FileIntf) bool {
+ 	if !symlinks.Supported && fi.IsSymlink() && !fi.IsInvalid() && !fi.IsDeleted() {
+ 		symlinkWarning.Do(func() {
+@@ -2391,3 +2385,23 @@ func makeForgetUpdate(files []protocol.FileInfo) []protocol.FileDownloadProgress
+ 	}
+ 	return updates
+ }
++
++// shouldIgnore returns true when a file should be excluded from processing
++func shouldIgnore(file db.FileIntf, matcher *ignore.Matcher, ignoreDelete bool) bool {
++	// We check things in a certain order here...
++
++	switch {
++	case ignoreDelete && file.IsDeleted():
++		// ignoreDelete first because it's a very cheap test so a win if it
++		// succeeds, and we might in the long run accumulate quite a few
++		// deleted files.
++		return true
++
++	case matcher.Match(file.FileName()).IsIgnored():
++		// ignore patterns second because ignoring them is a valid way to
++		// silence warnings about them being invalid and so on.
++		return true
++	}
++
++	return false
++}
+diff --git a/lib/model/model_test.go b/lib/model/model_test.go
+index ff95c767c..146c1a673 100644
+--- a/lib/model/model_test.go
++++ b/lib/model/model_test.go
+@@ -1185,43 +1185,6 @@ func benchmarkTree(b *testing.B, n1, n2 int) {
+ 	b.ReportAllocs()
+ }
+ 
+-func TestIgnoreDelete(t *testing.T) {
+-	db := db.OpenMemory()
+-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
+-
+-	// This folder should ignore external deletes
+-	cfg := defaultFolderConfig
+-	cfg.IgnoreDelete = true
+-
+-	m.AddFolder(cfg)
+-	m.ServeBackground()
+-	m.StartFolder("default")
+-	m.ScanFolder("default")
+-
+-	// Get a currently existing file
+-	f, ok := m.CurrentGlobalFile("default", "foo")
+-	if !ok {
+-		t.Fatal("foo should exist")
+-	}
+-
+-	// Mark it for deletion
+-	f.Deleted = true
+-	f.Version = f.Version.Update(142) // arbitrary short remote ID
+-	f.Blocks = nil
+-
+-	// Send the index
+-	m.Index(device1, "default", []protocol.FileInfo{f})
+-
+-	// Make sure we ignored it
+-	f, ok = m.CurrentGlobalFile("default", "foo")
+-	if !ok {
+-		t.Fatal("foo should exist")
+-	}
+-	if f.IsDeleted() {
+-		t.Fatal("foo should not be marked for deletion")
+-	}
+-}
+-
+ func TestUnifySubs(t *testing.T) {
+ 	cases := []struct {
+ 		in     []string // input to unifySubs
+diff --git a/lib/model/rwfolder.go b/lib/model/rwfolder.go
+index 2ab94bbba..9b4981f4f 100644
+--- a/lib/model/rwfolder.go
++++ b/lib/model/rwfolder.go
+@@ -13,6 +13,7 @@ import (
+ 	"math/rand"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 	"sort"
+ 	"strings"
+ 	"time"
+@@ -29,8 +30,6 @@ import (
+ 	"github.com/syncthing/syncthing/lib/versioner"
+ )
+ 
+-// TODO: Stop on errors
+-
+ func init() {
+ 	folderFactories[config.FolderTypeReadWrite] = newRWFolder
+ }
+@@ -84,14 +83,16 @@ type rwFolder struct {
+ 	dir              string
+ 	versioner        versioner.Versioner
+ 	ignorePerms      bool
+-	copiers          int
+-	pullers          int
+ 	order            config.PullOrder
+ 	maxConflicts     int
+ 	sleep            time.Duration
+ 	pause            time.Duration
+ 	allowSparse      bool
+ 	checkFreeSpace   bool
++	ignoreDelete     bool
++
++	copiers int
++	pullers int
+ 
+ 	queue       *jobQueue
+ 	dbUpdates   chan dbUpdateJob
+@@ -115,6 +116,7 @@ func newRWFolder(model *Model, cfg config.FolderConfiguration, ver versioner.Ver
+ 
+ 		virtualMtimeRepo: db.NewVirtualMtimeRepo(model.db, cfg.ID),
+ 		dir:              cfg.Path(),
++		versioner:        ver,
+ 		ignorePerms:      cfg.IgnorePerms,
+ 		copiers:          cfg.Copiers,
+ 		pullers:          cfg.Pullers,
+@@ -122,7 +124,7 @@ func newRWFolder(model *Model, cfg config.FolderConfiguration, ver versioner.Ver
+ 		maxConflicts:     cfg.MaxConflicts,
+ 		allowSparse:      !cfg.DisableSparseFiles,
+ 		checkFreeSpace:   cfg.MinDiskFreePct != 0,
+-		versioner:        ver,
++		ignoreDelete:     cfg.IgnoreDelete,
+ 
+ 		queue:       newJobQueue(),
+ 		pullTimer:   time.NewTimer(time.Second),
+@@ -423,15 +425,20 @@ func (f *rwFolder) pullerIteration(ignores *ignore.Matcher) int {
+ 		// directories as they come along, so parents before children. Files
+ 		// are queued and the order may be changed later.
+ 
+-		file := intf.(protocol.FileInfo)
++		if shouldIgnore(intf, ignores, f.ignoreDelete) {
++			return true
++		}
+ 
+-		if ignores.Match(file.Name).IsIgnored() {
+-			// This is an ignored file. Skip it, continue iteration.
++		if err := fileValid(intf); err != nil {
++			// The file isn't valid so we can't process it. Pretend that we
++			// tried and set the error for the file.
++			f.newError(intf.FileName(), err)
++			changed++
+ 			return true
+ 		}
+ 
++		file := intf.(protocol.FileInfo)
+ 		l.Debugln(f, "handling", file.Name)
+-
+ 		if !handleFile(file) {
+ 			// A new or changed file or symlink. This is the only case where
+ 			// we do stuff concurrently in the background. We only queue
+@@ -1561,3 +1568,44 @@ func (l fileErrorList) Less(a, b int) bool {
+ func (l fileErrorList) Swap(a, b int) {
+ 	l[a], l[b] = l[b], l[a]
+ }
++
++// fileValid returns nil when the file is valid for processing, or an error if it's not
++func fileValid(file db.FileIntf) error {
++	switch {
++	case file.IsDeleted():
++		// We don't care about file validity if we're not supposed to have it
++		return nil
++
++	case !symlinks.Supported && file.IsSymlink():
++		return errUnsupportedSymlink
++
++	case runtime.GOOS == "windows" && windowsInvalidFilename(file.FileName()):
++		return errInvalidFilename
++	}
++
++	return nil
++}
++
++var windowsDisallowedCharacters = string([]rune{
++	'<', '>', ':', '"', '|', '?', '*',
++	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
++	11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
++	21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
++	31,
++})
++
++func windowsInvalidFilename(name string) bool {
++	// None of the path components should end in space
++	for _, part := range strings.Split(name, `\`) {
++		if len(part) == 0 {
++			continue
++		}
++		if part[len(part)-1] == ' ' {
++			// Names ending in space are not valid.
++			return true
++		}
++	}
++
++	// The path must not contain any disallowed characters
++	return strings.ContainsAny(name, windowsDisallowedCharacters)
++}
+diff --git a/lib/protocol/nativemodel_windows.go b/lib/protocol/nativemodel_windows.go
+index 2c76f294a..0997386ac 100644
+--- a/lib/protocol/nativemodel_windows.go
++++ b/lib/protocol/nativemodel_windows.go
+@@ -4,21 +4,9 @@
+ 
+ package protocol
+ 
+-// Windows uses backslashes as file separator and disallows a bunch of
+-// characters in the filename
+-
+-import (
+-	"path/filepath"
+-	"strings"
+-)
+-
+-var disallowedCharacters = string([]rune{
+-	'<', '>', ':', '"', '|', '?', '*',
+-	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+-	11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+-	21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+-	31,
+-})
++// Windows uses backslashes as file separator
++
++import "path/filepath"
+ 
+ type nativeModel struct {
+ 	Model
+@@ -40,16 +28,7 @@ func (m nativeModel) Request(deviceID DeviceID, folder string, name string, offs
+ }
+ 
+ func fixupFiles(folder string, files []FileInfo) {
+-	for i, f := range files {
+-		if strings.ContainsAny(f.Name, disallowedCharacters) || strings.HasSuffix(f.Name, " ") {
+-			if f.IsDeleted() {
+-				// Don't complain if the file is marked as deleted, since it
+-				// can't possibly exist here anyway.
+-				continue
+-			}
+-			files[i].Invalid = true
+-			l.Warnf("File name %q (folder %q) contains invalid characters; marked as invalid.", f.Name, folder)
+-		}
++	for i := range files {
+ 		files[i].Name = filepath.FromSlash(files[i].Name)
+ 	}
+ }
+diff --git a/lib/protocol/nativemodel_windows_test.go b/lib/protocol/nativemodel_windows_test.go
+deleted file mode 100644
+index ef2a7757d..000000000
+--- a/lib/protocol/nativemodel_windows_test.go
++++ /dev/null
+@@ -1,27 +0,0 @@
+-// Copyright (C) 2016 The Protocol Authors.
+-
+-// +build windows
+-
+-package protocol
+-
+-import "testing"
+-
+-func TestFixupFiles(t *testing.T) {
+-	fs := []FileInfo{
+-		{Name: "ok"},  // This file is OK
+-		{Name: "b<d"}, // The rest should be marked as invalid
+-		{Name: "b?d"},
+-		{Name: "bad "},
+-	}
+-
+-	fixupFiles("default", fs)
+-
+-	if fs[0].IsInvalid() {
+-		t.Error("fs[0] should not be invalid")
+-	}
+-	for i := 1; i < len(fs); i++ {
+-		if !fs[i].IsInvalid() {
+-			t.Errorf("fs[%d] should be invalid", i)
+-		}
+-	}
+-}

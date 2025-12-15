@@ -1,0 +1,211 @@
+diff --git a/activerecord/CHANGELOG.md b/activerecord/CHANGELOG.md
+index e3cdd39af3..2984195d9e 100644
+--- a/activerecord/CHANGELOG.md
++++ b/activerecord/CHANGELOG.md
+@@ -1,3 +1,11 @@
++*   Don't establish a new connection if an identical pool exists already.
++
++    Previously, if `establish_connection` was called on a class that already had an established connection, the existing connection would be removed regardless of whether it was the same config. Now if a pool is found with the same values as the new connection, the existing connection will be returned instead of creating a new one.
++
++    This has a slight change in behavior if application code is depending on a new connection being established regardless of whether it's identical to an existing connection. If the old behavior is desirable, applications should call `ActiveRecord::Base#remove_connection` before establishing a new one. Calling `establish_connection` with a different config works the same way as it did previously.
++
++    *Eileen M. Uchitelle*
++
+ *   Update `db:prepare` task to load schema when an uninitialized database exists, and dump schema after migrations.
+ 
+     *Ben Sheldon*
+diff --git a/activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb b/activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb
+index f54f8246bc..3c9a8d8b1e 100644
+--- a/activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb
++++ b/activerecord/lib/active_record/connection_adapters/abstract/connection_handler.rb
+@@ -103,30 +103,32 @@ def connection_pool_list(role = ActiveRecord::Base.current_role)
+ 
+       def establish_connection(config, owner_name: Base, role: ActiveRecord::Base.current_role, shard: Base.current_shard)
+         owner_name = StringConnectionOwner.new(config.to_s) if config.is_a?(Symbol)
+-
+         pool_config = resolve_pool_config(config, owner_name, role, shard)
+         db_config = pool_config.db_config
+ 
+-        # Protects the connection named `ActiveRecord::Base` from being removed
+-        # if the user calls `establish_connection :primary`.
+-        if owner_to_pool_manager.key?(pool_config.connection_specification_name)
++        # If there is an existing pool with the same values as the pool_config
++        # don't remove the connection. Connections should only be removed if we are
++        # establishing a connection on a class that is already connected to a different
++        # configuration.
++        pool = retrieve_connection_pool(pool_config.connection_specification_name, role: role, shard: shard)
++
++        unless pool && pool.db_config == db_config
+           remove_connection_pool(pool_config.connection_specification_name, role: role, shard: shard)
+-        end
+ 
+-        message_bus = ActiveSupport::Notifications.instrumenter
+-        payload = {}
+-        if pool_config
+-          payload[:spec_name] = pool_config.connection_specification_name
+-          payload[:shard] = shard
+-          payload[:config] = db_config.configuration_hash
++          owner_to_pool_manager[pool_config.connection_specification_name] ||= PoolManager.new
++          pool_manager = get_pool_manager(pool_config.connection_specification_name)
++          pool_manager.set_pool_config(role, shard, pool_config)
++          pool = pool_config.pool
+         end
+ 
+-        owner_to_pool_manager[pool_config.connection_specification_name] ||= PoolManager.new
+-        pool_manager = get_pool_manager(pool_config.connection_specification_name)
+-        pool_manager.set_pool_config(role, shard, pool_config)
++        payload = {
++          spec_name: pool_config.connection_specification_name,
++          shard: shard,
++          config: db_config.configuration_hash
++        }
+ 
+-        message_bus.instrument("!connection.active_record", payload) do
+-          pool_config.pool
++        ActiveSupport::Notifications.instrumenter.instrument("!connection.active_record", payload) do
++          pool
+         end
+       end
+ 
+diff --git a/activerecord/lib/active_record/railties/databases.rake b/activerecord/lib/active_record/railties/databases.rake
+index 8dea59773c..a6d70b5c1c 100644
+--- a/activerecord/lib/active_record/railties/databases.rake
++++ b/activerecord/lib/active_record/railties/databases.rake
+@@ -488,7 +488,7 @@ db_namespace = namespace :db do
+     namespace :load do
+       ActiveRecord::Tasks::DatabaseTasks.for_each(databases) do |name|
+         desc "Loads a database schema file (either db/schema.rb or db/structure.sql, depending on `ENV['SCHEMA_FORMAT']` or `config.active_record.schema_format`) into the #{name} database"
+-        task name => [:load_config, :check_protected_environments] do
++        task name => [:load_config, :check_protected_environments, "db:test:purge:#{name}"] do
+           original_db_config = ActiveRecord::Base.connection_db_config
+           db_config = ActiveRecord::Base.configurations.configs_for(env_name: ActiveRecord::Tasks::DatabaseTasks.env, name: name)
+           schema_format = ENV.fetch("SCHEMA_FORMAT", ActiveRecord.schema_format).to_sym
+@@ -604,8 +604,11 @@ db_namespace = namespace :db do
+       # desc "Empty the #{name} test database"
+       namespace :purge do
+         task name => %w(load_config check_protected_environments) do
++          original_db_config = ActiveRecord::Base.connection_db_config
+           db_config = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: name)
+           ActiveRecord::Tasks::DatabaseTasks.purge(db_config)
++        ensure
++          ActiveRecord::Base.establish_connection(original_db_config) if original_db_config
+         end
+       end
+ 
+diff --git a/activerecord/lib/active_record/tasks/sqlite_database_tasks.rb b/activerecord/lib/active_record/tasks/sqlite_database_tasks.rb
+index 99dd2db3ee..84d429b16d 100644
+--- a/activerecord/lib/active_record/tasks/sqlite_database_tasks.rb
++++ b/activerecord/lib/active_record/tasks/sqlite_database_tasks.rb
+@@ -33,9 +33,11 @@ def drop
+ 
+       def purge
+         drop
++        connection.disconnect!
+       rescue NoDatabaseError
+       ensure
+         create
++        connection.reconnect!
+       end
+ 
+       def charset
+diff --git a/activerecord/test/cases/connection_adapters/connection_handler_test.rb b/activerecord/test/cases/connection_adapters/connection_handler_test.rb
+index 1c00a6a9ad..804db57955 100644
+--- a/activerecord/test/cases/connection_adapters/connection_handler_test.rb
++++ b/activerecord/test/cases/connection_adapters/connection_handler_test.rb
+@@ -273,6 +273,7 @@ def test_connection_specification_name_should_fallback_to_parent
+         ActiveRecord::Base.connection_specification_name = "readonly"
+         assert_equal "readonly", klassC.connection_specification_name
+       ensure
++        ApplicationRecord.remove_connection
+         Object.send :remove_const, :ApplicationRecord
+         ActiveRecord::Base.connection_specification_name = "ActiveRecord::Base"
+       end
+diff --git a/activerecord/test/cases/connection_adapters/connection_swapping_nested_test.rb b/activerecord/test/cases/connection_adapters/connection_swapping_nested_test.rb
+index cc938176a5..b5f5b7e758 100644
+--- a/activerecord/test/cases/connection_adapters/connection_swapping_nested_test.rb
++++ b/activerecord/test/cases/connection_adapters/connection_swapping_nested_test.rb
+@@ -448,6 +448,7 @@ def test_application_record_prevent_writes_can_be_changed
+             end
+           end
+         ensure
++          ApplicationRecord.remove_connection
+           ActiveRecord.application_record_class = nil
+           Object.send(:remove_const, :ApplicationRecord)
+           ActiveRecord::Base.establish_connection :arunit
+diff --git a/activerecord/test/cases/primary_class_test.rb b/activerecord/test/cases/primary_class_test.rb
+index ac4fab424f..ed153ad5a6 100644
+--- a/activerecord/test/cases/primary_class_test.rb
++++ b/activerecord/test/cases/primary_class_test.rb
+@@ -110,6 +110,7 @@ def test_application_record_shares_a_connection_with_active_record_by_default
+       assert_predicate ApplicationRecord, :application_record_class?
+       assert_equal ActiveRecord::Base.connection, ApplicationRecord.connection
+     ensure
++      ApplicationRecord.remove_connection
+       ActiveRecord.application_record_class = nil
+       Object.send(:remove_const, :ApplicationRecord)
+       ActiveRecord::Base.establish_connection :arunit
+@@ -125,6 +126,7 @@ def test_application_record_shares_a_connection_with_the_primary_abstract_class_
+       assert_predicate PrimaryClassTest::PrimaryAppRecord, :abstract_class?
+       assert_equal ActiveRecord::Base.connection, PrimaryClassTest::PrimaryAppRecord.connection
+     ensure
++      PrimaryClassTest::PrimaryAppRecord.remove_connection
+       ActiveRecord.application_record_class = nil
+       ActiveRecord::Base.establish_connection :arunit
+     end
+diff --git a/activerecord/test/cases/relation/load_async_test.rb b/activerecord/test/cases/relation/load_async_test.rb
+index cdf2c4db64..2265de594b 100644
+--- a/activerecord/test/cases/relation/load_async_test.rb
++++ b/activerecord/test/cases/relation/load_async_test.rb
+@@ -231,12 +231,10 @@ class LoadAsyncNullExecutorTest < ActiveRecord::TestCase
+       def setup
+         @old_config = ActiveRecord.async_query_executor
+         ActiveRecord.async_query_executor = nil
+-        ActiveRecord::Base.establish_connection :arunit
+       end
+ 
+       def teardown
+         ActiveRecord.async_query_executor = @old_config
+-        ActiveRecord::Base.establish_connection :arunit
+       end
+ 
+       def test_scheduled?
+diff --git a/railties/test/application/rake/migrations_test.rb b/railties/test/application/rake/migrations_test.rb
+index 210b81f10d..11fcfcc5b9 100644
+--- a/railties/test/application/rake/migrations_test.rb
++++ b/railties/test/application/rake/migrations_test.rb
+@@ -508,6 +508,35 @@ class TwoMigration < ActiveRecord::Migration::Current
+           assert_match(/up\s+\d{14}\s+\** NO FILE \**/, output)
+         end
+       end
++
++      test "migrations with execute run when connections are established from a loaded model" do
++        Dir.chdir(app_path) do
++          app_file "app/models/application_record.rb", <<-RUBY
++            class ApplicationRecord < ActiveRecord::Base
++              primary_abstract_class
++
++              establish_connection :primary
++            end
++          RUBY
++
++          rails "generate", "model", "user", "username:string", "password:string"
++
++          rails("db:migrate")
++
++          app_file "db/migrate/01_a_migration.bukkits.rb", <<-MIGRATION
++            class AMigration < ActiveRecord::Migration::Current
++              def change
++                User.first
++                execute("SELECT 1")
++              end
++            end
++          MIGRATION
++
++          output = rails("db:migrate")
++
++          assert_match(/execute\("SELECT 1"\)/, output)
++        end
++      end
+     end
+   end
+ end

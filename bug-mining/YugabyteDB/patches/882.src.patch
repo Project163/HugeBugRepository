@@ -1,0 +1,166 @@
+diff --git a/src/postgres/src/test/isolation/expected/yb-wait-queues-serializable-reads.out b/src/postgres/src/test/isolation/expected/yb-wait-queues-serializable-reads.out
+new file mode 100644
+index 0000000000..b530d78699
+--- /dev/null
++++ b/src/postgres/src/test/isolation/expected/yb-wait-queues-serializable-reads.out
+@@ -0,0 +1,11 @@
++Parsed test spec with 2 sessions
++
++starting permutation: s1_update s2_select s1_commit s2_commit
++step s1_update: UPDATE test SET v=2 WHERE k=1;
++step s2_select: SELECT * FROM test WHERE k=1; <waiting ...>
++step s1_commit: COMMIT;
++step s2_select: <... completed>
++k              v
++
++1              2
++step s2_commit: COMMIT;
+diff --git a/src/postgres/src/test/isolation/specs/yb-wait-queues-serializable-reads.spec b/src/postgres/src/test/isolation/specs/yb-wait-queues-serializable-reads.spec
+new file mode 100644
+index 0000000000..be477c3274
+--- /dev/null
++++ b/src/postgres/src/test/isolation/specs/yb-wait-queues-serializable-reads.spec
+@@ -0,0 +1,23 @@
++setup
++{
++  DROP TABLE IF EXISTS test;
++  CREATE TABLE test (k	int	PRIMARY KEY, v	int);
++  INSERT INTO test VALUES (1, 1);
++}
++
++teardown
++{
++  DROP TABLE test;
++}
++
++session "s1"
++setup		{ BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE; }
++step "s1_update" { UPDATE test SET v=2 WHERE k=1; }
++step "s1_commit" { COMMIT; }
++
++session "s2"
++setup		{ BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE; }
++step "s2_select" { SELECT * FROM test WHERE k=1; }
++step "s2_commit" { COMMIT; }
++
++permutation "s1_update" "s2_select" "s1_commit" "s2_commit"
+\ No newline at end of file
+diff --git a/src/postgres/src/test/isolation/yb_wait_queues_schedule b/src/postgres/src/test/isolation/yb_wait_queues_schedule
+index e2084cc544..cacd0db468 100644
+--- a/src/postgres/src/test/isolation/yb_wait_queues_schedule
++++ b/src/postgres/src/test/isolation/yb_wait_queues_schedule
+@@ -1,4 +1,5 @@
+ test: yb-wait-queues-single-shard-waiter-unlocks
+ test: yb-wait-queues-single-shard-waiters-same-tablet
+ test: lock-update-traversal
+-test: yb-wait-queues-weak-read-unlocks
+\ No newline at end of file
++test: yb-wait-queues-weak-read-unlocks
++test: yb-wait-queues-serializable-reads
+diff --git a/src/yb/docdb/conflict_resolution.cc b/src/yb/docdb/conflict_resolution.cc
+index 59e9f93b0c..09abe1d161 100644
+--- a/src/yb/docdb/conflict_resolution.cc
++++ b/src/yb/docdb/conflict_resolution.cc
+@@ -1217,6 +1217,7 @@ Status ResolveTransactionConflicts(const DocOperations& doc_ops,
+   DCHECK(hybrid_time.is_valid());
+   TRACE_FUNC();
+ 
++  VLOG_WITH_FUNC(3) << "conflict_management_policy=" << conflict_management_policy;
+   auto context = std::make_unique<TransactionConflictResolverContext>(
+       doc_ops, write_batch, hybrid_time, read_time, conflicts_metric,
+       conflict_management_policy);
+@@ -1253,6 +1254,8 @@ Status ResolveOperationConflicts(const DocOperations& doc_ops,
+                                  WaitQueue* wait_queue,
+                                  ResolutionCallback callback) {
+   TRACE("ResolveOperationConflicts");
++  VLOG_WITH_FUNC(3) << "conflict_management_policy=" << conflict_management_policy;
++
+   auto context = std::make_unique<OperationConflictResolverContext>(
+       &doc_ops, resolution_ht, conflicts_metric, conflict_management_policy);
+   auto request_scope = VERIFY_RESULT(RequestScope::Create(status_manager));
+diff --git a/src/yb/docdb/docdb.proto b/src/yb/docdb/docdb.proto
+index 3fde6eafa6..01bd324809 100644
+--- a/src/yb/docdb/docdb.proto
++++ b/src/yb/docdb/docdb.proto
+@@ -51,6 +51,12 @@ message KeyValueWriteBatchPB {
+   // currently we don't batch read RPCs from YSQL (which are the only ones that can set these 2
+   // fields). And hence, only a singular value is sufficient.
+   optional RowMarkType row_mark_type = 6;
++  // wait_policy is used only for explicit row-locking to identify 3 possibilities: WAIT_BLOCK,
++  // WAIT_SKIP, or WAIT_ERROR. See WaitPolicy for detailed information.
++  //
++  // If this request has read_pairs but row_mark_type is not set, then wait_policy should not be
++  // set. Such a situation can occur when read intents are to be written as part of SERIALIZABLE
++  // isolation level.
+   optional WaitPolicy wait_policy = 10;
+   repeated ApplyExternalTransactionPB apply_external_transactions = 7;
+ 
+diff --git a/src/yb/docdb/pgsql_operation.cc b/src/yb/docdb/pgsql_operation.cc
+index 70981b44a0..42f3ade2e2 100644
+--- a/src/yb/docdb/pgsql_operation.cc
++++ b/src/yb/docdb/pgsql_operation.cc
+@@ -18,11 +18,14 @@
+ #include <unordered_set>
+ #include <vector>
+ 
++#include <boost/none.hpp>
+ #include <boost/optional/optional_io.hpp>
+ 
++#include "yb/common/common.pb.h"
+ #include "yb/common/partition.h"
+ #include "yb/common/pgsql_error.h"
+ #include "yb/common/pg_system_attr.h"
++#include "yb/common/row_mark.h"
+ #include "yb/common/ql_value.h"
+ 
+ #include "yb/docdb/doc_path.h"
+@@ -143,17 +146,20 @@ Status CreateProjection(
+ }
+ 
+ void AddIntent(
+-    const std::string& encoded_key, WaitPolicy wait_policy, LWKeyValueWriteBatchPB *out) {
++    const std::string& encoded_key, boost::optional<WaitPolicy> wait_policy,
++    LWKeyValueWriteBatchPB *out) {
+   auto* pair = out->add_read_pairs();
+   pair->dup_key(encoded_key);
+   pair->dup_value(Slice(&ValueEntryTypeAsChar::kNullLow, 1));
+-  // Since we don't batch read RPCs that lock rows, we can get away with using a singular
+-  // wait_policy field. Once we start batching read requests (issue #2495), we will need a repeated
+-  // wait policies field.
+-  out->set_wait_policy(wait_policy);
++  if (wait_policy) {
++    // Since we don't batch read RPCs that lock rows, we can get away with using a singular
++    // wait_policy field. Once we start batching read requests (issue #2495), we will need a
++    // repeated wait policies field.
++    out->set_wait_policy(wait_policy.value());
++  }
+ }
+ 
+-Status AddIntent(const PgsqlExpressionPB& ybctid, WaitPolicy wait_policy,
++Status AddIntent(const PgsqlExpressionPB& ybctid, boost::optional<WaitPolicy> wait_policy,
+                  LWKeyValueWriteBatchPB* out) {
+   const auto &val = ybctid.value().binary_value();
+   SCHECK(!val.empty(), InternalError, "empty ybctid");
+@@ -1592,14 +1598,20 @@ Status PgsqlReadOperation::PopulateAggregate(WriteBuffer *result_buffer) {
+ }
+ 
+ Status PgsqlReadOperation::GetIntents(const Schema& schema, LWKeyValueWriteBatchPB* out) {
++  boost::optional<WaitPolicy> wait_policy = boost::none;
++  if (request_.has_row_mark_type() && IsValidRowMarkType(request_.row_mark_type())) {
++    DCHECK(request_.has_wait_policy());
++    wait_policy = request_.wait_policy();
++  }
++
+   if (request_.batch_arguments_size() > 0) {
+     for (const auto& batch_argument : request_.batch_arguments()) {
+       SCHECK(batch_argument.has_ybctid(), InternalError, "ybctid batch argument is expected");
+-      RETURN_NOT_OK(AddIntent(batch_argument.ybctid(), request_.wait_policy(), out));
++      RETURN_NOT_OK(AddIntent(batch_argument.ybctid(), wait_policy, out));
+     }
+   } else {
+     auto doc_key = VERIFY_RESULT(FetchDocKey(schema, request_));
+-    AddIntent(doc_key.Encode().ToStringBuffer(), request_.wait_policy(), out);
++    AddIntent(doc_key.Encode().ToStringBuffer(), wait_policy, out);
+   }
+   return Status::OK();
+ }

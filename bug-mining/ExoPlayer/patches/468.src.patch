@@ -1,0 +1,527 @@
+diff --git a/RELEASENOTES.md b/RELEASENOTES.md
+index 70da743164..08837b4a60 100644
+--- a/RELEASENOTES.md
++++ b/RELEASENOTES.md
+@@ -4,6 +4,8 @@
+ 
+ * HLS:
+   * Form an adaptive track group out of audio renditions with matching name.
++  * Support encrypted initialization segments
++    ([#5441](https://github.com/google/ExoPlayer/issues/5441)).
+ * DASH:
+   * Fix issue handling large `EventStream` presentation timestamps
+     ([#5490](https://github.com/google/ExoPlayer/issues/5490)).
+diff --git a/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsChunkSource.java b/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsChunkSource.java
+index b188aa74f3..13af2dbc79 100644
+--- a/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsChunkSource.java
++++ b/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsChunkSource.java
+@@ -40,9 +40,11 @@ import com.google.android.exoplayer2.util.TimestampAdjuster;
+ import com.google.android.exoplayer2.util.UriUtil;
+ import com.google.android.exoplayer2.util.Util;
+ import java.io.IOException;
+-import java.math.BigInteger;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Source of Hls (possibly adaptive) chunks.
+@@ -84,6 +86,12 @@ import java.util.List;
+ 
+   }
+ 
++  /**
++   * The maximum number of keys that the key cache can hold. This value must be 2 or greater in
++   * order to hold initialization segment and media segment keys simultaneously.
++   */
++  private static final int KEY_CACHE_SIZE = 4;
++
+   private final HlsExtractorFactory extractorFactory;
+   private final DataSource mediaDataSource;
+   private final DataSource encryptionDataSource;
+@@ -92,6 +100,7 @@ import java.util.List;
+   private final HlsPlaylistTracker playlistTracker;
+   private final TrackGroup trackGroup;
+   private final List<Format> muxedCaptionFormats;
++  private final FullSegmentEncryptionKeyCache keyCache;
+ 
+   private boolean isTimestampMaster;
+   private byte[] scratchSpace;
+@@ -99,11 +108,6 @@ import java.util.List;
+   private HlsUrl expectedPlaylistUrl;
+   private boolean independentSegments;
+ 
+-  private Uri encryptionKeyUri;
+-  private byte[] encryptionKey;
+-  private String encryptionIvString;
+-  private byte[] encryptionIv;
+-
+   // Note: The track group in the selection is typically *not* equal to trackGroup. This is due to
+   // the way in which HlsSampleStreamWrapper generates track groups. Use only index based methods
+   // in TrackSelection to avoid unexpected behavior.
+@@ -139,6 +143,7 @@ import java.util.List;
+     this.variants = variants;
+     this.timestampAdjusterProvider = timestampAdjusterProvider;
+     this.muxedCaptionFormats = muxedCaptionFormats;
++    keyCache = new FullSegmentEncryptionKeyCache();
+     liveEdgeInPeriodTimeUs = C.TIME_UNSET;
+     Format[] variantFormats = new Format[variants.length];
+     int[] initialTrackSelection = new int[variants.length];
+@@ -308,20 +313,16 @@ import java.util.List;
+     // Handle encryption.
+     HlsMediaPlaylist.Segment segment = mediaPlaylist.segments.get(segmentIndexInPlaylist);
+ 
+-    // Check if the segment is completely encrypted using the identity key format.
+-    if (segment.fullSegmentEncryptionKeyUri != null) {
+-      Uri keyUri = UriUtil.resolveToUri(mediaPlaylist.baseUri, segment.fullSegmentEncryptionKeyUri);
+-      if (!keyUri.equals(encryptionKeyUri)) {
+-        // Encryption is specified and the key has changed.
+-        out.chunk = newEncryptionKeyChunk(keyUri, segment.encryptionIV, selectedVariantIndex,
+-            trackSelection.getSelectionReason(), trackSelection.getSelectionData());
+-        return;
+-      }
+-      if (!Util.areEqual(segment.encryptionIV, encryptionIvString)) {
+-        setEncryptionData(keyUri, segment.encryptionIV, encryptionKey);
+-      }
+-    } else {
+-      clearEncryptionData();
++    // Check if the segment or its initialization segment are fully encrypted.
++    out.chunk =
++        maybeCreateEncryptionChunkFor(
++            segment.initializationSegment, mediaPlaylist, selectedVariantIndex);
++    if (out.chunk != null) {
++      return;
++    }
++    out.chunk = maybeCreateEncryptionChunkFor(segment, mediaPlaylist, selectedVariantIndex);
++    if (out.chunk != null) {
++      return;
+     }
+ 
+     out.chunk =
+@@ -338,8 +339,7 @@ import java.util.List;
+             isTimestampMaster,
+             timestampAdjusterProvider,
+             previous,
+-            encryptionKey,
+-            encryptionIv);
++            keyCache.asUnmodifiable());
+   }
+ 
+   /**
+@@ -352,8 +352,7 @@ import java.util.List;
+     if (chunk instanceof EncryptionKeyChunk) {
+       EncryptionKeyChunk encryptionKeyChunk = (EncryptionKeyChunk) chunk;
+       scratchSpace = encryptionKeyChunk.getDataHolder();
+-      setEncryptionData(encryptionKeyChunk.dataSpec.uri, encryptionKeyChunk.iv,
+-          encryptionKeyChunk.getResult());
++      keyCache.put(encryptionKeyChunk.dataSpec.uri, encryptionKeyChunk.getResult());
+     }
+   }
+ 
+@@ -486,38 +485,27 @@ import java.util.List;
+             : (mediaPlaylist.getEndTimeUs() - playlistTracker.getInitialStartTimeUs());
+   }
+ 
+-  private EncryptionKeyChunk newEncryptionKeyChunk(Uri keyUri, String iv, int variantIndex,
+-      int trackSelectionReason, Object trackSelectionData) {
+-    DataSpec dataSpec = new DataSpec(keyUri, 0, C.LENGTH_UNSET, null, DataSpec.FLAG_ALLOW_GZIP);
+-    return new EncryptionKeyChunk(encryptionDataSource, dataSpec, variants[variantIndex].format,
+-        trackSelectionReason, trackSelectionData, scratchSpace, iv);
+-  }
+-
+-  private void setEncryptionData(Uri keyUri, String iv, byte[] secretKey) {
+-    String trimmedIv;
+-    if (Util.toLowerInvariant(iv).startsWith("0x")) {
+-      trimmedIv = iv.substring(2);
+-    } else {
+-      trimmedIv = iv;
++  private Chunk maybeCreateEncryptionChunkFor(
++      @Nullable Segment segment, HlsMediaPlaylist mediaPlaylist, int selectedVariantIndex) {
++    if (segment == null || segment.fullSegmentEncryptionKeyUri == null) {
++      return null;
+     }
+-
+-    byte[] ivData = new BigInteger(trimmedIv, 16).toByteArray();
+-    byte[] ivDataWithPadding = new byte[16];
+-    int offset = ivData.length > 16 ? ivData.length - 16 : 0;
+-    System.arraycopy(ivData, offset, ivDataWithPadding, ivDataWithPadding.length - ivData.length
+-        + offset, ivData.length - offset);
+-
+-    encryptionKeyUri = keyUri;
+-    encryptionKey = secretKey;
+-    encryptionIvString = iv;
+-    encryptionIv = ivDataWithPadding;
+-  }
+-
+-  private void clearEncryptionData() {
+-    encryptionKeyUri = null;
+-    encryptionKey = null;
+-    encryptionIvString = null;
+-    encryptionIv = null;
++    Uri keyUri = UriUtil.resolveToUri(mediaPlaylist.baseUri, segment.fullSegmentEncryptionKeyUri);
++    if (keyCache.containsKey(keyUri)) {
++      // The key is present in the key cache. We re-insert it to prevent it from being evicted by
++      // the following key addition. Note that removal of the key is necessary to affect the
++      // eviction order.
++      keyCache.put(keyUri, keyCache.remove(keyUri));
++      return null;
++    }
++    DataSpec dataSpec = new DataSpec(keyUri, 0, C.LENGTH_UNSET, null, DataSpec.FLAG_ALLOW_GZIP);
++    return new EncryptionKeyChunk(
++        encryptionDataSource,
++        dataSpec,
++        variants[selectedVariantIndex].format,
++        trackSelection.getSelectionReason(),
++        trackSelection.getSelectionData(),
++        scratchSpace);
+   }
+ 
+   // Private classes.
+@@ -575,19 +563,21 @@ import java.util.List;
+ 
+   private static final class EncryptionKeyChunk extends DataChunk {
+ 
+-    public final String iv;
+-
+     private byte[] result;
+ 
+-    public EncryptionKeyChunk(DataSource dataSource, DataSpec dataSpec, Format trackFormat,
+-        int trackSelectionReason, Object trackSelectionData, byte[] scratchSpace, String iv) {
++    public EncryptionKeyChunk(
++        DataSource dataSource,
++        DataSpec dataSpec,
++        Format trackFormat,
++        int trackSelectionReason,
++        Object trackSelectionData,
++        byte[] scratchSpace) {
+       super(dataSource, dataSpec, C.DATA_TYPE_DRM, trackFormat, trackSelectionReason,
+           trackSelectionData, scratchSpace);
+-      this.iv = iv;
+     }
+ 
+     @Override
+-    protected void consume(byte[] data, int limit) throws IOException {
++    protected void consume(byte[] data, int limit) {
+       result = Arrays.copyOf(data, limit);
+     }
+ 
+@@ -642,4 +632,29 @@ import java.util.List;
+       return segmentStartTimeInPeriodUs + segment.durationUs;
+     }
+   }
++
++  /**
++   * LRU cache that holds up to {@link #KEY_CACHE_SIZE} full-segment-encryption keys. Which each
++   * addition, once the cache's size exceeds {@link #KEY_CACHE_SIZE}, the oldest item (according to
++   * insertion order) is removed.
++   */
++  private static final class FullSegmentEncryptionKeyCache extends LinkedHashMap<Uri, byte[]> {
++
++    private final Map<Uri, byte[]> unmodifiableView;
++
++    public FullSegmentEncryptionKeyCache() {
++      super(
++          /* initialCapacity= */ KEY_CACHE_SIZE * 2, /* loadFactor= */ 1, /* accessOrder= */ false);
++      unmodifiableView = Collections.unmodifiableMap(this);
++    }
++
++    @Override
++    protected boolean removeEldestEntry(Map.Entry<Uri, byte[]> entry) {
++      return size() > KEY_CACHE_SIZE;
++    }
++
++    public Map<Uri, byte[]> asUnmodifiable() {
++      return unmodifiableView;
++    }
++  }
+ }
+diff --git a/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsMediaChunk.java b/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsMediaChunk.java
+index 57f604bb2f..d307bbb04d 100644
+--- a/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsMediaChunk.java
++++ b/library/hls/src/main/java/com/google/android/exoplayer2/source/hls/HlsMediaChunk.java
+@@ -16,6 +16,7 @@
+ package com.google.android.exoplayer2.source.hls;
+ 
+ import android.net.Uri;
++import android.support.annotation.Nullable;
+ import android.util.Pair;
+ import com.google.android.exoplayer2.C;
+ import com.google.android.exoplayer2.Format;
+@@ -37,7 +38,9 @@ import com.google.android.exoplayer2.util.UriUtil;
+ import com.google.android.exoplayer2.util.Util;
+ import java.io.EOFException;
+ import java.io.IOException;
++import java.math.BigInteger;
+ import java.util.List;
++import java.util.Map;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+@@ -62,10 +65,7 @@ import java.util.concurrent.atomic.AtomicInteger;
+    * @param timestampAdjusterProvider The provider from which to obtain the {@link
+    *     TimestampAdjuster}.
+    * @param previousChunk The {@link HlsMediaChunk} that preceded this one. May be null.
+-   * @param fullSegmentEncryptionKey The key to decrypt the full segment, or null if the segment is
+-   *     not fully encrypted.
+-   * @param encryptionIv The AES initialization vector, or null if the segment is not fully
+-   *     encrypted.
++   * @param keyCache A map from encryption key URI to the corresponding encryption key.
+    */
+   public static HlsMediaChunk createInstance(
+       HlsExtractorFactory extractorFactory,
+@@ -74,26 +74,41 @@ import java.util.concurrent.atomic.AtomicInteger;
+       HlsMediaPlaylist mediaPlaylist,
+       int segmentIndexInPlaylist,
+       HlsUrl hlsUrl,
+-      List<Format> muxedCaptionFormats,
++      @Nullable List<Format> muxedCaptionFormats,
+       int trackSelectionReason,
+-      Object trackSelectionData,
++      @Nullable Object trackSelectionData,
+       boolean isMasterTimestampSource,
+       TimestampAdjusterProvider timestampAdjusterProvider,
+-      HlsMediaChunk previousChunk,
+-      byte[] fullSegmentEncryptionKey,
+-      byte[] encryptionIv) {
+-
+-    HlsMediaPlaylist.Segment segment = mediaPlaylist.segments.get(segmentIndexInPlaylist);
++      @Nullable HlsMediaChunk previousChunk,
++      Map<Uri, byte[]> keyCache) {
++    // Media segment.
++    HlsMediaPlaylist.Segment mediaSegment = mediaPlaylist.segments.get(segmentIndexInPlaylist);
+     DataSpec dataSpec =
+         new DataSpec(
+-            UriUtil.resolveToUri(mediaPlaylist.baseUri, segment.url),
+-            segment.byterangeOffset,
+-            segment.byterangeLength,
++            UriUtil.resolveToUri(mediaPlaylist.baseUri, mediaSegment.url),
++            mediaSegment.byterangeOffset,
++            mediaSegment.byterangeLength,
+             /* key= */ null);
+-
++    byte[] mediaSegmentKey =
++        keyCache.get(
++            UriUtil.resolveToUri(mediaPlaylist.baseUri, mediaSegment.fullSegmentEncryptionKeyUri));
++    boolean mediaSegmentEncrypted = mediaSegmentKey != null;
++    byte[] mediaSegmentIv =
++        mediaSegmentEncrypted ? getEncryptionIvArray(mediaSegment.encryptionIV) : null;
++    DataSource mediaDataSource = buildDataSource(dataSource, mediaSegmentKey, mediaSegmentIv);
++
++    // Init segment.
++    HlsMediaPlaylist.Segment initSegment = mediaSegment.initializationSegment;
+     DataSpec initDataSpec = null;
+-    HlsMediaPlaylist.Segment initSegment = segment.initializationSegment;
++    boolean initSegmentEncrypted = false;
++    DataSource initDataSource = null;
+     if (initSegment != null) {
++      byte[] initSegmentKey =
++          keyCache.get(
++              UriUtil.resolveToUri(mediaPlaylist.baseUri, initSegment.fullSegmentEncryptionKeyUri));
++      initSegmentEncrypted = initSegmentKey != null;
++      byte[] initSegmentIv =
++          initSegmentEncrypted ? getEncryptionIvArray(initSegment.encryptionIV) : null;
+       Uri initSegmentUri = UriUtil.resolveToUri(mediaPlaylist.baseUri, initSegment.url);
+       initDataSpec =
+           new DataSpec(
+@@ -101,12 +116,13 @@ import java.util.concurrent.atomic.AtomicInteger;
+               initSegment.byterangeOffset,
+               initSegment.byterangeLength,
+               /* key= */ null);
++      initDataSource = buildDataSource(dataSource, initSegmentKey, initSegmentIv);
+     }
+ 
+-    long segmentStartTimeInPeriodUs = startOfPlaylistInPeriodUs + segment.relativeStartTimeUs;
+-    long segmentEndTimeInPeriodUs = segmentStartTimeInPeriodUs + segment.durationUs;
++    long segmentStartTimeInPeriodUs = startOfPlaylistInPeriodUs + mediaSegment.relativeStartTimeUs;
++    long segmentEndTimeInPeriodUs = segmentStartTimeInPeriodUs + mediaSegment.durationUs;
+     int discontinuitySequenceNumber =
+-        mediaPlaylist.discontinuitySequence + segment.relativeDiscontinuitySequence;
++        mediaPlaylist.discontinuitySequence + mediaSegment.relativeDiscontinuitySequence;
+ 
+     Extractor previousExtractor = null;
+     Id3Decoder id3Decoder;
+@@ -128,9 +144,12 @@ import java.util.concurrent.atomic.AtomicInteger;
+ 
+     return new HlsMediaChunk(
+         extractorFactory,
+-        dataSource,
++        mediaDataSource,
+         dataSpec,
++        mediaSegmentEncrypted,
++        initDataSource,
+         initDataSpec,
++        initSegmentEncrypted,
+         hlsUrl,
+         muxedCaptionFormats,
+         trackSelectionReason,
+@@ -139,16 +158,14 @@ import java.util.concurrent.atomic.AtomicInteger;
+         segmentEndTimeInPeriodUs,
+         /* chunkMediaSequence= */ mediaPlaylist.mediaSequence + segmentIndexInPlaylist,
+         discontinuitySequenceNumber,
+-        segment.hasGapTag,
++        mediaSegment.hasGapTag,
+         isMasterTimestampSource,
+         /* timestampAdjuster= */ timestampAdjusterProvider.getAdjuster(discontinuitySequenceNumber),
+-        segment.drmInitData,
++        mediaSegment.drmInitData,
+         previousExtractor,
+         id3Decoder,
+         scratchId3Data,
+-        shouldSpliceIn,
+-        fullSegmentEncryptionKey,
+-        encryptionIv);
++        shouldSpliceIn);
+   }
+ 
+   public static final String PRIV_TIMESTAMP_FRAME_OWNER =
+@@ -171,19 +188,20 @@ import java.util.concurrent.atomic.AtomicInteger;
+    */
+   public final HlsUrl hlsUrl;
+ 
+-  private final DataSource initDataSource;
+-  private final DataSpec initDataSpec;
+-  private final boolean isEncrypted;
++  @Nullable private final DataSource initDataSource;
++  @Nullable private final DataSpec initDataSpec;
+   private final boolean isMasterTimestampSource;
+   private final boolean hasGapTag;
+   private final TimestampAdjuster timestampAdjuster;
+   private final boolean shouldSpliceIn;
+   private final HlsExtractorFactory extractorFactory;
+-  private final List<Format> muxedCaptionFormats;
+-  private final DrmInitData drmInitData;
+-  private final Extractor previousExtractor;
++  @Nullable private final List<Format> muxedCaptionFormats;
++  @Nullable private final DrmInitData drmInitData;
++  @Nullable private final Extractor previousExtractor;
+   private final Id3Decoder id3Decoder;
+   private final ParsableByteArray scratchId3Data;
++  private final boolean mediaSegmentEncrypted;
++  private final boolean initSegmentEncrypted;
+ 
+   private Extractor extractor;
+   private HlsSampleStreamWrapper output;
+@@ -195,11 +213,14 @@ import java.util.concurrent.atomic.AtomicInteger;
+ 
+   private HlsMediaChunk(
+       HlsExtractorFactory extractorFactory,
+-      DataSource dataSource,
++      DataSource mediaDataSource,
+       DataSpec dataSpec,
+-      DataSpec initDataSpec,
++      boolean mediaSegmentEncrypted,
++      DataSource initDataSource,
++      @Nullable DataSpec initDataSpec,
++      boolean initSegmentEncrypted,
+       HlsUrl hlsUrl,
+-      List<Format> muxedCaptionFormats,
++      @Nullable List<Format> muxedCaptionFormats,
+       int trackSelectionReason,
+       Object trackSelectionData,
+       long startTimeUs,
+@@ -209,15 +230,13 @@ import java.util.concurrent.atomic.AtomicInteger;
+       boolean hasGapTag,
+       boolean isMasterTimestampSource,
+       TimestampAdjuster timestampAdjuster,
+-      DrmInitData drmInitData,
+-      Extractor previousExtractor,
++      @Nullable DrmInitData drmInitData,
++      @Nullable Extractor previousExtractor,
+       Id3Decoder id3Decoder,
+       ParsableByteArray scratchId3Data,
+-      boolean shouldSpliceIn,
+-      byte[] fullSegmentEncryptionKey,
+-      byte[] encryptionIv) {
++      boolean shouldSpliceIn) {
+     super(
+-        buildDataSource(dataSource, fullSegmentEncryptionKey, encryptionIv),
++        mediaDataSource,
+         dataSpec,
+         hlsUrl.format,
+         trackSelectionReason,
+@@ -225,12 +244,14 @@ import java.util.concurrent.atomic.AtomicInteger;
+         startTimeUs,
+         endTimeUs,
+         chunkMediaSequence);
++    this.mediaSegmentEncrypted = mediaSegmentEncrypted;
+     this.discontinuitySequenceNumber = discontinuitySequenceNumber;
++    this.initDataSource = initDataSource;
+     this.initDataSpec = initDataSpec;
++    this.initSegmentEncrypted = initSegmentEncrypted;
+     this.hlsUrl = hlsUrl;
+     this.isMasterTimestampSource = isMasterTimestampSource;
+     this.timestampAdjuster = timestampAdjuster;
+-    this.isEncrypted = fullSegmentEncryptionKey != null;
+     this.hasGapTag = hasGapTag;
+     this.extractorFactory = extractorFactory;
+     this.muxedCaptionFormats = muxedCaptionFormats;
+@@ -239,7 +260,6 @@ import java.util.concurrent.atomic.AtomicInteger;
+     this.id3Decoder = id3Decoder;
+     this.scratchId3Data = scratchId3Data;
+     this.shouldSpliceIn = shouldSpliceIn;
+-    initDataSource = dataSource;
+     uid = uidSource.getAndIncrement();
+   }
+ 
+@@ -283,9 +303,20 @@ import java.util.concurrent.atomic.AtomicInteger;
+       // Note: The HLS spec forbids initialization segments for packed audio.
+       return;
+     }
+-    DataSpec initSegmentDataSpec = initDataSpec.subrange(initSegmentBytesLoaded);
++    DataSpec initSegmentDataSpec;
++    boolean skipLoadedBytes;
++    if (initSegmentEncrypted) {
++      initSegmentDataSpec = initDataSpec;
++      skipLoadedBytes = initSegmentBytesLoaded != 0;
++    } else {
++      initSegmentDataSpec = initDataSpec.subrange(initSegmentBytesLoaded);
++      skipLoadedBytes = false;
++    }
+     try {
+       DefaultExtractorInput input = prepareExtraction(initDataSource, initSegmentDataSpec);
++      if (skipLoadedBytes) {
++        input.skipFully(initSegmentBytesLoaded);
++      }
+       try {
+         int result = Extractor.RESULT_CONTINUE;
+         while (result == Extractor.RESULT_CONTINUE && !loadCanceled) {
+@@ -307,7 +338,7 @@ import java.util.concurrent.atomic.AtomicInteger;
+     // remainder of the chunk directly.
+     DataSpec loadDataSpec;
+     boolean skipLoadedBytes;
+-    if (isEncrypted) {
++    if (mediaSegmentEncrypted) {
+       loadDataSpec = dataSpec;
+       skipLoadedBytes = nextLoadPosition != 0;
+     } else {
+@@ -433,7 +464,27 @@ import java.util.concurrent.atomic.AtomicInteger;
+     return C.TIME_UNSET;
+   }
+ 
+-  // Internal factory methods.
++  // Internal methods.
++
++  private static byte[] getEncryptionIvArray(String ivString) {
++    String trimmedIv;
++    if (Util.toLowerInvariant(ivString).startsWith("0x")) {
++      trimmedIv = ivString.substring(2);
++    } else {
++      trimmedIv = ivString;
++    }
++
++    byte[] ivData = new BigInteger(trimmedIv, /* radix= */ 16).toByteArray();
++    byte[] ivDataWithPadding = new byte[16];
++    int offset = ivData.length > 16 ? ivData.length - 16 : 0;
++    System.arraycopy(
++        ivData,
++        offset,
++        ivDataWithPadding,
++        ivDataWithPadding.length - ivData.length + offset,
++        ivData.length - offset);
++    return ivDataWithPadding;
++  }
+ 
+   /**
+    * If the segment is fully encrypted, returns an {@link Aes128DataSource} that wraps the original

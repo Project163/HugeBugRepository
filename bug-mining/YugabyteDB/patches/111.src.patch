@@ -1,0 +1,185 @@
+diff --git a/src/yb/client/ql-transaction-test.cc b/src/yb/client/ql-transaction-test.cc
+index dfb508feeb..25bbc8e70e 100644
+--- a/src/yb/client/ql-transaction-test.cc
++++ b/src/yb/client/ql-transaction-test.cc
+@@ -53,6 +53,7 @@ DECLARE_bool(transaction_disable_proactive_cleanup_in_tests);
+ DECLARE_uint64(aborted_intent_cleanup_ms);
+ DECLARE_int32(remote_bootstrap_max_chunk_size);
+ DECLARE_int32(master_inject_latency_on_transactional_tablet_lookups_ms);
++DECLARE_int64(transaction_rpc_timeout_ms);
+ 
+ namespace yb {
+ namespace client {
+@@ -1212,14 +1213,27 @@ TEST_F(QLTransactionTest, ChangeLeader) {
+   constexpr auto kTestTime = 5s;
+ 
+   DisableTransactionTimeout();
++  FLAGS_transaction_rpc_timeout_ms = MonoDelta(1min).ToMicroseconds();
+ 
+   std::vector<std::thread> threads;
+   std::atomic<bool> stopped{false};
++  std::atomic<int> successes{0};
++  std::atomic<int> expirations{0};
+   for (size_t i = 0; i != kThreads; ++i) {
+-    threads.emplace_back([this, i, &stopped] {
++    threads.emplace_back([this, i, &stopped, &successes, &expirations] {
+       size_t idx = i;
+       while (!stopped) {
+-        WriteData(WriteOpType::INSERT, idx);
++        auto txn = CreateTransaction();
++        WriteRows(CreateSession(txn), idx, WriteOpType::INSERT);
++        auto status = txn->CommitFuture().get();
++        if (status.ok()) {
++          ++successes;
++        } else {
++          // We allow expiration on commit, because it means that commit succeed after leader
++          // change. And we just did not receive respose. But rate of such cases should be small.
++          ASSERT_TRUE(status.IsExpired()) << status;
++          ++expirations;
++        }
+         idx += kThreads;
+       }
+     });
+@@ -1250,6 +1264,9 @@ TEST_F(QLTransactionTest, ChangeLeader) {
+   for (auto& thread : threads) {
+     thread.join();
+   }
++
++  // Allow expirations to be 5% of successful commits.
++  ASSERT_LE(expirations.load() * 100, successes * 5);
+ }
+ 
+ class RemoteBootstrapTest : public QLTransactionTest {
+diff --git a/src/yb/client/serializable-txn-test.cc b/src/yb/client/serializable-txn-test.cc
+index 275773044f..2a4effa633 100644
+--- a/src/yb/client/serializable-txn-test.cc
++++ b/src/yb/client/serializable-txn-test.cc
+@@ -21,6 +21,8 @@
+ 
+ using namespace std::literals;
+ 
++DECLARE_int64(transaction_rpc_timeout_ms);
++
+ namespace yb {
+ namespace client {
+ 
+@@ -247,6 +249,8 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
+ // serializable isolation.
+ // With retries the resulting value should be equal to number of increments.
+ void SerializableTxnTest::TestIncrements(bool transactional) {
++  FLAGS_transaction_rpc_timeout_ms = MonoDelta(1min).ToMicroseconds();
++
+   const auto kThreads = RegularBuildVsSanitizers(3, 2);
+ 
+   std::vector<std::thread> threads;
+diff --git a/src/yb/client/txn-test-base.cc b/src/yb/client/txn-test-base.cc
+index 0260f43857..83044b2f47 100644
+--- a/src/yb/client/txn-test-base.cc
++++ b/src/yb/client/txn-test-base.cc
+@@ -139,7 +139,7 @@ void TransactionTestBase::WriteData(const WriteOpType op_type, size_t transactio
+   auto txn = CreateTransaction();
+   WriteRows(CreateSession(txn), transaction, op_type);
+   ASSERT_OK(txn->CommitFuture().get());
+-  LOG(INFO) << "Committed";
++  LOG(INFO) << "Committed: " << txn->id();
+ }
+ 
+ void TransactionTestBase::WriteDataWithRepetition() {
+diff --git a/src/yb/common/transaction.cc b/src/yb/common/transaction.cc
+index d2a177bd7e..83f94266db 100644
+--- a/src/yb/common/transaction.cc
++++ b/src/yb/common/transaction.cc
+@@ -19,6 +19,9 @@
+ 
+ using namespace std::literals;
+ 
++DEFINE_int64(transaction_rpc_timeout_ms, 5000 * yb::kTimeMultiplier,
++             "Timeout used by transaction related RPCs in milliseconds.");
++
+ namespace yb {
+ 
+ const std::string kTransactionsTableName = "transactions";
+@@ -99,7 +102,7 @@ std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata)
+ }
+ 
+ MonoDelta TransactionRpcTimeout() {
+-  return 5s * kTimeMultiplier;
++  return FLAGS_transaction_rpc_timeout_ms * 1ms;
+ }
+ 
+ // TODO(dtxn) correct deadline should be calculated and propagated.
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index ea7b53f19e..69a7ed4e5e 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -274,7 +274,6 @@ RaftConsensus::RaftConsensus(
+       queue_(queue.Pass()),
+       rng_(GetRandomSeed32()),
+       withhold_votes_until_(MonoTime::Min()),
+-      withhold_election_start_until_(MonoTime::Min().ToUint64()),
+       mark_dirty_clbk_(std::move(mark_dirty_clbk)),
+       shutdown_(false),
+       follower_memory_pressure_rejections_(metric_entity->FindOrCreateCounter(
+@@ -687,7 +686,7 @@ Status RaftConsensus::ElectionLostByProtege(const std::string& election_lost_by_
+       LOG_WITH_PREFIX(INFO) << "Our protege " << election_lost_by_uuid
+                             << ", lost election. Has leader: "
+                             << state_->HasLeaderUnlocked();
+-      withhold_election_start_until_.store(MonoTime::Min().ToUint64(), std::memory_order_relaxed);
++      withhold_election_start_until_.store(MonoTime::Min(), std::memory_order_relaxed);
+       election_lost_by_protege_at_ = MonoTime::Now();
+ 
+       start_election = !state_->HasLeaderUnlocked();
+@@ -715,7 +714,7 @@ void RaftConsensus::WithholdElectionAfterStepDown(const std::string& protege_uui
+     timeout *= FLAGS_after_stepdown_delay_election_multiplier;
+   }
+   auto deadline = MonoTime::Now() + timeout;
+-  withhold_election_start_until_.store(deadline.ToUint64(), std::memory_order_release);
++  withhold_election_start_until_.store(deadline, std::memory_order_release);
+   election_lost_by_protege_at_ = MonoTime();
+ }
+ 
+@@ -736,12 +735,11 @@ void RaftConsensus::RunLeaderElectionResponseRpcCallback(
+ 
+ void RaftConsensus::ReportFailureDetectedTask() {
+   MonoTime now;
+-  const auto kMinTime = MonoTime::Min().ToUint64();
+   for (;;) {
+     // Do not start election for an extended period of time if we were recently stepped down.
+     auto old_value = withhold_election_start_until_.load(std::memory_order_acquire);
+ 
+-    if (old_value == kMinTime) {
++    if (old_value == MonoTime::Min()) {
+       break;
+     }
+ 
+@@ -749,7 +747,7 @@ void RaftConsensus::ReportFailureDetectedTask() {
+       now = MonoTime::Now();
+     }
+ 
+-    if (now < MonoTime::FromUint64(old_value)) {
++    if (now < old_value) {
+       LOG(INFO) << "Skipping election due to delayed timeout.";
+       return;
+     }
+@@ -757,7 +755,7 @@ void RaftConsensus::ReportFailureDetectedTask() {
+     // If we ever stepped down and then delayed election start did get scheduled, reset that we
+     // are out of that extra delay mode.
+     if (withhold_election_start_until_.compare_exchange_weak(
+-        old_value, kMinTime, std::memory_order_release)) {
++        old_value, MonoTime::Min(), std::memory_order_release)) {
+       break;
+     }
+   }
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index 5b15a64a8a..6dd36d3a39 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -600,7 +600,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   // This is the time (in the MonoTime's uint64 representation) for which election should not start
+   // on this peer.
+-  std::atomic<uint64_t> withhold_election_start_until_;
++  std::atomic<MonoTime> withhold_election_start_until_{MonoTime::Min()};
+ 
+   // We record the moment at which we discover that an election has been lost by our "protege"
+   // during leader stepdown. Then, when the master asks us to step down again in favor of the same

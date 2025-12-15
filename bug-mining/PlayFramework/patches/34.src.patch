@@ -1,0 +1,353 @@
+diff --git a/framework/src/play/src/main/java/play/mvc/BodyParser.java b/framework/src/play/src/main/java/play/mvc/BodyParser.java
+index 9869d623a2..fe0a5a8758 100644
+--- a/framework/src/play/src/main/java/play/mvc/BodyParser.java
++++ b/framework/src/play/src/main/java/play/mvc/BodyParser.java
+@@ -12,6 +12,9 @@ import play.api.http.HttpConfiguration;
+ import play.api.http.Status$;
+ import play.api.libs.Files;
+ import play.api.mvc.BodyParsers$;
++import play.api.mvc.MaxSizeNotExceeded;
++import play.api.mvc.MaxSizeNotExceeded$;
++import play.api.mvc.MaxSizeStatus;
+ import play.core.j.JavaParsers;
+ import play.core.parsers.FormUrlEncodedParser;
+ import play.http.HttpErrorHandler;
+@@ -19,6 +22,7 @@ import play.libs.F;
+ import play.libs.XML;
+ import play.libs.streams.Accumulator;
+ import scala.compat.java8.FutureConverters;
++import scala.concurrent.Future;
+ 
+ import javax.inject.Inject;
+ import java.io.File;
+@@ -27,6 +31,7 @@ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CompletionStage;
+ import java.util.function.Function;
+ 
+ /**
+@@ -347,19 +352,19 @@ public interface BodyParser<A> {
+ 
+         @Override
+         public Accumulator<ByteString, F.Either<Result, A>> apply(Http.RequestHeader request) {
+-            return apply1(request).through(
+-                    Flow.<ByteString>create()
+-                            .transform(() -> new BodyParsers$.TakeUpTo(maxLength))
+-            ).recoverWith(exception -> {
+-                if (exception instanceof play.api.mvc.BodyParsers$.MaxLengthLimitAttained) {
+-                    return errorHandler.onClientError(request, Status$.MODULE$.REQUEST_ENTITY_TOO_LARGE(), "Request entity too large")
+-                            .thenApply(F.Either::<Result, A>Left);
+-                } else {
+-                    CompletableFuture<F.Either<Result, A>> cf = new CompletableFuture<>();
+-                    cf.completeExceptionally(exception);
+-                    return cf;
+-                }
+-            }, JavaParsers.trampoline());
++            Flow<ByteString, ByteString, Future<MaxSizeStatus>> takeUpToFlow = Flow.fromGraph(play.api.mvc.BodyParsers$.MODULE$.takeUpTo(maxLength));
++            Sink<ByteString, CompletionStage<F.Either<Result, A>>> result = apply1(request).toSink();
++
++            return Accumulator.fromSink(takeUpToFlow.toMat(result, (statusFuture, resultFuture) ->
++               FutureConverters.toJava(statusFuture).thenCompose(status -> {
++                  if (status instanceof MaxSizeNotExceeded$) {
++                      return resultFuture;
++                  } else {
++                      return errorHandler.onClientError(request, Status$.MODULE$.REQUEST_ENTITY_TOO_LARGE(), "Request entity too large")
++                              .thenApply(F.Either::<Result, A>Left);
++                  }
++               })
++            ));
+         }
+ 
+         /**
+diff --git a/framework/src/play/src/main/scala/play/api/mvc/ContentTypes.scala b/framework/src/play/src/main/scala/play/api/mvc/ContentTypes.scala
+index aa653f0807..a2db87b146 100644
+--- a/framework/src/play/src/main/scala/play/api/mvc/ContentTypes.scala
++++ b/framework/src/play/src/main/scala/play/api/mvc/ContentTypes.scala
+@@ -9,7 +9,7 @@ import play.api.libs.streams.Accumulator
+ import play.core.parsers.Multipart
+ import scala.language.reflectiveCalls
+ import java.io._
+-import scala.concurrent.Future
++import scala.concurrent.{ Promise, Future }
+ import scala.xml._
+ import play.api._
+ import play.api.libs.json._
+@@ -20,9 +20,9 @@ import scala.util.control.NonFatal
+ import play.api.http.{ LazyHttpErrorHandler, ParserConfiguration, HttpConfiguration, HttpVerbs }
+ import play.utils.PlayIO
+ import play.api.http.Status._
+-import akka.stream.Materializer
++import akka.stream._
+ import akka.stream.scaladsl.{ StreamConverters, Flow, Sink }
+-import akka.stream.stage.{ Context, PushStage, SyncDirective }
++import akka.stream.stage._
+ 
+ /**
+  * A request body that adapts automatically according the request Content-Type.
+@@ -668,17 +668,20 @@ trait BodyParsers {
+      */
+     def maxLength[A](maxLength: Long, parser: BodyParser[A])(implicit mat: Materializer): BodyParser[Either[MaxSizeExceeded, A]] = BodyParser("maxLength=" + maxLength + ", wrapping=" + parser.toString) { request =>
+       import play.api.libs.iteratee.Execution.Implicits.trampoline
+-      val takeUpToFlow = Flow[ByteString].transform { () => new BodyParsers.TakeUpTo(maxLength) }
+-      // If the parser is successful, the body becomes Right(body)
+-      parser.map(Right.apply)
+-        // Apply the request
+-        .apply(request)
+-        // Send it through our takeUpToFlow
+-        .through(takeUpToFlow)
+-        // And convert a max length failure to Right(Left(MaxSizeExceeded))
+-        .recover {
+-          case _: BodyParsers.MaxLengthLimitAttained => Right(Left(MaxSizeExceeded(maxLength)))
++      val takeUpToFlow = Flow.fromGraph(new BodyParsers.TakeUpTo(maxLength))
++
++      // Apply the request
++      val parserSink = parser.apply(request).toSink
++
++      Accumulator(takeUpToFlow.toMat(parserSink) { (statusFuture, resultFuture) =>
++        statusFuture.flatMap {
++          case exceeded: MaxSizeExceeded => Future.successful(Right(Left(exceeded)))
++          case _ => resultFuture.map {
++            case Left(result) => Left(result)
++            case Right(a) => Right(Right(a))
++          }
+         }
++      })
+     }
+ 
+     /**
+@@ -717,14 +720,19 @@ trait BodyParsers {
+     /**
+      * Enforce the max length on the stream consumed by the given accumulator.
+      */
+-    private def enforceMaxLength[A](request: RequestHeader, maxLength: Long, accumulator: Accumulator[ByteString, Either[Result, A]]): Accumulator[ByteString, Either[Result, A]] = {
+-      val takeUpToFlow = Flow[ByteString].transform { () => new BodyParsers.TakeUpTo(maxLength) }
+-      import play.api.libs.concurrent.Execution.Implicits.defaultContext
+-      accumulator.through(takeUpToFlow).recoverWith {
+-        case _: BodyParsers.MaxLengthLimitAttained =>
+-          val badResult = createBadResult("Request Entity Too Large", REQUEST_ENTITY_TOO_LARGE)(request)
+-          badResult.map(Left(_))
+-      }
++    private[play] def enforceMaxLength[A](request: RequestHeader, maxLength: Long, accumulator: Accumulator[ByteString, Either[Result, A]]): Accumulator[ByteString, Either[Result, A]] = {
++      val takeUpToFlow = Flow.fromGraph(new BodyParsers.TakeUpTo(maxLength))
++      Accumulator(takeUpToFlow.toMat(accumulator.toSink) { (statusFuture, resultFuture) =>
++        import play.api.libs.iteratee.Execution.Implicits.trampoline
++        val defaultCtx = play.api.libs.concurrent.Execution.Implicits.defaultContext
++
++        statusFuture.flatMap {
++          case MaxSizeExceeded(_) =>
++            val badResult = Future.successful(()).flatMap(_ => createBadResult("Request Entity Too Large", REQUEST_ENTITY_TOO_LARGE)(request))(defaultCtx)
++            badResult.map(Left(_))
++          case MaxSizeNotExceeded => resultFuture
++        }
++      })
+     }
+ 
+     /**
+@@ -762,13 +770,53 @@ object BodyParsers extends BodyParsers {
+ 
+   private val hcCache = Application.instanceCache[HttpConfiguration]
+ 
+-  private[play] class TakeUpTo(maxLength: Long) extends PushStage[ByteString, ByteString] {
+-    private var pushedBytes: Long = 0
++  private[play] def takeUpTo(maxLength: Long): Graph[FlowShape[ByteString, ByteString], Future[MaxSizeStatus]] = new TakeUpTo(maxLength)
++
++  private[play] class TakeUpTo(maxLength: Long) extends GraphStageWithMaterializedValue[FlowShape[ByteString, ByteString], Future[MaxSizeStatus]] {
++
++    private val in = Inlet[ByteString]("TakeUpTo.in")
++    private val out = Outlet[ByteString]("TakeUpTo.out")
+ 
+-    override def onPush(chunk: ByteString, ctx: Context[ByteString]): SyncDirective = {
+-      pushedBytes += chunk.size
+-      if (pushedBytes > maxLength) ctx.fail(new MaxLengthLimitAttained)
+-      else ctx.push(chunk)
++    override def shape: FlowShape[ByteString, ByteString] = FlowShape.of(in, out)
++
++    override def createLogicAndMaterializedValue(inheritedAttributes: Attributes): (GraphStageLogic, Future[MaxSizeStatus]) = {
++      val status = Promise[MaxSizeStatus]()
++      var pushedBytes: Long = 0
++
++      val logic = new GraphStageLogic(shape) {
++        setHandler(out, new OutHandler {
++          override def onPull(): Unit = {
++            pull(in)
++          }
++          override def onDownstreamFinish(): Unit = {
++            status.success(MaxSizeNotExceeded)
++            completeStage()
++          }
++        })
++        setHandler(in, new InHandler {
++          override def onPush(): Unit = {
++            val chunk = grab(in)
++            pushedBytes += chunk.size
++            if (pushedBytes > maxLength) {
++              status.success(MaxSizeExceeded(maxLength))
++              // Make sure we fail the stream, this will ensure downstream body parsers don't try to parse it
++              failStage(new MaxLengthLimitAttained)
++            } else {
++              push(out, chunk)
++            }
++          }
++          override def onUpstreamFinish(): Unit = {
++            status.success(MaxSizeNotExceeded)
++            completeStage()
++          }
++          override def onUpstreamFailure(ex: Throwable): Unit = {
++            status.failure(ex)
++            failStage(ex)
++          }
++        })
++      }
++
++      (logic, status.future)
+     }
+   }
+ 
+@@ -776,6 +824,16 @@ object BodyParsers extends BodyParsers {
+ }
+ 
+ /**
+- * Signal a max content size exceeded
++ * The status of a max size flow.
++ */
++sealed trait MaxSizeStatus
++
++/**
++ * Signal a max content size exceeded.
++ */
++case class MaxSizeExceeded(length: Long) extends MaxSizeStatus
++
++/**
++ * Signal max size is not exceeded.
+  */
+-case class MaxSizeExceeded(length: Long)
++case object MaxSizeNotExceeded extends MaxSizeStatus
+\ No newline at end of file
+diff --git a/framework/src/play/src/test/scala/play/api/mvc/MaxLengthBodyParserSpec.scala b/framework/src/play/src/test/scala/play/api/mvc/MaxLengthBodyParserSpec.scala
+new file mode 100644
+index 0000000000..091f46e45d
+--- /dev/null
++++ b/framework/src/play/src/test/scala/play/api/mvc/MaxLengthBodyParserSpec.scala
+@@ -0,0 +1,120 @@
++package play.api.mvc
++
++import akka.actor.ActorSystem
++import akka.stream.ActorMaterializer
++import akka.stream.scaladsl.{ Source, Sink }
++import akka.util.ByteString
++import org.specs2.mutable.Specification
++import org.specs2.specification.AfterAll
++import play.api.http.Status
++import play.api.libs.streams.Accumulator
++import play.core.test.FakeRequest
++
++import scala.concurrent.{ Await, Promise, Future }
++import scala.concurrent.duration._
++import scala.util.{ Failure, Try }
++
++/**
++ * All tests relating to max length handling
++ */
++object MaxLengthBodyParserSpec extends Specification with AfterAll {
++
++  val MaxLength10 = 10
++  val MaxLength20 = 20
++  val Body15 = ByteString("hello" * 3)
++  val req = FakeRequest("GET", "/x")
++
++  implicit val system = ActorSystem()
++  import system.dispatcher
++  implicit val mat = ActorMaterializer()
++
++  override def afterAll: Unit = {
++    system.terminate()
++  }
++
++  def bodyParser: (Accumulator[ByteString, Either[Result, ByteString]], Future[Unit]) = {
++    val bodyParsed = Promise[Unit]()
++    val parser = Accumulator(Sink.seq[ByteString].mapMaterializedValue(future =>
++      future.transform({ bytes =>
++        bodyParsed.success(())
++        Right(bytes.fold(ByteString.empty)(_ ++ _))
++      }, { t =>
++        bodyParsed.failure(t)
++        t
++      })
++    ))
++    (parser, bodyParsed.future)
++  }
++
++  def feed[A](accumulator: Accumulator[ByteString, A]): A = {
++    Await.result(accumulator.run(Source.fromIterator(() => Body15.grouped(3))), 5.seconds)
++  }
++
++  def assertDidNotParse(parsed: Future[Unit]) = {
++    Await.ready(parsed, 5.seconds)
++    parsed.value must beSome[Try[Unit]].like {
++      case Failure(t: BodyParsers.MaxLengthLimitAttained) => ok
++    }
++  }
++
++  def enforceMaxLengthEnforced(result: Either[Result, _]) = {
++    result must beLeft[Result].which { inner =>
++      inner.header.status must_== Status.REQUEST_ENTITY_TOO_LARGE
++    }
++  }
++
++  def maxLengthParserEnforced(result: Either[Result, Either[MaxSizeExceeded, ByteString]]) = {
++    result must beRight[Either[MaxSizeExceeded, ByteString]].which { inner =>
++      inner must beLeft(MaxSizeExceeded(MaxLength10))
++    }
++  }
++
++  "Max length body handling" should {
++
++    "be exceeded when using the default max length handling" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.enforceMaxLength(req, MaxLength10, parser))
++      enforceMaxLengthEnforced(result)
++      assertDidNotParse(parsed)
++    }
++
++    "be exceeded when using the maxLength body parser" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.maxLength(MaxLength10, BodyParser(req => parser)).apply(req))
++      maxLengthParserEnforced(result)
++      assertDidNotParse(parsed)
++    }
++
++    "be exceeded when using the maxLength body parser and an equal enforceMaxLength" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.maxLength(MaxLength10, BodyParser(req => BodyParsers.parse.enforceMaxLength(req, MaxLength10, parser))).apply(req))
++      maxLengthParserEnforced(result)
++      assertDidNotParse(parsed)
++    }
++
++    "be exceeded when using the maxLength body parser and a longer enforceMaxLength" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.maxLength(MaxLength10, BodyParser(req => BodyParsers.parse.enforceMaxLength(req, MaxLength20, parser))).apply(req))
++      maxLengthParserEnforced(result)
++      assertDidNotParse(parsed)
++    }
++
++    "be exceeded when using enforceMaxLength and a longer maxLength body parser" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.maxLength(MaxLength20, BodyParser(req => BodyParsers.parse.enforceMaxLength(req, MaxLength10, parser))).apply(req))
++      enforceMaxLengthEnforced(result)
++      assertDidNotParse(parsed)
++    }
++
++    "not be exceeded when nothing is exceeded" in {
++      val (parser, parsed) = bodyParser
++      val result = feed(BodyParsers.parse.maxLength(MaxLength20, BodyParser(req => BodyParsers.parse.enforceMaxLength(req, MaxLength20, parser))).apply(req))
++      result must beRight.which { inner =>
++        inner must beRight(Body15)
++      }
++      Await.result(parsed, 5.seconds) must_== ()
++    }
++
++  }
++
++}

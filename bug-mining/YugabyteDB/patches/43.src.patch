@@ -1,0 +1,264 @@
+diff --git a/src/yb/consensus/consensus_peers.cc b/src/yb/consensus/consensus_peers.cc
+index e2ff3c7a8c..c2202f9a73 100644
+--- a/src/yb/consensus/consensus_peers.cc
++++ b/src/yb/consensus/consensus_peers.cc
+@@ -424,7 +424,7 @@ void Peer::DoProcessResponse() {
+ }
+ 
+ Status Peer::SendRemoteBootstrapRequest() {
+-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Sending request to remotely bootstrap";
++  YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(INFO, 30) << "Sending request to remotely bootstrap";
+   controller_.Reset();
+   return raft_pool_token_->SubmitFunc([this]() {
+     proxy_->StartRemoteBootstrap(&rb_request_, &rb_response_, &controller_,
+@@ -439,10 +439,15 @@ void Peer::ProcessRemoteBootstrapResponse() {
+ 
+   std::unique_lock<Semaphore> sem_lock(sem_, std::adopt_lock);
+ 
+-  // We treat remote bootstrap as fire-and-forget.
+   if (rb_response_.has_error()) {
+-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin remote bootstrap on peer: "
+-                                      << rb_response_.ShortDebugString();
++    if (rb_response_.error().code() == tserver::TabletServerErrorPB::ALREADY_IN_PROGRESS) {
++      queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
++      YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(WARNING, 30)
++        << ":::Unable to begin remote bootstrap on peer: " << rb_response_.ShortDebugString();
++    } else {
++      LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin remote bootstrap on peer: "
++                                        << rb_response_.ShortDebugString();
++    }
+   }
+ }
+ 
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index 4b7a5f1e80..9b6eee4679 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -378,7 +378,8 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
+   if (member_type) *member_type = peer->member_type;
+   if (last_exchange_successful) *last_exchange_successful = peer->is_last_exchange_successful;
+   if (PREDICT_FALSE(peer->needs_remote_bootstrap)) {
+-    LOG_WITH_PREFIX_UNLOCKED(INFO) << "Peer needs remote bootstrap: " << peer->ToString();
++      YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(INFO, 30)
++          << "Peer needs remote bootstrap: " << peer->ToString();
+     *needs_remote_bootstrap = true;
+     return Status::OK();
+   }
+@@ -704,8 +705,13 @@ void PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
+           << response.ShortDebugString();
+ 
+       peer->needs_remote_bootstrap = true;
+-      LOG_WITH_PREFIX_UNLOCKED(INFO) << "Marked peer as needing remote bootstrap: "
+-                                     << peer->ToString();
++      // Since we received a response from the peer, we know it is alive. So we need to update
++      // peer->last_successful_communication_time, otherwise, we will remove this peer from the
++      // configuration if the remote bootstrap is not completed within
++      // FLAGS_follower_unavailable_considered_failed_sec seconds.
++      peer->last_successful_communication_time = MonoTime::Now();
++      YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N_SECS(INFO, 30)
++          << "Marked peer as needing remote bootstrap: " << peer->ToString();
+       *more_pending = true;
+       return;
+     }
+diff --git a/src/yb/integration-tests/remote_bootstrap-itest.cc b/src/yb/integration-tests/remote_bootstrap-itest.cc
+index 122a961ca3..1ba072fed9 100644
+--- a/src/yb/integration-tests/remote_bootstrap-itest.cc
++++ b/src/yb/integration-tests/remote_bootstrap-itest.cc
+@@ -981,6 +981,90 @@ void RemoteBootstrapITest::ClientCrashesBeforeChangeRole(YBTableType table_type)
+                                                   crash_test_workload_->rows_inserted()));
+ }
+ 
++TEST_F(RemoteBootstrapITest, TestVeryLongRemoteBootstrap) {
++  vector<string> ts_flags, master_flags;
++
++  // Make everything happen 100x faster:
++  //  - follower_unavailable_considered_failed_sec from 300 to 3 secs
++  //  - raft_heartbeat_interval_ms from 500 to 5 ms
++  //  - consensus_rpc_timeout_ms from 3000 to 30 ms
++
++  ts_flags.push_back("--follower_unavailable_considered_failed_sec=3");
++  ts_flags.push_back("--raft_heartbeat_interval_ms=5");
++  ts_flags.push_back("--consensus_rpc_timeout_ms=30");
++
++  // Increase the number of missed heartbeats used to detect leader failure since in slow testing
++  // instances it is very easy to miss the default (6) heartbeats since they are being sent very
++  // fast (5ms).
++  ts_flags.push_back("--leader_failure_max_missed_heartbeat_periods=40.0");
++
++  // Make the remote bootstrap take longer than follower_unavailable_considered_failed_sec seconds
++  // so the peer gets removed from the config while it is being remote bootstrapped.
++  ts_flags.push_back("--simulate_long_remote_bootstrap_sec=5");
++
++  master_flags.push_back("--enable_load_balancing=false");
++
++  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, 4));
++
++  // We'll do a config change to remote bootstrap a replica here later. For now, shut it down.
++  auto constexpr kTsIndex = 0;
++  LOG(INFO) << "Shutting down TS " << cluster_->tablet_server(kTsIndex)->uuid();
++  cluster_->tablet_server(kTsIndex)->Shutdown();
++  auto new_ts = ts_map_[cluster_->tablet_server(kTsIndex)->uuid()].get();
++
++  // Bounce the Master so it gets new tablet reports and doesn't try to assign a replica to the
++  // dead TS.
++  const auto timeout = MonoDelta::FromSeconds(40);
++  cluster_->master()->Shutdown();
++  LOG(INFO) << "Restarting master " << cluster_->master()->uuid();
++  ASSERT_OK(cluster_->master()->Restart());
++  ASSERT_OK(cluster_->WaitForTabletServerCount(3, timeout));
++
++  // Populate a tablet with some data.
++  LOG(INFO)  << "Starting workload";
++  TestWorkload workload(cluster_.get());
++  workload.Setup(YBTableType::YQL_TABLE_TYPE);
++  workload.Start();
++  while (workload.rows_inserted() < 10) {
++    SleepFor(MonoDelta::FromMilliseconds(1));
++  }
++  LOG(INFO) << "Stopping workload";
++  workload.StopAndJoin();
++
++  // Figure out the tablet id of the created tablet.
++  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
++  TServerDetails* ts = ts_map_[cluster_->tablet_server(1)->uuid()].get();
++  ASSERT_OK(WaitForNumTabletsOnTS(ts, 1, timeout, &tablets));
++  string tablet_id = tablets[0].tablet_status().tablet_id();
++
++  TServerDetails* leader_ts;
++  // Find out who's leader.
++  ASSERT_OK(FindTabletLeader(ts_map_, tablet_id, timeout, &leader_ts));
++
++  // Add back TS0.
++  ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
++  LOG(INFO) << "Adding tserver with uuid " << new_ts->uuid();
++  ASSERT_OK(itest::AddServer(leader_ts, tablet_id, new_ts, RaftPeerPB::PRE_VOTER, boost::none,
++                             timeout));
++  // After adding  new_ts, the leader will detect that TS0 needs to be remote bootstrapped. Verify
++  // that this process completes successfully.
++  ASSERT_OK(inspect_->WaitForTabletDataStateOnTS(kTsIndex, tablet_id, TABLET_DATA_READY));
++  LOG(INFO) << "Tablet " << tablet_id << " in state TABLET_DATA_READY in tablet server "
++              << new_ts->uuid();
++
++  ASSERT_OK(WaitUntilCommittedConfigNumVotersIs(4, leader_ts, tablet_id, timeout));
++  LOG(INFO) << "Number of voters for tablet " << tablet_id << " is 4";
++
++  // Ensure all the servers agree before we proceed.
++  ASSERT_OK(WaitForServersToAgree(timeout, ts_map_, tablet_id, workload.batches_completed()));
++
++  ClusterVerifier cluster_verifier(cluster_.get());
++      ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
++      ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(workload.table_name(),
++                                                      ClusterVerifier::AT_LEAST,
++                                                      workload.rows_inserted()));
++}
++
+ TEST_F(RemoteBootstrapITest, TestRejectRogueLeaderKeyValueType) {
+   RejectRogueLeader(YBTableType::YQL_TABLE_TYPE);
+ }
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index 3f80480fd1..2b91b3a5fb 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -4232,7 +4232,7 @@ Status CatalogManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB&
+   const TabletId& tablet_id = req.tablet_id();
+   std::unique_lock<std::mutex> l(remote_bootstrap_mtx_, std::try_to_lock);
+   if (!l.owns_lock()) {
+-    return STATUS(IllegalState,
++    return STATUS(AlreadyPresent,
+                   Substitute("Remote bootstrap of tablet $0 already in progress", tablet_id));
+   }
+ 
+diff --git a/src/yb/tserver/remote_bootstrap_client.cc b/src/yb/tserver/remote_bootstrap_client.cc
+index dc77b7015a..1fcb45a209 100644
+--- a/src/yb/tserver/remote_bootstrap_client.cc
++++ b/src/yb/tserver/remote_bootstrap_client.cc
+@@ -99,6 +99,11 @@ DEFINE_test_flag(double, fault_crash_bootstrap_client_before_changing_role, 0.0,
+ DEFINE_int32(remote_bootstrap_max_chunk_size, 1_MB,
+              "Maximum chunk size to be transferred at a time during remote bootstrap.");
+ 
++DEFINE_test_flag(int32, simulate_long_remote_bootstrap_sec, 0,
++                 "The remote bootstrap client will take at least this number of seconds to finish. "
++                 "We use this for testing a scenario where a remote bootstrap takes longer than "
++                 "follower_unavailable_considered_failed_sec seconds");
++
+ // RETURN_NOT_OK_PREPEND() with a remote-error unwinding step.
+ #define RETURN_NOT_OK_UNWIND_PREPEND(status, controller, msg) \
+   RETURN_NOT_OK_PREPEND(UnwindRemoteError(status, controller), msg)
+@@ -356,6 +361,13 @@ Status RemoteBootstrapClient::FetchAll(TabletStatusListener* status_listener) {
+   VLOG_WITH_PREFIX(2) << "Fetching table_type: " << TableType_Name(meta_->table_type());
+   RETURN_NOT_OK(DownloadRocksDBFiles());
+   RETURN_NOT_OK(DownloadWALs());
++
++  // We sleep here to simulate the transfer of very large files.
++  if (PREDICT_FALSE(FLAGS_simulate_long_remote_bootstrap_sec > 0)) {
++    LOG_WITH_PREFIX(INFO) << "Sleeping " << FLAGS_simulate_long_remote_bootstrap_sec
++                          << " seconds to simulate the transfer of very large files";
++    SleepFor(MonoDelta::FromSeconds(FLAGS_simulate_long_remote_bootstrap_sec));
++  }
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 203c6d9adf..4f0e9cf40e 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1428,7 +1428,18 @@ void ConsensusServiceImpl::StartRemoteBootstrap(const StartRemoteBootstrapReques
+     return;
+   }
+   Status s = tablet_manager_->StartRemoteBootstrap(*req);
+-  LOG_IF(WARNING, !s.ok()) << "Start remote bootstrap failed: " << s;
++  if (!s.ok()) {
++    // Using Status::AlreadyPresent for a remote bootstrap operation that is already in progress.
++    if (s.IsAlreadyPresent()) {
++      YB_LOG_EVERY_N_SECS(WARNING, 30) << "Start remote bootstrap failed: " << s;
++      SetupErrorAndRespond(resp->mutable_error(), s, TabletServerErrorPB::ALREADY_IN_PROGRESS,
++                           &context);
++      return;
++    } else {
++      LOG(WARNING) << "Start remote bootstrap failed: " << s;
++    }
++  }
++
+   RETURN_UNKNOWN_ERROR_IF_NOT_OK(s, resp, &context);
+   context.RespondSuccess();
+ }
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index e7e516588c..e85aff453c 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -873,7 +873,7 @@ Status TSTabletManager::StartTabletStateTransitionUnlocked(
+     scoped_refptr<TransitionInProgressDeleter>* deleter) {
+   lock_.AssertAcquiredForWriting();
+   if (!InsertIfNotPresent(&transition_in_progress_, tablet_id, reason)) {
+-    return STATUS(IllegalState,
++    return STATUS(AlreadyPresent,
+         Substitute("State transition of tablet $0 already in progress: $1",
+                     tablet_id, transition_in_progress_[tablet_id]));
+   }
+diff --git a/src/yb/tserver/tserver.proto b/src/yb/tserver/tserver.proto
+index 14aee839f4..00c2d08419 100644
+--- a/src/yb/tserver/tserver.proto
++++ b/src/yb/tserver/tserver.proto
+@@ -133,6 +133,9 @@ message TabletServerErrorPB {
+ 
+     // This follower hasn't heard from the leader for a specified amount of time.
+     STALE_FOLLOWER = 25;
++
++    // The operation is already in progress. Used for remote bootstrap requests for now.
++    ALREADY_IN_PROGRESS = 26;
+   }
+ 
+   // The error code.
+diff --git a/src/yb/util/logging.h b/src/yb/util/logging.h
+index 697764e8b5..8099494f9c 100644
+--- a/src/yb/util/logging.h
++++ b/src/yb/util/logging.h
+@@ -139,6 +139,8 @@ enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
+   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToLog)
+ 
+ #define YB_LOG_WITH_PREFIX_EVERY_N(severity, n) YB_LOG_EVERY_N(severity, n) << LogPrefix()
++#define YB_LOG_WITH_PREFIX_UNLOCKED_EVERY_N(severity, n) \
++    YB_LOG_EVERY_N(severity, n) << LogPrefixUnlocked()
+ 
+ #define YB_SYSLOG_EVERY_N(severity, n) \
+   YB_SOME_KIND_OF_LOG_EVERY_N(severity, (n), google::LogMessage::SendToSyslogAndLog)

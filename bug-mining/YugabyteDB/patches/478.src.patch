@@ -1,0 +1,1001 @@
+diff --git a/src/yb/common/ql_rowwise_iterator_interface.h b/src/yb/common/ql_rowwise_iterator_interface.h
+index f927467ea6..671f270661 100644
+--- a/src/yb/common/ql_rowwise_iterator_interface.h
++++ b/src/yb/common/ql_rowwise_iterator_interface.h
+@@ -16,9 +16,10 @@
+ 
+ #include <memory>
+ 
++#include "yb/docdb/docdb_fwd.h"
++
+ #include "yb/util/result.h"
+ #include "yb/util/status.h"
+-#include "yb/docdb/doc_key.h"
+ 
+ namespace yb {
+ 
+diff --git a/src/yb/common/ql_storage_interface.h b/src/yb/common/ql_storage_interface.h
+index 9ba93d5153..a483209145 100644
+--- a/src/yb/common/ql_storage_interface.h
++++ b/src/yb/common/ql_storage_interface.h
+@@ -21,6 +21,8 @@
+ #include "yb/common/schema.h"
+ #include "yb/common/ql_rowwise_iterator_interface.h"
+ 
++#include "yb/docdb/docdb_fwd.h"
++
+ namespace yb {
+ namespace common {
+ 
+@@ -81,16 +83,16 @@ class YQLStorageIf {
+ 
+   // Create iterator for querying by partition and range key.
+   virtual CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+-                                     int64_t batch_arg_index,
+                                      const Schema& projection,
+                                      const Schema& schema,
+                                      const TransactionOperationContextOpt& txn_op_context,
+                                      CoarseTimePoint deadline,
+                                      const ReadHybridTime& read_time,
++                                     const docdb::DocKey& start_doc_key,
+                                      YQLRowwiseIteratorIf::UniPtr* iter) const = 0;
+ 
+   // Create iterator for querying by ybctid.
+-  virtual CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
++  virtual CHECKED_STATUS GetIterator(uint64 stmt_id,
+                                      const Schema& projection,
+                                      const Schema& schema,
+                                      const TransactionOperationContextOpt& txn_op_context,
+diff --git a/src/yb/docdb/doc_pgsql_scanspec.h b/src/yb/docdb/doc_pgsql_scanspec.h
+index cc05745ccc..9f58d17f73 100644
+--- a/src/yb/docdb/doc_pgsql_scanspec.h
++++ b/src/yb/docdb/doc_pgsql_scanspec.h
+@@ -122,6 +122,8 @@ class DocPgsqlScanSpec : public common::PgsqlScanSpec {
+ 
+   // Scan behavior.
+   bool is_forward_scan_;
++
++  DISALLOW_COPY_AND_ASSIGN(DocPgsqlScanSpec);
+ };
+ 
+ }  // namespace docdb
+diff --git a/src/yb/docdb/docdb_fwd.h b/src/yb/docdb/docdb_fwd.h
+index 3837b0dd49..f2c9743bc5 100644
+--- a/src/yb/docdb/docdb_fwd.h
++++ b/src/yb/docdb/docdb_fwd.h
+@@ -21,12 +21,14 @@ namespace docdb {
+ 
+ class ConsensusFrontier;
+ class DeadlineInfo;
++class DocKey;
+ class DocPath;
+ class DocWriteBatch;
+ class IntentAwareIterator;
+ class KeyValueWriteBatchPB;
+-class QLWriteOperation;
+ class PgsqlWriteOperation;
++class QLWriteOperation;
++class SubDocKey;
+ 
+ struct ApplyTransactionState;
+ struct DocDB;
+diff --git a/src/yb/docdb/pgsql_operation.cc b/src/yb/docdb/pgsql_operation.cc
+index 08fa608e9b..1d4b1cada4 100644
+--- a/src/yb/docdb/pgsql_operation.cc
++++ b/src/yb/docdb/pgsql_operation.cc
+@@ -99,11 +99,10 @@ Result<R> FetchDocKeyImpl(const Schema& schema,
+     SCHECK(!ybctid.empty(), InternalError, "empty ybctid");
+     return edk_processor(ybctid);
+   } else {
+-    vector<PrimitiveValue> hashed_components, range_components;
+-    RETURN_NOT_OK(InitKeyColumnPrimitiveValues(
+-        req.partition_column_values(), schema, 0 /* start_idx */, &hashed_components));
+-    RETURN_NOT_OK(InitKeyColumnPrimitiveValues(
+-        req.range_column_values(), schema, schema.num_hash_key_columns(), &range_components));
++    auto hashed_components = VERIFY_RESULT(InitKeyColumnPrimitiveValues(
++        req.partition_column_values(), schema, 0 /* start_idx */));
++    auto range_components = VERIFY_RESULT(InitKeyColumnPrimitiveValues(
++        req.range_column_values(), schema, schema.num_hash_key_columns()));
+     return dk_processor(hashed_components.empty()
+         ? DocKey(schema, std::move(range_components))
+         : DocKey(
+@@ -129,6 +128,53 @@ Result<DocKey> FetchDocKey(const Schema& schema, const PgsqlWriteRequestPB& requ
+       });
+ }
+ 
++Result<common::YQLRowwiseIteratorIf::UniPtr> CreateIterator(
++    const common::YQLStorageIf& ql_storage,
++    const PgsqlReadRequestPB& request,
++    const Schema& projection,
++    const Schema& schema,
++    const TransactionOperationContextOpt& txn_op_context,
++    CoarseTimePoint deadline,
++    const ReadHybridTime& read_time,
++    bool is_explicit_request_read_time) {
++
++  common::YQLRowwiseIteratorIf::UniPtr result;
++  // TODO(neil) Remove the following IF block when it is completely obsolete.
++  // The following IF block has not been used since 2.1 release.
++  // We keep it here only for rolling upgrade purpose.
++  if (request.has_ybctid_column_value()) {
++    SCHECK(!request.has_paging_state(),
++           InternalError,
++           "Each ybctid value identifies one row in the table while paging state "
++           "is only used for multi-row queries.");
++    RETURN_NOT_OK(ql_storage.GetIterator(
++        request.stmt_id(), projection, schema, txn_op_context,
++        deadline, read_time, request.ybctid_column_value().value(), &result));
++  } else {
++    SubDocKey start_sub_doc_key;
++    auto actual_read_time = read_time;
++    // Decode the start SubDocKey from the paging state and set scan start key.
++    if (request.has_paging_state() &&
++        request.paging_state().has_next_row_key() &&
++        !request.paging_state().next_row_key().empty()) {
++      KeyBytes start_key_bytes(request.paging_state().next_row_key());
++      RETURN_NOT_OK(start_sub_doc_key.FullyDecodeFrom(start_key_bytes.AsSlice()));
++      // TODO(dmitry) Remove backward compatibility block when obsolete.
++      if (!is_explicit_request_read_time) {
++        if (request.paging_state().has_read_time()) {
++          actual_read_time = ReadHybridTime::FromPB(request.paging_state().read_time());
++        } else {
++          actual_read_time.read = start_sub_doc_key.hybrid_time();
++        }
++      }
++    }
++    RETURN_NOT_OK(ql_storage.GetIterator(
++        request, projection, schema, txn_op_context,
++        deadline, read_time, start_sub_doc_key.doc_key(), &result));
++  }
++  return std::move(result);
++}
++
+ } // namespace
+ 
+ //--------------------------------------------------------------------------------------------------
+@@ -599,6 +645,7 @@ Status PgsqlWriteOperation::GetDocPaths(GetDocPathsMode mode,
+ Result<size_t> PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storage,
+                                            CoarseTimePoint deadline,
+                                            const ReadHybridTime& read_time,
++                                           bool is_explicit_request_read_time,
+                                            const Schema& schema,
+                                            const Schema *index_schema,
+                                            faststring *result_buffer,
+@@ -614,19 +661,16 @@ Result<size_t> PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storag
+   // Fetching data.
+   bool has_paging_state = false;
+   if (request_.batch_arguments_size() > 0) {
+-    if (request_.has_ybctid_column_value()) {
+-      fetched_rows = VERIFY_RESULT(ExecuteBatchYbctid(
+-          ql_storage, deadline, read_time, schema,
+-          request_.unknown_ybctid_allowed(), result_buffer, restart_read_ht));
+-    } else {
+-      fetched_rows = VERIFY_RESULT(ExecuteBatch(ql_storage, deadline, read_time, schema,
+-                                                index_schema, result_buffer, restart_read_ht,
+-                                                &has_paging_state));
+-    }
++    SCHECK(request_.has_ybctid_column_value(),
++           InternalError,
++           "ybctid arguments can be batched only");
++    fetched_rows = VERIFY_RESULT(ExecuteBatchYbctid(
++        ql_storage, deadline, read_time, schema,
++        request_.unknown_ybctid_allowed(), result_buffer, restart_read_ht));
+   } else {
+-    fetched_rows = VERIFY_RESULT(ExecuteScalar(ql_storage, deadline, read_time, schema,
+-                                               index_schema, -1 /* batch_arg_index */,
+-                                               result_buffer, restart_read_ht, &has_paging_state));
++    fetched_rows = VERIFY_RESULT(ExecuteScalar(
++        ql_storage, deadline, read_time, is_explicit_request_read_time, schema, index_schema,
++        result_buffer, restart_read_ht, &has_paging_state));
+   }
+ 
+   if (FLAGS_trace_docdb_calls) {
+@@ -639,9 +683,9 @@ Result<size_t> PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storag
+ Result<size_t> PgsqlReadOperation::ExecuteScalar(const common::YQLStorageIf& ql_storage,
+                                                  CoarseTimePoint deadline,
+                                                  const ReadHybridTime& read_time,
++                                                 bool is_explicit_request_read_time,
+                                                  const Schema& schema,
+                                                  const Schema *index_schema,
+-                                                 int64_t batch_arg_index,
+                                                  faststring *result_buffer,
+                                                  HybridTime *restart_read_ht,
+                                                  bool *has_paging_state) {
+@@ -666,17 +710,17 @@ Result<size_t> PgsqlReadOperation::ExecuteScalar(const common::YQLStorageIf& ql_
+   const Schema* scan_schema;
+ 
+   RETURN_NOT_OK(CreateProjection(schema, request_.column_refs(), &projection));
+-  RETURN_NOT_OK(ql_storage.GetIterator(request_, batch_arg_index,
+-                                       projection, schema, txn_op_context_,
+-                                       deadline, read_time, &table_iter_));
++  table_iter_ = VERIFY_RESULT(CreateIterator(
++      ql_storage, request_, projection, schema, txn_op_context_,
++      deadline, read_time, is_explicit_request_read_time));
+ 
+   ColumnId ybbasectid_id;
+   if (request_.has_index_request()) {
+     const PgsqlReadRequestPB& index_request = request_.index_request();
+     RETURN_NOT_OK(CreateProjection(*index_schema, index_request.column_refs(), &index_projection));
+-    RETURN_NOT_OK(ql_storage.GetIterator(index_request, batch_arg_index,
+-                                         index_projection, *index_schema,
+-                                         txn_op_context_, deadline, read_time, &index_iter_));
++    index_iter_ = VERIFY_RESULT(CreateIterator(
++        ql_storage, index_request, index_projection, *index_schema, txn_op_context_,
++        deadline, read_time, is_explicit_request_read_time));
+     iter = index_iter_.get();
+     const size_t idx = index_schema->find_column("ybidxbasectid");
+     SCHECK_NE(idx, Schema::kColumnNotFound, Corruption, "ybidxbasectid not found in index schema");
+@@ -752,36 +796,11 @@ Result<size_t> PgsqlReadOperation::ExecuteScalar(const common::YQLStorageIf& ql_
+   }
+ 
+   RETURN_NOT_OK(SetPagingStateIfNecessary(
+-      iter, fetched_rows, row_count_limit, scan_time_exceeded, scan_schema, batch_arg_index,
++      iter, fetched_rows, row_count_limit, scan_time_exceeded, scan_schema,
+       read_time, has_paging_state));
+   return fetched_rows;
+ }
+ 
+-Result<size_t> PgsqlReadOperation::ExecuteBatch(const common::YQLStorageIf& ql_storage,
+-                                                CoarseTimePoint deadline,
+-                                                const ReadHybridTime& read_time,
+-                                                const Schema& schema,
+-                                                const Schema *index_schema,
+-                                                faststring *result_buffer,
+-                                                HybridTime *restart_read_ht,
+-                                                bool *has_paging_state) {
+-  size_t fetched_rows = 0;
+-  bool exec_has_paging_state = false;
+-
+-  int32_t batch_arg_count = request_.batch_arguments_size();
+-  int64_t batch_arg_index = 0;
+-  while (!exec_has_paging_state && batch_arg_index < batch_arg_count) {
+-    fetched_rows += VERIFY_RESULT(ExecuteScalar(ql_storage, deadline, read_time, schema,
+-                                                index_schema, batch_arg_index, result_buffer,
+-                                                restart_read_ht, &exec_has_paging_state));
+-    batch_arg_index++;
+-  }
+-  *has_paging_state = exec_has_paging_state;
+-
+-  response_.set_batch_arg_count(batch_arg_index);
+-  return fetched_rows;
+-}
+-
+ Result<size_t> PgsqlReadOperation::ExecuteBatchYbctid(const common::YQLStorageIf& ql_storage,
+                                                       CoarseTimePoint deadline,
+                                                       const ReadHybridTime& read_time,
+@@ -796,7 +815,7 @@ Result<size_t> PgsqlReadOperation::ExecuteBatchYbctid(const common::YQLStorageIf
+   size_t row_count = 0;
+   for (const PgsqlBatchArgumentPB& batch_argument : request_.batch_arguments()) {
+     // Get the row.
+-    RETURN_NOT_OK(ql_storage.GetIterator(request_, projection, schema, txn_op_context_,
++    RETURN_NOT_OK(ql_storage.GetIterator(request_.stmt_id(), projection, schema, txn_op_context_,
+                                          deadline, read_time, batch_argument.ybctid().value(),
+                                          &table_iter_));
+     row.Clear();
+@@ -827,7 +846,6 @@ Status PgsqlReadOperation::SetPagingStateIfNecessary(const common::YQLRowwiseIte
+                                                      const size_t row_count_limit,
+                                                      const bool scan_time_exceeded,
+                                                      const Schema* schema,
+-                                                     int64_t batch_arg_index,
+                                                      const ReadHybridTime& read_time,
+                                                      bool *has_paging_state) {
+   *has_paging_state = false;
+diff --git a/src/yb/docdb/pgsql_operation.h b/src/yb/docdb/pgsql_operation.h
+index 3695c45e83..20d3710fd5 100644
+--- a/src/yb/docdb/pgsql_operation.h
++++ b/src/yb/docdb/pgsql_operation.h
+@@ -150,6 +150,7 @@ class PgsqlReadOperation : public DocExprExecutor {
+   Result<size_t> Execute(const common::YQLStorageIf& ql_storage,
+                          CoarseTimePoint deadline,
+                          const ReadHybridTime& read_time,
++                         bool is_explicit_request_read_time,
+                          const Schema& schema,
+                          const Schema *index_schema,
+                          faststring *result_buffer,
+@@ -164,25 +165,13 @@ class PgsqlReadOperation : public DocExprExecutor {
+   Result<size_t> ExecuteScalar(const common::YQLStorageIf& ql_storage,
+                                CoarseTimePoint deadline,
+                                const ReadHybridTime& read_time,
++                               bool is_explicit_request_read_time,
+                                const Schema& schema,
+                                const Schema *index_schema,
+-                               int64_t batch_arg_index,
+                                faststring *result_buffer,
+                                HybridTime *restart_read_ht,
+                                bool *has_paging_state);
+ 
+-  // Execute a READ operator for a given batch of arguments.
+-  // - Currently, batch argument is used for only ybctid, a virtual columns.
+-  // - We haven't used batch of actual columns yet (hash, range, regular).
+-  Result<size_t> ExecuteBatch(const common::YQLStorageIf& ql_storage,
+-                              CoarseTimePoint deadline,
+-                              const ReadHybridTime& read_time,
+-                              const Schema& schema,
+-                              const Schema *index_schema,
+-                              faststring *result_buffer,
+-                              HybridTime *restart_read_ht,
+-                              bool *has_paging_state);
+-
+   // Execute a READ operator for a given batch of ybctids.
+   Result<size_t> ExecuteBatchYbctid(const common::YQLStorageIf& ql_storage,
+                                     CoarseTimePoint deadline,
+@@ -207,7 +196,6 @@ class PgsqlReadOperation : public DocExprExecutor {
+                                            const size_t row_count_limit,
+                                            const bool scan_time_exceeded,
+                                            const Schema* schema,
+-                                           int64_t batch_arg_index,
+                                            const ReadHybridTime& read_time,
+                                            bool *has_paging_state);
+ 
+diff --git a/src/yb/docdb/primitive_value_util.cc b/src/yb/docdb/primitive_value_util.cc
+index 6eeb8448e3..8c508bb10e 100644
+--- a/src/yb/docdb/primitive_value_util.cc
++++ b/src/yb/docdb/primitive_value_util.cc
+@@ -48,11 +48,12 @@ Status QLKeyColumnValuesToPrimitiveValues(
+ }
+ 
+ // ------------------------------------------------------------------------------------------------
+-Status InitKeyColumnPrimitiveValues(
++Result<vector<PrimitiveValue>> InitKeyColumnPrimitiveValues(
+     const google::protobuf::RepeatedPtrField<PgsqlExpressionPB> &column_values,
+     const Schema &schema,
+-    size_t start_idx,
+-    vector<PrimitiveValue> *components) {
++    size_t start_idx) {
++  vector<PrimitiveValue> values;
++  values.reserve(column_values.size());
+   size_t column_idx = start_idx;
+   for (const auto& column_value : column_values) {
+     if (!schema.is_key_column(column_idx)) {
+@@ -64,8 +65,8 @@ Status InitKeyColumnPrimitiveValues(
+     const auto sorting_type = schema.column(column_idx).sorting_type();
+     if (column_value.has_value()) {
+       const auto& value = column_value.value();
+-      components->push_back(IsNull(value) ? PrimitiveValue::NullValue(sorting_type)
+-                                          : PrimitiveValue::FromQLValuePB(value, sorting_type));
++      values.push_back(IsNull(value) ? PrimitiveValue::NullValue(sorting_type)
++                                     : PrimitiveValue::FromQLValuePB(value, sorting_type));
+     } else {
+       // TODO(neil) The current setup only works for CQL as it assumes primary key value must not
+       // be dependent on any column values. This needs to be fixed as PostgreSQL expression might
+@@ -76,63 +77,11 @@ Status InitKeyColumnPrimitiveValues(
+       QLExprResult result;
+       RETURN_NOT_OK(executor.EvalExpr(column_value, nullptr, result.Writer(), &schema));
+ 
+-      components->push_back(PrimitiveValue::FromQLValuePB(result.Value(), sorting_type));
++      values.push_back(PrimitiveValue::FromQLValuePB(result.Value(), sorting_type));
+     }
+     column_idx++;
+   }
+-  return Status::OK();
+-}
+-
+-namespace {
+-  template <typename TemplatePB>
+-  boost::optional<int32_t> HashCodeFromPB(const TemplatePB pb) {
+-    return pb.has_hash_code() ? boost::make_optional<int32_t>(pb.hash_code()) : boost::none;
+-  }
+-
+-  template <typename TemplatePB>
+-  boost::optional<int32_t> MaxHashCodeFromPB(const TemplatePB pb) {
+-    return pb.has_max_hash_code() ? boost::make_optional<int32_t>(pb.max_hash_code()) : boost::none;
+-  }
+-} // namespace
+-
+-boost::optional<int32_t> DocHashCode(const PgsqlReadRequestPB& request,
+-                                     int64_t batch_arg_index) {
+-  if (batch_arg_index < 0) {
+-    return HashCodeFromPB(request);
+-  }
+-  return HashCodeFromPB(request.batch_arguments(batch_arg_index));
+-}
+-
+-boost::optional<int32_t> DocMaxHashCode(const PgsqlReadRequestPB& request,
+-                                        int64_t batch_arg_index) {
+-  if (batch_arg_index < 0) {
+-    return MaxHashCodeFromPB(request);
+-  }
+-  return MaxHashCodeFromPB(request.batch_arguments(batch_arg_index));
+-}
+-
+-bool
+-DocHasPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+-  return batch_arg_index < 0 ? request.partition_column_values_size() > 0
+-      : request.batch_arguments(batch_arg_index).partition_column_values_size() > 0;
+-}
+-
+-const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+-DocPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+-  return batch_arg_index < 0 ? request.partition_column_values()
+-                             : request.batch_arguments(batch_arg_index).partition_column_values();
+-}
+-
+-bool
+-DocHasRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+-  // Use shared range value in "request" because currently we do not batch RANGE values.
+-  return request.range_column_values().size() > 0;
+-}
+-
+-const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+-DocRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index) {
+-  // Use shared range value in "request" because currently we do not batch RANGE values.
+-  return request.range_column_values();
++  return std::move(values);
+ }
+ 
+ }  // namespace docdb
+diff --git a/src/yb/docdb/primitive_value_util.h b/src/yb/docdb/primitive_value_util.h
+index e42460c82e..ee193b0205 100644
+--- a/src/yb/docdb/primitive_value_util.h
++++ b/src/yb/docdb/primitive_value_util.h
+@@ -30,26 +30,10 @@ CHECKED_STATUS QLKeyColumnValuesToPrimitiveValues(
+     const Schema &schema, size_t column_idx, const size_t column_count,
+     vector<PrimitiveValue> *components);
+ 
+-CHECKED_STATUS InitKeyColumnPrimitiveValues(
++Result<vector<PrimitiveValue>> InitKeyColumnPrimitiveValues(
+     const google::protobuf::RepeatedPtrField<PgsqlExpressionPB> &column_values,
+     const Schema &schema,
+-    size_t start_idx,
+-    vector<PrimitiveValue> *components);
+-
+-boost::optional<int32_t> DocHashCode(const PgsqlReadRequestPB& request,
+-                                     int64_t batch_arg_index);
+-
+-boost::optional<int32_t> DocMaxHashCode(const PgsqlReadRequestPB& request,
+-                                        int64_t batch_arg_index);
+-bool DocHasRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index);
+-
+-const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+-DocRangeValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index);
+-
+-bool DocHasPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index);
+-
+-const google::protobuf::RepeatedPtrField<PgsqlExpressionPB>&
+-DocPartitionValues(const PgsqlReadRequestPB& request, int64_t batch_arg_index);
++    size_t start_idx);
+ 
+ }  // namespace docdb
+ }  // namespace yb
+diff --git a/src/yb/docdb/ql_rocksdb_storage.cc b/src/yb/docdb/ql_rocksdb_storage.cc
+index 662e7403f3..41270c8213 100644
+--- a/src/yb/docdb/ql_rocksdb_storage.cc
++++ b/src/yb/docdb/ql_rocksdb_storage.cc
+@@ -124,7 +124,7 @@ Status QLRocksDBStorage::InitIterator(common::YQLRowwiseIteratorIf* iter,
+   return Status::OK();
+ }
+ 
+-Status QLRocksDBStorage::GetIterator(const PgsqlReadRequestPB& request,
++Status QLRocksDBStorage::GetIterator(uint64 stmt_id,
+                                      const Schema& projection,
+                                      const Schema& schema,
+                                      const TransactionOperationContextOpt& txn_op_context,
+@@ -132,109 +132,62 @@ Status QLRocksDBStorage::GetIterator(const PgsqlReadRequestPB& request,
+                                      const ReadHybridTime& read_time,
+                                      const QLValuePB& ybctid,
+                                      common::YQLRowwiseIteratorIf::UniPtr* iter) const {
+-  std::unique_ptr<DocRowwiseIterator> doc_iter;
+-
+-  // Populate dockey from ybctid.
+   DocKey range_doc_key(schema);
+   RETURN_NOT_OK(range_doc_key.DecodeFrom(ybctid.binary_value()));
+-  doc_iter = std::make_unique<DocRowwiseIterator>(
++  auto doc_iter = std::make_unique<DocRowwiseIterator>(
+       projection, schema, txn_op_context, doc_db_, deadline, read_time);
+-  RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(schema, request.stmt_id(), range_doc_key)));
+-
++  RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(schema, stmt_id, range_doc_key)));
+   *iter = std::move(doc_iter);
+   return Status::OK();
+ }
+ 
+ Status QLRocksDBStorage::GetIterator(const PgsqlReadRequestPB& request,
+-                                     int64_t batch_arg_index,
+                                      const Schema& projection,
+                                      const Schema& schema,
+                                      const TransactionOperationContextOpt& txn_op_context,
+                                      CoarseTimePoint deadline,
+                                      const ReadHybridTime& read_time,
++                                     const DocKey& start_doc_key,
+                                      common::YQLRowwiseIteratorIf::UniPtr* iter) const {
+-  std::unique_ptr<DocRowwiseIterator> doc_iter;
+-
+-  // TODO(neil) Remove the following IF block when it is completely obsolete.
+-  // The following IF block has not been used since 2.1 release.
+-  // We keep it here only for rolling upgrade purpose.
+-  if (batch_arg_index < 0 && request.has_ybctid_column_value()) {
+-    CHECK(!request.has_paging_state()) << "ASSERT(!ybctid || !paging_state). Each ybctid value "
+-      "identifies one row in the table while paging state is only used for multi-row queries.";
+-    DocKey range_doc_key(schema);
+-    RETURN_NOT_OK(range_doc_key.DecodeFrom(request.ybctid_column_value().value().binary_value()));
+-    doc_iter = std::make_unique<DocRowwiseIterator>(
+-        projection, schema, txn_op_context, doc_db_, deadline, read_time);
+-    RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(schema,
+-                                                  request.stmt_id(),
+-                                                  range_doc_key)));
+-    *iter = std::move(doc_iter);
+-    return Status::OK();
+-  }
+-
+   // Populate dockey from QL key columns.
+-  vector<PrimitiveValue> hashed_components;
+-  RETURN_NOT_OK(InitKeyColumnPrimitiveValues(DocPartitionValues(request, batch_arg_index),
+-                                             schema,
+-                                             0,
+-                                             &hashed_components));
++  auto hashed_components = VERIFY_RESULT(InitKeyColumnPrimitiveValues(
++      request.partition_column_values(), schema, 0 /* start_idx */));
+ 
+-  SubDocKey start_sub_doc_key;
+-  ReadHybridTime req_read_time = read_time;
+-  // Decode the start SubDocKey from the paging state and set scan start key and hybrid time.
+-  if (request.has_paging_state() &&
+-      request.paging_state().has_next_row_key() &&
+-      !request.paging_state().next_row_key().empty()) {
+-    KeyBytes start_key_bytes(request.paging_state().next_row_key());
+-    RETURN_NOT_OK(start_sub_doc_key.FullyDecodeFrom(start_key_bytes.AsSlice()));
+-    if (request.paging_state().has_read_time()) {
+-      req_read_time = ReadHybridTime::FromPB(request.paging_state().read_time());
+-    } else {
+-      req_read_time.read = start_sub_doc_key.hybrid_time();
+-    }
+-  }
+-
+-  doc_iter = std::make_unique<DocRowwiseIterator>(
+-      projection, schema, txn_op_context, doc_db_, deadline, req_read_time);
++  auto doc_iter = std::make_unique<DocRowwiseIterator>(
++      projection, schema, txn_op_context, doc_db_, deadline, read_time);
+ 
+-  if (DocHasRangeValues(request, batch_arg_index)) {
++  if (!request.range_column_values().empty()) {
+     // Construct the scan spec basing on the RANGE condition.
+-    uint32_t hash_code = batch_arg_index < 0 ? request.hash_code()
+-        : request.batch_arguments(batch_arg_index).hash_code();
+-    vector<PrimitiveValue> range_components;
+-    RETURN_NOT_OK(InitKeyColumnPrimitiveValues(DocRangeValues(request, batch_arg_index),
+-                                               schema,
+-                                               schema.num_hash_key_columns(),
+-                                               &range_components));
+-    RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(schema,
+-                                                  request.stmt_id(),
+-                                                  hashed_components.empty()
+-                                                    ? DocKey(schema, range_components)
+-                                                    : DocKey(schema,
+-                                                             hash_code,
+-                                                             hashed_components,
+-                                                             range_components),
+-                                                  start_sub_doc_key.doc_key(),
+-                                                  request.is_forward_scan())));
++    auto range_components = VERIFY_RESULT(InitKeyColumnPrimitiveValues(
++        request.range_column_values(), schema, schema.num_hash_key_columns()));
++    RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(
++        schema,
++        request.stmt_id(),
++        hashed_components.empty()
++          ? DocKey(schema, std::move(range_components))
++          : DocKey(schema,
++                   request.hash_code(),
++                   std::move(hashed_components),
++                   std::move(range_components)),
++        start_doc_key,
++        request.is_forward_scan())));
+   } else {
+-    // Construct the scan spec basing on the WHERE condition.
+-    auto hash_code = DocHashCode(request, batch_arg_index);
+-    auto max_hash_code = DocMaxHashCode(request, batch_arg_index);
+-
+-    CHECK(!request.has_where_expr()) << "WHERE clause is not yet supported in docdb::pgsql";
+-    RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(schema,
+-                                                  request.stmt_id(),
+-                                                  hashed_components,
+-                                                  request.has_condition_expr()
+-                                                    ? &request.condition_expr().condition()
+-                                                    : nullptr,
+-                                                  hash_code,
+-                                                  max_hash_code,
+-                                                  request.has_where_expr()
+-                                                    ? &request.where_expr()
+-                                                    : nullptr,
+-                                                  start_sub_doc_key.doc_key(),
+-                                                  request.is_forward_scan())));
++    // Construct the scan spec basing on the HASH condition.
++
++    SCHECK(!request.has_where_expr(),
++           InternalError,
++           "WHERE clause is not yet supported in docdb::pgsql");
++    RETURN_NOT_OK(doc_iter->Init(DocPgsqlScanSpec(
++        schema,
++        request.stmt_id(),
++        hashed_components,
++        request.has_condition_expr() ? &request.condition_expr().condition() : nullptr,
++        request.hash_code(),
++        request.has_max_hash_code() ? boost::make_optional<int32_t>(request.max_hash_code())
++                                    : boost::none,
++        nullptr /* where_expr */,
++        start_doc_key,
++        request.is_forward_scan())));
+   }
+ 
+   *iter = std::move(doc_iter);
+diff --git a/src/yb/docdb/ql_rocksdb_storage.h b/src/yb/docdb/ql_rocksdb_storage.h
+index 7bb1ff446b..ea78bee37c 100644
+--- a/src/yb/docdb/ql_rocksdb_storage.h
++++ b/src/yb/docdb/ql_rocksdb_storage.h
+@@ -65,15 +65,15 @@ class QLRocksDBStorage : public common::YQLStorageIf {
+                               const QLValuePB& ybctid) const override;
+ 
+   CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+-                             int64_t batch_arg_index,
+                              const Schema& projection,
+                              const Schema& schema,
+                              const TransactionOperationContextOpt& txn_op_context,
+                              CoarseTimePoint deadline,
+                              const ReadHybridTime& read_time,
++                             const DocKey& start_doc_key,
+                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
+ 
+-  CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
++  CHECKED_STATUS GetIterator(uint64 stmt_id,
+                              const Schema& projection,
+                              const Schema& schema,
+                              const TransactionOperationContextOpt& txn_op_context,
+diff --git a/src/yb/master/system_tablet.h b/src/yb/master/system_tablet.h
+index 8e923d3dfd..51ed7b6181 100644
+--- a/src/yb/master/system_tablet.h
++++ b/src/yb/master/system_tablet.h
+@@ -60,6 +60,7 @@ class SystemTablet : public tablet::AbstractTablet {
+ 
+   CHECKED_STATUS HandlePgsqlReadRequest(CoarseTimePoint deadline,
+                                         const ReadHybridTime& read_time,
++                                        bool is_explicit_request_read_time,
+                                         const PgsqlReadRequestPB& pgsql_read_request,
+                                         const TransactionMetadataPB& transaction_metadata,
+                                         tablet::PgsqlReadRequestResult* result,
+diff --git a/src/yb/master/yql_virtual_table.h b/src/yb/master/yql_virtual_table.h
+index 990b1d168a..c9671373f7 100644
+--- a/src/yb/master/yql_virtual_table.h
++++ b/src/yb/master/yql_virtual_table.h
+@@ -88,18 +88,18 @@ class YQLVirtualTable : public common::YQLStorageIf {
+   }
+ 
+   CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+-                             int64_t batch_arg_index,
+                              const Schema& projection,
+                              const Schema& schema,
+                              const TransactionOperationContextOpt& txn_op_context,
+                              CoarseTimePoint deadline,
+                              const ReadHybridTime& read_time,
++                             const docdb::DocKey& start_doc_key,
+                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override {
+     LOG(FATAL) << "Postgresql virtual tables are not yet implemented";
+     return Status::OK();
+   }
+ 
+-  CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
++  CHECKED_STATUS GetIterator(uint64 stmt_id,
+                              const Schema& projection,
+                              const Schema& schema,
+                              const TransactionOperationContextOpt& txn_op_context,
+diff --git a/src/yb/tablet/abstract_tablet.cc b/src/yb/tablet/abstract_tablet.cc
+index 6b11ce763a..fdd65db503 100644
+--- a/src/yb/tablet/abstract_tablet.cc
++++ b/src/yb/tablet/abstract_tablet.cc
+@@ -73,6 +73,7 @@ Status AbstractTablet::HandleQLReadRequest(CoarseTimePoint deadline,
+ 
+ Status AbstractTablet::HandlePgsqlReadRequest(CoarseTimePoint deadline,
+                                               const ReadHybridTime& read_time,
++                                              bool is_explicit_request_read_time,
+                                               const PgsqlReadRequestPB& pgsql_read_request,
+                                               const TransactionOperationContextOpt& txn_op_context,
+                                               PgsqlReadRequestResult* result,
+@@ -86,8 +87,9 @@ Status AbstractTablet::HandlePgsqlReadRequest(CoarseTimePoint deadline,
+       ? GetSchema(pgsql_read_request.index_request().table_id()) : nullptr;
+ 
+   TRACE("Start Execute");
+-  auto fetched_rows = doc_op.Execute(QLStorage(), deadline, read_time, *schema, index_schema.get(),
+-                                     &result->rows_data, &result->restart_read_ht);
++  auto fetched_rows = doc_op.Execute(
++      QLStorage(), deadline, read_time, is_explicit_request_read_time, *schema, index_schema.get(),
++      &result->rows_data, &result->restart_read_ht);
+   TRACE("Done Execute");
+   if (!fetched_rows.ok()) {
+     result->response.set_status(PgsqlResponsePB::PGSQL_STATUS_RUNTIME_ERROR);
+diff --git a/src/yb/tablet/abstract_tablet.h b/src/yb/tablet/abstract_tablet.h
+index 8404b30e73..4014a7251a 100644
+--- a/src/yb/tablet/abstract_tablet.h
++++ b/src/yb/tablet/abstract_tablet.h
+@@ -99,6 +99,7 @@ class AbstractTablet {
+   virtual CHECKED_STATUS HandlePgsqlReadRequest(
+       CoarseTimePoint deadline,
+       const ReadHybridTime& read_time,
++      bool is_explicit_request_read_time,
+       const PgsqlReadRequestPB& ql_read_request,
+       const TransactionMetadataPB& transaction_metadata,
+       PgsqlReadRequestResult* result,
+@@ -123,6 +124,7 @@ class AbstractTablet {
+ 
+   CHECKED_STATUS HandlePgsqlReadRequest(CoarseTimePoint deadline,
+                                         const ReadHybridTime& read_time,
++                                        bool is_explicit_request_read_time,
+                                         const PgsqlReadRequestPB& pgsql_read_request,
+                                         const TransactionOperationContextOpt& txn_op_context,
+                                         PgsqlReadRequestResult* result,
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index a5bd329573..50f4afb5c6 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -1625,6 +1625,7 @@ void Tablet::UpdateQLIndexesFlushed(
+ Status Tablet::HandlePgsqlReadRequest(
+     CoarseTimePoint deadline,
+     const ReadHybridTime& read_time,
++    bool is_explicit_request_read_time,
+     const PgsqlReadRequestPB& pgsql_read_request,
+     const TransactionMetadataPB& transaction_metadata,
+     PgsqlReadRequestResult* result,
+@@ -1654,7 +1655,8 @@ Status Tablet::HandlePgsqlReadRequest(
+           table_info->schema.table_properties().is_ysql_catalog_table());
+   RETURN_NOT_OK(txn_op_ctx);
+   return AbstractTablet::HandlePgsqlReadRequest(
+-      deadline, read_time, pgsql_read_request, *txn_op_ctx, result, num_rows_read);
++      deadline, read_time, is_explicit_request_read_time,
++      pgsql_read_request, *txn_op_ctx, result, num_rows_read);
+ }
+ 
+ // Returns true if the query can be satisfied by rows present in current tablet.
+diff --git a/src/yb/tablet/tablet.h b/src/yb/tablet/tablet.h
+index b60e2bfb11..04e484e0fe 100644
+--- a/src/yb/tablet/tablet.h
++++ b/src/yb/tablet/tablet.h
+@@ -343,6 +343,7 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
+   CHECKED_STATUS HandlePgsqlReadRequest(
+       CoarseTimePoint deadline,
+       const ReadHybridTime& read_time,
++      bool is_explicit_request_read_time,
+       const PgsqlReadRequestPB& pgsql_read_request,
+       const TransactionMetadataPB& transaction_metadata,
+       PgsqlReadRequestResult* result,
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index cea6c08826..7d807e5bac 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1673,6 +1673,15 @@ struct ReadContext {
+     }
+     return Status::OK();
+   }
++
++  ReadHybridTime FormRestartReadHybridTime(const HybridTime& restart_time)  const {
++    DCHECK_GT(restart_time, read_time.read);
++    VLOG(1) << "Restart read required at: " << restart_time << ", original: " << read_time;
++    auto result = read_time;
++    result.read = restart_time;
++    result.local_limit = safe_ht_to_read;
++    return result;
++  }
+ };
+ 
+ // Used when we write intents during read, i.e. for serializable isolation.
+@@ -2142,13 +2151,7 @@ Result<ReadHybridTime> TabletServiceImpl::DoReadImpl(ReadContext* read_context)
+           read_context->req->transaction(), &result));
+       TRACE("Done HandleQLReadRequest");
+       if (result.restart_read_ht.is_valid()) {
+-        DCHECK_GT(result.restart_read_ht, read_context->read_time.read);
+-        VLOG(1) << "Restart read required at: " << result.restart_read_ht
+-                << ", original: " << read_context->read_time;
+-        auto read_time = read_context->read_time;
+-        read_time.read = result.restart_read_ht;
+-        read_time.local_limit = read_context->safe_ht_to_read;
+-        return read_time;
++        return read_context->FormRestartReadHybridTime(result.restart_read_ht);
+       }
+       result.response.set_rows_data_sidecar(read_context->context->AddRpcSidecar(result.rows_data));
+       read_context->resp->add_ql_batch()->Swap(&result.response);
+@@ -2164,17 +2167,15 @@ Result<ReadHybridTime> TabletServiceImpl::DoReadImpl(ReadContext* read_context)
+       TRACE("Start HandlePgsqlReadRequest");
+       size_t num_rows_read;
+       RETURN_NOT_OK(read_context->tablet->HandlePgsqlReadRequest(
+-          read_context->context->GetClientDeadline(), read_tx.read_time(), pgsql_read_req,
++          read_context->context->GetClientDeadline(), read_tx.read_time(),
++          !read_context->allow_retry /* is_explicit_request_read_time */, pgsql_read_req,
+           read_context->req->transaction(), &result, &num_rows_read));
+ 
+       total_num_rows_read += num_rows_read;
+ 
+       TRACE("Done HandlePgsqlReadRequest");
+       if (result.restart_read_ht.is_valid()) {
+-        VLOG(1) << "Restart read required at: " << result.restart_read_ht;
+-        read_context->read_time.read = result.restart_read_ht;
+-        read_context->read_time.local_limit = read_context->safe_ht_to_read;
+-        return read_context->read_time;
++        return read_context->FormRestartReadHybridTime(result.restart_read_ht);
+       }
+       result.response.set_rows_data_sidecar(read_context->context->AddRpcSidecar(result.rows_data));
+       read_context->resp->add_pgsql_batch()->Swap(&result.response);
+diff --git a/src/yb/util/barrier.h b/src/yb/util/barrier.h
+index e8fff8af16..e7c452edb6 100644
+--- a/src/yb/util/barrier.h
++++ b/src/yb/util/barrier.h
+@@ -45,41 +45,51 @@ namespace yb {
+ class Barrier {
+  public:
+   // Initialize the barrier with the given initial count.
+-  explicit Barrier(int count) :
++  explicit Barrier(size_t count) :
+       cond_(&mutex_),
+       count_(count),
+-      initial_count_(count) {
+-    DCHECK_GT(count, 0);
++      wait_count_(count) {
+   }
+ 
+-  ~Barrier() {
++  // Wait until all threads have reached the barrier.
++  // Once all threads have reached the barrier, it is reset to the initial count.
++  void Wait() {
++    WaitImpl(false /* detach */);
+   }
+ 
+   // Wait until all threads have reached the barrier.
+-  // Once all threads have reached the barrier, the barrier is reset
+-  // to the initial count.
+-  void Wait() {
++  // Once all threads have reached the barrier, it is reset to the initial count minus 1.
++  // This method must be called in case thread is finished.
++  // Other threads will not wait for it on next loop.
++  void Detach() {
++    WaitImpl(true /* detach */);
++  }
++
++ private:
++  void WaitImpl(bool detach) {
+     ThreadRestrictions::AssertWaitAllowed();
+     MutexLock l(mutex_);
++    if (detach) {
++      DCHECK_GT(wait_count_, 0);
++      --wait_count_;
++    }
+     if (--count_ == 0) {
+-      count_ = initial_count_;
+-      cycle_count_++;
++      count_ = wait_count_;
++      ++cycle_count_;
+       cond_.Broadcast();
+       return;
+     }
+ 
+-    int initial_cycle = cycle_count_;
+-    while (cycle_count_ == initial_cycle) {
++    for (const auto initial_cycle = cycle_count_; cycle_count_ == initial_cycle;) {
+       cond_.Wait();
+     }
+   }
+ 
+- private:
+   Mutex mutex_;
+   ConditionVariable cond_;
+-  int count_;
+-  uint32_t cycle_count_ = 0;
+-  const int initial_count_;
++  size_t count_;
++  size_t cycle_count_ = 0;
++  size_t wait_count_;
+   DISALLOW_COPY_AND_ASSIGN(Barrier);
+ };
+ 
+diff --git a/src/yb/yql/pggate/pg_doc_op.cc b/src/yb/yql/pggate/pg_doc_op.cc
+index 7152fbd6c2..d1a695e7d7 100644
+--- a/src/yb/yql/pggate/pg_doc_op.cc
++++ b/src/yb/yql/pggate/pg_doc_op.cc
+@@ -660,7 +660,9 @@ Status PgDocReadOp::ProcessResponsePagingState() {
+         innermost_req = innermost_req->mutable_index_request();
+       }
+       *innermost_req->mutable_paging_state() = std::move(*res.mutable_paging_state());
+-
++      if (innermost_req->paging_state().has_read_time()) {
++        read_op->SetReadTime(ReadHybridTime::FromPB(innermost_req->paging_state().read_time()));
++      }
+       // Parse/Analysis/Rewrite catalog version has already been checked on the first request.
+       // The docdb layer will check the target table's schema version is compatible.
+       // This allows long-running queries to continue in the presence of other DDL statements
+diff --git a/src/yb/yql/pgwrapper/pg_libpq-test.cc b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+index 0babe0c53f..6d9fa4f90a 100644
+--- a/src/yb/yql/pgwrapper/pg_libpq-test.cc
++++ b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+@@ -11,6 +11,7 @@
+ // under the License.
+ 
+ #include "yb/gutil/strings/join.h"
++#include "yb/util/barrier.h"
+ #include "yb/util/monotime.h"
+ #include "yb/util/pg_quote.h"
+ #include "yb/util/random_util.h"
+@@ -3052,5 +3053,90 @@ TEST_F(PgLibPqTableTimeoutTest, YB_DISABLE_TEST_IN_TSAN(TestTableTimeoutAndResta
+   }, MonoDelta::FromSeconds(20), "Verify Table was removed by Transaction GC"));
+ }
+ 
++namespace {
++
++class CoordinatedRunner {
++ public:
++  using RepeatableCommand = std::function<Status()>;
++
++  explicit CoordinatedRunner(std::vector<RepeatableCommand> commands)
++      : barrier_(commands.size()) {
++    threads_.reserve(commands.size());
++    for (auto& c : commands) {
++      threads_.emplace_back([this, cmd = std::move(c)] () {
++        while (!(stop_.load(std::memory_order_acquire) ||
++            error_detected_.load(std::memory_order_acquire))) {
++          barrier_.Wait();
++          const auto status = cmd();
++          if (!status.ok()) {
++            LOG(ERROR) << "Error detected: " << status;
++            error_detected_.store(true, std::memory_order_release);
++          }
++        }
++        barrier_.Detach();
++      });
++    }
++  }
++
++  void Stop() {
++    stop_.store(true, std::memory_order_release);
++    for (auto& thread : threads_) {
++      thread.join();
++    }
++  }
++
++  bool HasError() {
++    return error_detected_.load(std::memory_order_acquire);
++  }
++
++ private:
++  std::vector<std::thread> threads_;
++  Barrier barrier_;
++  std::atomic<bool> stop_{false};
++  std::atomic<bool> error_detected_{false};
++};
++
++bool RetryableError(const Status& status) {
++  const auto msg = status.message().ToBuffer();
++  const std::string expected_errors[] = {"Try Again",
++                                         "Catalog Version Mismatch",
++                                         "Restart read required at",
++                                         "schema version mismatch for table"};
++  for (const auto& expected : expected_errors) {
++    if (msg.find(expected) != std::string::npos) {
++      return true;
++    }
++  }
++  return false;
++}
++
++} // namespace
++
++TEST_F(PgLibPqTest, YB_DISABLE_TEST_IN_TSAN(PagingReadRestart)) {
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.Execute("CREATE TABLE t (key INT PRIMARY KEY)"));
++  ASSERT_OK(conn.Execute("INSERT INTO t SELECT generate_series(1, 5000)"));
++  const size_t reader_count = 20;
++  std::vector<CoordinatedRunner::RepeatableCommand> commands;
++  commands.reserve(reader_count + 1);
++  commands.emplace_back(
++      [connection = std::make_shared<PGConn>(ASSERT_RESULT(Connect()))] () -> Status {
++        RETURN_NOT_OK(connection->Execute("ALTER TABLE t ADD COLUMN v INT DEFAULT 100"));
++        RETURN_NOT_OK(connection->Execute("ALTER TABLE t DROP COLUMN v"));
++        return Status::OK();
++  });
++  for (size_t i = 0; i < reader_count; ++i) {
++    commands.emplace_back(
++        [connection = std::make_shared<PGConn>(ASSERT_RESULT(Connect()))] () -> Status {
++          const auto res = connection->Fetch("SELECT key FROM t");
++          return (res.ok() || RetryableError(res.status())) ? Status::OK() : res.status();
++    });
++  }
++  CoordinatedRunner runner(std::move(commands));
++  std::this_thread::sleep_for(10s);
++  runner.Stop();
++  ASSERT_FALSE(runner.HasError());
++}
++
+ } // namespace pgwrapper
+ } // namespace yb

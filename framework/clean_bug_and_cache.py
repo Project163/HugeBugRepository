@@ -37,7 +37,7 @@ def main():
     )
 
     # Allow users to specify the input file, defaulting to framework/delete.txt
-    default_input = os.path.join(config.SCRIPT_DIR, 'example_github.txt')
+    default_input = os.path.join(config.SCRIPT_DIR, 'delete.txt')
     parser.add_argument(
         '-i', '--input', 
         dest='input_file', 

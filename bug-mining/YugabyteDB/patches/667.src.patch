@@ -1,0 +1,859 @@
+diff --git a/src/postgres/contrib/amcheck/expected/check_btree.out b/src/postgres/contrib/amcheck/expected/check_btree.out
+index ef5c9e1a1c..f61f9a8abe 100644
+--- a/src/postgres/contrib/amcheck/expected/check_btree.out
++++ b/src/postgres/contrib/amcheck/expected/check_btree.out
+@@ -159,11 +159,34 @@ SELECT bt_index_check('toasty', true);
+  
+ (1 row)
+ 
++--
++-- Check that index expressions and predicates are run as the table's owner
++--
++TRUNCATE bttest_a;
++INSERT INTO bttest_a SELECT * FROM generate_series(1, 1000);
++ALTER TABLE bttest_a OWNER TO regress_bttest_role;
++-- A dummy index function checking current_user
++CREATE FUNCTION ifun(int8) RETURNS int8 AS $$
++BEGIN
++	ASSERT current_user = 'regress_bttest_role',
++		format('ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++CREATE INDEX bttest_a_expr_idx ON bttest_a ((ifun(id) + ifun(0)))
++	WHERE ifun(id + 10) > ifun(10);
++SELECT bt_index_check('bttest_a_expr_idx', true);
++ bt_index_check 
++----------------
++ 
++(1 row)
++
+ -- cleanup
+ DROP TABLE bttest_a;
+ DROP TABLE bttest_b;
+ DROP TABLE bttest_multi;
+ DROP TABLE delete_test_table;
+ DROP TABLE toast_bug;
++DROP FUNCTION ifun(int8);
+ DROP OWNED BY bttest_role; -- permissions
+ DROP ROLE bttest_role;
+diff --git a/src/postgres/contrib/amcheck/sql/check_btree.sql b/src/postgres/contrib/amcheck/sql/check_btree.sql
+index 0ad1631476..2903f13a27 100644
+--- a/src/postgres/contrib/amcheck/sql/check_btree.sql
++++ b/src/postgres/contrib/amcheck/sql/check_btree.sql
+@@ -103,11 +103,32 @@ INSERT INTO toast_bug SELECT repeat('a', 2200);
+ -- Should not get false positive report of corruption:
+ SELECT bt_index_check('toasty', true);
+ 
++--
++-- Check that index expressions and predicates are run as the table's owner
++--
++TRUNCATE bttest_a;
++INSERT INTO bttest_a SELECT * FROM generate_series(1, 1000);
++ALTER TABLE bttest_a OWNER TO regress_bttest_role;
++-- A dummy index function checking current_user
++CREATE FUNCTION ifun(int8) RETURNS int8 AS $$
++BEGIN
++	ASSERT current_user = 'regress_bttest_role',
++		format('ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++
++CREATE INDEX bttest_a_expr_idx ON bttest_a ((ifun(id) + ifun(0)))
++	WHERE ifun(id + 10) > ifun(10);
++
++SELECT bt_index_check('bttest_a_expr_idx', true);
++
+ -- cleanup
+ DROP TABLE bttest_a;
+ DROP TABLE bttest_b;
+ DROP TABLE bttest_multi;
+ DROP TABLE delete_test_table;
+ DROP TABLE toast_bug;
++DROP FUNCTION ifun(int8);
+ DROP OWNED BY bttest_role; -- permissions
+ DROP ROLE bttest_role;
+diff --git a/src/postgres/contrib/amcheck/verify_nbtree.c b/src/postgres/contrib/amcheck/verify_nbtree.c
+index d57d35dc25..a89b8a41d5 100644
+--- a/src/postgres/contrib/amcheck/verify_nbtree.c
++++ b/src/postgres/contrib/amcheck/verify_nbtree.c
+@@ -33,6 +33,7 @@
+ #include "lib/bloomfilter.h"
+ #include "miscadmin.h"
+ #include "storage/lmgr.h"
++#include "utils/guc.h"
+ #include "utils/memutils.h"
+ #include "utils/snapmgr.h"
+ 
+@@ -204,6 +205,9 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed)
+ 	Relation	indrel;
+ 	Relation	heaprel;
+ 	LOCKMODE	lockmode;
++	Oid			save_userid;
++	int			save_sec_context;
++	int			save_nestlevel;
+ 
+ 	if (parentcheck)
+ 		lockmode = ShareLock;
+@@ -220,9 +224,27 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed)
+ 	 */
+ 	heapid = IndexGetRelation(indrelid, true);
+ 	if (OidIsValid(heapid))
++	{
+ 		heaprel = heap_open(heapid, lockmode);
++
++		/*
++		 * Switch to the table owner's userid, so that any index functions are
++		 * run as that user.  Also lock down security-restricted operations
++		 * and arrange to make GUC variable changes local to this command.
++		 */
++		GetUserIdAndSecContext(&save_userid, &save_sec_context);
++		SetUserIdAndSecContext(heaprel->rd_rel->relowner,
++							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++		save_nestlevel = NewGUCNestLevel();
++	}
+ 	else
++	{
+ 		heaprel = NULL;
++		/* for "gcc -Og" https://gcc.gnu.org/bugzilla/show_bug.cgi?id=78394 */
++		save_userid = InvalidOid;
++		save_sec_context = -1;
++		save_nestlevel = -1;
++	}
+ 
+ 	/*
+ 	 * Open the target index relations separately (like relation_openrv(), but
+@@ -255,6 +277,12 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed)
+ 	/* Check index, possibly against table it is an index on */
+ 	bt_check_every_level(indrel, heaprel, parentcheck, heapallindexed);
+ 
++	/* Roll back any GUC changes executed by index functions */
++	AtEOXact_GUC(false, save_nestlevel);
++
++	/* Restore userid and security context */
++	SetUserIdAndSecContext(save_userid, save_sec_context);
++
+ 	/*
+ 	 * Release locks early. That's ok here because nothing in the called
+ 	 * routines will trigger shared cache invalidations to be sent, so we can
+diff --git a/src/postgres/src/backend/access/brin/brin.c b/src/postgres/src/backend/access/brin/brin.c
+index 4bb6aee6ce..94e4b21512 100644
+--- a/src/postgres/src/backend/access/brin/brin.c
++++ b/src/postgres/src/backend/access/brin/brin.c
+@@ -31,6 +31,7 @@
+ #include "storage/freespace.h"
+ #include "utils/builtins.h"
+ #include "utils/index_selfuncs.h"
++#include "utils/guc.h"
+ #include "utils/memutils.h"
+ #include "utils/rel.h"
+ 
+@@ -869,6 +870,9 @@ brin_summarize_range(PG_FUNCTION_ARGS)
+ 	Oid			heapoid;
+ 	Relation	indexRel;
+ 	Relation	heapRel;
++	Oid			save_userid;
++	int			save_sec_context;
++	int			save_nestlevel;
+ 	double		numSummarized = 0;
+ 
+ 	if (RecoveryInProgress())
+@@ -895,7 +899,22 @@ brin_summarize_range(PG_FUNCTION_ARGS)
+ 	 */
+ 	heapoid = IndexGetRelation(indexoid, true);
+ 	if (OidIsValid(heapoid))
++	{
+ 		heapRel = heap_open(heapoid, ShareUpdateExclusiveLock);
++
++		/*
++		 * Autovacuum calls us.  For its benefit, switch to the table owner's
++		 * userid, so that any index functions are run as that user.  Also
++		 * lock down security-restricted operations and arrange to make GUC
++		 * variable changes local to this command.  This is harmless, albeit
++		 * unnecessary, when called from SQL, because we fail shortly if the
++		 * user does not own the index.
++		 */
++		GetUserIdAndSecContext(&save_userid, &save_sec_context);
++		SetUserIdAndSecContext(heapRel->rd_rel->relowner,
++							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++		save_nestlevel = NewGUCNestLevel();
++	}
+ 	else
+ 		heapRel = NULL;
+ 
+@@ -910,7 +929,7 @@ brin_summarize_range(PG_FUNCTION_ARGS)
+ 						RelationGetRelationName(indexRel))));
+ 
+ 	/* User must own the index (comparable to privileges needed for VACUUM) */
+-	if (!pg_class_ownercheck(indexoid, GetUserId()))
++	if (heapRel != NULL && !pg_class_ownercheck(indexoid, save_userid))
+ 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX,
+ 					   RelationGetRelationName(indexRel));
+ 
+@@ -928,6 +947,12 @@ brin_summarize_range(PG_FUNCTION_ARGS)
+ 	/* OK, do it */
+ 	brinsummarize(indexRel, heapRel, heapBlk, true, &numSummarized, NULL);
+ 
++	/* Roll back any GUC changes executed by index functions */
++	AtEOXact_GUC(false, save_nestlevel);
++
++	/* Restore userid and security context */
++	SetUserIdAndSecContext(save_userid, save_sec_context);
++
+ 	relation_close(indexRel, ShareUpdateExclusiveLock);
+ 	relation_close(heapRel, ShareUpdateExclusiveLock);
+ 
+@@ -969,6 +994,9 @@ brin_desummarize_range(PG_FUNCTION_ARGS)
+ 	 * passed indexoid isn't an index then IndexGetRelation() will fail.
+ 	 * Rather than emitting a not-very-helpful error message, postpone
+ 	 * complaining, expecting that the is-it-an-index test below will fail.
++	 *
++	 * Unlike brin_summarize_range(), autovacuum never calls this.  Hence, we
++	 * don't switch userid.
+ 	 */
+ 	heapoid = IndexGetRelation(indexoid, true);
+ 	if (OidIsValid(heapoid))
+diff --git a/src/postgres/src/backend/catalog/index.c b/src/postgres/src/backend/catalog/index.c
+index eb40820a84..6782eabb42 100644
+--- a/src/postgres/src/backend/catalog/index.c
++++ b/src/postgres/src/backend/catalog/index.c
+@@ -3424,7 +3424,17 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
+ 
+ 	/* Open and lock the parent heap relation */
+ 	heapRelation = heap_open(heapId, ShareUpdateExclusiveLock);
+-	/* And the target index relation */
++
++	/*
++	 * Switch to the table owner's userid, so that any index functions are run
++	 * as that user.  Also lock down security-restricted operations and
++	 * arrange to make GUC variable changes local to this command.
++	 */
++	GetUserIdAndSecContext(&save_userid, &save_sec_context);
++	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
++						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++	save_nestlevel = NewGUCNestLevel();
++
+ 	indexRelation = index_open(indexId, RowExclusiveLock);
+ 
+ 	/*
+@@ -3437,16 +3447,6 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
+ 	/* mark build is concurrent just for consistency */
+ 	indexInfo->ii_Concurrent = true;
+ 
+-	/*
+-	 * Switch to the table owner's userid, so that any index functions are run
+-	 * as that user.  Also lock down security-restricted operations and
+-	 * arrange to make GUC variable changes local to this command.
+-	 */
+-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+-	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+-	save_nestlevel = NewGUCNestLevel();
+-
+ 	/*
+ 	 * Scan the index and gather up all the TIDs into a tuplesort object.
+ 	 */
+@@ -3958,6 +3958,9 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
+ 	Relation	iRel,
+ 				heapRelation;
+ 	Oid			heapId;
++	Oid			save_userid;
++	int			save_sec_context;
++	int			save_nestlevel;
+ 	IndexInfo  *indexInfo;
+ 	volatile bool skipped_constraint = false;
+ 	PGRUsage	ru0;
+@@ -3971,6 +3974,16 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
+ 	heapId = IndexGetRelation(indexId, false);
+ 	heapRelation = heap_open(heapId, ShareLock);
+ 
++	/*
++	 * Switch to the table owner's userid, so that any index functions are run
++	 * as that user.  Also lock down security-restricted operations and
++	 * arrange to make GUC variable changes local to this command.
++	 */
++	GetUserIdAndSecContext(&save_userid, &save_sec_context);
++	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
++						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++	save_nestlevel = NewGUCNestLevel();
++
+ 	/*
+ 	 * Open the target index relation and get an exclusive lock on it, to
+ 	 * ensure that no one else is touching this particular index.
+@@ -4178,6 +4191,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
+ 				 errdetail_internal("%s",
+ 									pg_rusage_show(&ru0))));
+ 
++	/* Roll back any GUC changes executed by index functions */
++	AtEOXact_GUC(false, save_nestlevel);
++
++	/* Restore userid and security context */
++	SetUserIdAndSecContext(save_userid, save_sec_context);
++
+ 	/* Close rels, but keep locks */
+ 	index_close(iRel, NoLock);
+ 	heap_close(heapRelation, NoLock);
+diff --git a/src/postgres/src/backend/commands/cluster.c b/src/postgres/src/backend/commands/cluster.c
+index ff401b8612..81be695a51 100644
+--- a/src/postgres/src/backend/commands/cluster.c
++++ b/src/postgres/src/backend/commands/cluster.c
+@@ -270,6 +270,9 @@ void
+ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ {
+ 	Relation	OldHeap;
++	Oid			save_userid;
++	int			save_sec_context;
++	int			save_nestlevel;
+ 
+ 	/* Check for user-requested abort. */
+ 	CHECK_FOR_INTERRUPTS();
+@@ -286,6 +289,16 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 	if (!OldHeap)
+ 		return;
+ 
++	/*
++	 * Switch to the table owner's userid, so that any index functions are run
++	 * as that user.  Also lock down security-restricted operations and
++	 * arrange to make GUC variable changes local to this command.
++	 */
++	GetUserIdAndSecContext(&save_userid, &save_sec_context);
++	SetUserIdAndSecContext(OldHeap->rd_rel->relowner,
++						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++	save_nestlevel = NewGUCNestLevel();
++
+ 	/*
+ 	 * Since we may open a new transaction for each relation, we have to check
+ 	 * that the relation still is what we think it is.
+@@ -300,10 +313,10 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 		Form_pg_index indexForm;
+ 
+ 		/* Check that the user still owns the relation */
+-		if (!pg_class_ownercheck(tableOid, GetUserId()))
++		if (!pg_class_ownercheck(tableOid, save_userid))
+ 		{
+ 			relation_close(OldHeap, AccessExclusiveLock);
+-			return;
++			goto out;
+ 		}
+ 
+ 		/*
+@@ -317,7 +330,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 		if (RELATION_IS_OTHER_TEMP(OldHeap))
+ 		{
+ 			relation_close(OldHeap, AccessExclusiveLock);
+-			return;
++			goto out;
+ 		}
+ 
+ 		if (OidIsValid(indexOid))
+@@ -328,7 +341,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(indexOid)))
+ 			{
+ 				relation_close(OldHeap, AccessExclusiveLock);
+-				return;
++				goto out;
+ 			}
+ 
+ 			/*
+@@ -338,14 +351,14 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 			if (!HeapTupleIsValid(tuple))	/* probably can't happen */
+ 			{
+ 				relation_close(OldHeap, AccessExclusiveLock);
+-				return;
++				goto out;
+ 			}
+ 			indexForm = (Form_pg_index) GETSTRUCT(tuple);
+ 			if (!indexForm->indisclustered)
+ 			{
+ 				ReleaseSysCache(tuple);
+ 				relation_close(OldHeap, AccessExclusiveLock);
+-				return;
++				goto out;
+ 			}
+ 			ReleaseSysCache(tuple);
+ 		}
+@@ -399,7 +412,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 		!RelationIsPopulated(OldHeap))
+ 	{
+ 		relation_close(OldHeap, AccessExclusiveLock);
+-		return;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -414,6 +427,13 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
+ 	rebuild_relation(OldHeap, indexOid, verbose);
+ 
+ 	/* NB: rebuild_relation does heap_close() on OldHeap */
++
++out:
++	/* Roll back any GUC changes executed by index functions */
++	AtEOXact_GUC(false, save_nestlevel);
++
++	/* Restore userid and security context */
++	SetUserIdAndSecContext(save_userid, save_sec_context);
+ }
+ 
+ /*
+diff --git a/src/postgres/src/backend/commands/indexcmds.c b/src/postgres/src/backend/commands/indexcmds.c
+index 7348a81f12..6f3c5fa4a3 100644
+--- a/src/postgres/src/backend/commands/indexcmds.c
++++ b/src/postgres/src/backend/commands/indexcmds.c
+@@ -55,6 +55,7 @@
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+ #include "utils/fmgroids.h"
++#include "utils/guc.h"
+ #include "utils/inval.h"
+ #include "utils/lsyscache.h"
+ #include "utils/memutils.h"
+@@ -368,11 +369,16 @@ DefineIndex(Oid relationId,
+ 	ObjectAddress address;
+ 	LockRelId	heaprelid;
+ 	LOCKMODE	lockmode;
++	Oid			root_save_userid;
++	int			root_save_sec_context;
++	int			root_save_nestlevel;
+ 	int			i;
+ 
+ 	Oid			databaseId;
+ 	bool		relIsShared;
+ 
++	root_save_nestlevel = NewGUCNestLevel();
++
+ 	/*
+ 	 * count key attributes in index
+ 	 */
+@@ -406,6 +412,15 @@ DefineIndex(Oid relationId,
+ 	 */
+ 	rel = heap_open(relationId, AccessShareLock);
+ 
++	/*
++	 * Switch to the table owner's userid, so that any index functions are run
++	 * as that user.  Also lock down security-restricted operations.  We
++	 * already arranged to make GUC variable changes local to this command.
++	 */
++	GetUserIdAndSecContext(&root_save_userid, &root_save_sec_context);
++	SetUserIdAndSecContext(rel->rd_rel->relowner,
++						   root_save_sec_context | SECURITY_RESTRICTED_OPERATION);
++
+ 	databaseId = YBCGetDatabaseOid(rel);
+ 	relIsShared = rel->rd_rel->relisshared;
+ 
+@@ -576,7 +591,7 @@ DefineIndex(Oid relationId,
+ 	{
+ 		AclResult	aclresult;
+ 
+-		aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(),
++		aclresult = pg_namespace_aclcheck(namespaceId, root_save_userid,
+ 										  ACL_CREATE);
+ 		if (aclresult != ACLCHECK_OK)
+ 			aclcheck_error(aclresult, OBJECT_SCHEMA,
+@@ -642,7 +657,7 @@ DefineIndex(Oid relationId,
+ 	{
+ 		AclResult	aclresult;
+ 
+-		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
++		aclresult = pg_tablespace_aclcheck(tablespaceId, root_save_userid,
+ 										   ACL_CREATE);
+ 		if (aclresult != ACLCHECK_OK)
+ 			aclcheck_error(aclresult, OBJECT_TABLESPACE,
+@@ -1093,10 +1108,30 @@ DefineIndex(Oid relationId,
+ 
+ 	if (!OidIsValid(indexRelationId))
+ 	{
++		/*
++		 * Roll back any GUC changes executed by index functions.  Also revert
++		 * to original default_tablespace if we changed it above.
++		 */
++		AtEOXact_GUC(false, root_save_nestlevel);
++
++		/* Restore userid and security context */
++		SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
++
+ 		heap_close(rel, NoLock);
+ 		return address;
+ 	}
+ 
++	/*
++	 * Roll back any GUC changes executed by index functions, and keep
++	 * subsequent changes local to this command.  It's barely possible that
++	 * some index function changed a behavior-affecting GUC, e.g. xmloption,
++	 * that affects subsequent steps.  This improves bug-compatibility with
++	 * older PostgreSQL versions.  They did the AtEOXact_GUC() here for the
++	 * purpose of clearing the above default_tablespace change.
++	 */
++	AtEOXact_GUC(false, root_save_nestlevel);
++	root_save_nestlevel = NewGUCNestLevel();
++
+ 	/* Add any requested comment */
+ 	if (stmt->idxcomment != NULL)
+ 		CreateComments(indexRelationId, RelationRelationId, 0,
+@@ -1142,6 +1177,9 @@ DefineIndex(Oid relationId,
+ 			{
+ 				Oid			childRelid = part_oids[i];
+ 				Relation	childrel;
++				Oid			child_save_userid;
++				int			child_save_sec_context;
++				int			child_save_nestlevel;
+ 				List	   *childidxs;
+ 				ListCell   *cell;
+ 				AttrNumber *attmap;
+@@ -1149,6 +1187,13 @@ DefineIndex(Oid relationId,
+ 				int			maplen;
+ 
+ 				childrel = heap_open(childRelid, lockmode);
++
++				GetUserIdAndSecContext(&child_save_userid,
++									   &child_save_sec_context);
++				SetUserIdAndSecContext(childrel->rd_rel->relowner,
++									   child_save_sec_context | SECURITY_RESTRICTED_OPERATION);
++				child_save_nestlevel = NewGUCNestLevel();
++
+ 				childidxs = RelationGetIndexList(childrel);
+ 				attmap =
+ 					convert_tuples_by_name_map(RelationGetDescr(childrel),
+@@ -1218,6 +1263,9 @@ DefineIndex(Oid relationId,
+ 				}
+ 
+ 				list_free(childidxs);
++				AtEOXact_GUC(false, child_save_nestlevel);
++				SetUserIdAndSecContext(child_save_userid,
++									   child_save_sec_context);
+ 				heap_close(childrel, NoLock);
+ 
+ 				/*
+@@ -1262,12 +1310,22 @@ DefineIndex(Oid relationId,
+ 
+ 					childStmt->idxname = NULL;
+ 					childStmt->relationId = childRelid;
++
++					/*
++					 * Recurse as the starting user ID.  Callee will use that
++					 * for permission checks, then switch again.
++					 */
++					Assert(GetUserId() == child_save_userid);
++					SetUserIdAndSecContext(root_save_userid,
++										   root_save_sec_context);
+ 					DefineIndex(childRelid, childStmt,
+ 								InvalidOid, /* no predefined OID */
+ 								indexRelationId,	/* this is our child */
+ 								createdConstraintId,
+ 								is_alter_table, check_rights, check_not_in_use,
+ 								skip_build, quiet);
++					SetUserIdAndSecContext(child_save_userid,
++										   child_save_sec_context);
+ 				}
+ 
+ 				pfree(attmap);
+@@ -1304,9 +1362,14 @@ DefineIndex(Oid relationId,
+ 		 * Indexes on partitioned tables are not themselves built, so we're
+ 		 * done here.
+ 		 */
++		AtEOXact_GUC(false, root_save_nestlevel);
++		SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
+ 		return address;
+ 	}
+ 
++	AtEOXact_GUC(false, root_save_nestlevel);
++	SetUserIdAndSecContext(root_save_userid, root_save_sec_context);
++
+ 	if (!concurrent)
+ 	{
+ 		/* Close the heap and we're done, in the non-concurrent case */
+diff --git a/src/postgres/src/backend/commands/ybccmds.c b/src/postgres/src/backend/commands/ybccmds.c
+index e33d746cf2..3bf32fa4c6 100644
+--- a/src/postgres/src/backend/commands/ybccmds.c
++++ b/src/postgres/src/backend/commands/ybccmds.c
+@@ -1277,6 +1277,9 @@ YbBackfillIndex(BackfillIndexStmt *stmt, DestReceiver *dest)
+ 	Relation	indexRel;
+ 	TupOutputState *tstate;
+ 	YbPgExecOutParam *out_param;
++	Oid			save_userid;
++	int			save_sec_context;
++	int			save_nestlevel;
+ 
+ 	if (*YBCGetGFlags()->ysql_disable_index_backfill)
+ 		ereport(ERROR,
+@@ -1303,6 +1306,17 @@ YbBackfillIndex(BackfillIndexStmt *stmt, DestReceiver *dest)
+ 	heapId = IndexGetRelation(indexId, false);
+ 	// TODO(jason): why ShareLock instead of ShareUpdateExclusiveLock?
+ 	heapRel = heap_open(heapId, ShareLock);
++
++	/*
++	 * Switch to the table owner's userid, so that any index functions are run
++	 * as that user.  Also lock down security-restricted operations and
++	 * arrange to make GUC variable changes local to this command.
++	 */
++	GetUserIdAndSecContext(&save_userid, &save_sec_context);
++	SetUserIdAndSecContext(heapRel->rd_rel->relowner,
++						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
++	save_nestlevel = NewGUCNestLevel();
++
+ 	indexRel = index_open(indexId, ShareLock);
+ 
+ 	indexInfo = BuildIndexInfo(indexRel);
+@@ -1325,6 +1339,12 @@ YbBackfillIndex(BackfillIndexStmt *stmt, DestReceiver *dest)
+ 	index_close(indexRel, ShareLock);
+ 	heap_close(heapRel, ShareLock);
+ 
++	/* Roll back any GUC changes executed by index functions */
++	AtEOXact_GUC(false, save_nestlevel);
++
++	/* Restore userid and security context */
++	SetUserIdAndSecContext(save_userid, save_sec_context);
++
+ 	/* output tuples */
+ 	tstate = begin_tup_output_tupdesc(dest, YbBackfillIndexResultDesc(stmt));
+ 	do_text_output_oneline(tstate, out_param->bfoutput->data);
+diff --git a/src/postgres/src/backend/utils/init/miscinit.c b/src/postgres/src/backend/utils/init/miscinit.c
+index 526ceb2808..bb5c66645a 100644
+--- a/src/postgres/src/backend/utils/init/miscinit.c
++++ b/src/postgres/src/backend/utils/init/miscinit.c
+@@ -464,15 +464,21 @@ GetAuthenticatedUserId(void)
+  * with guc.c's internal state, so SET ROLE has to be disallowed.
+  *
+  * SECURITY_RESTRICTED_OPERATION indicates that we are inside an operation
+- * that does not wish to trust called user-defined functions at all.  This
+- * bit prevents not only SET ROLE, but various other changes of session state
+- * that normally is unprotected but might possibly be used to subvert the
+- * calling session later.  An example is replacing an existing prepared
+- * statement with new code, which will then be executed with the outer
+- * session's permissions when the prepared statement is next used.  Since
+- * these restrictions are fairly draconian, we apply them only in contexts
+- * where the called functions are really supposed to be side-effect-free
+- * anyway, such as VACUUM/ANALYZE/REINDEX.
++ * that does not wish to trust called user-defined functions at all.  The
++ * policy is to use this before operations, e.g. autovacuum and REINDEX, that
++ * enumerate relations of a database or schema and run functions associated
++ * with each found relation.  The relation owner is the new user ID.  Set this
++ * as soon as possible after locking the relation.  Restore the old user ID as
++ * late as possible before closing the relation; restoring it shortly after
++ * close is also tolerable.  If a command has both relation-enumerating and
++ * non-enumerating modes, e.g. ANALYZE, both modes set this bit.  This bit
++ * prevents not only SET ROLE, but various other changes of session state that
++ * normally is unprotected but might possibly be used to subvert the calling
++ * session later.  An example is replacing an existing prepared statement with
++ * new code, which will then be executed with the outer session's permissions
++ * when the prepared statement is next used.  These restrictions are fairly
++ * draconian, but the functions called in relation-enumerating operations are
++ * really supposed to be side-effect-free anyway.
+  *
+  * SECURITY_NOFORCE_RLS indicates that we are inside an operation which should
+  * ignore the FORCE ROW LEVEL SECURITY per-table indication.  This is used to
+diff --git a/src/postgres/src/test/regress/expected/privileges.out b/src/postgres/src/test/regress/expected/privileges.out
+index cf41be00cf..637dacf35d 100644
+--- a/src/postgres/src/test/regress/expected/privileges.out
++++ b/src/postgres/src/test/regress/expected/privileges.out
+@@ -1233,6 +1233,61 @@ SELECT has_table_privilege('regress_priv_user1', 'atest4', 'SELECT WITH GRANT OP
+ -- security-restricted operations
+ \c -
+ CREATE ROLE regress_sro_user;
++-- Check that index expressions and predicates are run as the table's owner
++-- A dummy index function checking current_user
++CREATE FUNCTION sro_ifun(int) RETURNS int AS $$
++BEGIN
++	-- Below we set the table's owner to regress_sro_user
++	ASSERT current_user = 'regress_sro_user',
++		format('sro_ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++-- Create a table owned by regress_sro_user
++CREATE TABLE sro_tab (a int);
++ALTER TABLE sro_tab OWNER TO regress_sro_user;
++INSERT INTO sro_tab VALUES (1), (2), (3);
++-- Create an expression index with a predicate
++CREATE INDEX sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++DROP INDEX sro_idx;
++-- Do the same concurrently
++CREATE INDEX CONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++-- REINDEX
++REINDEX TABLE sro_tab;
++REINDEX INDEX sro_idx;
++REINDEX TABLE CONCURRENTLY sro_tab;
++DROP INDEX sro_idx;
++-- CLUSTER
++CREATE INDEX sro_cluster_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)));
++CLUSTER sro_tab USING sro_cluster_idx;
++DROP INDEX sro_cluster_idx;
++-- BRIN index
++CREATE INDEX sro_brin ON sro_tab USING brin ((sro_ifun(a) + sro_ifun(0)));
++SELECT brin_desummarize_range('sro_brin', 0);
++ brin_desummarize_range 
++------------------------
++ 
++(1 row)
++
++SELECT brin_summarize_range('sro_brin', 0);
++ brin_summarize_range 
++----------------------
++                    1
++(1 row)
++
++DROP TABLE sro_tab;
++-- Check with a partitioned table
++CREATE TABLE sro_ptab (a int) PARTITION BY RANGE (a);
++ALTER TABLE sro_ptab OWNER TO regress_sro_user;
++CREATE TABLE sro_part PARTITION OF sro_ptab FOR VALUES FROM (1) TO (10);
++ALTER TABLE sro_part OWNER TO regress_sro_user;
++INSERT INTO sro_ptab VALUES (1), (2), (3);
++CREATE INDEX sro_pidx ON sro_ptab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++REINDEX TABLE sro_ptab;
++REINDEX INDEX CONCURRENTLY sro_pidx;
+ SET SESSION AUTHORIZATION regress_sro_user;
+ CREATE FUNCTION unwanted_grant() RETURNS void LANGUAGE sql AS
+ 	'GRANT regress_priv_group2 TO regress_sro_user';
+diff --git a/src/postgres/src/test/regress/expected/yb_pg_privileges.out b/src/postgres/src/test/regress/expected/yb_pg_privileges.out
+index 2daec91bb9..9cef8b8886 100644
+--- a/src/postgres/src/test/regress/expected/yb_pg_privileges.out
++++ b/src/postgres/src/test/regress/expected/yb_pg_privileges.out
+@@ -1217,6 +1217,39 @@ SELECT has_table_privilege('regress_priv_user1', 'atest4', 'SELECT WITH GRANT OP
+  t
+ (1 row)
+ 
++-- security-restricted operations
++\c -
++CREATE ROLE regress_sro_user;
++-- Check that index expressions and predicates are run as the table's owner
++-- A dummy index function checking current_user
++CREATE FUNCTION sro_ifun(int) RETURNS int AS $$
++BEGIN
++	-- Below we set the table's owner to regress_sro_user
++	ASSERT current_user = 'regress_sro_user',
++		format('sro_ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++-- Create a table owned by regress_sro_user
++CREATE TABLE sro_tab (a int);
++ALTER TABLE sro_tab OWNER TO regress_sro_user;
++INSERT INTO sro_tab VALUES (1), (2), (3);
++-- Create an expression index with a predicate
++-- YB note: index creation in upstream PG is by default nonconcurrent (unlike YB)
++CREATE INDEX NONCONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++DROP INDEX sro_idx;
++-- Do the same concurrently
++CREATE INDEX CONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++-- Check with a partitioned table
++CREATE TABLE sro_ptab (a int) PARTITION BY RANGE (a);
++ALTER TABLE sro_ptab OWNER TO regress_sro_user;
++CREATE TABLE sro_part PARTITION OF sro_ptab FOR VALUES FROM (1) TO (10);
++ALTER TABLE sro_part OWNER TO regress_sro_user;
++INSERT INTO sro_ptab VALUES (1), (2), (3);
++CREATE INDEX sro_pidx ON sro_ptab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
+ -- Admin options
+ SET SESSION AUTHORIZATION regress_priv_user4;
+ CREATE FUNCTION dogrant_ok() RETURNS void LANGUAGE sql SECURITY DEFINER AS
+diff --git a/src/postgres/src/test/regress/sql/privileges.sql b/src/postgres/src/test/regress/sql/privileges.sql
+index c67fff23f9..8b34fb4340 100644
+--- a/src/postgres/src/test/regress/sql/privileges.sql
++++ b/src/postgres/src/test/regress/sql/privileges.sql
+@@ -765,6 +765,53 @@ SELECT has_table_privilege('regress_priv_user1', 'atest4', 'SELECT WITH GRANT OP
+ \c -
+ CREATE ROLE regress_sro_user;
+ 
++-- Check that index expressions and predicates are run as the table's owner
++
++-- A dummy index function checking current_user
++CREATE FUNCTION sro_ifun(int) RETURNS int AS $$
++BEGIN
++	-- Below we set the table's owner to regress_sro_user
++	ASSERT current_user = 'regress_sro_user',
++		format('sro_ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++-- Create a table owned by regress_sro_user
++CREATE TABLE sro_tab (a int);
++ALTER TABLE sro_tab OWNER TO regress_sro_user;
++INSERT INTO sro_tab VALUES (1), (2), (3);
++-- Create an expression index with a predicate
++CREATE INDEX sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++DROP INDEX sro_idx;
++-- Do the same concurrently
++CREATE INDEX CONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++-- REINDEX
++REINDEX TABLE sro_tab;
++REINDEX INDEX sro_idx;
++REINDEX TABLE CONCURRENTLY sro_tab;
++DROP INDEX sro_idx;
++-- CLUSTER
++CREATE INDEX sro_cluster_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)));
++CLUSTER sro_tab USING sro_cluster_idx;
++DROP INDEX sro_cluster_idx;
++-- BRIN index
++CREATE INDEX sro_brin ON sro_tab USING brin ((sro_ifun(a) + sro_ifun(0)));
++SELECT brin_desummarize_range('sro_brin', 0);
++SELECT brin_summarize_range('sro_brin', 0);
++DROP TABLE sro_tab;
++-- Check with a partitioned table
++CREATE TABLE sro_ptab (a int) PARTITION BY RANGE (a);
++ALTER TABLE sro_ptab OWNER TO regress_sro_user;
++CREATE TABLE sro_part PARTITION OF sro_ptab FOR VALUES FROM (1) TO (10);
++ALTER TABLE sro_part OWNER TO regress_sro_user;
++INSERT INTO sro_ptab VALUES (1), (2), (3);
++CREATE INDEX sro_pidx ON sro_ptab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++REINDEX TABLE sro_ptab;
++REINDEX INDEX CONCURRENTLY sro_pidx;
++
+ SET SESSION AUTHORIZATION regress_sro_user;
+ CREATE FUNCTION unwanted_grant() RETURNS void LANGUAGE sql AS
+ 	'GRANT regress_priv_group2 TO regress_sro_user';
+diff --git a/src/postgres/src/test/regress/sql/yb_pg_privileges.sql b/src/postgres/src/test/regress/sql/yb_pg_privileges.sql
+index 06fa30f91a..a236edcf08 100644
+--- a/src/postgres/src/test/regress/sql/yb_pg_privileges.sql
++++ b/src/postgres/src/test/regress/sql/yb_pg_privileges.sql
+@@ -777,6 +777,42 @@ SELECT has_table_privilege('regress_priv_user3', 'atest4', 'SELECT'); -- false
+ SELECT has_table_privilege('regress_priv_user1', 'atest4', 'SELECT WITH GRANT OPTION'); -- true
+ 
+ 
++-- security-restricted operations
++\c -
++CREATE ROLE regress_sro_user;
++
++-- Check that index expressions and predicates are run as the table's owner
++
++-- A dummy index function checking current_user
++CREATE FUNCTION sro_ifun(int) RETURNS int AS $$
++BEGIN
++	-- Below we set the table's owner to regress_sro_user
++	ASSERT current_user = 'regress_sro_user',
++		format('sro_ifun(%s) called by %s', $1, current_user);
++	RETURN $1;
++END;
++$$ LANGUAGE plpgsql IMMUTABLE;
++-- Create a table owned by regress_sro_user
++CREATE TABLE sro_tab (a int);
++ALTER TABLE sro_tab OWNER TO regress_sro_user;
++INSERT INTO sro_tab VALUES (1), (2), (3);
++-- Create an expression index with a predicate
++-- YB note: index creation in upstream PG is by default nonconcurrent (unlike YB)
++CREATE INDEX NONCONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++DROP INDEX sro_idx;
++-- Do the same concurrently
++CREATE INDEX CONCURRENTLY sro_idx ON sro_tab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++-- Check with a partitioned table
++CREATE TABLE sro_ptab (a int) PARTITION BY RANGE (a);
++ALTER TABLE sro_ptab OWNER TO regress_sro_user;
++CREATE TABLE sro_part PARTITION OF sro_ptab FOR VALUES FROM (1) TO (10);
++ALTER TABLE sro_part OWNER TO regress_sro_user;
++INSERT INTO sro_ptab VALUES (1), (2), (3);
++CREATE INDEX sro_pidx ON sro_ptab ((sro_ifun(a) + sro_ifun(0)))
++	WHERE sro_ifun(a + 10) > sro_ifun(10);
++
+ -- Admin options
+ 
+ SET SESSION AUTHORIZATION regress_priv_user4;

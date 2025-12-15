@@ -1,0 +1,294 @@
+diff --git a/src/yb/rocksdb/db/db_test.cc b/src/yb/rocksdb/db/db_test.cc
+index 9ca4459e86..5cac2a9450 100644
+--- a/src/yb/rocksdb/db/db_test.cc
++++ b/src/yb/rocksdb/db/db_test.cc
+@@ -6720,6 +6720,53 @@ TEST_F(DBTest, DontDeletePendingOutputs) {
+   Compact("a", "b");
+ }
+ 
++TEST_F(DBTest, DontDeletePendingOutputsDuringConcurrentFlushes) {
++  const auto kConcurrentFlushes = 4;
++  const auto kFlushIterationsPerThread = 300;
++
++  Options options;
++  options.env = env_;
++  options.create_if_missing = true;
++  options.max_background_flushes = kConcurrentFlushes;
++
++  DestroyAndReopen(options);
++
++  std::atomic<bool> stop_requested(false);
++
++  std::vector<std::thread> flush_threads;
++
++  auto purge_thread = std::thread([this, &stop_requested] {
++    LOG(INFO) << "Started purge thread";
++    while (!stop_requested) {
++      JobContext job_context(0);
++      dbfull()->TEST_LockMutex();
++      dbfull()->FindObsoleteFiles(&job_context, true /*force*/);
++      dbfull()->TEST_UnlockMutex();
++      if (job_context.HaveSomethingToDelete()) {
++        dbfull()->PurgeObsoleteFiles(job_context);
++      }
++      job_context.Clean();
++    }
++  });
++
++  for (int i = 0; i < kConcurrentFlushes; ++i) {
++    flush_threads.emplace_back([this] {
++      for (int iter = 0; iter < kFlushIterationsPerThread; ++iter) {
++        ASSERT_OK(Put("a", "begin"));
++        ASSERT_OK(Put("z", "end"));
++        ASSERT_OK(Flush());
++      }
++    });
++  }
++
++  for (auto& thread : flush_threads) {
++    thread.join();
++  }
++
++  stop_requested = true;
++  purge_thread.join();
++}
++
+ #ifndef ROCKSDB_LITE
+ TEST_F(DBTest, DontDeleteMovedFile) {
+   // This test triggers move compaction and verifies that the file is not
+diff --git a/src/yb/rocksdb/db/file_numbers.cc b/src/yb/rocksdb/db/file_numbers.cc
+index 464c74ad78..4bdb92a8be 100644
+--- a/src/yb/rocksdb/db/file_numbers.cc
++++ b/src/yb/rocksdb/db/file_numbers.cc
+@@ -24,10 +24,7 @@ std::string FileNumbersHolder::ToString() const {
+ FileNumbersHolder FileNumbersProvider::NewFileNumber() {
+   // No need to lock because VersionSet::next_file_number_ is atomic.
+   auto file_number = versions_->NewFileNumber();
+-  {
+-    std::lock_guard<SpinMutex> l(mutex_);
+-    fset_.insert(file_number);
+-  }
++  AddFileNumber(file_number);
+   auto holder = FileNumbersHolder(this);
+   holder.Add(file_number);
+   return holder;
+@@ -56,9 +53,17 @@ std::string FileNumbersProvider::ToString() const {
+   return yb::ToString(fset_);
+ }
+ 
++void FileNumbersProvider::AddFileNumber(FileNumber file_number) {
++  std::lock_guard<SpinMutex> l(mutex_);
++  fset_.insert(file_number);
++}
++
+ void FileNumbersProvider::RemoveFileNumber(FileNumber file_number) {
+   std::lock_guard<SpinMutex> l(mutex_);
+-  fset_.erase(file_number);
++  auto iter = fset_.find(file_number);
++  if (iter != fset_.end()) {
++    fset_.erase(iter);
++  }
+ }
+ 
+ }  // namespace rocksdb
+diff --git a/src/yb/rocksdb/db/file_numbers.h b/src/yb/rocksdb/db/file_numbers.h
+index db3a876c35..f3c7258736 100644
+--- a/src/yb/rocksdb/db/file_numbers.h
++++ b/src/yb/rocksdb/db/file_numbers.h
+@@ -24,45 +24,66 @@
+ namespace rocksdb {
+ 
+ typedef uint64_t FileNumber;
+-typedef std::unordered_set<FileNumber> FileNumberSet;
++typedef std::unordered_multiset<FileNumber> FileNumberSet;
+ 
+ class VersionSet;
+ 
+ // Utility interface used by FileNumbersHolder and FileNumbersProvider (see below).
+-class FileNumberRemover {
++class FileNumberAdderRemover {
+  public:
++  virtual void AddFileNumber(FileNumber file_number) = 0;
+   virtual void RemoveFileNumber(FileNumber file_number) = 0;
+-  virtual ~FileNumberRemover() {}
++  virtual ~FileNumberAdderRemover() {}
+ };
+ 
+-// RAII wrapper which holds file numbers and passes them to remover_->RemoveFileNumber
+-// when destroyed.
++// RAII wrapper which holds file numbers and passes them to adder_remover_->RemoveFileNumber
++// when destroyed. Also calls adder_remover_->AddFileNumber on copy.
+ class FileNumbersHolder {
+  public:
+-  FileNumbersHolder(const FileNumbersHolder&) = delete;
+-  FileNumbersHolder& operator=(const FileNumbersHolder&) = delete;
++  FileNumbersHolder(const FileNumbersHolder& rhs) :
++    adder_remover_(rhs.adder_remover_), file_numbers_(rhs.file_numbers_) {
++    HoldFileNumbers();
++  }
++
++  FileNumbersHolder& operator=(const FileNumbersHolder& rhs) {
++    if (&rhs != this) {
++      Reset();
++      adder_remover_ = rhs.adder_remover_;
++      file_numbers_ = rhs.file_numbers_;
++      HoldFileNumbers();
++    }
++    return *this;
++  }
+ 
+   // Default constructor creates empty holder which is not intended to add any file numbers.
+   FileNumbersHolder() {}
+   // Creates holder which can be used to add file numbers.
+-  explicit FileNumbersHolder(FileNumberRemover* remover) : remover_(remover) {}
++  explicit FileNumbersHolder(FileNumberAdderRemover* remover) : adder_remover_(remover) {}
+ 
+   FileNumbersHolder(FileNumbersHolder&& rhs)
+-      : remover_(std::move(rhs.remover_)), file_numbers_(std::move(rhs.file_numbers_)) {
++      : adder_remover_(std::move(rhs.adder_remover_)), file_numbers_(std::move(rhs.file_numbers_)) {
+     rhs.file_numbers_.clear();
+   }
+ 
+   FileNumbersHolder& operator=(FileNumbersHolder&& rhs) {
+-    remover_ = std::move(rhs.remover_);
+-    file_numbers_ = std::move(rhs.file_numbers_);
+-    rhs.file_numbers_.clear();
++    if (&rhs != this) {
++      Reset();
++      adder_remover_ = std::move(rhs.adder_remover_);
++      file_numbers_ = std::move(rhs.file_numbers_);
++      rhs.file_numbers_.clear();
++    }
+     return *this;
+   }
+ 
+   ~FileNumbersHolder() {
++    Reset();
++  }
++
++  void Reset() {
+     for (auto file_number : file_numbers_) {
+-      remover_->RemoveFileNumber(file_number);
++      adder_remover_->RemoveFileNumber(file_number);
+     }
++    file_numbers_.clear();
+   }
+ 
+   // Returns last number added.
+@@ -80,7 +101,13 @@ class FileNumbersHolder {
+   std::string ToString() const;
+ 
+  private:
+-  FileNumberRemover* remover_;
++  void HoldFileNumbers() {
++    for (auto file_number : file_numbers_) {
++      adder_remover_->AddFileNumber(file_number);
++    }
++  }
++
++  FileNumberAdderRemover* adder_remover_;
+   boost::container::small_vector<FileNumber, 1> file_numbers_;
+ };
+ 
+@@ -89,7 +116,7 @@ class FileNumbersHolder {
+ // destroyed, corresponding file numbers will be removed from internal storage. Also provides a
+ // function to check whether specific file number is contained in internal storage.
+ // See DBImpl::pending_outputs_ description for more details on usage and application.
+-class FileNumbersProvider : public FileNumberRemover {
++class FileNumbersProvider : public FileNumberAdderRemover {
+  public:
+   explicit FileNumbersProvider(VersionSet* versions)
+       : versions_(versions) {}
+@@ -106,6 +133,9 @@ class FileNumbersProvider : public FileNumberRemover {
+   // Check whether we have have file_number in internal storage.
+   bool HasFileNumber(FileNumber file_number) const;
+ 
++  // Add file_number to internal storage.
++  void AddFileNumber(FileNumber file_number) override;
++
+   // Remove file_number from internal storage.
+   void RemoveFileNumber(FileNumber file_number) override;
+ 
+diff --git a/src/yb/rocksdb/db/flush_job.cc b/src/yb/rocksdb/db/flush_job.cc
+index e6d3c013ca..1aa36b9a49 100644
+--- a/src/yb/rocksdb/db/flush_job.cc
++++ b/src/yb/rocksdb/db/flush_job.cc
+@@ -195,7 +195,7 @@ Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
+     Status s = cfd_->imm()->InstallMemtableFlushResults(
+         cfd_, mutable_cf_options_, mems, versions_, db_mutex_,
+         meta.fd.GetNumber(), &job_context_->memtables_to_free, db_directory_,
+-        log_buffer_);
++        log_buffer_, *fnum);
+     if (!s.ok()) {
+       fnum = s;
+     }
+diff --git a/src/yb/rocksdb/db/memtable.h b/src/yb/rocksdb/db/memtable.h
+index f11882aa9e..82ec626f9e 100644
+--- a/src/yb/rocksdb/db/memtable.h
++++ b/src/yb/rocksdb/db/memtable.h
+@@ -34,6 +34,7 @@
+ #include <vector>
+ 
+ #include "yb/rocksdb/db/dbformat.h"
++#include "yb/rocksdb/db/file_numbers.h"
+ #include "yb/rocksdb/db/skiplist.h"
+ #include "yb/rocksdb/db/version_edit.h"
+ #include "yb/rocksdb/db.h"
+@@ -371,9 +372,12 @@ class MemTable {
+   std::atomic<uint64_t> num_deletes_;
+ 
+   // These are used to manage memtable flushes to storage
+-  bool flush_in_progress_; // started the flush
+-  bool flush_completed_;   // finished the flush
+-  uint64_t file_number_;    // filled up after flush is complete
++  bool flush_in_progress_;        // started the flush
++  bool flush_completed_;          // finished the flush
++  uint64_t file_number_;          // filled up after flush is complete
++  // Filled up after flush is complete to prevent file from being deleted util it is added into the
++  // VersionSet.
++  FileNumbersHolder file_number_holder_;
+ 
+   // The updates to be applied to the transaction log when this
+   // memtable is flushed to storage.
+diff --git a/src/yb/rocksdb/db/memtable_list.cc b/src/yb/rocksdb/db/memtable_list.cc
+index b19a05e0a3..0b57d99674 100644
+--- a/src/yb/rocksdb/db/memtable_list.cc
++++ b/src/yb/rocksdb/db/memtable_list.cc
+@@ -325,7 +325,7 @@ Status MemTableList::InstallMemtableFlushResults(
+     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+     const autovector<MemTable*>& mems, VersionSet* vset, InstrumentedMutex* mu,
+     uint64_t file_number, autovector<MemTable*>* to_delete,
+-    Directory* db_directory, LogBuffer* log_buffer) {
++    Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder) {
+   AutoThreadOperationStageUpdater stage_updater(
+       ThreadStatus::STAGE_MEMTABLE_INSTALL_FLUSH_RESULTS);
+   mu->AssertHeld();
+@@ -345,6 +345,7 @@ Status MemTableList::InstallMemtableFlushResults(
+         frontiers = temp_range->Clone();
+       }
+     }
++    mems[i]->file_number_holder_ = file_number_holder;
+     mems[i]->file_number_ = file_number;
+   }
+   if (frontiers) {
+@@ -400,6 +401,7 @@ Status MemTableList::InstallMemtableFlushResults(
+         m->edit_.Clear();
+         num_flush_not_started_++;
+         m->file_number_ = 0;
++        m->file_number_holder_.Reset();
+         imm_flush_needed.store(true, std::memory_order_release);
+       }
+       ++mem_id;
+diff --git a/src/yb/rocksdb/db/memtable_list.h b/src/yb/rocksdb/db/memtable_list.h
+index b7bbb35abf..2b1da73563 100644
+--- a/src/yb/rocksdb/db/memtable_list.h
++++ b/src/yb/rocksdb/db/memtable_list.h
+@@ -209,7 +209,7 @@ class MemTableList {
+       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+       const autovector<MemTable*>& m, VersionSet* vset, InstrumentedMutex* mu,
+       uint64_t file_number, autovector<MemTable*>* to_delete,
+-      Directory* db_directory, LogBuffer* log_buffer);
++      Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder);
+ 
+   // New memtables are inserted at the front of the list.
+   // Takes ownership of the referenced held on *m by the caller of Add().

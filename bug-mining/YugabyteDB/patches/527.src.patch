@@ -1,0 +1,393 @@
+diff --git a/src/yb/rpc/rpc-test.cc b/src/yb/rpc/rpc-test.cc
+index 44024659ff..8a5bf04586 100644
+--- a/src/yb/rpc/rpc-test.cc
++++ b/src/yb/rpc/rpc-test.cc
+@@ -869,30 +869,45 @@ TEST_F(TestRpc, SendingQueueMemoryUsage) {
+ 
+   MemoryUsage current, latest_before_realloc;
+ 
+-  const auto allocated_bytes_initial = GetCurrentAllocatedBytes();
+-  while (current.allocated_bytes < 1_MB) {
++  StartAllocationsTracking();
++  const auto heap_allocated_bytes_initial = MemTracker::GetTCMallocCurrentAllocatedBytes();
++  while (current.heap_allocated_bytes < 1_MB) {
+     auto data_ptr = std::make_shared<StringOutboundData>(
+         kEmptyMsgLengthPrefix, kMsgLengthPrefixLength, "Empty message");
+     sending.emplace_back(data_ptr, tracker);
+ 
+-    const auto allocated_bytes = GetCurrentAllocatedBytes() - allocated_bytes_initial;
+-    if (allocated_bytes != current.allocated_bytes) {
++    const auto heap_allocated_bytes =
++        MemTracker::GetTCMallocCurrentAllocatedBytes() - heap_allocated_bytes_initial;
++    if (heap_allocated_bytes != current.heap_allocated_bytes) {
+       latest_before_realloc = current;
+     }
+-    current.allocated_bytes = allocated_bytes;
++    current.heap_allocated_bytes = heap_allocated_bytes;
++    current.heap_requested_bytes = GetHeapRequestedBytes();
+     current.tracked_consumption += sending.back().consumption.consumption();
+     // Account data_ptr as well.
+     current.tracked_consumption += sizeof(data_ptr);
+     current.entities_count = sending.size();
+   }
++  StopAllocationsTracking();
+ 
+   LOG(INFO) << DumpMemoryUsage(latest_before_realloc);
+ 
+-  // Amount of memory really allocated from tcmalloc could be higher due to round up.
++  LOG(INFO) << "Tracked consumption: " << latest_before_realloc.tracked_consumption;
++  LOG(INFO) << "Requested bytes: " << latest_before_realloc.heap_requested_bytes;
++  LOG(INFO) << "Allocated bytes: " << latest_before_realloc.heap_allocated_bytes;
++
++  ASSERT_LE(latest_before_realloc.tracked_consumption, latest_before_realloc.heap_requested_bytes);
++  // We should track at least kDynamicMemoryUsageAccuracyLowLimit memory requested from heap.
+   ASSERT_GT(
+       latest_before_realloc.tracked_consumption,
+-      size_t(latest_before_realloc.allocated_bytes / kHighMemoryAllocationAccuracyLimit));
+-  ASSERT_LE(latest_before_realloc.tracked_consumption, latest_before_realloc.allocated_bytes);
++      size_t(latest_before_realloc.heap_requested_bytes * kDynamicMemoryUsageAccuracyLowLimit));
++
++  ASSERT_LE(latest_before_realloc.heap_requested_bytes, latest_before_realloc.heap_allocated_bytes);
++  // Expect TCMalloc to allocate more memory than requested due to roundup, but limited by
++  // kMemoryAllocationAccuracyHighLimit.
++  ASSERT_LE(
++      latest_before_realloc.heap_allocated_bytes,
++      latest_before_realloc.heap_requested_bytes * kMemoryAllocationAccuracyHighLimit);
+ }
+ 
+ #endif
+diff --git a/src/yb/util/CMakeLists.txt b/src/yb/util/CMakeLists.txt
+index e57c2caa20..651c295c8e 100644
+--- a/src/yb/util/CMakeLists.txt
++++ b/src/yb/util/CMakeLists.txt
+@@ -318,6 +318,7 @@ add_dependencies(yb_util gen_version_info)
+ 
+ add_library(yb_test_util
+   logging_test_util.cc
++  memory/memory_usage_test_util.cc
+   test_util.cc)
+ target_link_libraries(yb_test_util
+   gflags
+diff --git a/src/yb/util/memory/memory_usage-test.cc b/src/yb/util/memory/memory_usage-test.cc
+index b9f2f642b6..4c5181ea66 100644
+--- a/src/yb/util/memory/memory_usage-test.cc
++++ b/src/yb/util/memory/memory_usage-test.cc
+@@ -17,22 +17,12 @@
+ #define YB_UTIL_MEMORY_MEMORY_USAGE_TEST_H
+ 
+ #include "yb/util/memory/memory_usage.h"
++#include "yb/util/memory/memory_usage_test_util.h"
+ #include "yb/util/size_literals.h"
+ #include "yb/util/test_util.h"
+ 
+ DEFINE_bool(print_memory_usage, false, "Print real memory usage instead of assert.");
+ 
+-size_t last_allocated_bytes = 0;
+-
+-#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
+-
+-void* operator new(std::size_t n) {
+-  last_allocated_bytes = n;
+-  return malloc(n);
+-}
+-
+-#endif
+-
+ namespace yb {
+ 
+ class MemoryUsageTest : public YBTest {};
+@@ -42,25 +32,45 @@ TEST_F(MemoryUsageTest, String) {
+ #else
+ TEST_F(MemoryUsageTest, DISABLED_String) {
+ #endif
+-  size_t prev_allocated_bytes = 0;
+-  size_t length_start = 0;
+-  for (auto length = 0; length <= 1_KB; ++length) {
+-    last_allocated_bytes = 0;
+-    std::string result(length, 'X');
+-    const auto allocated_bytes = last_allocated_bytes;
+-    const auto memory_usage_estimate = DynamicMemoryUsageOf(result);
+-    if (FLAGS_print_memory_usage) {
+-      if (allocated_bytes != prev_allocated_bytes) {
+-        LOG(INFO) << "std::string length: " << length_start << "-" << length - 1
+-                  << " (delta: " << length - length_start << ")"
+-                  << ", bytes allocated: " << prev_allocated_bytes;
+-        length_start = length;
+-        prev_allocated_bytes = allocated_bytes;
++  LOG(INFO) << "sizeof(std::string): " << sizeof(std::string);
++  for (auto additional_capacity : {false, true}) {
++    size_t prev_allocated_bytes = 0;
++    size_t length_start = 0;
++    size_t capacity_min = std::numeric_limits<size_t>::max();
++    size_t capacity_max = std::numeric_limits<size_t>::min();
++    for (auto length = 0; length <= 1_KB; ++length) {
++      StartAllocationsTracking();
++      std::string result(length, 'X');
++      if (additional_capacity) {
++        result.reserve(length + 100);
++      }
++      StopAllocationsTracking();
++      const auto allocated_bytes = GetHeapRequestedBytes();
++      const auto memory_usage_estimate = DynamicMemoryUsageOf(result);
++      const auto capacity = result.capacity();
++      if (FLAGS_print_memory_usage) {
++        if (allocated_bytes != prev_allocated_bytes) {
++          LOG(INFO) << "std::string length: " << length_start << "-" << length - 1
++                    << " (range width: " << length - length_start << ")"
++                    << ", capacity: " << capacity_min << "-" << capacity_max
++                    << " (range width: " << capacity_max - capacity_min + 1 << ")"
++                    << ", bytes allocated: " << prev_allocated_bytes
++                    << ", allocated - length_start: " << prev_allocated_bytes - length_start
++                    << ", allocated - capacity_min: " << prev_allocated_bytes - capacity_min
++                    << ", memory_usage_estimate: " << memory_usage_estimate;
++          length_start = length;
++          prev_allocated_bytes = allocated_bytes;
++          capacity_min = std::numeric_limits<size_t>::max();
++          capacity_max = std::numeric_limits<size_t>::min();
++        }
++        capacity_min = std::min(capacity_min, capacity);
++        capacity_max = std::max(capacity_max, capacity);
++      } else {
++        ASSERT_EQ(memory_usage_estimate, allocated_bytes)
++            << "std::string length: " << length << ", capacity: " << capacity
++            << ", bytes allocated: " << allocated_bytes
++            << ", yb::DynamicMemoryUsage: " << memory_usage_estimate;
+       }
+-    } else {
+-      ASSERT_EQ(memory_usage_estimate, allocated_bytes)
+-          << "std::string length: " << length << ", bytes allocated: " << allocated_bytes
+-          << ", yb::DynamicMemoryUsage: " << memory_usage_estimate;
+     }
+   }
+ }
+diff --git a/src/yb/util/memory/memory_usage.h b/src/yb/util/memory/memory_usage.h
+index e801e01012..351c26c990 100644
+--- a/src/yb/util/memory/memory_usage.h
++++ b/src/yb/util/memory/memory_usage.h
+@@ -59,17 +59,29 @@ typename std::enable_if<std::is_integral<typename std::remove_reference<Int>::ty
+ // memory from heap for bigger strings. Exact memory allocation behaviour depends on C++ std
+ // library implementation.
+ 
+-#ifdef __clang__
++#if defined(__clang__)
+ 
+ constexpr const auto kStdStringInternalCapacity = 22;
+ 
+ inline std::size_t DynamicMemoryUsageOf(const std::string& value) {
+-  if (value.size() <= kStdStringInternalCapacity) {
++  const auto capacity = value.capacity();
++  if (capacity <= kStdStringInternalCapacity) {
+     return 0;
+   } else {
+     // std::string allocates 16*n bytes for capacity from [16*(n - 1); 16*n - 1].
+     // 48 bytes for capacity in [32; 47], 64 bytes for capacity in [48; 63] and so on...
+-    return (value.capacity() + 16) & ~(size_t(0xf));
++    return (capacity + 16) & ~(size_t(0xf));
++  }
++}
++
++#elif (__GNUC__ >= 9)
++
++inline std::size_t DynamicMemoryUsageOf(const std::string& value) {
++  const auto capacity = value.capacity();
++  if (capacity == 0) {
++    return 0;
++  } else {
++    return capacity + 25;
+   }
+ }
+ 
+@@ -78,14 +90,15 @@ inline std::size_t DynamicMemoryUsageOf(const std::string& value) {
+ constexpr const auto kStdStringInternalCapacity = 15;
+ 
+ inline std::size_t DynamicMemoryUsageOf(const std::string& value) {
+-  if (value.size() <= kStdStringInternalCapacity) {
++  const auto capacity = value.capacity();
++  if (capacity <= kStdStringInternalCapacity) {
+     return 0;
+   } else {
+-    return value.capacity() + 1;
++    return capacity + 1;
+   }
+ }
+ 
+-#endif
++#endif // defined(__clang__)
+ 
+ template <class T>
+ typename boost::enable_if<boost::is_base_of<google::protobuf::Message, T>, std::size_t>::type
+diff --git a/src/yb/util/memory/memory_usage_test_util.cc b/src/yb/util/memory/memory_usage_test_util.cc
+new file mode 100644
+index 0000000000..832fd751e0
+--- /dev/null
++++ b/src/yb/util/memory/memory_usage_test_util.cc
+@@ -0,0 +1,116 @@
++//--------------------------------------------------------------------------------------------------
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++//--------------------------------------------------------------------------------------------------
++
++#include "yb/util/memory/memory_usage_test_util.h"
++
++#include "yb/util/format.h"
++#include "yb/util/memory/arena.h"
++
++#if defined(TCMALLOC_ENABLED)
++#include <gperftools/malloc_hook.h>
++#endif // defined(TCMALLOC_ENABLED)
++
++namespace yb {
++
++#if defined(TCMALLOC_ENABLED) && !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
++
++size_t heap_requested_bytes = 0;
++bool heap_allocation_tracking_enabled = false;
++
++// We use preallocated arena for heap_allocations map to avoid this map memory allocations be
++// counted by tcmalloc during memory usage tests.
++ThreadSafeArena heap_allocations_map_arena(10_MB, 10_MB);
++
++template<class Key, class Value, class Compare = std::less<Key>>
++using MapOnArena =
++    std::map<Key, Value, Compare, ThreadSafeArenaAllocator<std::pair<const Key, Value>>>;
++MapOnArena<const void*, size_t> heap_allocations(&heap_allocations_map_arena);
++
++void NewHook(const void* ptr, const std::size_t size) {
++  if (heap_allocation_tracking_enabled) {
++    heap_allocation_tracking_enabled = false;
++    heap_requested_bytes += size;
++    auto emplaced = heap_allocations.emplace(ptr, size);
++    if (!emplaced.second) {
++      LOG(FATAL) << "Double allocation at ptr: " << ptr << " size requested: " << size
++                 << " previous size: " << emplaced.first->second;
++    }
++    heap_allocation_tracking_enabled = true;
++  }
++}
++
++void DeleteHook(const void* ptr) {
++  if (heap_allocation_tracking_enabled) {
++    heap_allocation_tracking_enabled = false;
++    auto it = heap_allocations.find(ptr);
++    if (it != heap_allocations.end()) {
++      heap_requested_bytes -= it->second;
++      heap_allocations.erase(it);
++    }
++    heap_allocation_tracking_enabled = true;
++  }
++}
++
++void StartAllocationsTracking() {
++  heap_requested_bytes = 0;
++  heap_allocations.clear();
++  heap_allocation_tracking_enabled = true;
++  MallocHook_AddNewHook(&NewHook);
++  MallocHook_AddDeleteHook(&DeleteHook);
++}
++
++void StopAllocationsTracking() {
++  heap_allocation_tracking_enabled = false;
++  MallocHook_RemoveNewHook(&NewHook);
++  MallocHook_RemoveDeleteHook(&DeleteHook);
++}
++
++size_t GetHeapRequestedBytes() {
++  return heap_requested_bytes;
++}
++
++#else
++
++std::string kNotSupported("$0 is not supported under ASAN/TSAN or without TCMalloc");
++
++void StartAllocationsTracking() {
++  LOG(FATAL) << Format(kNotSupported, __FUNCTION__);
++}
++
++void StopAllocationsTracking() {
++  LOG(FATAL) << Format(kNotSupported, __FUNCTION__);
++}
++
++size_t GetHeapRequestedBytes() {
++  LOG(FATAL) << Format(kNotSupported, __FUNCTION__);
++  return 0;
++}
++
++#endif // defined(TCMALLOC_ENABLED) && !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
++
++std::string DumpMemoryUsage(const MemoryUsage& memory_usage) {
++  std::ostringstream ss;
++  ss << "Entities: " << memory_usage.entities_count << std::endl;
++  auto dump_memory = [&ss, &memory_usage](const char* label, const size_t bytes) {
++    ss << "Memory " << label << ": " << bytes
++       << ", per entity: " << bytes / memory_usage.entities_count << std::endl;
++  };
++  dump_memory("requested", memory_usage.heap_requested_bytes);
++  dump_memory("allocated", memory_usage.heap_allocated_bytes);
++  dump_memory("tracked", memory_usage.tracked_consumption);
++  return ss.str();
++}
++
++}  // namespace yb
+diff --git a/src/yb/util/memory/memory_usage_test_util.h b/src/yb/util/memory/memory_usage_test_util.h
+index ddcf25690e..9163e08aa6 100644
+--- a/src/yb/util/memory/memory_usage_test_util.h
++++ b/src/yb/util/memory/memory_usage_test_util.h
+@@ -16,37 +16,28 @@
+ #ifndef YB_UTIL_MEMORY_MEMORY_USAGE_TEST_UTIL_H
+ #define YB_UTIL_MEMORY_MEMORY_USAGE_TEST_UTIL_H
+ 
+-#include "yb/util/mem_tracker.h"
++#include <string>
+ 
+ namespace yb {
+ 
+-#if defined(TCMALLOC_ENABLED)
+-
+-size_t GetCurrentAllocatedBytes() {
+-  return MemTracker::GetTCMallocProperty("generic.current_allocated_bytes");
+-}
+-
+-#endif
++void StartAllocationsTracking();
++void StopAllocationsTracking();
++size_t GetHeapRequestedBytes();
+ 
+ struct MemoryUsage {
+-  size_t allocated_bytes = 0;
++  size_t heap_requested_bytes = 0;
++  size_t heap_allocated_bytes = 0;
+   size_t tracked_consumption = 0;
+   size_t entities_count = 0;
+ };
+ 
+-std::string DumpMemoryUsage(const MemoryUsage& memory_usage) {
+-  std::ostringstream ss;
+-  ss << "Entities: " << memory_usage.entities_count << std::endl;
+-  ss << "Memory allocated: " << memory_usage.allocated_bytes
+-     << ", per entity: " << memory_usage.allocated_bytes / memory_usage.entities_count << std::endl;
+-  ss << "Tracked memory: " << memory_usage.tracked_consumption
+-     << ", per entity: " << memory_usage.tracked_consumption / memory_usage.entities_count
+-     << std::endl;
+-  return ss.str();
+-}
++std::string DumpMemoryUsage(const MemoryUsage& memory_usage);
+ 
+ // tcmalloc could allocate more memory than requested due to round up.
+-const auto kHighMemoryAllocationAccuracyLimit = 1.125;
++const auto kMemoryAllocationAccuracyHighLimit = 1.15;
++
++// DynamicMemoryUsage should track at least 95% of heap memory requested to allocate.
++const auto kDynamicMemoryUsageAccuracyLowLimit = 0.95;
+ 
+ }  // namespace yb
+ 

@@ -1,0 +1,157 @@
+diff --git a/ent/src/yb/cdc/cdc_service.cc b/ent/src/yb/cdc/cdc_service.cc
+index ed5116fae6..96690f2fe5 100644
+--- a/ent/src/yb/cdc/cdc_service.cc
++++ b/ent/src/yb/cdc/cdc_service.cc
+@@ -472,16 +472,48 @@ void CDCServiceImpl::UpdateLagMetrics() {
+     SharedLock<decltype(mutex_)> l(mutex_);
+     tablet_checkpoints = tablet_checkpoints_;
+   }
+-  for (auto it = tablet_checkpoints.begin(); it != tablet_checkpoints.end(); it++) {
++
++  client::TableHandle table;
++  auto s = table.Open(kCdcStateTableName, async_client_init_->client());
++  if (!s.ok()) {
++    // It is possible that this runs before the cdc_state table is created. This is
++    // ok. It just means that this is the first time the cluster starts.
++    YB_LOG_EVERY_N_SECS(WARNING, 30) << "Unable to open table " << kCdcStateTableName.table_name()
++                                     << " for metrics update.";
++    return;
++  }
++
++  std::unordered_set<ProducerTabletInfo, ProducerTabletInfo::Hash> tablets_in_cdc_state_table;
++  client::TableIteratorOptions options;
++  options.columns = std::vector<string>{master::kCdcTabletId, master::kCdcStreamId};
++  bool failed = false;
++  options.error_handler = [&failed](const Status& status) {
++    YB_LOG_EVERY_N_SECS(WARNING, 30) << "Scan of table " << kCdcStateTableName.table_name()
++                                     << " failed: " << status << ". Could not update metrics.";
++    failed = true;
++  };
++  // First go through tablets in the cdc_state table and update metrics for each one.
++  for (const auto& row : client::TableRange(table, options)) {
++    auto tablet_id = row.column(master::kCdcTabletIdIdx).string_value();
++    auto stream_id = row.column(master::kCdcStreamIdIdx).string_value();
+     std::shared_ptr<tablet::TabletPeer> tablet_peer;
+-    Status s = tablet_manager_->GetTabletPeer(it->tablet_id(), &tablet_peer);
+-    if (s.IsNotFound() ||
+-        tablet_peer->LeaderStatus() != consensus::LeaderStatus::LEADER_AND_READY) {
+-      // We either couldn't find the tablet or we're not the leader for this tablet, skip.
++    Status s = tablet_manager_->GetTabletPeer(tablet_id, &tablet_peer);
++    if (s.IsNotFound()) {
++      continue;
++    }
++
++    ProducerTabletInfo tablet_info = {"" /* universe_uuid */, stream_id, tablet_id};
++    tablets_in_cdc_state_table.insert(tablet_info);
++    auto tablet_metric = GetCDCTabletMetrics(tablet_info, tablet_peer);
++    if (!tablet_metric) {
+       continue;
+     }
+-    auto tablet_metric = GetCDCTabletMetrics(it->producer_tablet_info, tablet_peer);
+-    if (tablet_metric) {
++    if (tablet_peer->LeaderStatus() != consensus::LeaderStatus::LEADER_AND_READY) {
++      // Set lag to 0 because we're not the leader for this tablet anymore, which means another peer
++      // is responsible for tracking this tablet's lag.
++      tablet_metric->async_replication_sent_lag_micros->set_value(0);
++      tablet_metric->async_replication_committed_lag_micros->set_value(0);
++    } else {
+       // Get the physical time of the last committed record on producer.
+       auto last_replicated_micros = GetLastReplicatedTime(tablet_peer);
+ 
+@@ -494,6 +526,29 @@ void CDCServiceImpl::UpdateLagMetrics() {
+           last_replicated_micros - last_committed_micros);
+     }
+   }
++  if (failed) {
++    return;
++  }
++
++  // Now, go through tablets in tablet_checkpoints_ and set lag to 0 for all tablets we're no
++  // longer replicating.
++  for (auto it = tablet_checkpoints.begin(); it != tablet_checkpoints.end(); it++) {
++    ProducerTabletInfo tablet_info = {"" /* universe_uuid */, it->stream_id(), it->tablet_id()};
++    if (tablets_in_cdc_state_table.find(tablet_info) == tablets_in_cdc_state_table.end()) {
++      // We're no longer replicating this tablet, so set lag to 0.
++      std::shared_ptr<tablet::TabletPeer> tablet_peer;
++      Status s = tablet_manager_->GetTabletPeer(it->tablet_id(), &tablet_peer);
++      if (s.IsNotFound()) {
++        continue;
++      }
++      auto tablet_metric = GetCDCTabletMetrics(it->producer_tablet_info, tablet_peer);
++      if (!tablet_metric) {
++        continue;
++      }
++      tablet_metric->async_replication_sent_lag_micros->set_value(0);
++      tablet_metric->async_replication_committed_lag_micros->set_value(0);
++    }
++  }
+ }
+ 
+ MicrosTime CDCServiceImpl::GetLastReplicatedTime(
+diff --git a/ent/src/yb/integration-tests/cdc_service-int-test.cc b/ent/src/yb/integration-tests/cdc_service-int-test.cc
+index 4ff9244a75..6613b9d15d 100644
+--- a/ent/src/yb/integration-tests/cdc_service-int-test.cc
++++ b/ent/src/yb/integration-tests/cdc_service-int-test.cc
+@@ -483,6 +483,62 @@ TEST_F(CDCServiceTest, TestDeleteCDCStream) {
+   }
+ }
+ 
++TEST_F(CDCServiceTest, TestMetricsOnDeletedReplication) {
++  CDCStreamId stream_id;
++  CreateCDCStream(cdc_proxy_, table_.table()->id(), &stream_id);
++
++  std::string tablet_id;
++  GetTablet(&tablet_id);
++
++  const auto& tserver = cluster_->mini_tablet_server(0)->server();
++  // Use proxy for to most accurately simulate normal requests.
++  const auto& proxy = tserver->proxy();
++
++  GetChangesRequestPB change_req;
++  GetChangesResponsePB change_resp;
++  change_req.set_tablet_id(tablet_id);
++  change_req.set_stream_id(stream_id);
++  change_req.mutable_from_checkpoint()->mutable_op_id()->set_index(0);
++  change_req.mutable_from_checkpoint()->mutable_op_id()->set_term(0);
++  {
++    RpcController rpc;
++    SCOPED_TRACE(change_req.DebugString());
++    ASSERT_OK(cdc_proxy_->GetChanges(change_req, &change_resp, &rpc));
++  }
++
++  // Insert test rows, one at a time so they have different hybrid times.
++  tserver::WriteRequestPB write_req;
++  tserver::WriteResponsePB write_resp;
++  write_req.set_tablet_id(tablet_id);
++  {
++    RpcController rpc;
++    AddTestRowInsert(1, 11, "key1", &write_req);
++    AddTestRowInsert(2, 22, "key2", &write_req);
++    SCOPED_TRACE(write_req.DebugString());
++    ASSERT_OK(proxy->Write(write_req, &write_resp, &rpc));
++    SCOPED_TRACE(write_resp.DebugString());
++    ASSERT_FALSE(write_resp.has_error());
++  }
++
++  auto cdc_service = dynamic_cast<CDCServiceImpl*>(
++      tserver->rpc_server()->service_pool("yb.cdc.CDCService")->TEST_get_service().get());
++  // Assert that leader lag > 0.
++  ASSERT_OK(WaitFor([&]() -> Result<bool> {
++    auto metrics = cdc_service->GetCDCTabletMetrics({"" /* UUID */, stream_id, tablet_id});
++    return metrics->async_replication_sent_lag_micros->value() > 0 &&
++        metrics->async_replication_committed_lag_micros->value() > 0;
++  }, MonoDelta::FromSeconds(10), "Wait for Lag > 0"));
++
++  // Now, delete the replication stream and assert that lag is 0.
++  ASSERT_OK(client_->DeleteCDCStream(stream_id));
++  ASSERT_OK(WaitFor([&]() -> Result<bool> {
++    auto metrics = cdc_service->GetCDCTabletMetrics({"" /* UUID */, stream_id, tablet_id});
++    return metrics->async_replication_sent_lag_micros->value() == 0 &&
++        metrics->async_replication_committed_lag_micros->value() == 0;
++  }, MonoDelta::FromSeconds(10), "Wait for Lag = 0"));
++}
++
++
+ TEST_F(CDCServiceTest, TestGetChanges) {
+   CDCStreamId stream_id;
+   CreateCDCStream(cdc_proxy_, table_.table()->id(), &stream_id);

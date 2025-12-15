@@ -1,0 +1,757 @@
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index 8c5d150942..aa85311cef 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -11,6 +11,8 @@
+ // under the License.
+ //
+ 
++#include <boost/scope_exit.hpp>
++
+ #include "yb/client/client.h"
+ #include "yb/client/ql-dml-test-base.h"
+ #include "yb/client/table_handle.h"
+@@ -18,6 +20,8 @@
+ #include "yb/consensus/raft_consensus.h"
+ #include "yb/consensus/retryable_requests.h"
+ 
++#include "yb/docdb/consensus_frontier.h"
++
+ #include "yb/tablet/tablet_peer.h"
+ 
+ #include "yb/tserver/mini_tablet_server.h"
+@@ -26,12 +30,23 @@
+ #include "yb/yql/cql/ql/util/statement_result.h"
+ #include "yb/util/bfql/gen_opcodes.h"
+ 
++#include "yb/rocksdb/utilities/checkpoint.h"
++#include "yb/rocksdb/metadata.h"
++
++#include "yb/tablet/tablet_options.h"
++#include "yb/docdb/docdb_rocksdb_util.h"
++
+ DECLARE_double(respond_write_failed_probability);
+ DECLARE_bool(detect_duplicates_for_retryable_requests);
+ DECLARE_int32(raft_heartbeat_interval_ms);
+ 
+ using namespace std::literals;
+ 
++using rocksdb::checkpoint::CreateCheckpoint;
++using rocksdb::UserFrontierPtr;
++using yb::tablet::TabletOptions;
++using yb::docdb::InitRocksDBOptions;
++
+ namespace yb {
+ namespace client {
+ 
+@@ -108,11 +123,15 @@ class QLStressTest : public QLDmlTestBase {
+     return row.column(0);
+   }
+ 
++  void VerifyFlushedFrontiers();
++
+   void TestRetryWrites(bool restarts);
+ 
+   bool CheckRetryableRequestsCounts(size_t* total_entries, size_t* total_leaders);
+ 
+   TableHandle table_;
++
++  int checkpoint_index_ = 0;
+ };
+ 
+ bool QLStressTest::CheckRetryableRequestsCounts(size_t* total_entries, size_t* total_leaders) {
+@@ -380,5 +399,87 @@ TEST_F_EX(QLStressTest, ShortTimeLeaderDoesNotReplicateNoOp, QLStressTestSingleT
+   ASSERT_OK(flush_future2.get());
+ }
+ 
++namespace {
++
++void VerifyFlushedFrontier(const UserFrontierPtr& frontier, OpId* op_id) {
++  ASSERT_TRUE(frontier);
++  if (frontier) {
++    *op_id = down_cast<docdb::ConsensusFrontier*>(frontier.get())->op_id();
++    ASSERT_GT(op_id->term, 0);
++    ASSERT_GT(op_id->index, 0);
++  }
++}
++
++}  // anonymous namespace
++void QLStressTest::VerifyFlushedFrontiers() {
++  for (const auto& mini_tserver : cluster_->mini_tablet_servers()) {
++    auto peers = mini_tserver->server()->tablet_manager()->GetTabletPeers();
++    for (const auto& peer : peers) {
++      rocksdb::DB* db = peer->tablet()->TEST_db();
++      OpId op_id;
++      ASSERT_NO_FATALS(VerifyFlushedFrontier(db->GetFlushedFrontier(), &op_id));
++
++      // Also check that if we checkpoint this DB and open the checkpoint separately, the
++      // flushed frontier non-zero as well.
++      std::string checkpoint_dir;
++      ASSERT_OK(Env::Default()->GetTestDirectory(&checkpoint_dir));
++      checkpoint_dir += Format("/checkpoint_$0", checkpoint_index_);
++      checkpoint_index_++;
++
++      ASSERT_OK(CreateCheckpoint(db, checkpoint_dir));
++
++      rocksdb::Options options;
++
++      InitRocksDBOptions(&options, "test_tablet", nullptr, TabletOptions());
++      std::unique_ptr<rocksdb::DB> checkpoint_db;
++      rocksdb::DB* checkpoint_db_raw_ptr = nullptr;
++
++      options.create_if_missing = false;
++      ASSERT_OK(rocksdb::DB::Open(options, checkpoint_dir, &checkpoint_db_raw_ptr));
++      checkpoint_db.reset(checkpoint_db_raw_ptr);
++      OpId checkpoint_op_id;
++      ASSERT_NO_FATALS(
++          VerifyFlushedFrontier(checkpoint_db->GetFlushedFrontier(), &checkpoint_op_id));
++      ASSERT_OK(Env::Default()->DeleteRecursively(checkpoint_dir));
++
++      ASSERT_LE(op_id, checkpoint_op_id);
++    }
++  }
++}
++
++TEST_F_EX(QLStressTest, FlushCompact, QLStressTestSingleTablet) {
++  std::atomic<bool> stop(false);
++
++  std::thread writer([this, &stop] {
++    auto session = NewSession();
++    int key = 0;
++    std::string value = "value_";
++    while (!stop.load(std::memory_order_acquire)) {
++      ASSERT_OK(WriteRow(session, key, value + std::to_string(key)));
++      ++key;
++    }
++  });
++
++  BOOST_SCOPE_EXIT(&stop, &writer) {
++    stop.store(true);
++    writer.join();
++  } BOOST_SCOPE_EXIT_END;
++
++  auto start_time = MonoTime::Now();
++  const auto kTimeout = MonoDelta::FromSeconds(60);
++  int num_iter = 0;
++  while (MonoTime::Now() - start_time < kTimeout) {
++    ++num_iter;
++    std::this_thread::sleep_for(1s);
++    ASSERT_OK(cluster_->FlushTablets());
++    ASSERT_NO_FATALS(VerifyFlushedFrontiers());
++    std::this_thread::sleep_for(1s);
++    auto compact_status = cluster_->CompactTablets();
++    LOG_IF(INFO, !compact_status.ok()) << "Compaction failed: " << compact_status;
++    ASSERT_NO_FATALS(VerifyFlushedFrontiers());
++  }
++  ASSERT_GE(num_iter, 5);
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/docdb/consensus_frontier-test.cc b/src/yb/docdb/consensus_frontier-test.cc
+index f0f3e7e5a0..3c82cccc4b 100644
+--- a/src/yb/docdb/consensus_frontier-test.cc
++++ b/src/yb/docdb/consensus_frontier-test.cc
+@@ -63,6 +63,25 @@ TEST_F(ConsensusFrontierTest, TestUpdates) {
+     ConsensusFrontier higher_cutoff{{1, 1}, 1000_usec_ht, 501_usec_ht};
+     ConsensusFrontier higher_idx_lower_ht{{1, 2}, 999_usec_ht, 500_usec_ht};
+ 
++    EXPECT_TRUE(higher_idx.Dominates(frontier, UpdateUserValueType::kLargest));
++    EXPECT_TRUE(higher_ht.Dominates(frontier, UpdateUserValueType::kLargest));
++    EXPECT_TRUE(higher_cutoff.Dominates(frontier, UpdateUserValueType::kLargest));
++    EXPECT_FALSE(higher_idx.Dominates(frontier, UpdateUserValueType::kSmallest));
++    EXPECT_FALSE(higher_ht.Dominates(frontier, UpdateUserValueType::kSmallest));
++    EXPECT_FALSE(higher_cutoff.Dominates(frontier, UpdateUserValueType::kSmallest));
++    EXPECT_FALSE(frontier.Dominates(higher_idx, UpdateUserValueType::kLargest));
++    EXPECT_FALSE(frontier.Dominates(higher_ht, UpdateUserValueType::kLargest));
++    EXPECT_FALSE(frontier.Dominates(higher_cutoff, UpdateUserValueType::kLargest));
++    EXPECT_TRUE(frontier.Dominates(higher_idx, UpdateUserValueType::kSmallest));
++    EXPECT_TRUE(frontier.Dominates(higher_ht, UpdateUserValueType::kSmallest));
++    EXPECT_TRUE(frontier.Dominates(higher_cutoff, UpdateUserValueType::kSmallest));
++
++    // frontier and higher_idx_lower_ht are "incomparable" according to the "dominates" ordering.
++    EXPECT_FALSE(frontier.Dominates(higher_idx_lower_ht, UpdateUserValueType::kSmallest));
++    EXPECT_FALSE(frontier.Dominates(higher_idx_lower_ht, UpdateUserValueType::kLargest));
++    EXPECT_FALSE(higher_idx_lower_ht.Dominates(frontier, UpdateUserValueType::kSmallest));
++    EXPECT_FALSE(higher_idx_lower_ht.Dominates(frontier, UpdateUserValueType::kLargest));
++
+     EXPECT_TRUE(frontier.IsUpdateValid(higher_idx, UpdateUserValueType::kLargest));
+     EXPECT_TRUE(frontier.IsUpdateValid(higher_ht, UpdateUserValueType::kLargest));
+     EXPECT_FALSE(higher_idx.IsUpdateValid(frontier, UpdateUserValueType::kLargest));
+@@ -113,6 +132,7 @@ TEST_F(ConsensusFrontierTest, TestUpdates) {
+         PbToString(pb),
+         "{ op_id: { term: 2 index: 3 } hybrid_time: { physical: 24 logical: 1696 } "
+             "history_cutoff: { physical: 48 logical: 3392 } }");
++
+ }
+ 
+ }  // namespace docdb
+diff --git a/src/yb/docdb/consensus_frontier.cc b/src/yb/docdb/consensus_frontier.cc
+index 8c2e0a0529..8da17af7d1 100644
+--- a/src/yb/docdb/consensus_frontier.cc
++++ b/src/yb/docdb/consensus_frontier.cc
+@@ -18,9 +18,12 @@
+ namespace yb {
+ namespace docdb {
+ 
++ConsensusFrontier::~ConsensusFrontier() {
++}
++
+ bool ConsensusFrontier::Equals(const UserFrontier& pre_rhs) const {
+   const ConsensusFrontier& rhs = down_cast<const ConsensusFrontier&>(pre_rhs);
+-  return op_id_ == rhs.op_id_ && ht_ == rhs.ht_;
++  return op_id_ == rhs.op_id_ && ht_ == rhs.ht_ && history_cutoff_ == rhs.history_cutoff_;
+ }
+ 
+ void ConsensusFrontier::ToPB(google::protobuf::Any* any) const {
+diff --git a/src/yb/docdb/consensus_frontier.h b/src/yb/docdb/consensus_frontier.h
+index 447b825163..4b5838b85d 100644
+--- a/src/yb/docdb/consensus_frontier.h
++++ b/src/yb/docdb/consensus_frontier.h
+@@ -23,7 +23,7 @@ namespace docdb {
+ // between this and user boundary values is that here hybrid time is taken from committed Raft log
+ // entries, whereas user boundary values extract hybrid time from keys in a memtable. This is
+ // important for transactions, because boundary values would have the commit time of a transaction,
+-// but e.g. "apply intent" Raft log entries will have a later hybrid time, which would be saved
++// but e.g. "apply intent" Raft log entries will have a later hybrid time, which would be reflected
+ // here.
+ class ConsensusFrontier : public rocksdb::UserFrontier {
+  public:
+@@ -37,6 +37,8 @@ class ConsensusFrontier : public rocksdb::UserFrontier {
+         ht_(ht),
+         history_cutoff_(history_cutoff) {}
+ 
++  virtual ~ConsensusFrontier();
++
+   bool Equals(const UserFrontier& rhs) const override;
+   std::string ToString() const override;
+   void ToPB(google::protobuf::Any* pb) const override;
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index d74b774fb4..490f5faead 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -329,6 +329,13 @@ Status MiniCluster::FlushTablets(tablet::FlushMode mode, tablet::FlushFlags flag
+   return Status::OK();
+ }
+ 
++Status MiniCluster::CompactTablets() {
++  for (const auto& tablet_server : mini_tablet_servers_) {
++    RETURN_NOT_OK(tablet_server->CompactTablets());
++  }
++  return Status::OK();
++}
++
+ Status MiniCluster::SwitchMemtables() {
+   for (const auto& tablet_server : mini_tablet_servers_) {
+     RETURN_NOT_OK(tablet_server->SwitchMemtables());
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index e7b830a015..3841de86e6 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -116,6 +116,7 @@ class MiniCluster : public MiniClusterBase {
+   CHECKED_STATUS FlushTablets(
+       tablet::FlushMode mode = tablet::FlushMode::kSync,
+       tablet::FlushFlags flags = tablet::FlushFlags::kAll);
++  CHECKED_STATUS CompactTablets();
+   CHECKED_STATUS SwitchMemtables();
+   CHECKED_STATUS CleanTabletLogs();
+ 
+diff --git a/src/yb/rocksdb/db/compaction_job.cc b/src/yb/rocksdb/db/compaction_job.cc
+index 1309c9e563..eab7c04e60 100644
+--- a/src/yb/rocksdb/db/compaction_job.cc
++++ b/src/yb/rocksdb/db/compaction_job.cc
+@@ -974,7 +974,7 @@ Status CompactionJob::InstallCompactionResults(
+     }
+   }
+   if (largest_user_frontier_) {
+-    compaction->edit()->SetFlushedFrontierUpdate(largest_user_frontier_);
++    compaction->edit()->UpdateFlushedFrontier(largest_user_frontier_);
+   }
+   return versions_->LogAndApply(compaction->column_family_data(),
+                                 mutable_cf_options, compaction->edit(),
+diff --git a/src/yb/rocksdb/db/db_impl.cc b/src/yb/rocksdb/db/db_impl.cc
+index 374efbbe05..b29f74a23e 100644
+--- a/src/yb/rocksdb/db/db_impl.cc
++++ b/src/yb/rocksdb/db/db_impl.cc
+@@ -1145,7 +1145,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
+     edit.SetColumnFamily(cfd->GetID());
+     auto frontier = versions_->FlushedFrontier();
+     if (frontier) {
+-      edit.SetFlushedFrontierUpdate(frontier->Clone());
++      edit.UpdateFlushedFrontier(frontier->Clone());
+     }
+     version_edits.insert({cfd->GetID(), edit});
+   }
+@@ -5462,7 +5462,7 @@ Status DBImpl::ApplyVersionEdit(VersionEdit* edit) {
+ 
+ Status DBImpl::SetFlushedFrontier(UserFrontierPtr frontier) {
+   VersionEdit edit;
+-  edit.SetFlushedFrontierUpdate(std::move(frontier));
++  edit.UpdateFlushedFrontier(std::move(frontier));
+   return ApplyVersionEdit(&edit);
+ }
+ 
+diff --git a/src/yb/rocksdb/db/log_reader.cc b/src/yb/rocksdb/db/log_reader.cc
+index c84be89175..d9ca657197 100644
+--- a/src/yb/rocksdb/db/log_reader.cc
++++ b/src/yb/rocksdb/db/log_reader.cc
+@@ -107,8 +107,9 @@ bool Reader::ReadRecord(Slice* record, std::string* scratch,
+   Slice fragment;
+   while (true) {
+     uint64_t physical_record_offset = end_of_buffer_offset_ - buffer_.size();
+-    size_t drop_size;
++    size_t drop_size = 0;
+     const unsigned int record_type = ReadPhysicalRecord(&fragment, &drop_size);
++
+     switch (record_type) {
+       case kFullType:
+       case kRecyclableFullType:
+@@ -338,7 +339,7 @@ unsigned int Reader::ReadPhysicalRecord(Slice* result, size_t* drop_size) {
+   while (true) {
+     // We need at least the minimum header size
+     if (buffer_.size() < (size_t)kHeaderSize) {
+-      int r;
++      int r = 0;
+       if (!ReadMore(drop_size, &r)) {
+         return r;
+       }
+diff --git a/src/yb/rocksdb/db/log_reader.h b/src/yb/rocksdb/db/log_reader.h
+index 6b4eb4e069..10eb390cb5 100644
+--- a/src/yb/rocksdb/db/log_reader.h
++++ b/src/yb/rocksdb/db/log_reader.h
+@@ -21,10 +21,13 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file. See the AUTHORS file for names of contributors.
+ 
+-#pragma once
+-#include <memory>
++#ifndef YB_ROCKSDB_DB_LOG_READER_H
++#define YB_ROCKSDB_DB_LOG_READER_H
++
+ #include <stdint.h>
+ 
++#include <memory>
++
+ #include "yb/rocksdb/db/log_format.h"
+ #include "yb/util/slice.h"
+ #include "yb/rocksdb/status.h"
+@@ -34,7 +37,6 @@ namespace rocksdb {
+ 
+ class SequentialFileReader;
+ class Logger;
+-using std::unique_ptr;
+ 
+ namespace log {
+ 
+@@ -67,10 +69,13 @@ class Reader {
+   //
+   // The Reader will start reading at the first record located at physical
+   // position >= initial_offset within the file.
+-  Reader(std::shared_ptr<Logger> info_log,
+-	 unique_ptr<SequentialFileReader>&& file,
+-         Reporter* reporter, bool checksum, uint64_t initial_offset,
+-         uint64_t log_num);
++  Reader(
++      std::shared_ptr<Logger> info_log,
++      std::unique_ptr<SequentialFileReader>&& file,
++      Reporter* reporter,
++      bool checksum,
++      uint64_t initial_offset,
++      uint64_t log_num);
+ 
+   ~Reader();
+ 
+@@ -104,7 +109,7 @@ class Reader {
+ 
+  private:
+   std::shared_ptr<Logger> info_log_;
+-  const unique_ptr<SequentialFileReader> file_;
++  const std::unique_ptr<SequentialFileReader> file_;
+   Reporter* const reporter_;
+   bool const checksum_;
+   char* const backing_store_;
+@@ -118,6 +123,7 @@ class Reader {
+ 
+   // Offset of the last record returned by ReadRecord.
+   uint64_t last_record_offset_;
++
+   // Offset of the first location past the end of buffer_.
+   uint64_t end_of_buffer_offset_;
+ 
+@@ -165,3 +171,5 @@ class Reader {
+ 
+ }  // namespace log
+ }  // namespace rocksdb
++
++#endif  // YB_ROCKSDB_DB_LOG_READER_H
+diff --git a/src/yb/rocksdb/db/log_writer.cc b/src/yb/rocksdb/db/log_writer.cc
+index 214a60f51b..94d4e79d19 100644
+--- a/src/yb/rocksdb/db/log_writer.cc
++++ b/src/yb/rocksdb/db/log_writer.cc
+@@ -125,7 +125,7 @@ Status Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n) {
+     // Only encode low 32-bits of the 64-bit log number.  This means
+     // we will fail to detect an old record if we recycled a log from
+     // ~4 billion logs ago, but that is effectively impossible, and
+-    // even if it were we'dbe far more likely to see a false positive
++    // even if it were we'd be far more likely to see a false positive
+     // on the 32-bit CRC.
+     EncodeFixed32(buf + 7, static_cast<uint32_t>(log_number_));
+     crc = crc32c::Extend(crc, buf + 7, 4);
+diff --git a/src/yb/rocksdb/db/memtable_list.cc b/src/yb/rocksdb/db/memtable_list.cc
+index 7c78819951..b19a05e0a3 100644
+--- a/src/yb/rocksdb/db/memtable_list.cc
++++ b/src/yb/rocksdb/db/memtable_list.cc
+@@ -349,7 +349,7 @@ Status MemTableList::InstallMemtableFlushResults(
+   }
+   if (frontiers) {
+     DCHECK_NE(0, mems[0]->edit_.GetNewFiles().size());
+-    mems[0]->edit_.SetFlushedFrontierUpdate(frontiers->Largest().Clone());
++    mems[0]->edit_.UpdateFlushedFrontier(frontiers->Largest().Clone());
+   }
+ 
+   // if some other thread is already committing, then return
+diff --git a/src/yb/rocksdb/db/metadata.cc b/src/yb/rocksdb/db/metadata.cc
+index 330bd5e60e..dffedc90b9 100644
+--- a/src/yb/rocksdb/db/metadata.cc
++++ b/src/yb/rocksdb/db/metadata.cc
+@@ -32,4 +32,29 @@ void UserFrontier::Update(const UserFrontier* rhs, UpdateUserValueType type, Use
+   }
+ }
+ 
++bool UserFrontier::Dominates(const UserFrontier& rhs, UpdateUserValueType update_type) const {
++  // Check that this value, if updated with the given rhs, stays the same, and hence "dominates" it.
++  std::unique_ptr<UserFrontier> copy = Clone();
++  copy->Update(rhs, update_type);
++  return Equals(*copy);
++}
++
++void UpdateUserFrontier(UserFrontierPtr* value, const UserFrontierPtr& update,
++                        UpdateUserValueType type) {
++  if (*value) {
++    (**value).Update(*update, type);
++  } else {
++    *value = update;
++  }
++}
++
++void UpdateUserFrontier(UserFrontierPtr* value, UserFrontierPtr&& update,
++                        UpdateUserValueType type) {
++  if (*value) {
++    (**value).Update(*update, type);
++  } else {
++    *value = std::move(update);
++  }
++}
++
+ } // namespace rocksdb
+diff --git a/src/yb/rocksdb/db/version_edit.cc b/src/yb/rocksdb/db/version_edit.cc
+index b31be31604..f552ff6aa8 100644
+--- a/src/yb/rocksdb/db/version_edit.cc
++++ b/src/yb/rocksdb/db/version_edit.cc
+@@ -31,6 +31,7 @@
+ #include "yb/rocksdb/util/sync_point.h"
+ #include "yb/util/logging.h"
+ #include "yb/util/slice.h"
++#include "yb/util/debug-util.h"
+ 
+ namespace rocksdb {
+ 
+@@ -247,6 +248,8 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice&
+     return STATUS(Corruption, "VersionEdit");
+   }
+ 
++  VLOG(1) << "Parsed version edit: " << pb.ShortDebugString();
++
+   if (pb.has_comparator()) {
+     comparator_ = std::move(*pb.mutable_comparator());
+   }
+@@ -280,6 +283,7 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice&
+ 
+   const size_t new_files_size = static_cast<size_t>(pb.new_files_size());
+   new_files_.resize(new_files_size);
++
+   for (size_t i = 0; i < new_files_size; ++i) {
+     auto& source = pb.new_files(static_cast<int>(i));
+     int level = source.level();
+@@ -304,6 +308,28 @@ Status VersionEdit::DecodeFrom(BoundaryValuesExtractor* extractor, const Slice&
+     meta.marked_for_compaction = source.marked_for_compaction();
+     max_level_ = std::max(max_level_, level);
+     meta.imported = source.imported();
++
++    // Use the relevant fields in the "largest" frontier to update the "flushed" frontier for this
++    // version edit. In practice this will only look at OpId and will discard hybrid time and
++    // history cutoff (which probably won't be there anyway) coming from the boundary values.
++    if (meta.largest.user_frontier) {
++      if (!flushed_frontier_) {
++        LOG(DFATAL) << "Flushed frontier not present but a file's largest user frontier present: "
++                    << meta.largest.user_frontier->ToString()
++                    << ", version edit protobuf:\n" << pb.DebugString();
++      } else if (!flushed_frontier_->Dominates(*meta.largest.user_frontier,
++                                               UpdateUserValueType::kLargest)) {
++        // The flushed frontier of this VersionEdit must already include the information provided
++        // by flushed frontiers of individual files.
++        LOG(DFATAL) << "Flushed frontier is present but has to be updated with data from "
++                    << "file boundary: flushed_frontier=" << flushed_frontier_->ToString()
++                    << ", a file's larget user frontier: "
++                    << meta.largest.user_frontier->ToString()
++                    << ", version edit protobuf:\n" << pb.DebugString();
++      }
++      UpdateUserFrontier(
++          &flushed_frontier_, meta.largest.user_frontier, UpdateUserValueType::kLargest);
++    }
+   }
+ 
+   column_family_ = pb.column_family();
+@@ -330,4 +356,8 @@ void VersionEdit::InitNewDB() {
+   flushed_frontier_.reset();
+ }
+ 
++void VersionEdit::UpdateFlushedFrontier(UserFrontierPtr value) {
++  UpdateUserFrontier(&flushed_frontier_, std::move(value), UpdateUserValueType::kLargest);
++}
++
+ }  // namespace rocksdb
+diff --git a/src/yb/rocksdb/db/version_edit.h b/src/yb/rocksdb/db/version_edit.h
+index fdbb3c8dd9..f3907c1519 100644
+--- a/src/yb/rocksdb/db/version_edit.h
++++ b/src/yb/rocksdb/db/version_edit.h
+@@ -161,9 +161,7 @@ class VersionEdit {
+   void SetLastSequence(SequenceNumber seq) {
+     last_sequence_ = seq;
+   }
+-  void SetFlushedFrontierUpdate(UserFrontierPtr value) {
+-    flushed_frontier_ = std::move(value);
+-  }
++  void UpdateFlushedFrontier(UserFrontierPtr value);
+   void SetMaxColumnFamily(uint32_t max_column_family) {
+     max_column_family_ = max_column_family;
+   }
+@@ -254,6 +252,10 @@ class VersionEdit {
+ 
+   std::string DebugString(bool hex_key = false) const;
+ 
++  std::string ToString() const {
++    return DebugString();
++  }
++
+  private:
+   friend class VersionSet;
+   friend class Version;
+@@ -268,7 +270,6 @@ class VersionEdit {
+   boost::optional<uint32_t> max_column_family_;
+   boost::optional<SequenceNumber> last_sequence_;
+   UserFrontierPtr flushed_frontier_;
+-  UserFrontierPtr flushed_frontier_update_;
+ 
+   DeletedFileSet deleted_files_;
+   std::vector<std::pair<int, FileMetaData>> new_files_;
+diff --git a/src/yb/rocksdb/db/version_edit_test.cc b/src/yb/rocksdb/db/version_edit_test.cc
+index 8d243df1e0..2eea19c9cc 100644
+--- a/src/yb/rocksdb/db/version_edit_test.cc
++++ b/src/yb/rocksdb/db/version_edit_test.cc
+@@ -58,7 +58,7 @@ void SetupVersionEdit(VersionEdit* edit) {
+   edit->SetNextFile(kBig + 200);
+   edit->SetLastSequence(kBig + 1000);
+   test::TestUserFrontier frontier(kBig + 100);
+-  edit->SetFlushedFrontierUpdate(frontier.Clone());
++  edit->UpdateFlushedFrontier(frontier.Clone());
+ }
+ 
+ TEST_F(VersionEditTest, EncodeDecode) {
+diff --git a/src/yb/rocksdb/db/version_set.cc b/src/yb/rocksdb/db/version_set.cc
+index 5a720491c5..201f9f6d5e 100644
+--- a/src/yb/rocksdb/db/version_set.cc
++++ b/src/yb/rocksdb/db/version_set.cc
+@@ -2158,7 +2158,7 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
+   Version* v = nullptr;
+   std::unique_ptr<BaseReferencedVersionBuilder> builder_guard(nullptr);
+ 
+-  // process all requests in the queue
++  // Process all requests in the queue.
+   ManifestWriter* last_writer = &w;
+   assert(!manifest_writers_.empty());
+   assert(manifest_writers_.front() == &w);
+@@ -2230,8 +2230,9 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
+           "Creating manifest %" PRIu64 "\n", pending_manifest_file_number_);
+       unique_ptr<WritableFile> descriptor_file;
+       EnvOptions opt_env_opts = env_->OptimizeForManifestWrite(env_options_);
++      descriptor_log_file_name_ = DescriptorFileName(dbname_, pending_manifest_file_number_);
+       s = NewWritableFile(
+-          env_, DescriptorFileName(dbname_, pending_manifest_file_number_),
++          env_, descriptor_log_file_name_,
+           &descriptor_file, opt_env_opts);
+       if (s.ok()) {
+         descriptor_file->SetPreallocationBlockSize(
+@@ -2241,6 +2242,8 @@ Status VersionSet::LogAndApply(ColumnFamilyData* column_family_data,
+             new WritableFileWriter(std::move(descriptor_file), opt_env_opts));
+         descriptor_log_.reset(new log::Writer(std::move(file_writer), 0, false));
+         s = WriteSnapshot(descriptor_log_.get());
++      } else {
++        descriptor_log_file_name_ = "";
+       }
+     }
+ 
+@@ -2402,6 +2405,11 @@ void VersionSet::LogAndApplyHelper(ColumnFamilyData* cfd,
+   }
+   edit->SetNextFile(next_file_number_.load());
+   edit->SetLastSequence(LastSequence());
++  if (flushed_frontier_) {
++    // Make sure that the flushed frontier stored in the version edit takes into account all the
++    // operations that were flushed prior to it.
++    edit->UpdateFlushedFrontier(flushed_frontier_);
++  }
+ 
+   builder->Apply(edit);
+ }
+@@ -2675,7 +2683,8 @@ Status VersionSet::Recover(
+       }
+ 
+       if (edit.flushed_frontier_) {
+-        flushed_frontier = std::move(edit.flushed_frontier_);
++        UpdateUserFrontier(
++            &flushed_frontier, edit.flushed_frontier_, UpdateUserValueType::kLargest);
+       }
+     }
+     if (s.IsEndOfFile()) {
+@@ -3309,6 +3318,7 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
+         }
+       }
+       edit.SetLogNumber(cfd->GetLogNumber());
++      edit.flushed_frontier_ = flushed_frontier_;
+       RETURN_NOT_OK(AddEdit(edit, db_options_, log));
+     }
+   }
+@@ -3711,12 +3721,8 @@ void VersionSet::EnsureNonDecreasingFlushedFrontier(
+   }
+ }
+ 
+-void VersionSet::UpdateFlushedFrontierNoSanityChecking(UserFrontierPtr values) {
+-  if (flushed_frontier_) {
+-    flushed_frontier_->Update(*values, UpdateUserValueType::kLargest);
+-  } else {
+-    flushed_frontier_ = std::move(values);
+-  }
++void VersionSet::UpdateFlushedFrontierNoSanityChecking(UserFrontierPtr value) {
++  UpdateUserFrontier(&flushed_frontier_, std::move(value), UpdateUserValueType::kLargest);
+ }
+ 
+ }  // namespace rocksdb
+diff --git a/src/yb/rocksdb/db/version_set.h b/src/yb/rocksdb/db/version_set.h
+index 2ae24da78b..173e14c559 100644
+--- a/src/yb/rocksdb/db/version_set.h
++++ b/src/yb/rocksdb/db/version_set.h
+@@ -794,6 +794,7 @@ class VersionSet {
+ 
+   // Opened lazily
+   std::unique_ptr<log::Writer> descriptor_log_;
++  std::string descriptor_log_file_name_;
+ 
+   // generates a increasing version number for every new version
+   uint64_t current_version_number_ = 0;
+diff --git a/src/yb/rocksdb/metadata.h b/src/yb/rocksdb/metadata.h
+index a72a8b28c3..50d7c615dd 100644
+--- a/src/yb/rocksdb/metadata.h
++++ b/src/yb/rocksdb/metadata.h
+@@ -89,6 +89,11 @@ class UserFrontier;
+ // modified the copied value, the original value would also change.
+ typedef yb::clone_ptr<UserFrontier> UserFrontierPtr;
+ 
++void UpdateUserFrontier(UserFrontierPtr* value, const UserFrontierPtr& update,
++                        UpdateUserValueType type);
++void UpdateUserFrontier(UserFrontierPtr* value, UserFrontierPtr&& update,
++                        UpdateUserValueType type);
++
+ // When writing a batch of RocksDB records, the user could specify "frontier" values of that batch,
+ // such as smallest/largest Raft OpId or smallest/largest HybridTime of records in that batch. We
+ // maintain these values for each SSTable file and whole DB. This class defines an abstract
+@@ -111,6 +116,11 @@ class UserFrontier {
+   // only decrease them. Fields that are not set in rhs are not checked.
+   virtual bool IsUpdateValid(const UserFrontier& rhs, UpdateUserValueType type) const = 0;
+ 
++  // Returns true if this frontier dominates another frontier, i.e. if we update this frontier
++  // with the values from the other one in the direction specified by update_type, nothing will
++  // change. This is used to check invariants.
++  bool Dominates(const UserFrontier& rhs, UpdateUserValueType update_type) const;
++
+   virtual void FromOpIdPBDeprecated(const yb::OpIdPB& op_id) = 0;
+   virtual void FromPB(const google::protobuf::Any& pb) = 0;
+ 
+diff --git a/src/yb/rocksdb/utilities/checkpoint/checkpoint.cc b/src/yb/rocksdb/utilities/checkpoint/checkpoint.cc
+index 83377cf166..15d7129ffd 100644
+--- a/src/yb/rocksdb/utilities/checkpoint/checkpoint.cc
++++ b/src/yb/rocksdb/utilities/checkpoint/checkpoint.cc
+@@ -120,8 +120,8 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
+     }
+     if (!is_table_file || !same_fs) {
+       RLOG(db->GetOptions().info_log, "Copying %s", src_fname.c_str());
+-      s = CopyFile(db->GetEnv(), db->GetName() + src_fname,
+-                   full_private_path + src_fname,
++      std::string dest_name = full_private_path + src_fname;
++      s = CopyFile(db->GetEnv(), db->GetName() + src_fname, dest_name,
+                    (type == kDescriptorFile) ? manifest_file_size : 0);
+     }
+   }
+@@ -201,8 +201,8 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
+   }
+ 
+   // here we know that we succeeded and installed the new snapshot
+-  RLOG(db->GetOptions().info_log, "Snapshot DONE. All is good");
+-  RLOG(db->GetOptions().info_log, "Snapshot sequence number: %" PRIu64,
++  RLOG(db->GetOptions().info_log, "Checkpoint DONE. All is good");
++  RLOG(db->GetOptions().info_log, "Checkpoint sequence number: %" PRIu64,
+       sequence_number);
+ 
+   return s;
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index e85945c1f5..e2fecfbfa0 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -1251,6 +1251,16 @@ Status Tablet::Flush(FlushMode mode, FlushFlags flags) {
+   return Status::OK();
+ }
+ 
++Status Tablet::CompactSync() {
++  std::vector<std::string> file_names;
++  for (const auto& lfmd : regular_db_->GetLiveFilesMetaData()) {
++    file_names.push_back(lfmd.name);
++  }
++
++  LOG(INFO) << "Files to compact: " << yb::ToString(file_names);
++  return regular_db_->CompactFiles(rocksdb::CompactionOptions(), file_names, 0);
++}
++
+ Status Tablet::WaitForFlush() {
+   TRACE_EVENT0("tablet", "Tablet::WaitForFlush");
+ 
+diff --git a/src/yb/tserver/mini_tablet_server.cc b/src/yb/tserver/mini_tablet_server.cc
+index 68eeed414d..f5e50d9e9e 100644
+--- a/src/yb/tserver/mini_tablet_server.cc
++++ b/src/yb/tserver/mini_tablet_server.cc
+@@ -178,6 +178,15 @@ Status MiniTabletServer::FlushTablets(tablet::FlushMode mode, tablet::FlushFlags
+   });
+ }
+ 
++Status MiniTabletServer::CompactTablets() {
++  if (!server_) {
++    return Status::OK();
++  }
++  return ForAllTablets(this, [](TabletPeer* tablet_peer) {
++    return tablet_peer->tablet()->CompactSync();
++  });
++}
++
+ Status MiniTabletServer::SwitchMemtables() {
+   return ForAllTablets(this, [](TabletPeer* tablet_peer) {
+     return tablet_peer->tablet()->TEST_SwitchMemtable();
+diff --git a/src/yb/tserver/mini_tablet_server.h b/src/yb/tserver/mini_tablet_server.h
+index 8058822b1a..0ee3c45099 100644
+--- a/src/yb/tserver/mini_tablet_server.h
++++ b/src/yb/tserver/mini_tablet_server.h
+@@ -83,6 +83,7 @@ class MiniTabletServer {
+   CHECKED_STATUS FlushTablets(
+       tablet::FlushMode mode = tablet::FlushMode::kSync,
+       tablet::FlushFlags flags = tablet::FlushFlags::kAll);
++  CHECKED_STATUS CompactTablets();
+   CHECKED_STATUS SwitchMemtables();
+   CHECKED_STATUS CleanTabletLogs();
+ 

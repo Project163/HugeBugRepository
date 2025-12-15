@@ -1,0 +1,338 @@
+diff --git a/lib/model/folder_sendrecv.go b/lib/model/folder_sendrecv.go
+index 88e14b087..7635db9ad 100644
+--- a/lib/model/folder_sendrecv.go
++++ b/lib/model/folder_sendrecv.go
+@@ -288,6 +288,9 @@ func (f *sendReceiveFolder) processNeeded(ignores *ignore.Matcher, dbUpdateChan
+ 
+ 	changed := 0
+ 	var processDirectly []protocol.FileInfo
++	var dirDeletions []protocol.FileInfo
++	fileDeletions := map[string]protocol.FileInfo{}
++	buckets := map[string][]protocol.FileInfo{}
+ 
+ 	// Iterate the list of items that we need and sort them into piles.
+ 	// Regular files to pull goes into the file queue, everything else
+@@ -319,7 +322,23 @@ func (f *sendReceiveFolder) processNeeded(ignores *ignore.Matcher, dbUpdateChan
+ 			changed++
+ 
+ 		case file.IsDeleted():
+-			processDirectly = append(processDirectly, file)
++			if file.IsDirectory() {
++				// Perform directory deletions at the end, as we may have
++				// files to delete inside them before we get to that point.
++				dirDeletions = append(dirDeletions, file)
++			} else {
++				fileDeletions[file.Name] = file
++				df, ok := f.model.CurrentFolderFile(f.folderID, file.Name)
++				// Local file can be already deleted, but with a lower version
++				// number, hence the deletion coming in again as part of
++				// WithNeed, furthermore, the file can simply be of the wrong
++				// type if we haven't yet managed to pull it.
++				if ok && !df.IsDeleted() && !df.IsSymlink() && !df.IsDirectory() && !df.IsInvalid() {
++					// Put files into buckets per first hash
++					key := string(df.Blocks[0].Hash)
++					buckets[key] = append(buckets[key], df)
++				}
++			}
+ 			changed++
+ 
+ 		case file.Type == protocol.FileInfoTypeFile:
+@@ -344,6 +363,7 @@ func (f *sendReceiveFolder) processNeeded(ignores *ignore.Matcher, dbUpdateChan
+ 
+ 		default:
+ 			// Directories, symlinks
++			l.Debugln(f, "to be processed directly", file)
+ 			processDirectly = append(processDirectly, file)
+ 			changed++
+ 		}
+@@ -364,10 +384,6 @@ func (f *sendReceiveFolder) processNeeded(ignores *ignore.Matcher, dbUpdateChan
+ 
+ 	// Process the list.
+ 
+-	fileDeletions := map[string]protocol.FileInfo{}
+-	dirDeletions := []protocol.FileInfo{}
+-	buckets := map[string][]protocol.FileInfo{}
+-
+ 	for _, fi := range processDirectly {
+ 		select {
+ 		case <-f.ctx.Done():
+@@ -375,34 +391,11 @@ func (f *sendReceiveFolder) processNeeded(ignores *ignore.Matcher, dbUpdateChan
+ 		default:
+ 		}
+ 
+-		// Verify that the thing we are handling lives inside a directory,
+-		// and not a symlink or empty space.
+-		if err := osutil.TraversesSymlink(f.fs, filepath.Dir(fi.Name)); err != nil {
+-			f.newError("traverses d", fi.Name, err)
++		if !f.checkParent(fi.Name, scanChan) {
+ 			continue
+ 		}
+ 
+ 		switch {
+-		case fi.IsDeleted():
+-			// A deleted file, directory or symlink
+-			if fi.IsDirectory() {
+-				// Perform directory deletions at the end, as we may have
+-				// files to delete inside them before we get to that point.
+-				dirDeletions = append(dirDeletions, fi)
+-			} else {
+-				fileDeletions[fi.Name] = fi
+-				df, ok := f.model.CurrentFolderFile(f.folderID, fi.Name)
+-				// Local file can be already deleted, but with a lower version
+-				// number, hence the deletion coming in again as part of
+-				// WithNeed, furthermore, the file can simply be of the wrong
+-				// type if we haven't yet managed to pull it.
+-				if ok && !df.IsDeleted() && !df.IsSymlink() && !df.IsDirectory() && !df.IsInvalid() {
+-					// Put files into buckets per first hash
+-					key := string(df.Blocks[0].Hash)
+-					buckets[key] = append(buckets[key], df)
+-				}
+-			}
+-
+ 		case fi.IsDirectory() && !fi.IsSymlink():
+ 			l.Debugln(f, "Handling directory", fi.Name)
+ 			f.handleDir(fi, dbUpdateChan)
+@@ -464,33 +457,10 @@ nextFile:
+ 			continue
+ 		}
+ 
+-		dirName := filepath.Dir(fi.Name)
+-
+-		// Verify that the thing we are handling lives inside a directory,
+-		// and not a symlink or empty space.
+-		if err := osutil.TraversesSymlink(f.fs, dirName); err != nil {
+-			f.newError("traverses q", fi.Name, err)
++		if !f.checkParent(fi.Name, scanChan) {
+ 			continue
+ 		}
+ 
+-		// issues #114 and #4475: This works around a race condition
+-		// between two devices, when one device removes a directory and the
+-		// other creates a file in it. However that happens, we end up with
+-		// a directory for "foo" with the delete bit, but a file "foo/bar"
+-		// that we want to sync. We never create the directory, and hence
+-		// fail to create the file and end up looping forever on it. This
+-		// breaks that by creating the directory and scheduling a scan,
+-		// where it will be found and the delete bit on it removed.  The
+-		// user can then clean up as they like...
+-		if _, err := f.fs.Lstat(dirName); fs.IsNotExist(err) {
+-			l.Debugln("%v resurrecting parent directory of %v", f, fi.Name)
+-			if err := f.fs.MkdirAll(dirName, 0755); err != nil {
+-				f.newError("resurrecting parent dir", fi.Name, err)
+-				continue
+-			}
+-			scanChan <- dirName
+-		}
+-
+ 		// Check our list of files to be removed for a match, in which case
+ 		// we can just do a rename instead.
+ 		key := string(fi.Blocks[0].Hash)
+@@ -640,6 +610,40 @@ func (f *sendReceiveFolder) handleDir(file protocol.FileInfo, dbUpdateChan chan<
+ 	}
+ }
+ 
++// checkParent verifies that the thing we are handling lives inside a directory,
++// and not a symlink or regular file. It also resurrects missing parent dirs.
++func (f *sendReceiveFolder) checkParent(file string, scanChan chan<- string) bool {
++	parent := filepath.Dir(file)
++
++	if err := osutil.TraversesSymlink(f.fs, parent); err != nil {
++		f.newError("traverses q", file, err)
++		return false
++	}
++
++	// issues #114 and #4475: This works around a race condition
++	// between two devices, when one device removes a directory and the
++	// other creates a file in it. However that happens, we end up with
++	// a directory for "foo" with the delete bit, but a file "foo/bar"
++	// that we want to sync. We never create the directory, and hence
++	// fail to create the file and end up looping forever on it. This
++	// breaks that by creating the directory and scheduling a scan,
++	// where it will be found and the delete bit on it removed. The
++	// user can then clean up as they like...
++	// This can also occur if an entire tree structure was deleted, but only
++	// a leave has been scanned.
++	if _, err := f.fs.Lstat(parent); !fs.IsNotExist(err) {
++		l.Debugf("%v parent not missing %v", f, file)
++		return true
++	}
++	l.Debugf("%v resurrecting parent directory of %v", f, file)
++	if err := f.fs.MkdirAll(parent, 0755); err != nil {
++		f.newError("resurrecting parent dir", file, err)
++		return false
++	}
++	scanChan <- parent
++	return true
++}
++
+ // handleSymlink creates or updates the given symlink
+ func (f *sendReceiveFolder) handleSymlink(file protocol.FileInfo, dbUpdateChan chan<- dbUpdateJob) {
+ 	// Used in the defer closure below, updated by the function body. Take
+@@ -723,9 +727,7 @@ func (f *sendReceiveFolder) handleDeleteDir(file protocol.FileInfo, ignores *ign
+ 		})
+ 	}()
+ 
+-	err = f.deleteDir(file.Name, ignores, scanChan)
+-
+-	if err != nil {
++	if err = f.deleteDir(file.Name, ignores, scanChan); err != nil {
+ 		f.newError("delete dir", file.Name, err)
+ 		return
+ 	}
+@@ -1409,9 +1411,9 @@ func (f *sendReceiveFolder) performFinish(ignores *ignore.Matcher, state *shared
+ 		// to handle that specially.
+ 		changed := false
+ 		switch {
+-		case !state.hasCurFile:
++		case !state.hasCurFile || state.curFile.Deleted:
+ 			// The file appeared from nowhere
+-			l.Debugln("file exists but not scanned; not finishing:", state.file.Name)
++			l.Debugln("file exists on disk but not in db; not finishing:", state.file.Name)
+ 			changed = true
+ 
+ 		case stat.IsDir() != state.curFile.IsDirectory() || stat.IsSymlink() != state.curFile.IsSymlink():
+diff --git a/lib/model/model_test.go b/lib/model/model_test.go
+index 456bbc4a9..c48f63ef6 100644
+--- a/lib/model/model_test.go
++++ b/lib/model/model_test.go
+@@ -405,14 +405,9 @@ func (f *fakeConnection) DownloadProgress(folder string, updates []protocol.File
+ 	})
+ }
+ 
+-func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileInfoType, data []byte) {
+-	f.mut.Lock()
+-	defer f.mut.Unlock()
+-
++func (f *fakeConnection) addFileLocked(name string, flags uint32, ftype protocol.FileInfoType, data []byte, version protocol.Vector) {
+ 	blockSize := protocol.BlockSize(int64(len(data)))
+ 	blocks, _ := scanner.Blocks(context.TODO(), bytes.NewReader(data), blockSize, int64(len(data)), nil, true)
+-	var version protocol.Vector
+-	version = version.Update(f.id.Short())
+ 
+ 	if ftype == protocol.FileInfoTypeFile || ftype == protocol.FileInfoTypeDirectory {
+ 		f.files = append(f.files, protocol.FileInfo{
+@@ -442,6 +437,27 @@ func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileI
+ 	}
+ 	f.fileData[name] = data
+ }
++func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileInfoType, data []byte) {
++	f.mut.Lock()
++	defer f.mut.Unlock()
++
++	var version protocol.Vector
++	version = version.Update(f.id.Short())
++	f.addFileLocked(name, flags, ftype, data, version)
++}
++
++func (f *fakeConnection) updateFile(name string, flags uint32, ftype protocol.FileInfoType, data []byte) {
++	f.mut.Lock()
++	defer f.mut.Unlock()
++
++	for i, fi := range f.files {
++		if fi.Name == name {
++			f.files = append(f.files[:i], f.files[i+1:]...)
++			f.addFileLocked(name, flags, ftype, data, fi.Version.Update(f.id.Short()))
++			return
++		}
++	}
++}
+ 
+ func (f *fakeConnection) deleteFile(name string) {
+ 	f.mut.Lock()
+diff --git a/lib/model/requests_test.go b/lib/model/requests_test.go
+index 126a9b842..be378f0f9 100644
+--- a/lib/model/requests_test.go
++++ b/lib/model/requests_test.go
+@@ -266,7 +266,7 @@ func TestRequestVersioningSymlinkAttack(t *testing.T) {
+ 	}
+ 
+ 	// Recreate foo and a file in it with some data
+-	fc.addFile("foo", 0755, protocol.FileInfoTypeDirectory, nil)
++	fc.updateFile("foo", 0755, protocol.FileInfoTypeDirectory, nil)
+ 	fc.addFile("foo/test", 0644, protocol.FileInfoTypeFile, []byte("testtesttest"))
+ 	fc.sendIndexUpdate()
+ 	for updates := 0; updates < 1; updates += <-idx {
+@@ -531,6 +531,83 @@ func TestRescanIfHaveInvalidContent(t *testing.T) {
+ 	}
+ }
+ 
++func TestParentDeletion(t *testing.T) {
++	m, fc, tmpDir := setupModelWithConnection()
++	defer m.Stop()
++	defer os.RemoveAll(tmpDir)
++
++	parent := "foo"
++	child := filepath.Join(parent, "bar")
++	testFs := fs.NewFilesystem(fs.FilesystemTypeBasic, tmpDir)
++
++	received := make(chan []protocol.FileInfo)
++	fc.addFile(parent, 0777, protocol.FileInfoTypeDirectory, nil)
++	fc.addFile(child, 0777, protocol.FileInfoTypeDirectory, nil)
++	fc.mut.Lock()
++	fc.indexFn = func(folder string, fs []protocol.FileInfo) {
++		received <- fs
++		return
++	}
++	fc.mut.Unlock()
++	fc.sendIndexUpdate()
++
++	// Get back index from initial setup
++	select {
++	case fs := <-received:
++		if len(fs) != 2 {
++			t.Fatalf("Sent index with %d files, should be 2", len(fs))
++		}
++	case <-time.After(time.Second):
++		t.Fatalf("timed out")
++	}
++
++	// Delete parent dir
++	if err := testFs.RemoveAll(parent); err != nil {
++		t.Fatal(err)
++	}
++
++	// Scan only the child dir (not the parent)
++	if err := m.ScanFolderSubdirs("default", []string{child}); err != nil {
++		t.Fatal("Failed scanning:", err)
++	}
++
++	select {
++	case fs := <-received:
++		if len(fs) != 1 {
++			t.Fatalf("Sent index with %d files, should be 1", len(fs))
++		}
++		if fs[0].Name != child {
++			t.Fatalf(`Sent index with file "%v", should be "%v"`, fs[0].Name, child)
++		}
++	case <-time.After(time.Second):
++		t.Fatalf("timed out")
++	}
++
++	// Recreate the child dir on the remote
++	fc.updateFile(child, 0777, protocol.FileInfoTypeDirectory, nil)
++	fc.sendIndexUpdate()
++
++	// Wait for the child dir to be recreated and sent to the remote
++	select {
++	case fs := <-received:
++		l.Debugln("sent:", fs)
++		found := false
++		for _, f := range fs {
++			if f.Name == child {
++				if f.Deleted {
++					t.Fatalf(`File "%v" is still deleted`, child)
++				}
++				found = true
++			}
++		}
++		if !found {
++			t.Fatalf(`File "%v" is missing in index`, child)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatalf("timed out")
++	}
++}
++
+ func setupModelWithConnection() (*Model, *fakeConnection, string) {
+ 	tmpDir := createTmpDir()
+ 	cfg := defaultCfgWrapper.RawCopy()

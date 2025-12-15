@@ -1,0 +1,296 @@
+diff --git a/src/yb/master/ysql_ddl_handler.cc b/src/yb/master/ysql_ddl_handler.cc
+index 2722439085..ebe6095488 100644
+--- a/src/yb/master/ysql_ddl_handler.cc
++++ b/src/yb/master/ysql_ddl_handler.cc
+@@ -399,10 +399,14 @@ Status CatalogManager::YsqlDdlTxnCompleteCallbackInternal(
+       RETURN_NOT_OK(HandleAbortedYsqlDdlTxn(txn_data));
+     }
+   } else {
+-    // If success is nullopt, it represents a PG DDL statement that only increments the schema
+-    // version of this table without any table schema change. There is nothing to do but to
+-    // cleanup.
+-    RETURN_NOT_OK(ClearYsqlDdlTxnState(txn_data));
++    // If success is nullopt, it represents a transaction where all DDL statements are either that:
++    // 1. only increments the schema version of the table without any table schema change.
++    // 2. were ambiguous to determine and their commit or abort ends up with the same schema.
++    //    example: BEGIN; CREATE TABLE; DROP TABLE; COMMIT or ROLLBACK;
++    // We can choose either COMMIT or ABORT. It doesn't matter. So we choose COMMIT here.
++    VLOG(3) << "Ysql DDL transaction " << txn_id << " for table " << table->ToString()
++            << " is ambiguous, treating it as a success";
++    RETURN_NOT_OK(HandleSuccessfulYsqlDdlTxn(txn_data));
+   }
+   return Status::OK();
+ }
+diff --git a/src/yb/master/ysql_ddl_verification_task.cc b/src/yb/master/ysql_ddl_verification_task.cc
+index cf06e20561..7d0a87669b 100644
+--- a/src/yb/master/ysql_ddl_verification_task.cc
++++ b/src/yb/master/ysql_ddl_verification_task.cc
+@@ -231,6 +231,12 @@ Status PgSchemaCheckerWithReadTime(SysCatalogTable* sys_catalog,
+     name_col = kTableNameColName;
+   }
+ 
++  VLOG(3) << "Checking PG catalog for table " << table->ToString()
++                    << " with id: " << table->id()
++                    << " with oid " << oid
++                    << " in pg_catalog table " << pg_catalog_table_id
++                    << " at read time " << read_time;
++
+   auto read_data = VERIFY_RESULT(sys_catalog->TableReadData(pg_catalog_table_id, read_time));
+   auto oid_col_id = VERIFY_RESULT(read_data.ColumnByName("oid")).rep();
+   auto relname_col_id = VERIFY_RESULT(read_data.ColumnByName(name_col)).rep();
+@@ -272,17 +278,30 @@ Status PgSchemaCheckerWithReadTime(SysCatalogTable* sys_catalog,
+     table_found = true;
+     if (check_relfilenode) {
+       const auto& relfilenode_col = row.GetValue(relfilenode_col_id);
+-      if (relfilenode_col->uint32_value() != VERIFY_RESULT(table->GetPgRelfilenodeOid())) {
++      const auto& docdb_relfilenodeOid = VERIFY_RESULT(table->GetPgRelfilenodeOid());
++      if (relfilenode_col->uint32_value() != docdb_relfilenodeOid) {
++        VLOG(3) << "Table rewrite detected for " << table->ToString()
++                << " with oid " << oid
++                << " and pg_class relfilenode " << relfilenode_col->uint32_value()
++                << ", docdb relfilenode " << docdb_relfilenodeOid;
+         table_found = false;
+         table_rewritten = true;
+       }
+     }
+   }
+ 
+-  // Table not found in pg_class. This can only happen in three cases:
+-  // * Table creation failed,
+-  // * A table deletion went through successfully,
+-  // * In some unit tests where --TEST_yb_test_table_rewrite_keep_old_table=true
++  // Table not found in pg_class. This can only happen in the following cases:
++  // 1. Table was created in the current transaction and:
++  //   a. the transaction was aborted. BEGIN; CREATE TABLE; ROLLBACK;
++  //   b. the table was dropped as well and the transaction was committed.
++  //      BEGIN; CREATE TABLE; DROP TABLE; COMMIT;
++  //   c. the table was dropped as well and the transaction was aborted.
++  //      BEGIN; CREATE TABLE; DROP TABLE; ROLLBACK;
++  //   Note that we cannot differentiate between the 1b and 1c cases here since in both the cases,
++  //   the table won't be found in the PG catalog.
++  // 2. Table existed before the transaction and its deletion went through successfully.
++  //    BEGIN; DROP TABLE; COMMIT;
++  // 3. In some unit tests where --TEST_yb_test_table_rewrite_keep_old_table=true
+   //   is set on yb-master and PG GUC yb_test_table_rewrite_keep_old_table is true,
+   //   an ALTER TABLE statement that involves a table rewrite will not have
+   //   "contains_drop_table_op" set, therefore is_being_deleted_by_ysql_ddl_txn()
+@@ -291,23 +310,36 @@ Status PgSchemaCheckerWithReadTime(SysCatalogTable* sys_catalog,
+   //   for testing purpose.
+   if (!table_found) {
+     *read_restart_ht = VERIFY_RESULT(iter->GetReadRestartData()).restart_time;
++    // Case 1.b. and 1.c.
++    if (l->is_being_created_by_ysql_ddl_txn() && l->is_being_deleted_by_ysql_ddl_txn()) {
++      VLOG(3) << "Ysql transaction for " << table->ToString()
++              << " cannot be concluded as commit or rollback as it was created and deleted in the"
++              << " same transaction";
++      *result = std::nullopt;
++      return Status::OK();
++    }
++    // Case 1.a.
++    if (l->is_being_created_by_ysql_ddl_txn()) {
++      VLOG(3) << "Ysql Create transaction for " << table->ToString()
++              << " detected to have failed as table not found in PG catalog";
++      *result = false;
++      return Status::OK();
++    }
++    // Case 2.
+     if (l->is_being_deleted_by_ysql_ddl_txn()) {
++      VLOG(3) << "Ysql Drop transaction for " << table->ToString()
++              << " detected to have succeeded as table not found in PG catalog";
+       *result = true;
+       return Status::OK();
+     }
+-    if (FLAGS_TEST_yb_test_table_rewrite_keep_old_table) {
+-      // If alter table resulted in a table rewrite and the old table is
+-      // already deleted from PG catalog after the ddl transaction completes,
+-      // then the ddl transaction must have committed because the old table
+-      // should still exist if the ddl transaction aborted.
+-      if (l->is_being_altered_by_ysql_ddl_txn() && table_rewritten) {
+-        *result = true;
+-        return Status::OK();
+-      }
+-    }
+-    CHECK(l->is_being_created_by_ysql_ddl_txn())
++    // Must be case 3 where alter table resulted in a table rewrite and the old table was
++    // successfully deleted from the PG catalog after the DDL transaction completed. If the
++    // transaction had aborted, the old table would not exist in the catalog.
++    CHECK(FLAGS_TEST_yb_test_table_rewrite_keep_old_table &&
++          l->is_being_altered_by_ysql_ddl_txn() &&
++          table_rewritten)
+         << table->ToString() << " " << l->pb.ysql_ddl_txn_verifier_state(0).ShortDebugString();
+-    *result = false;
++    *result = true;
+     return Status::OK();
+   }
+ 
+@@ -322,6 +354,8 @@ Status PgSchemaCheckerWithReadTime(SysCatalogTable* sys_catalog,
+   }
+ 
+   if (l->is_being_created_by_ysql_ddl_txn()) {
++    VLOG(3) << "Ysql Create transaction for " << table->ToString()
++      << " detected to have succeeded as table found in PG catalog";
+     *result = true;
+     return Status::OK();
+   }
+diff --git a/src/yb/yql/pgwrapper/CMakeLists.txt b/src/yb/yql/pgwrapper/CMakeLists.txt
+index 7f59f5c589..a58838d27e 100644
+--- a/src/yb/yql/pgwrapper/CMakeLists.txt
++++ b/src/yb/yql/pgwrapper/CMakeLists.txt
+@@ -133,6 +133,7 @@ ADD_YB_TEST(pg_create_database-test)
+ ADD_YB_TEST(pg_ddl_atomicity-test)
+ ADD_YB_TEST(pg_ddl_atomicity_stress-test)
+ ADD_YB_TEST(pg_ddl_concurrency-test)
++ADD_YB_TEST(pg_ddl_transaction-test)
+ ADD_YB_TEST(pg_debug_read_restarts-test)
+ ADD_YB_TEST(pg_drop_column_test)
+ ADD_YB_TEST(pg_export_snapshot-test)
+diff --git a/src/yb/yql/pgwrapper/pg_ddl_transaction-test.cc b/src/yb/yql/pgwrapper/pg_ddl_transaction-test.cc
+new file mode 100644
+index 0000000000..30850f2c56
+--- /dev/null
++++ b/src/yb/yql/pgwrapper/pg_ddl_transaction-test.cc
+@@ -0,0 +1,144 @@
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++
++#include "yb/client/table_info.h"
++#include "yb/integration-tests/yb_mini_cluster_test_base.h"
++
++#include "yb/client/client-test-util.h"
++
++#include "yb/util/async_util.h"
++#include "yb/yql/pgwrapper/libpq_test_base.h"
++#include "yb/yql/pgwrapper/libpq_utils.h"
++
++namespace yb::pgwrapper {
++
++const std::string kDatabase = "yugabyte";
++
++class PgDdlTransactionTest : public LibPqTestBase {
++ public:
++  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
++    LibPqTestBase::UpdateMiniClusterOptions(opts);
++    opts->extra_master_flags.push_back("--TEST_ysql_yb_ddl_transaction_block_enabled=true");
++    opts->extra_tserver_flags.push_back("--ysql_pg_conf_csv=log_statement=all");
++    opts->extra_tserver_flags.push_back("--TEST_ysql_yb_ddl_transaction_block_enabled=true");
++  }
++};
++
++TEST_F(PgDdlTransactionTest, TestTableCreateDropSameTransaction) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnTServers(
++      "report_ysql_ddl_txn_status_to_master", "false"));
++
++  // Table shouldn't exist in DocDB after the transaction commmit.
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_commit(id int)"));
++  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_commit"));
++  ASSERT_OK(conn.Execute("COMMIT"));
++  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_commit", 10);
++
++  // Table shouldn't exist in DocDB after the transaction rollback.
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_rollback(id int)"));
++  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_rollback"));
++  ASSERT_OK(conn.Execute("ROLLBACK"));
++  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_rollback", 10);
++}
++
++TEST_F(PgDdlTransactionTest, TestTableCreateDropSameTransactionAnotherTableUsedForDisambiguation) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnTServers(
++      "report_ysql_ddl_txn_status_to_master", "false"));
++
++  // The state of the table 'foo' should be used to determine that the transaction was a success.
++  // As a result, the table 'foo' should exist in DocDB.
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_commit(id int)"));
++  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_commit"));
++  ASSERT_OK(conn.Execute("CREATE TABLE foo(id int)"));
++  ASSERT_OK(conn.Execute("COMMIT"));
++  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_commit", 10);
++  ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", "foo"));
++  VerifyTableExists(client.get(), kDatabase, "foo", 10);
++
++  // The state of the table 'bar' should be used to determine that the transaction was an abort.
++  // As a result, the table 'bar' should not exist in DocDB.
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("CREATE TABLE txn_create_drop_rollback(id int)"));
++  ASSERT_OK(conn.Execute("DROP TABLE txn_create_drop_rollback"));
++  ASSERT_OK(conn.Execute("CREATE TABLE bar(id int)"));
++  ASSERT_OK(conn.Execute("ROLLBACK"));
++  VerifyTableNotExists(client.get(), kDatabase, "txn_create_drop_rollback", 10);
++  VerifyTableNotExists(client.get(), kDatabase, "bar", 10);
++}
++
++TEST_F(PgDdlTransactionTest, TestTableDropCommit) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnTServers(
++      "report_ysql_ddl_txn_status_to_master", "false"));
++
++  ASSERT_OK(conn.Execute("CREATE TABLE txn_drop_existing(id int)"));
++  ASSERT_RESULT(GetTableIdByTableName(client.get(), "yugabyte", "txn_drop_existing"));
++
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("DROP TABLE txn_drop_existing"));
++  ASSERT_OK(conn.Execute("COMMIT"));
++  VerifyTableNotExists(client.get(), kDatabase, "txn_drop_existing", 10);
++}
++
++// Test for https://github.com/yugabyte/yugabyte-db/issues/27359.
++TEST_F(PgDdlTransactionTest, TestRewriteAndDropMaterializedViewInTxn) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnTServers(
++      "report_ysql_ddl_txn_status_to_master", "false"));
++
++  ASSERT_OK(conn.Execute("CREATE TABLE transactions (id SERIAL PRIMARY KEY, amount INT)"));
++  ASSERT_OK(conn.Execute("CREATE TABLE foo (id SERIAL PRIMARY KEY)"));
++  ASSERT_OK(conn.Execute("INSERT INTO transactions (amount) VALUES (10), (20), (30)"));
++  ASSERT_OK(conn.Execute(
++      "CREATE MATERIALIZED VIEW sales_summary AS "
++      "SELECT COUNT(*) AS transaction_count, SUM(amount) AS total_amount FROM transactions"));
++  auto row = ASSERT_RESULT((conn.FetchRow<int64_t, int64_t>("SELECT * FROM sales_summary")));
++  std::tuple<int64_t, int64_t> expected_row = {3, 60}; // 3 rows, total amount 10+20+30
++  ASSERT_EQ(row, expected_row);
++
++  ASSERT_OK(conn.Execute("INSERT INTO transactions (amount) VALUES (40)"));
++
++  // Rewrite and drop the materialized view in a transaction. We are using the table 'foo' to
++  // detect whether the transaction was determined to be a success or an abort.
++  ASSERT_OK(conn.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++  ASSERT_OK(conn.Execute("REFRESH MATERIALIZED VIEW sales_summary"));
++  ASSERT_OK(conn.Execute("DROP MATERIALIZED VIEW sales_summary"));
++  ASSERT_OK(conn.Execute("ALTER TABLE foo ADD COLUMN new_col INT"));
++  ASSERT_OK(conn.Execute("ROLLBACK"));
++
++  // The transaction must have been deemed as an abort. This can be detected by the absence of the
++  // column 'new_col' in the table 'foo'.
++  auto foo_table_id = ASSERT_RESULT(GetTableIdByTableName(client.get(), kDatabase, "foo"));
++  std::shared_ptr<client::YBTableInfo> foo_table_info = std::make_shared<client::YBTableInfo>();
++  Synchronizer sync;
++  ASSERT_OK(client->GetTableSchemaById(foo_table_id, foo_table_info, sync.AsStatusCallback()));
++  ASSERT_OK(sync.Wait());
++  const auto& columns = foo_table_info->schema.columns();
++  ASSERT_EQ(columns.size(), 1);
++  ASSERT_EQ(columns[0].name(), "id");
++
++  // View should still exist and show the old data as the refresh was rolled back.
++  row = ASSERT_RESULT((conn.FetchRow<int64_t, int64_t>("SELECT * FROM sales_summary")));
++  expected_row = {3, 60};
++  ASSERT_EQ(row, expected_row);
++}
++
++} // namespace yb::pgwrapper

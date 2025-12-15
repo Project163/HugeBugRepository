@@ -1,0 +1,850 @@
+diff --git a/build-support/common-test-env.sh b/build-support/common-test-env.sh
+index a759cbe989..01dd76d577 100644
+--- a/build-support/common-test-env.sh
++++ b/build-support/common-test-env.sh
+@@ -795,7 +795,7 @@ determine_test_timeout() {
+   if [[ -n ${YB_TEST_TIMEOUT:-} ]]; then
+     timeout_sec=$YB_TEST_TIMEOUT
+   else
+-    if [[ $rel_test_binary == "bin/compact_on_deletion_collector_test" ]]; then
++    if [[ $rel_test_binary == "tests-pgwrapper/pg_wrapper-test" ]]; then
+       # This test is particularly slow on TSAN, and it has to be run all at once (we cannot use
+       # --gtest_filter) because of dependencies between tests.
+       timeout_sec=$INCREASED_TEST_TIMEOUT_SEC
+diff --git a/src/postgres/src/backend/executor/execUtils.c b/src/postgres/src/backend/executor/execUtils.c
+index a5925ca7e3..2479c54fb0 100644
+--- a/src/postgres/src/backend/executor/execUtils.c
++++ b/src/postgres/src/backend/executor/execUtils.c
+@@ -111,6 +111,8 @@ CreateExecutorState(void)
+ 
+ 	estate->es_output_cid = (CommandId) 0;
+ 
++	estate->es_yb_read_ht = 0;
++
+ 	estate->es_result_relations = NULL;
+ 	estate->es_num_result_relations = 0;
+ 	estate->es_result_relation_info = NULL;
+diff --git a/src/postgres/src/backend/executor/ybcScan.c b/src/postgres/src/backend/executor/ybcScan.c
+index ce847a9fb8..ba11a1e628 100644
+--- a/src/postgres/src/backend/executor/ybcScan.c
++++ b/src/postgres/src/backend/executor/ybcScan.c
+@@ -239,7 +239,8 @@ YbScanState ybcBeginScan(Relation rel, List *target_attrs, List *yb_conds)
+ 	/* Allocate and initialize YB scan state. */
+ 	ybc_state = (YbScanState) palloc0(sizeof(YbScanStateData));
+ 
+-	HandleYBStatus(YBCPgNewSelect(ybc_pg_session, dboid, relid, &ybc_state->handle));
++	HandleYBStatus(YBCPgNewSelect(
++	    ybc_pg_session, dboid, relid, &ybc_state->handle, NULL /* read_time */));
+ 	ResourceOwnerEnlargeYugaByteStmts(CurrentResourceOwner);
+ 	ResourceOwnerRememberYugaByteStmt(CurrentResourceOwner, ybc_state->handle);
+ 	ybc_state->stmt_owner = CurrentResourceOwner;
+diff --git a/src/postgres/src/backend/executor/ybc_fdw.c b/src/postgres/src/backend/executor/ybc_fdw.c
+index b09011210a..43f6f1dd7a 100644
+--- a/src/postgres/src/backend/executor/ybc_fdw.c
++++ b/src/postgres/src/backend/executor/ybc_fdw.c
+@@ -579,9 +579,10 @@ ybcBeginForeignScan(ForeignScanState *node, int eflags)
+ 
+ 	node->fdw_state = (void *) ybc_state;
+ 	HandleYBStatus(YBCPgNewSelect(ybc_pg_session,
+-								  YBCGetDatabaseOid(relation),
+-								  RelationGetRelid(relation),
+-	                              &ybc_state->handle));
++								                YBCGetDatabaseOid(relation),
++								                RelationGetRelid(relation),
++	                              &ybc_state->handle,
++	                              node->ss.ps.state ? &node->ss.ps.state->es_yb_read_ht : 0));
+ 	ResourceOwnerEnlargeYugaByteStmts(CurrentResourceOwner);
+ 	ResourceOwnerRememberYugaByteStmt(CurrentResourceOwner, ybc_state->handle);
+ 	ybc_state->stmt_owner = CurrentResourceOwner;
+diff --git a/src/postgres/src/include/nodes/execnodes.h b/src/postgres/src/include/nodes/execnodes.h
+index 4420e541f0..535756b91a 100644
+--- a/src/postgres/src/include/nodes/execnodes.h
++++ b/src/postgres/src/include/nodes/execnodes.h
+@@ -511,6 +511,9 @@ typedef struct EState
+ 	struct dsa_area *es_query_dsa;
+ 
+ 	bool		es_use_parallel_mode; /* can we use parallel workers? */
++
++	uint64_t es_yb_read_ht; /* read hybrid time used by YB proxy to read consistent snapshot,
++                             initial value is 0, it means that value is not initialised */
+ } EState;
+ 
+ 
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index 58e5c78bcc..0a59404665 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -1865,6 +1865,10 @@ bool YBSession::allow_local_calls_in_curr_thread() const {
+   return data_->allow_local_calls_in_curr_thread();
+ }
+ 
++void YBSession::SetInTxnLimit(HybridTime value) {
++  data_->SetInTxnLimit(value);
++}
++
+ void YBSession::SetForceConsistentRead(bool value) {
+   data_->SetForceConsistentRead(value);
+ }
+diff --git a/src/yb/client/client.h b/src/yb/client/client.h
+index 4534413f26..4b7c56a48c 100644
+--- a/src/yb/client/client.h
++++ b/src/yb/client/client.h
+@@ -1131,6 +1131,9 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
+   void set_allow_local_calls_in_curr_thread(bool flag);
+   bool allow_local_calls_in_curr_thread() const;
+ 
++  // Sets in transaction read limit for this session.
++  void SetInTxnLimit(HybridTime value);
++
+   YBClient* client() const;
+ 
+   // Sets force consistent read mode, if true then consistent read point will be used even we have
+diff --git a/src/yb/client/session-internal.cc b/src/yb/client/session-internal.cc
+index 025fe78652..fc3698c04d 100644
+--- a/src/yb/client/session-internal.cc
++++ b/src/yb/client/session-internal.cc
+@@ -138,11 +138,21 @@ void YBSessionData::set_allow_local_calls_in_curr_thread(bool flag) {
+   allow_local_calls_in_curr_thread_ = flag;
+ }
+ 
++void YBSessionData::SetInTxnLimit(HybridTime value) {
++  auto *rp = DCHECK_NOTNULL(read_point());
++  if (rp) {
++    read_point()->SetInTxnLimit(value);
++  }
++}
++
++ConsistentReadPoint* YBSessionData::read_point() {
++  return transaction_ ? &transaction_->read_point() : read_point_.get();
++}
++
+ internal::Batcher& YBSessionData::Batcher() {
+   if (!batcher_) {
+     batcher_.reset(new internal::Batcher(
+-        client_.get(), error_collector_.get(), shared_from_this(), transaction_,
+-        transaction_ ? &transaction_->read_point() : read_point_.get(),
++        client_.get(), error_collector_.get(), shared_from_this(), transaction_, read_point(),
+         force_consistent_read_));
+     if (timeout_.Initialized()) {
+       batcher_->SetTimeout(timeout_);
+diff --git a/src/yb/client/session-internal.h b/src/yb/client/session-internal.h
+index a646df1803..54b4d9dabf 100644
+--- a/src/yb/client/session-internal.h
++++ b/src/yb/client/session-internal.h
+@@ -106,7 +106,11 @@ class YBSessionData : public std::enable_shared_from_this<YBSessionData> {
+ 
+   void SetForceConsistentRead(bool value);
+ 
++  void SetInTxnLimit(HybridTime value);
++
+  private:
++  ConsistentReadPoint* read_point();
++
+   internal::Batcher& Batcher();
+ 
+   // The client that this session is associated with.
+diff --git a/src/yb/common/common.proto b/src/yb/common/common.proto
+index 7523c8bbf0..fef0b39ba8 100644
+--- a/src/yb/common/common.proto
++++ b/src/yb/common/common.proto
+@@ -358,6 +358,8 @@ message ReadHybridTimePB {
+   optional fixed64 local_limit_ht = 2;
+ 
+   optional fixed64 global_limit_ht = 3;
++
++  optional fixed64 in_txn_limit_ht = 4;
+ }
+ 
+ // For clarification of field meaning see comments of appropriate fields in YBTransaction::Impl
+diff --git a/src/yb/common/consistent_read_point.cc b/src/yb/common/consistent_read_point.cc
+index c4aa6329cf..e2d6094b78 100644
+--- a/src/yb/common/consistent_read_point.cc
++++ b/src/yb/common/consistent_read_point.cc
+@@ -117,6 +117,10 @@ void ConsistentReadPoint::ApplyChildTransactionResult(const ChildTransactionResu
+   }
+ }
+ 
++void ConsistentReadPoint::SetInTxnLimit(HybridTime value) {
++  read_time_.in_txn_limit = value;
++}
++
+ ConsistentReadPoint& ConsistentReadPoint::operator=(ConsistentReadPoint&& other) {
+   clock_.swap(other.clock_);
+   read_time_ = std::move(other.read_time_);
+diff --git a/src/yb/common/consistent_read_point.h b/src/yb/common/consistent_read_point.h
+index a4e4a2016e..f355349afa 100644
+--- a/src/yb/common/consistent_read_point.h
++++ b/src/yb/common/consistent_read_point.h
+@@ -67,6 +67,9 @@ class ConsistentReadPoint {
+   // Apply restart read times from a child transaction result. This method is thread-safe.
+   void ApplyChildTransactionResult(const ChildTransactionResultPB& result);
+ 
++  // Sets in transaction limit.
++  void SetInTxnLimit(HybridTime value);
++
+   ConsistentReadPoint& operator=(ConsistentReadPoint&& other);
+ 
+  private:
+diff --git a/src/yb/common/read_hybrid_time.h b/src/yb/common/read_hybrid_time.h
+index 9dd0f3d0ac..740a5f20c9 100644
+--- a/src/yb/common/read_hybrid_time.h
++++ b/src/yb/common/read_hybrid_time.h
+@@ -34,6 +34,9 @@ struct ReadHybridTime {
+   // Read time limit, that is used for global entries, for instance transactions.
+   HybridTime global_limit;
+ 
++  // Read time limit for intents from the same transaction.
++  HybridTime in_txn_limit;
++
+   // Serial no of request that uses this read hybrid time.
+   int64_t serial_no = 0;
+ 
+@@ -42,7 +45,7 @@ struct ReadHybridTime {
+   }
+ 
+   static ReadHybridTime SingleTime(HybridTime value) {
+-    return {value, value, value, 0};
++    return {value, value, value, HybridTime::kMax, 0};
+   }
+ 
+   static ReadHybridTime FromMicros(MicrosTime micros) {
+@@ -54,7 +57,7 @@ struct ReadHybridTime {
+   }
+ 
+   static ReadHybridTime FromHybridTimeRange(const HybridTimeRange& range) {
+-    return {range.first, range.second, range.second, 0};
++    return {range.first, range.second, range.second, HybridTime::kMax, 0};
+   }
+ 
+   template <class PB>
+@@ -79,6 +82,9 @@ struct ReadHybridTime {
+       HybridTime(read_time.read_ht()),
+       HybridTime(read_time.local_limit_ht()),
+       HybridTime(read_time.global_limit_ht()),
++      // Use max hybrid time for backward compatibility.
++      read_time.in_txn_limit_ht() ? HybridTime(read_time.in_txn_limit_ht()) : HybridTime::kMax,
++      0
+     };
+   }
+ 
+@@ -89,6 +95,8 @@ struct ReadHybridTime {
+       out->set_read_ht(read.ToUint64());
+       out->set_local_limit_ht(local_limit.ToUint64());
+       out->set_global_limit_ht(global_limit.ToUint64());
++      out->set_in_txn_limit_ht(
++          in_txn_limit.is_valid() ? in_txn_limit.ToUint64() : HybridTime::kMax.ToUint64());
+     } else {
+       pb->clear_read_time();
+     }
+@@ -103,8 +111,8 @@ struct ReadHybridTime {
+   }
+ 
+   std::string ToString() const {
+-    return Format("{ read: $0 local_limit: $1 global_limit: $2 serial_no: $3 }",
+-                  read, local_limit, global_limit, serial_no);
++    return Format("{ read: $0 local_limit: $1 global_limit: $2 in_txn_limit: $3 serial_no: $4 }",
++                  read, local_limit, global_limit, in_txn_limit, serial_no);
+   }
+ };
+ 
+diff --git a/src/yb/docdb/doc_operation.cc b/src/yb/docdb/doc_operation.cc
+index 26850e879b..c4f8e03b93 100644
+--- a/src/yb/docdb/doc_operation.cc
++++ b/src/yb/docdb/doc_operation.cc
+@@ -13,6 +13,8 @@
+ 
+ #include "yb/docdb/doc_operation.h"
+ 
++#include <boost/optional/optional_io.hpp>
++
+ #include "yb/common/jsonb.h"
+ #include "yb/common/partition.h"
+ #include "yb/common/ql_expr.h"
+@@ -3266,6 +3268,8 @@ Status PgsqlWriteOperation::Init(PgsqlWriteRequestPB* request, PgsqlResponsePB*
+ }
+ 
+ Status PgsqlWriteOperation::Apply(const DocOperationApplyData& data) {
++  VLOG(4) << "Write, read time: " << data.read_time << ", txn: " << txn_op_context_;
++
+   switch (request_.stmt_type()) {
+     case PgsqlWriteRequestPB::PGSQL_INSERT:
+       return ApplyInsert(data);
+@@ -3467,6 +3471,8 @@ Status PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storage,
+                                    const Schema& query_schema,
+                                    PgsqlResultSet *resultset,
+                                    HybridTime *restart_read_ht) {
++  VLOG(4) << "Read, read time: " << read_time << ", txn: " << txn_op_context_;
++
+   size_t row_count_limit = std::numeric_limits<std::size_t>::max();
+   if (request_.has_limit()) {
+     if (request_.limit() == 0) {
+diff --git a/src/yb/docdb/intent_aware_iterator.cc b/src/yb/docdb/intent_aware_iterator.cc
+index 4410b461c6..f4060200da 100644
+--- a/src/yb/docdb/intent_aware_iterator.cc
++++ b/src/yb/docdb/intent_aware_iterator.cc
+@@ -627,31 +627,40 @@ void IntentAwareIterator::ProcessIntent() {
+       resolved_intent_txn_dht_.ToString(),
+       decode_result->value_time.ToString(),
+       read_time_.ToString());
+-  auto real_time = decode_result->same_transaction ? intent_dht_from_same_txn_
+-                                                   : resolved_intent_txn_dht_;
+-  if (decode_result->value_time > real_time &&
+-      (decode_result->same_transaction ||
+-       decode_result->value_time.hybrid_time() <= read_time_.global_limit)) {
+-    if (resolved_intent_state_ == ResolvedIntentState::kNoIntent) {
+-      resolved_intent_key_prefix_.Reset(decode_result->intent_prefix);
+-      auto prefix = prefix_stack_.empty() ? Slice() : prefix_stack_.back();
+-      resolved_intent_state_ =
+-          decode_result->intent_prefix.starts_with(prefix) ? ResolvedIntentState::kValid
+-          : ResolvedIntentState::kInvalidPrefix;
+-    }
+-    if (decode_result->same_transaction) {
+-      intent_dht_from_same_txn_ = decode_result->value_time;
+-      // We set resolved_intent_txn_dht_ to maximum possible time (time higher than read_time_.read
+-      // will cause read restart or will be ignored if higher than read_time_.global_limit) in
+-      // order to ignore intents/values from other transactions. But we save origin intent time into
+-      // intent_dht_from_same_txn_, so we can compare time of intents for the same key from the same
+-      // transaction and select the latest one.
+-      resolved_intent_txn_dht_ = DocHybridTime(read_time_.read, kMaxWriteId);
+-    } else {
+-      resolved_intent_txn_dht_ = decode_result->value_time;
+-    }
+-    resolved_intent_value_.Reset(decode_result->intent_value);
++  auto resolved_intent_time = decode_result->same_transaction ? intent_dht_from_same_txn_
++                                                              : resolved_intent_txn_dht_;
++  // If we already resolved intent that is newer that this one, we should ignore current
++  // intent because we are interested in the most recent intent only.
++  if (decode_result->value_time <= resolved_intent_time) {
++    return;
++  }
++
++  // Ignore intent past read limit.
++  auto max_allowed_time = decode_result->same_transaction
++      ? read_time_.in_txn_limit : read_time_.global_limit;
++  if (decode_result->value_time.hybrid_time() > max_allowed_time) {
++    return;
++  }
++
++  if (resolved_intent_state_ == ResolvedIntentState::kNoIntent) {
++    resolved_intent_key_prefix_.Reset(decode_result->intent_prefix);
++    auto prefix = prefix_stack_.empty() ? Slice() : prefix_stack_.back();
++    resolved_intent_state_ =
++        decode_result->intent_prefix.starts_with(prefix) ? ResolvedIntentState::kValid
++        : ResolvedIntentState::kInvalidPrefix;
++  }
++  if (decode_result->same_transaction) {
++    intent_dht_from_same_txn_ = decode_result->value_time;
++    // We set resolved_intent_txn_dht_ to maximum possible time (time higher than read_time_.read
++    // will cause read restart or will be ignored if higher than read_time_.global_limit) in
++    // order to ignore intents/values from other transactions. But we save origin intent time into
++    // intent_dht_from_same_txn_, so we can compare time of intents for the same key from the same
++    // transaction and select the latest one.
++    resolved_intent_txn_dht_ = DocHybridTime(read_time_.read, kMaxWriteId);
++  } else {
++    resolved_intent_txn_dht_ = decode_result->value_time;
+   }
++  resolved_intent_value_.Reset(decode_result->intent_value);
+ }
+ 
+ void IntentAwareIterator::UpdateResolvedIntentSubDocKeyEncoded() {
+diff --git a/src/yb/yql/pggate/pg_doc_op.cc b/src/yb/yql/pggate/pg_doc_op.cc
+index 3d3ebee21d..eea0b62b78 100644
+--- a/src/yb/yql/pggate/pg_doc_op.cc
++++ b/src/yb/yql/pggate/pg_doc_op.cc
+@@ -19,8 +19,8 @@ using std::shared_ptr;
+ namespace yb {
+ namespace pggate {
+ 
+-PgDocOp::PgDocOp(PgSession::ScopedRefPtr pg_session)
+-    : pg_session_(std::move(pg_session)) {
++PgDocOp::PgDocOp(PgSession::ScopedRefPtr pg_session, uint64_t* read_time)
++    : pg_session_(std::move(pg_session)), read_time_(read_time) {
+ }
+ 
+ PgDocOp::~PgDocOp() {
+@@ -127,8 +127,9 @@ Status PgDocOp::SendRequestIfNeededUnlocked() {
+ 
+ //--------------------------------------------------------------------------------------------------
+ 
+-PgDocReadOp::PgDocReadOp(PgSession::ScopedRefPtr pg_session, client::YBPgsqlReadOp *read_op)
+-    : PgDocOp(pg_session), read_op_(read_op) {
++PgDocReadOp::PgDocReadOp(
++    PgSession::ScopedRefPtr pg_session, uint64_t* read_time, client::YBPgsqlReadOp *read_op)
++    : PgDocOp(pg_session, read_time), read_op_(read_op) {
+ }
+ 
+ PgDocReadOp::~PgDocReadOp() {
+@@ -143,7 +144,7 @@ void PgDocReadOp::InitUnlocked(std::unique_lock<std::mutex>* lock) {
+ }
+ 
+ Status PgDocReadOp::SendRequestUnlocked() {
+-  RETURN_NOT_OK(pg_session_->PgApplyAsync(read_op_));
++  RETURN_NOT_OK(pg_session_->PgApplyAsync(read_op_, read_time_));
+   waiting_for_response_ = true;
+   RETURN_NOT_OK(
+       pg_session_->PgFlushAsync([this](const Status& s) { PgDocReadOp::ReceiveResponse(s); }));
+@@ -183,7 +184,7 @@ void PgDocReadOp::ReceiveResponse(Status exec_status) {
+ //--------------------------------------------------------------------------------------------------
+ 
+ PgDocWriteOp::PgDocWriteOp(PgSession::ScopedRefPtr pg_session, client::YBPgsqlWriteOp *write_op)
+-    : PgDocOp(pg_session), write_op_(write_op) {
++    : PgDocOp(pg_session, nullptr /* read_time */), write_op_(write_op) {
+ }
+ 
+ PgDocWriteOp::~PgDocWriteOp() {
+@@ -192,7 +193,7 @@ PgDocWriteOp::~PgDocWriteOp() {
+ Status PgDocWriteOp::SendRequestUnlocked() {
+   CHECK(!waiting_for_response_);
+ 
+-  RETURN_NOT_OK(pg_session_->PgApplyAsync(write_op_));
++  RETURN_NOT_OK(pg_session_->PgApplyAsync(write_op_, read_time_));
+   waiting_for_response_ = true;
+   Status s = pg_session_->PgFlushAsync([this](const Status& s) {
+     PgDocWriteOp::ReceiveResponse(s);
+@@ -226,7 +227,8 @@ void PgDocWriteOp::ReceiveResponse(Status exec_status) {
+ 
+ //--------------------------------------------------------------------------------------------------
+ 
+-PgDocCompoundOp::PgDocCompoundOp(PgSession::ScopedRefPtr pg_session) : PgDocOp(pg_session) {
++PgDocCompoundOp::PgDocCompoundOp(PgSession::ScopedRefPtr pg_session)
++    : PgDocOp(pg_session, nullptr /* read_time */) {
+ }
+ 
+ PgDocCompoundOp::~PgDocCompoundOp() {
+diff --git a/src/yb/yql/pggate/pg_doc_op.h b/src/yb/yql/pggate/pg_doc_op.h
+index 1bc3100ab2..fe44ee7d8e 100644
+--- a/src/yb/yql/pggate/pg_doc_op.h
++++ b/src/yb/yql/pggate/pg_doc_op.h
+@@ -40,7 +40,9 @@ class PgDocOp {
+   static const int64_t kPrefetchLimit = INT32_MAX;
+ 
+   // Constructors & Destructors.
+-  explicit PgDocOp(PgSession::ScopedRefPtr pg_session);
++  // read_time points to place where read_time for whole postgres statement is stored.
++  // It is available while statement is executed.
++  explicit PgDocOp(PgSession::ScopedRefPtr pg_session, uint64_t* read_time);
+   virtual ~PgDocOp();
+ 
+   // Postgres Ops.
+@@ -68,6 +70,8 @@ class PgDocOp {
+   // Session control.
+   PgSession::ScopedRefPtr pg_session_;
+ 
++  uint64_t* const read_time_;
++
+   // This mutex protects the fields below.
+   mutable std::mutex mtx_;
+   std::condition_variable cv_;
+@@ -105,7 +109,8 @@ class PgDocReadOp : public PgDocOp {
+   typedef scoped_refptr<PgDocReadOp> ScopedRefPtr;
+ 
+   // Constructors & Destructors.
+-  PgDocReadOp(PgSession::ScopedRefPtr pg_session, client::YBPgsqlReadOp *read_op);
++  PgDocReadOp(
++      PgSession::ScopedRefPtr pg_session, uint64_t* read_time, client::YBPgsqlReadOp *read_op);
+   virtual ~PgDocReadOp();
+ 
+   // Access function.
+@@ -115,8 +120,8 @@ class PgDocReadOp : public PgDocOp {
+ 
+  private:
+   // Process response from DocDB.
+-  virtual void InitUnlocked(std::unique_lock<std::mutex>* lock) override;
+-  virtual CHECKED_STATUS SendRequestUnlocked() override;
++  void InitUnlocked(std::unique_lock<std::mutex>* lock) override;
++  CHECKED_STATUS SendRequestUnlocked() override;
+   virtual void ReceiveResponse(Status exec_status);
+ 
+   // Operator.
+@@ -145,7 +150,7 @@ class PgDocWriteOp : public PgDocOp {
+ 
+  private:
+   // Process response from DocDB.
+-  virtual CHECKED_STATUS SendRequestUnlocked() override;
++  CHECKED_STATUS SendRequestUnlocked() override;
+   virtual void ReceiveResponse(Status exec_status);
+ 
+   // Operator.
+diff --git a/src/yb/yql/pggate/pg_select.cc b/src/yb/yql/pggate/pg_select.cc
+index aecca5feab..3abc591bcc 100644
+--- a/src/yb/yql/pggate/pg_select.cc
++++ b/src/yb/yql/pggate/pg_select.cc
+@@ -33,11 +33,11 @@ PgSelect::PgSelect(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_i
+ PgSelect::~PgSelect() {
+ }
+ 
+-Status PgSelect::Prepare() {
++Status PgSelect::Prepare(uint64_t* read_time) {
+   RETURN_NOT_OK(LoadTable());
+ 
+   // Allocate READ/SELECT operation.
+-  auto doc_op = make_shared<PgDocReadOp>(pg_session_, table_desc_->NewPgsqlSelect());
++  auto doc_op = make_shared<PgDocReadOp>(pg_session_, read_time, table_desc_->NewPgsqlSelect());
+   read_req_ = doc_op->read_op()->mutable_request();
+   PrepareColumns();
+ 
+diff --git a/src/yb/yql/pggate/pg_select.h b/src/yb/yql/pggate/pg_select.h
+index da6179fc59..1115027cea 100644
+--- a/src/yb/yql/pggate/pg_select.h
++++ b/src/yb/yql/pggate/pg_select.h
+@@ -37,10 +37,12 @@ class PgSelect : public PgDml {
+   PgSelect(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
+   virtual ~PgSelect();
+ 
+-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_SELECT; }
++  StmtOp stmt_op() const override { return StmtOp::STMT_SELECT; }
+ 
+   // Prepare SELECT before execution.
+-  CHECKED_STATUS Prepare();
++  // read_time points to place where read_time for whole postgres statement is stored.
++  // It is available while statement is executed.
++  CHECKED_STATUS Prepare(uint64_t* read_time);
+ 
+   // Setup internal structures for binding values during prepare.
+   void PrepareColumns();
+diff --git a/src/yb/yql/pggate/pg_session.cc b/src/yb/yql/pggate/pg_session.cc
+index f68de301cf..2d76ecdd38 100644
+--- a/src/yb/yql/pggate/pg_session.cc
++++ b/src/yb/yql/pggate/pg_session.cc
+@@ -49,10 +49,12 @@ static MonoDelta kSessionTimeout = 60s;
+ PgSession::PgSession(
+     std::shared_ptr<client::YBClient> client,
+     const string& database_name,
+-    scoped_refptr<PgTxnManager> pg_txn_manager)
++    scoped_refptr<PgTxnManager> pg_txn_manager,
++    scoped_refptr<server::HybridClock> clock)
+     : client_(client),
+       session_(client_->NewSession()),
+-      pg_txn_manager_(std::move(pg_txn_manager)) {
++      pg_txn_manager_(std::move(pg_txn_manager)),
++      clock_(std::move(clock)) {
+   session_->SetTimeout(kSessionTimeout);
+   session_->SetForceConsistentRead(true);
+ }
+@@ -145,7 +147,7 @@ Result<PgTableDesc::ScopedRefPtr> PgSession::LoadTable(const PgObjectId& table_i
+   return make_scoped_refptr<PgTableDesc>(table);
+ }
+ 
+-Status PgSession::PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op) {
++Status PgSession::PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op, uint64_t* read_time) {
+   VLOG(2) << __PRETTY_FUNCTION__ << " called, is_transactional="
+           << op->IsTransactional();
+   if (op->IsTransactional()) {
+@@ -153,7 +155,14 @@ Status PgSession::PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op) {
+   } else {
+     has_non_txn_ops_ = true;
+   }
+-  return VERIFY_RESULT(GetSessionForOp(op))->Apply(op);
++  auto session = VERIFY_RESULT(GetSessionForOp(op));
++  if (read_time && has_txn_ops_) {
++    if (!*read_time) {
++      *read_time = clock_->Now().ToUint64();
++    }
++    session->SetInTxnLimit(HybridTime(*read_time));
++  }
++  return session->Apply(op);
+ }
+ 
+ Status PgSession::PgFlushAsync(StatusFunctor callback) {
+diff --git a/src/yb/yql/pggate/pg_session.h b/src/yb/yql/pggate/pg_session.h
+index 14aa16b8fc..13cba02f70 100644
+--- a/src/yb/yql/pggate/pg_session.h
++++ b/src/yb/yql/pggate/pg_session.h
+@@ -24,6 +24,8 @@
+ #include "yb/util/oid_generator.h"
+ #include "yb/util/result.h"
+ 
++#include "yb/server/hybrid_clock.h"
++
+ #include "yb/yql/pggate/pg_env.h"
+ #include "yb/yql/pggate/pg_column.h"
+ #include "yb/yql/pggate/pg_tabledesc.h"
+@@ -43,7 +45,8 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
+   // Constructors.
+   PgSession(std::shared_ptr<client::YBClient> client,
+             const string& database_name,
+-            scoped_refptr<PgTxnManager> pg_txn_manager);
++            scoped_refptr<PgTxnManager> pg_txn_manager,
++            scoped_refptr<server::HybridClock> clock);
+   virtual ~PgSession();
+ 
+   //------------------------------------------------------------------------------------------------
+@@ -83,7 +86,7 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
+   Result<PgTableDesc::ScopedRefPtr> LoadTable(const PgObjectId& table_id);
+ 
+   // Apply the given operation to read and write database content.
+-  CHECKED_STATUS PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op);
++  CHECKED_STATUS PgApplyAsync(const std::shared_ptr<client::YBPgsqlOp>& op, uint64_t* read_time);
+   CHECKED_STATUS PgFlushAsync(StatusFunctor callback);
+ 
+   // Return the number of errors which are pending.
+@@ -153,6 +156,8 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
+   // A transaction manager allowing to begin/abort/commit transactions.
+   scoped_refptr<PgTxnManager> pg_txn_manager_;
+ 
++  const scoped_refptr<server::HybridClock> clock_;
++
+   // Execution status.
+   Status status_;
+   string errmsg_;
+diff --git a/src/yb/yql/pggate/pggate.cc b/src/yb/yql/pggate/pggate.cc
+index f0d2d61bfa..c808c2b388 100644
+--- a/src/yb/yql/pggate/pggate.cc
++++ b/src/yb/yql/pggate/pggate.cc
+@@ -109,7 +109,7 @@ Status PgApiImpl::DestroyEnv(PgEnv *pg_env) {
+ Status PgApiImpl::CreateSession(const PgEnv *pg_env,
+                                 const string& database_name,
+                                 PgSession **pg_session) {
+-  auto session = make_scoped_refptr<PgSession>(client(), database_name, pg_txn_manager_);
++  auto session = make_scoped_refptr<PgSession>(client(), database_name, pg_txn_manager_, clock_);
+   if (!database_name.empty()) {
+     RETURN_NOT_OK(session->ConnectDatabase(database_name));
+   }
+@@ -460,11 +460,12 @@ Status PgApiImpl::ExecDelete(PgStatement *handle) {
+ 
+ Status PgApiImpl::NewSelect(PgSession *pg_session,
+                             const PgObjectId& table_id,
+-                            PgStatement **handle) {
++                            PgStatement **handle,
++                            uint64_t* read_time) {
+   DCHECK(pg_session) << "Invalid session handle";
+   *handle = nullptr;
+   auto stmt = make_scoped_refptr<PgSelect>(pg_session, table_id);
+-  RETURN_NOT_OK(stmt->Prepare());
++  RETURN_NOT_OK(stmt->Prepare(read_time));
+   *handle = stmt.detach();
+   return Status::OK();
+ }
+diff --git a/src/yb/yql/pggate/pggate.h b/src/yb/yql/pggate/pggate.h
+index ae15ce7dd9..5b165793b5 100644
+--- a/src/yb/yql/pggate/pggate.h
++++ b/src/yb/yql/pggate/pggate.h
+@@ -257,7 +257,8 @@ class PgApiImpl {
+ 
+   //------------------------------------------------------------------------------------------------
+   // Select.
+-  CHECKED_STATUS NewSelect(PgSession *pg_session, const PgObjectId& table_id, PgStatement **handle);
++  CHECKED_STATUS NewSelect(
++      PgSession *pg_session, const PgObjectId& table_id, PgStatement **handle, uint64_t* read_time);
+ 
+   CHECKED_STATUS ExecSelect(PgStatement *handle);
+ 
+diff --git a/src/yb/yql/pggate/test/pggate_test_catalog.cc b/src/yb/yql/pggate/test/pggate_test_catalog.cc
+index 8828c84e4a..49f11df535 100644
+--- a/src/yb/yql/pggate/test/pggate_test_catalog.cc
++++ b/src/yb/yql/pggate/test/pggate_test_catalog.cc
+@@ -103,7 +103,8 @@ TEST_F(PggateTestCatalog, TestDml) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table WITH RANGE values";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+@@ -171,7 +172,8 @@ TEST_F(PggateTestCatalog, TestDml) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table WITHOUT RANGE values";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgNewColumnRef(pg_stmt, 1, &colref);
+@@ -275,7 +277,8 @@ TEST_F(PggateTestCatalog, TestDml) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgNewColumnRef(pg_stmt, 1, &colref);
+@@ -405,7 +408,8 @@ TEST_F(PggateTestCatalog, TestCopydb) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Select from from test table in the new database";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, copy_db_oid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, copy_db_oid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+diff --git a/src/yb/yql/pggate/test/pggate_test_delete.cc b/src/yb/yql/pggate/test/pggate_test_delete.cc
+index 73ca005a1d..0b8c365ea9 100644
+--- a/src/yb/yql/pggate/test/pggate_test_delete.cc
++++ b/src/yb/yql/pggate/test/pggate_test_delete.cc
+@@ -134,7 +134,8 @@ TEST_F(PggateTestDelete, TestDelete) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+diff --git a/src/yb/yql/pggate/test/pggate_test_select.cc b/src/yb/yql/pggate/test/pggate_test_select.cc
+index 0a1c8e4772..9aa6c9c125 100644
+--- a/src/yb/yql/pggate/test/pggate_test_select.cc
++++ b/src/yb/yql/pggate/test/pggate_test_select.cc
+@@ -111,7 +111,8 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table WITH RANGE values";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+@@ -191,7 +192,8 @@ TEST_F(PggateTestSelect, TestSelectOneTablet) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table WITHOUT RANGE values";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgNewColumnRef(pg_stmt, 1, &colref);
+diff --git a/src/yb/yql/pggate/test/pggate_test_select_multi_tablets.cc b/src/yb/yql/pggate/test/pggate_test_select_multi_tablets.cc
+index f4ad516369..6108a79b35 100644
+--- a/src/yb/yql/pggate/test/pggate_test_select_multi_tablets.cc
++++ b/src/yb/yql/pggate/test/pggate_test_select_multi_tablets.cc
+@@ -53,7 +53,8 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
+ 
+   // SELECT: Empty Table ---------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from empty table";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+@@ -139,7 +140,8 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from partitioned table WITH specifying RANGE column";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgNewColumnRef(pg_stmt, 1, &colref);
+@@ -211,7 +213,8 @@ TEST_F(PggateTestSelectMultiTablets, TestSelectMultiTablets) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from partitioned table WITHOUT specifying RANGE column";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgNewColumnRef(pg_stmt, 1, &colref);
+diff --git a/src/yb/yql/pggate/test/pggate_test_update.cc b/src/yb/yql/pggate/test/pggate_test_update.cc
+index 875be8d7c6..b4d8591f76 100644
+--- a/src/yb/yql/pggate/test/pggate_test_update.cc
++++ b/src/yb/yql/pggate/test/pggate_test_update.cc
+@@ -152,7 +152,8 @@ TEST_F(PggateTestDelete, TestDelete) {
+ 
+   // SELECT ----------------------------------------------------------------------------------------
+   LOG(INFO) << "Test SELECTing from non-partitioned table";
+-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
++  CHECK_YBC_STATUS(YBCPgNewSelect(
++      pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt, nullptr /* read_time */));
+ 
+   // Specify the selected expressions.
+   YBCPgExpr colref;
+diff --git a/src/yb/yql/pggate/ybc_pggate.cc b/src/yb/yql/pggate/ybc_pggate.cc
+index 47d8046466..4d835704ff 100644
+--- a/src/yb/yql/pggate/ybc_pggate.cc
++++ b/src/yb/yql/pggate/ybc_pggate.cc
+@@ -341,9 +341,10 @@ YBCStatus YBCPgExecDelete(YBCPgStatement handle) {
+ YBCStatus YBCPgNewSelect(YBCPgSession pg_session,
+                          const YBCPgOid database_oid,
+                          const YBCPgOid table_oid,
+-                         YBCPgStatement *handle) {
++                         YBCPgStatement *handle,
++                         uint64_t* read_time) {
+   const PgObjectId table_id(database_oid, table_oid);
+-  return ToYBCStatus(pgapi->NewSelect(pg_session, table_id, handle));
++  return ToYBCStatus(pgapi->NewSelect(pg_session, table_id, handle, read_time));
+ }
+ 
+ YBCStatus YBCPgExecSelect(YBCPgStatement handle) {
+diff --git a/src/yb/yql/pggate/ybc_pggate.h b/src/yb/yql/pggate/ybc_pggate.h
+index 7bbdc267b3..4121b182d2 100644
+--- a/src/yb/yql/pggate/ybc_pggate.h
++++ b/src/yb/yql/pggate/ybc_pggate.h
+@@ -240,10 +240,13 @@ YBCStatus YBCPgNewDelete(YBCPgSession pg_session,
+ YBCStatus YBCPgExecDelete(YBCPgStatement handle);
+ 
+ // SELECT ------------------------------------------------------------------------------------------
++// read_time points to place where read_time for whole postgres statement is stored.
++// It is available while statement is executed.
+ YBCStatus YBCPgNewSelect(YBCPgSession pg_session,
+                          YBCPgOid database_oid,
+                          YBCPgOid table_oid,
+-                         YBCPgStatement *handle);
++                         YBCPgStatement *handle,
++                         uint64_t* read_time);
+ 
+ YBCStatus YBCPgExecSelect(YBCPgStatement handle);
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_wrapper-test.cc b/src/yb/yql/pgwrapper/pg_wrapper-test.cc
+index 58605d4001..fde9a4e7aa 100644
+--- a/src/yb/yql/pgwrapper/pg_wrapper-test.cc
++++ b/src/yb/yql/pgwrapper/pg_wrapper-test.cc
+@@ -101,7 +101,7 @@ class PgWrapperTest : public YBMiniClusterTestBase<ExternalMiniCluster> {
+     DontVerifyClusterBeforeNextTearDown();
+   }
+ 
+-  void RunPsqlCommand(string statement, string expected_output) {
++  void RunPsqlCommand(const std::string& statement, const std::string& expected_output) {
+     std::string tmp_dir;
+     ASSERT_OK(Env::Default()->GetTestDirectory(&tmp_dir));
+ 
+@@ -132,15 +132,19 @@ class PgWrapperTest : public YBMiniClusterTestBase<ExternalMiniCluster> {
+   }
+ 
+   void CreateTable(string statement) {
+-    ASSERT_NO_FATALS(RunPsqlCommand(statement, "CREATE TABLE"));
++    RunPsqlCommand(statement, "CREATE TABLE");
+   }
+ 
+-  void InsertOneRow(string statement) {
+-    ASSERT_NO_FATALS(RunPsqlCommand(statement, "INSERT 0 1"));
++  void InsertRows(const std::string& statement, size_t expected_rows) {
++    RunPsqlCommand(statement, Format("INSERT 0 $0", expected_rows));
++  }
++
++  void InsertOneRow(const std::string& statement) {
++    InsertRows(statement, 1 /* expected_rows */);
+   }
+ 
+   void UpdateOneRow(string statement) {
+-    ASSERT_NO_FATALS(RunPsqlCommand(statement, "UPDATE 1"));
++    RunPsqlCommand(statement, "UPDATE 1");
+   }
+ 
+   void FlushOrCompact(string table_id, FlushOrCompaction flush_or_compaction) {
+@@ -303,5 +307,15 @@ TEST_F(PgWrapperTest, YB_DISABLE_TEST_IN_TSAN(TestCompactHistoryWithTxn)) {
+   read_txn_thread.join();
+ }
+ 
++TEST_F(PgWrapperTest, YB_DISABLE_TEST_IN_TSAN(InsertSelect)) {
++  ASSERT_NO_FATALS(CreateTable("CREATE TABLE mytbl (k INT, v TEXT)"));
++
++  ASSERT_NO_FATALS(InsertOneRow("INSERT INTO mytbl (k, v) VALUES (1, 'abc')"));
++  for (size_t i = 0; i != RegularBuildVsSanitizers(7, 1); ++i) {
++     ASSERT_NO_FATALS(InsertRows(
++         "INSERT INTO mytbl SELECT * FROM mytbl", 1 << i /* expected_rows */));
++  }
++}
++
+ }  // namespace pgwrapper
+ }  // namespace yb

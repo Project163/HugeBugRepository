@@ -1,0 +1,167 @@
+diff --git a/src/yb/client/backup-txn-test.cc b/src/yb/client/backup-txn-test.cc
+index 051e5d57ce..ccdce0ac0f 100644
+--- a/src/yb/client/backup-txn-test.cc
++++ b/src/yb/client/backup-txn-test.cc
+@@ -242,6 +242,42 @@ class BackupTxnTest : public TransactionTestBase {
+     return Status::OK();
+   }
+ 
++  CHECKED_STATUS WaitAllSnapshotsDeleted() {
++    RETURN_NOT_OK(WaitFor([this]() -> Result<bool> {
++      auto snapshots = VERIFY_RESULT(ListSnapshots());
++      SCHECK_EQ(snapshots.size(), 1, IllegalState, "Wrong number of snapshots");
++      if (snapshots[0].entry().state(), SysSnapshotEntryPB::DELETED) {
++        return true;
++      }
++      SCHECK_EQ(snapshots[0].entry().state(), SysSnapshotEntryPB::DELETING, IllegalState,
++                "Wrong snapshot state");
++      return false;
++    }, kWaitTimeout * kTimeMultiplier, "Complete delete snapshot"));
++
++    return WaitFor([this]() -> Result<bool> {
++      auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
++      for (const auto& peer : peers) {
++        auto db = peer->tablet()->doc_db().regular;
++        if (!db) {
++          continue;
++        }
++        auto dir = tablet::TabletSnapshots::SnapshotsDirName(db->GetName());
++        auto children = VERIFY_RESULT(Env::Default()->GetChildren(dir, ExcludeDots::kTrue));
++        if (!children.empty()) {
++          LOG(INFO) << peer->LogPrefix() << "Children: " << AsString(children);
++          return false;
++        }
++      }
++      return true;
++    }, kWaitTimeout * kTimeMultiplier, "Delete on tablets");
++  }
++
++  CHECKED_STATUS WaitAllSnapshotsCleaned() {
++    return WaitFor([this]() -> Result<bool> {
++      return VERIFY_RESULT(ListSnapshots()).empty();
++    }, kWaitTimeout * kTimeMultiplier, "Snapshot cleanup");
++  }
++
+   Result<ImportedSnapshotData> StartImportSnapshot(const master::SnapshotInfoPB& snapshot) {
+     master::ImportSnapshotMetaRequestPB req;
+     master::ImportSnapshotMetaResponsePB resp;
+@@ -342,40 +378,28 @@ TEST_F(BackupTxnTest, Delete) {
+   auto snapshot_id = ASSERT_RESULT(CreateSnapshot());
+   ASSERT_OK(VerifySnapshot(snapshot_id, SysSnapshotEntryPB::COMPLETE));
+   ASSERT_OK(DeleteSnapshot(snapshot_id));
++  ASSERT_OK(WaitAllSnapshotsDeleted());
+ 
+-  ASSERT_OK(WaitFor([this]() -> Result<bool> {
+-    auto snapshots = VERIFY_RESULT(ListSnapshots());
+-    SCHECK_EQ(snapshots.size(), 1, IllegalState, "Wrong number of snapshots");
+-    if (snapshots[0].entry().state(), SysSnapshotEntryPB::DELETED) {
+-      return true;
+-    }
+-    SCHECK_EQ(snapshots[0].entry().state(), SysSnapshotEntryPB::DELETING, IllegalState,
+-              "Wrong snapshot state");
+-    return false;
+-  }, kWaitTimeout * kTimeMultiplier, "Complete delete snapshot"));
+-
+-  ASSERT_OK(WaitFor([this]() -> Result<bool> {
+-    auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+-    for (const auto& peer : peers) {
+-      auto db = peer->tablet()->doc_db().regular;
+-      if (!db) {
+-        continue;
+-      }
+-      auto dir = tablet::TabletSnapshots::SnapshotsDirName(db->GetName());
+-      auto children = VERIFY_RESULT(Env::Default()->GetChildren(dir, ExcludeDots::kTrue));
+-      if (!children.empty()) {
+-        LOG(INFO) << peer->LogPrefix() << "Children: " << AsString(children);
+-        return false;
+-      }
+-    }
+-    return true;
+-  }, kWaitTimeout * kTimeMultiplier, "Delete on tablets"));
++  SetAtomicFlag(1000, &FLAGS_snapshot_coordinator_cleanup_delay_ms);
++
++  ASSERT_OK(WaitAllSnapshotsCleaned());
++}
++
++TEST_F(BackupTxnTest, CleanupAfterRestart) {
++  SetAtomicFlag(300000, &FLAGS_snapshot_coordinator_cleanup_delay_ms);
++
++  ASSERT_NO_FATALS(WriteData());
++  auto snapshot_id = ASSERT_RESULT(CreateSnapshot());
++  ASSERT_OK(VerifySnapshot(snapshot_id, SysSnapshotEntryPB::COMPLETE));
++  ASSERT_OK(DeleteSnapshot(snapshot_id));
++  ASSERT_OK(WaitAllSnapshotsDeleted());
++
++  ASSERT_FALSE(ASSERT_RESULT(ListSnapshots()).empty());
+ 
+   SetAtomicFlag(1000, &FLAGS_snapshot_coordinator_cleanup_delay_ms);
++  ASSERT_OK(cluster_->leader_mini_master()->Restart());
+ 
+-  ASSERT_OK(WaitFor([this]() -> Result<bool> {
+-    return VERIFY_RESULT(ListSnapshots()).empty();
+-  }, kWaitTimeout * kTimeMultiplier, "Snapshot cleanup"));
++  ASSERT_OK(WaitAllSnapshotsCleaned());
+ }
+ 
+ TEST_F(BackupTxnTest, ImportMeta) {
+diff --git a/src/yb/master/master_snapshot_coordinator.cc b/src/yb/master/master_snapshot_coordinator.cc
+index 07ce0d30f0..e536a4ca25 100644
+--- a/src/yb/master/master_snapshot_coordinator.cc
++++ b/src/yb/master/master_snapshot_coordinator.cc
+@@ -132,9 +132,7 @@ class StateWithTablets {
+       tablets_.emplace(id, state);
+     }
+     num_tablets_in_initial_state_ = state == initial_state_ ? tablet_ids.size() : 0;
+-    if (num_tablets_in_initial_state_ == 0) {
+-      complete_at_ = CoarseMonoClock::Now();
+-    }
++    CheckCompleteness();
+   }
+ 
+   // Initialize tablet states using tablet ids, i.e. put all tablets in initial state.
+@@ -152,6 +150,7 @@ class StateWithTablets {
+         ++num_tablets_in_initial_state_;
+       }
+     }
++    CheckCompleteness();
+   }
+ 
+   StateWithTablets(const StateWithTablets&) = delete;
+@@ -189,7 +188,12 @@ class StateWithTablets {
+   }
+ 
+   bool PassedSinceCompletion(const MonoDelta& duration) const {
+-    if (!AllTabletsDone() || complete_at_ == CoarseTimePoint()) {
++    if (!AllTabletsDone()) {
++      return false;
++    }
++
++    if (complete_at_ == CoarseTimePoint()) {
++      YB_LOG_EVERY_N_SECS(DFATAL, 30) << "All tablets done but complete done was not set";
+       return false;
+     }
+ 
+@@ -283,9 +287,7 @@ class StateWithTablets {
+         }
+       }
+       --num_tablets_in_initial_state_;
+-      if (num_tablets_in_initial_state_ == 0) {
+-        complete_at_ = CoarseMonoClock::Now();
+-      }
++      CheckCompleteness();
+     } else {
+       LOG(DFATAL) << "Finished " << InitialStateName() << " snapshot at tablet " << tablet_id
+                   << " in a wrong state " << state << ": " << status;
+@@ -372,6 +374,12 @@ class StateWithTablets {
+   }
+ 
+  private:
++  void CheckCompleteness() {
++    if (num_tablets_in_initial_state_ == 0) {
++      complete_at_ = CoarseMonoClock::Now();
++    }
++  }
++
+   SnapshotCoordinatorContext& context_;
+   SysSnapshotEntryPB::State initial_state_;
+ 

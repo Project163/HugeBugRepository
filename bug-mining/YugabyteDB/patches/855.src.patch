@@ -1,0 +1,171 @@
+diff --git a/src/yb/consensus/raft_consensus-test.cc b/src/yb/consensus/raft_consensus-test.cc
+index 1cf491b0fe..dfc04e9594 100644
+--- a/src/yb/consensus/raft_consensus-test.cc
++++ b/src/yb/consensus/raft_consensus-test.cc
+@@ -791,7 +791,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_EQ(caller_term, response.responder_term());
+   ASSERT_EQ(OpId::FromPB(response.status().last_received()), preceding_opid);
+-  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()), OpId::Min());
++  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()), preceding_opid);
+ 
+   // Append a no-op.
+   noop_opid = OpId(caller_term, ++log_index);
+@@ -844,5 +844,71 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()), noop_opid);
+ }
+ 
++TEST_F(RaftConsensusTest, TestLastLeaderReceivedNotMinimum) {
++  SetUpConsensus(kMinimumTerm, 3);
++  SetUpGeneralExpectations();
++  ConsensusBootstrapInfo info;
++  ASSERT_OK(consensus_->Start(info));
++
++  auto request_ptr = rpc::MakeSharedMessage<LWConsensusRequestPB>();
++  auto& request = *request_ptr;
++  LWConsensusResponsePB response(&request.arena());
++  int64_t caller_term = 0;
++  int64_t log_index = 0;
++
++  caller_term = 1;
++  string caller_uuid = config_.peers(0).permanent_uuid();
++  OpId preceding_opid = OpId::Min();
++
++  // Heartbeat. This will cause the term to increment on the follower.
++  request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
++  response.Clear();
++  ASSERT_OK(consensus_->Update(request_ptr, &response, CoarseBigDeadline()));
++  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
++  ASSERT_EQ(caller_term, response.responder_term());
++  ASSERT_EQ(OpId::FromPB(response.status().last_received()), OpId::Min());
++  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()), OpId::Min());
++
++  // Replicate ops 0 -> 2000 from peer 0
++  OpIdPB noop_opid_pb;
++  OpId noop_opid;
++  for (int i = 0; i < 2000; ++i) {
++    noop_opid_pb = MakeOpId(caller_term, ++log_index);
++    noop_opid = OpId::FromPB(noop_opid_pb);
++    AddNoOpToConsensusRequest(&request, noop_opid);
++  }
++  response.Clear();
++  ASSERT_OK(consensus_->Update(request_ptr, &response, CoarseBigDeadline()));
++  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
++  ASSERT_EQ(OpId::FromPB(response.status().last_received()), noop_opid);
++  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()),  noop_opid);
++
++  // Heartbeat from peer 1 to establish new leader
++  caller_term = 2;
++  caller_uuid = config_.peers(1).permanent_uuid();
++  request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
++  response.Clear();
++  ASSERT_OK(consensus_->Update(request_ptr, &response, CoarseBigDeadline()));
++  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
++  ASSERT_EQ(caller_term, response.responder_term());
++  ASSERT_EQ(OpId::FromPB(response.status().last_received()), noop_opid);
++  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()), OpId::Min());
++
++  // Re-replicate ops 1->100 from peer 1 as the new leader
++  log_index = 1;
++  OpIdPB replicating_op_id_pb = MakeOpId(caller_term - 1, log_index);
++  OpId replicating_op_id;
++  request = MakeConsensusRequest(caller_term, caller_uuid, replicating_op_id);
++  for (int i = 0; i < 100; ++i) {
++    replicating_op_id_pb = MakeOpId(caller_term - 1, log_index++);
++    replicating_op_id = OpId::FromPB(replicating_op_id_pb);
++    AddNoOpToConsensusRequest(&request, replicating_op_id);
++  }
++  response.Clear();
++  ASSERT_OK(consensus_->Update(request_ptr, &response, CoarseBigDeadline()));
++  ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
++  ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()),  replicating_op_id);
++}
++
+ }  // namespace consensus
+ }  // namespace yb
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 2001cb31e2..7bac3386f3 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -46,6 +46,7 @@
+ #include "yb/consensus/consensus_round.h"
+ #include "yb/consensus/leader_election.h"
+ #include "yb/consensus/log.h"
++#include "yb/consensus/opid_util.h"
+ #include "yb/consensus/peer_manager.h"
+ #include "yb/consensus/quorum_util.h"
+ #include "yb/consensus/replica_state.h"
+@@ -2205,16 +2206,21 @@ Status RaftConsensus::MarkOperationsAsCommittedUnlocked(const LWConsensusRequest
+   // watermark to the last message that remains in 'deduped_req'.
+   //
+   // It's possible that the leader didn't send us any new data -- it might be a completely
+-  // duplicate request. In that case, we don't need to update LastReceived at all.
++  // duplicate request. In that case, we only update LastReceivedOpIdFromCurrentLeader
++  // Not updating this may result in the leader resending the same set of op-ids
++  // and resulting in empty de-duped requests forever. See GH #15629.
+   if (!deduped_req.messages.empty()) {
+     OpId last_appended = OpId::FromPB(deduped_req.messages.back()->id());
+     TRACE(Format("Updating last received op as $0", last_appended));
+     state_->UpdateLastReceivedOpIdUnlocked(last_appended);
+-  } else if (state_->GetLastReceivedOpIdUnlocked().index < deduped_req.preceding_op_id.index) {
+-    return STATUS_FORMAT(InvalidArgument,
+-                         "Bad preceding_opid: $0, last received: $1",
+-                         deduped_req.preceding_op_id,
+-                         state_->GetLastReceivedOpIdUnlocked());
++  } else {
++    if (state_->GetLastReceivedOpIdUnlocked().index < deduped_req.preceding_op_id.index) {
++      return STATUS_FORMAT(InvalidArgument,
++                          "Bad preceding_opid: $0, last received: $1",
++                          deduped_req.preceding_op_id,
++                          state_->GetLastReceivedOpIdUnlocked());
++    }
++    state_->UpdateLastReceivedOpIdFromCurrentLeaderIfEmptyUnlocked(deduped_req.preceding_op_id);
+   }
+ 
+   VLOG_WITH_PREFIX(1) << "Marking committed up to " << apply_up_to;
+diff --git a/src/yb/consensus/replica_state.cc b/src/yb/consensus/replica_state.cc
+index 6ac1e93d81..3b83ad5865 100644
+--- a/src/yb/consensus/replica_state.cc
++++ b/src/yb/consensus/replica_state.cc
+@@ -901,7 +901,7 @@ Status ReplicaState::ApplyPendingOperationsUnlocked(
+     auto current_id = round->id();
+ 
+     if (PREDICT_TRUE(prev_id)) {
+-      CHECK_OK(CheckOpInSequence(prev_id, current_id));
++      CHECK_OK_PREPEND(CheckOpInSequence(prev_id, current_id), LogPrefix());
+     }
+ 
+     if (current_id.index > committed_op_id.index) {
+@@ -1042,8 +1042,16 @@ void ReplicaState::UpdateLastReceivedOpIdUnlocked(const OpId& op_id) {
+       << ", Trace:" << std::endl << (trace ? trace->DumpToString(true) : "No trace found");
+ 
+   last_received_op_id_ = op_id;
+-  last_received_op_id_current_leader_ = op_id;
+   next_index_ = op_id.index + 1;
++  last_received_op_id_current_leader_ = op_id;
++}
++
++void ReplicaState::UpdateLastReceivedOpIdFromCurrentLeaderIfEmptyUnlocked(const OpId& op_id) {
++  if (last_received_op_id_current_leader_.empty()) {
++    VLOG_WITH_PREFIX(0) << __func__ << " Updating last_received opid from "
++      << last_received_op_id_current_leader_.ToString() << " to " << op_id.ToString();
++    last_received_op_id_current_leader_ = op_id;
++  }
+ }
+ 
+ const yb::OpId& ReplicaState::GetLastReceivedOpIdUnlocked() const {
+diff --git a/src/yb/consensus/replica_state.h b/src/yb/consensus/replica_state.h
+index fc79b41e5f..f99db4e559 100644
+--- a/src/yb/consensus/replica_state.h
++++ b/src/yb/consensus/replica_state.h
+@@ -317,6 +317,10 @@ class ReplicaState {
+   // This must be called under a lock.
+   void UpdateLastReceivedOpIdUnlocked(const OpId& op_id);
+ 
++  // Updates the last received operation from current leader.
++  // This must be called under a lock.
++  void UpdateLastReceivedOpIdFromCurrentLeaderIfEmptyUnlocked(const OpId& op_id);
++
+   // Returns the last received op id. This must be called under the lock.
+   const OpId& GetLastReceivedOpIdUnlocked() const;
+ 

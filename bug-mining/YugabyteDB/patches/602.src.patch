@@ -1,0 +1,427 @@
+diff --git a/src/yb/consensus/consensus_peers.cc b/src/yb/consensus/consensus_peers.cc
+index 79356339b9..1c314d3d6e 100644
+--- a/src/yb/consensus/consensus_peers.cc
++++ b/src/yb/consensus/consensus_peers.cc
+@@ -344,9 +344,9 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
+     processing_lock.unlock();
+     performing_update_lock.unlock();
+     performing_heartbeat_lock.release();
+-    multi_raft_batcher_->AddRequestToBatch(&heartbeat_request_, &heartbeat_response_,
+-                                           std::bind(&Peer::ProcessHeartbeatResponse,
+-                                                     retain_self, _1));
++    multi_raft_batcher_->AddRequestToBatch(
++        &heartbeat_request_, &heartbeat_response_,
++        std::bind(&Peer::ProcessHeartbeatResponse, retain_self, _1));
+     return;
+   }
+ 
+diff --git a/src/yb/consensus/multi_raft_batcher.cc b/src/yb/consensus/multi_raft_batcher.cc
+index 0dc0bb9dd0..f2aeb225f5 100644
+--- a/src/yb/consensus/multi_raft_batcher.cc
++++ b/src/yb/consensus/multi_raft_batcher.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "yb/consensus/multi_raft_batcher.h"
+ #include <memory>
++#include <thread>
+ 
+ #include "yb/common/wire_protocol.h"
+ 
+@@ -25,7 +26,6 @@
+ using namespace std::literals;
+ using namespace std::placeholders;
+ 
+-
+ DEFINE_bool(enable_multi_raft_heartbeat_batcher, true,
+             "If true, enables multi-Raft batching of raft heartbeats.");
+ 
+@@ -44,6 +44,16 @@ namespace consensus {
+ 
+ using rpc::PeriodicTimer;
+ 
++namespace {
++
++// Tracks a single peers ConsensusResponsePB as well as its ProcessResponse callback.
++struct ResponseCallbackData {
++  ConsensusResponsePB* resp;
++  HeartbeatResponseCallback callback;
++};
++
++}
++
+ struct MultiRaftHeartbeatBatcher::MultiRaftConsensusData {
+   MultiRaftConsensusRequestPB batch_req;
+   MultiRaftConsensusResponsePB batch_res;
+@@ -51,27 +61,34 @@ struct MultiRaftHeartbeatBatcher::MultiRaftConsensusData {
+   std::vector<ResponseCallbackData> response_callback_data;
+ };
+ 
+-MultiRaftHeartbeatBatcher::MultiRaftHeartbeatBatcher(const yb::HostPort& hostport,
+-                                                     rpc::ProxyCache* proxy_cache,
+-                                                     rpc::Messenger* messenger):
+-    messenger_(messenger),
+-    consensus_proxy_(std::make_unique<ConsensusServiceProxy>(proxy_cache, hostport)),
+-    current_batch_(std::make_shared<MultiRaftConsensusData>()) {}
++MultiRaftHeartbeatBatcher::MultiRaftHeartbeatBatcher(
++    const HostPort& hostport,
++    rpc::ProxyCache* proxy_cache,
++    rpc::Messenger* messenger,
++    std::atomic<int>* running_calls)
++    : messenger_(messenger),
++      consensus_proxy_(std::make_unique<ConsensusServiceProxy>(proxy_cache, hostport)),
++      current_batch_(std::make_shared<MultiRaftConsensusData>()),
++      running_calls_(running_calls) {}
+ 
+ void MultiRaftHeartbeatBatcher::Start() {
+-  std::weak_ptr<MultiRaftHeartbeatBatcher> weak_peer = shared_from_this();
++  std::weak_ptr<MultiRaftHeartbeatBatcher> weak_self = shared_from_this();
+   batch_sender_ = PeriodicTimer::Create(
+     messenger_,
+-    [weak_peer]() {
+-      if (auto peer = weak_peer.lock()) {
+-        peer->PrepareAndSendBatchRequest();
++    [weak_self]() {
++      if (auto self = weak_self.lock()) {
++        self->PrepareAndSendBatchRequest();
+       }
+     },
+     MonoDelta::FromMilliseconds(FLAGS_multi_raft_heartbeat_interval_ms));
+   batch_sender_->Start();
+ }
+ 
+-MultiRaftHeartbeatBatcher::~MultiRaftHeartbeatBatcher() = default;
++MultiRaftHeartbeatBatcher::~MultiRaftHeartbeatBatcher() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  LOG_IF(DFATAL, current_batch_ && !current_batch_->response_callback_data.empty())
++      << "Not empty batch in ~MultiRaftHeartbeatBatcher";
++}
+ 
+ void MultiRaftHeartbeatBatcher::AddRequestToBatch(ConsensusRequestPB* request,
+                                                   ConsensusResponsePB* response,
+@@ -80,8 +97,8 @@ void MultiRaftHeartbeatBatcher::AddRequestToBatch(ConsensusRequestPB* request,
+   {
+     std::lock_guard<std::mutex> lock(mutex_);
+     current_batch_->response_callback_data.push_back({
+-      response,
+-      std::move(callback)
++      .resp = response,
++      .callback = std::move(callback)
+     });
+     // Add a ConsensusRequestPB to the batch
+     current_batch_->batch_req.add_consensus_request()->Swap(request);
+@@ -90,9 +107,7 @@ void MultiRaftHeartbeatBatcher::AddRequestToBatch(ConsensusRequestPB* request,
+       data = PrepareNextBatchRequest();
+     }
+   }
+-  if (data) {
+-    SendBatchRequest(data);
+-  }
++  SendBatchRequest(data);
+ }
+ 
+ void MultiRaftHeartbeatBatcher::PrepareAndSendBatchRequest() {
+@@ -106,12 +121,14 @@ void MultiRaftHeartbeatBatcher::PrepareAndSendBatchRequest() {
+ 
+ std::shared_ptr<MultiRaftHeartbeatBatcher::MultiRaftConsensusData>
+     MultiRaftHeartbeatBatcher::PrepareNextBatchRequest() {
+-  if (current_batch_->batch_req.consensus_request_size() == 0) {
++  if (!current_batch_ || current_batch_->batch_req.consensus_request_size() == 0) {
+     return nullptr;
+   }
+   batch_sender_->Snooze();
+-  auto data = std::move(current_batch_);
+-  current_batch_ = std::make_shared<MultiRaftConsensusData>();
++  auto data = std::make_shared<MultiRaftConsensusData>();
++  current_batch_.swap(data);
++  auto running_calls = ++*running_calls_;
++  LOG_IF(DFATAL, running_calls <= 0) << "Wrong number or running calls: " << running_calls;
+   return data;
+ }
+ 
+@@ -122,30 +139,40 @@ void MultiRaftHeartbeatBatcher::SendBatchRequest(std::shared_ptr<MultiRaftConsen
+ 
+   data->controller.Reset();
+   data->controller.set_timeout(MonoDelta::FromMilliseconds(
+-    FLAGS_consensus_rpc_timeout_ms * data->batch_req.consensus_request_size()));
++      FLAGS_consensus_rpc_timeout_ms * data->batch_req.consensus_request_size()));
++  auto callback = [data, running_calls = running_calls_]() {
++    --*running_calls;
++    auto status = data->controller.status();
++    for (int i = 0; i < data->batch_req.consensus_request_size(); i++) {
++      auto callback_data = data->response_callback_data[i];
++      if (status.ok()) {
++        callback_data.resp->Swap(data->batch_res.mutable_consensus_response(i));
++      }
++      callback_data.callback(status);
++    }
++  };
+   consensus_proxy_->MultiRaftUpdateConsensusAsync(
+-    data->batch_req, &data->batch_res, &data->controller,
+-    std::bind(&MultiRaftHeartbeatBatcher::MultiRaftUpdateHeartbeatResponseCallback,
+-              shared_from_this(), data));
++      data->batch_req, &data->batch_res, &data->controller, callback);
+ }
+ 
+-void MultiRaftHeartbeatBatcher::MultiRaftUpdateHeartbeatResponseCallback(
+-    std::shared_ptr<MultiRaftConsensusData> data) {
+-  auto status = data->controller.status();
+-  for (int i = 0; i < data->batch_req.consensus_request_size(); i++) {
+-    auto callback_data = data->response_callback_data[i];
+-    if (status.ok()) {
+-      callback_data.resp->Swap(data->batch_res.mutable_consensus_response(i));
+-    }
+-    callback_data.callback(status);
++void MultiRaftHeartbeatBatcher::Shutdown() {
++  decltype(current_batch_) batch;
++  batch_sender_->Stop();
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    batch.swap(current_batch_);
++  }
++  static const Status status = STATUS(Aborted, "MultiRaft shutdown");
++  for (const auto& callback : batch->response_callback_data) {
++    callback.callback(status);
+   }
+ }
+ 
+ MultiRaftManager::MultiRaftManager(rpc::Messenger* messenger,
+                                    rpc::ProxyCache* proxy_cache,
+-                                   CloudInfoPB local_peer_cloud_info_pb):
+-    messenger_(messenger), proxy_cache_(proxy_cache),
+-    local_peer_cloud_info_pb_(std::move(local_peer_cloud_info_pb)) {}
++                                   CloudInfoPB local_peer_cloud_info_pb)
++    : messenger_(messenger), proxy_cache_(proxy_cache),
++      local_peer_cloud_info_pb_(std::move(local_peer_cloud_info_pb)) {}
+ 
+ MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB& remote_peer_pb) {
+   if (!FLAGS_enable_multi_raft_heartbeat_batcher) {
+@@ -154,6 +181,10 @@ MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB&
+ 
+   auto hostport = HostPortFromPB(DesiredHostPort(remote_peer_pb, local_peer_cloud_info_pb_));
+   std::lock_guard<std::mutex> lock(mutex_);
++  if (shutdown_) {
++    LOG(DFATAL) << __func__ << " after shutdown";
++    return nullptr;
++  }
+   MultiRaftHeartbeatBatcherPtr batcher;
+ 
+   // After taking the lock, check if there is already a batcher
+@@ -162,11 +193,43 @@ MultiRaftHeartbeatBatcherPtr MultiRaftManager::AddOrGetBatcher(const RaftPeerPB&
+   if (res != batchers_.end() && (batcher = res->second.lock())) {
+     return batcher;
+   }
+-  batcher = std::make_shared<MultiRaftHeartbeatBatcher>(hostport, proxy_cache_, messenger_);
++  batcher = std::make_shared<MultiRaftHeartbeatBatcher>(
++      hostport, proxy_cache_, messenger_, &running_calls_);
+   batchers_[hostport] = batcher;
+   batcher->Start();
+   return batcher;
+ }
+ 
++MultiRaftManager::~MultiRaftManager() {
++  LOG_IF(DFATAL, !shutdown_) << "Shutdown was not invoked";
++}
++
++void MultiRaftManager::StartShutdown() {
++  std::vector<MultiRaftHeartbeatBatcherPtr> batchers;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    shutdown_ = true;
++    batchers.reserve(batchers_.size());
++    for (const auto& [hostport, weak_batcher] : batchers_) {
++      auto batcher = weak_batcher.lock();
++      if (batcher) {
++        batchers.push_back(batcher);
++      }
++    }
++    batchers_.clear();
++  }
++  for (const auto& batcher : batchers) {
++    batcher->Shutdown();
++  }
++}
++
++void MultiRaftManager::CompleteShutdown() {
++  int expected = 0;
++  while (!running_calls_.compare_exchange_weak(expected, std::numeric_limits<int>::min() / 2)) {
++    std::this_thread::sleep_for(10ms);
++    expected = 0;
++  }
++}
++
+ }  // namespace consensus
+ }  // namespace yb
+diff --git a/src/yb/consensus/multi_raft_batcher.h b/src/yb/consensus/multi_raft_batcher.h
+index 56acc64ed6..8549e46544 100644
+--- a/src/yb/consensus/multi_raft_batcher.h
++++ b/src/yb/consensus/multi_raft_batcher.h
+@@ -34,7 +34,6 @@ namespace consensus {
+ 
+ using HeartbeatResponseCallback = std::function<void(const Status&)>;
+ 
+-
+ // - MultiRaftHeartbeatBatcher is responsible for the batching of heartbeats
+ //   among peers that are communicating with remote peers at the same tserver
+ // - It is also responsible for periodically sending out these batched requests
+@@ -46,9 +45,10 @@ using HeartbeatResponseCallback = std::function<void(const Status&)>;
+ //   but only a single batch is being built at any given time
+ class MultiRaftHeartbeatBatcher : public std::enable_shared_from_this<MultiRaftHeartbeatBatcher> {
+  public:
+-  MultiRaftHeartbeatBatcher(const yb::HostPort& hostport,
++  MultiRaftHeartbeatBatcher(const HostPort& hostport,
+                             rpc::ProxyCache* proxy_cache,
+-                            rpc::Messenger* messenger);
++                            rpc::Messenger* messenger,
++                            std::atomic<int>* running_calls);
+ 
+   ~MultiRaftHeartbeatBatcher();
+ 
+@@ -63,13 +63,9 @@ class MultiRaftHeartbeatBatcher : public std::enable_shared_from_this<MultiRaftH
+                          ConsensusResponsePB* response,
+                          HeartbeatResponseCallback callback);
+ 
+- private:
+-  // Tracks a single peers ConsensusResponsePB as well as its ProcessResponse callback.
+-  struct ResponseCallbackData {
+-    ConsensusResponsePB* resp;
+-    HeartbeatResponseCallback callback;
+-  };
++  void Shutdown();
+ 
++ private:
+   // Tracks all the metadata for a single batch request, including a list of all
+   // ResponseCallbackData registered by each local peer with this batch in AddRequestToBatch().
+   struct MultiRaftConsensusData;
+@@ -93,8 +89,9 @@ class MultiRaftHeartbeatBatcher : public std::enable_shared_from_this<MultiRaftH
+   std::mutex mutex_;
+ 
+   std::shared_ptr<MultiRaftConsensusData> current_batch_ GUARDED_BY(mutex_);
+-};
+ 
++  std::atomic<int>* running_calls_;
++};
+ 
+ // MultiRaftManager is responsible for managing all MultiRaftHeartbeatBatchers
+ // for a given tserver (utilizes a mapping between a hostport and the corresponding batcher).
+@@ -106,10 +103,15 @@ class MultiRaftManager: public std::enable_shared_from_this<MultiRaftManager> {
+                    rpc::ProxyCache* proxy_cache,
+                    CloudInfoPB local_peer_cloud_info_pb);
+ 
++  ~MultiRaftManager();
++
+   // Add a batcher with the given hostport (if one does not already exist)
+   // and returns the newly created batcher.
+   MultiRaftHeartbeatBatcherPtr AddOrGetBatcher(const RaftPeerPB& remote_peer_pb);
+ 
++  void StartShutdown();
++  void CompleteShutdown();
++
+  private:
+   rpc::Messenger* messenger_;
+ 
+@@ -124,6 +126,9 @@ class MultiRaftManager: public std::enable_shared_from_this<MultiRaftManager> {
+   // MultiRaftBatchers will be shared for the same remote peer info.
+   std::unordered_map<HostPort, std::weak_ptr<MultiRaftHeartbeatBatcher>,
+                      HostPortHash> batchers_ GUARDED_BY(mutex_);
++
++  bool shutdown_ = false;
++  std::atomic<int> running_calls_{0};
+ };
+ 
+ }   // namespace consensus
+diff --git a/src/yb/master/sys_catalog.cc b/src/yb/master/sys_catalog.cc
+index 957a19588e..cc5358054e 100644
+--- a/src/yb/master/sys_catalog.cc
++++ b/src/yb/master/sys_catalog.cc
+@@ -187,6 +187,10 @@ void SysCatalogTable::StartShutdown() {
+   if (peer) {
+     CHECK(peer->StartShutdown());
+   }
++
++  if (multi_raft_manager_) {
++    multi_raft_manager_->StartShutdown();
++  }
+ }
+ 
+ void SysCatalogTable::CompleteShutdown() {
+@@ -197,6 +201,9 @@ void SysCatalogTable::CompleteShutdown() {
+   inform_removed_master_pool_->Shutdown();
+   raft_pool_->Shutdown();
+   tablet_prepare_pool_->Shutdown();
++  if (multi_raft_manager_) {
++    multi_raft_manager_->CompleteShutdown();
++  }
+ }
+ 
+ Status SysCatalogTable::ConvertConfigToMasterAddresses(
+diff --git a/src/yb/tablet/tablet_peer-test.cc b/src/yb/tablet/tablet_peer-test.cc
+index e3a8fb3315..0793a525ee 100644
+--- a/src/yb/tablet/tablet_peer-test.cc
++++ b/src/yb/tablet/tablet_peer-test.cc
+@@ -220,11 +220,13 @@ class TabletPeerTest : public YBTabletTest {
+   }
+ 
+   void TearDown() override {
++    multi_raft_manager_->StartShutdown();
+     messenger_->Shutdown();
+     WARN_NOT_OK(
+         tablet_peer_->Shutdown(
+             ShouldAbortActiveTransactions::kFalse, DisableFlushOnShutdown::kFalse),
+         "Tablet peer shutdown failed");
++    multi_raft_manager_->CompleteShutdown();
+     YBTabletTest::TearDown();
+   }
+ 
+diff --git a/src/yb/tserver/remote_bootstrap_session-test.cc b/src/yb/tserver/remote_bootstrap_session-test.cc
+index ff55c0ebb5..ac36c56adf 100644
+--- a/src/yb/tserver/remote_bootstrap_session-test.cc
++++ b/src/yb/tserver/remote_bootstrap_session-test.cc
+@@ -45,12 +45,14 @@ void RemoteBootstrapSessionTest::SetUp() {
+ }
+ 
+ void RemoteBootstrapSessionTest::TearDown() {
++  multi_raft_manager_->StartShutdown();
+   messenger_->Shutdown();
+   session_.reset();
+   WARN_NOT_OK(
+     tablet_peer_->Shutdown(
+         tablet::ShouldAbortActiveTransactions::kTrue, tablet::DisableFlushOnShutdown::kFalse),
+     "Tablet peer shutdown failed");
++  multi_raft_manager_->CompleteShutdown();
+   YBTabletTest::TearDown();
+ }
+ 
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index 8fd792b79b..ce93a0c120 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -1588,6 +1588,8 @@ void TSTabletManager::StartShutdown() {
+       shutting_down_peers_.push_back(peer);
+     }
+   }
++
++  multi_raft_manager_->StartShutdown();
+ }
+ 
+ void TSTabletManager::CompleteShutdown() {
+@@ -1625,6 +1627,8 @@ void TSTabletManager::CompleteShutdown() {
+ 
+     state_ = MANAGER_SHUTDOWN;
+   }
++
++  multi_raft_manager_->CompleteShutdown();
+ }
+ 
+ std::string TSTabletManager::LogPrefix() const {
+diff --git a/src/yb/util/unique_lock.h b/src/yb/util/unique_lock.h
+index ae8c709c15..b5bb2614ea 100644
+--- a/src/yb/util/unique_lock.h
++++ b/src/yb/util/unique_lock.h
+@@ -35,6 +35,7 @@ class SCOPED_CAPABILITY UniqueLock {
+   explicit UniqueLock(Mutex &mutex) ACQUIRE(mutex) : unique_lock_(mutex) {}
+ 
+   explicit UniqueLock(Mutex &mutex, std::defer_lock_t defer) : unique_lock_(mutex, defer) {}
++  UniqueLock(UniqueLock&& rhs) = default;
+ 
+   ~UniqueLock() RELEASE() = default;
+ 

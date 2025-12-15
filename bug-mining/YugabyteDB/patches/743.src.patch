@@ -1,0 +1,401 @@
+diff --git a/src/yb/integration-tests/create-table-itest.cc b/src/yb/integration-tests/create-table-itest.cc
+index 0c4e656015..c4a3ed6520 100644
+--- a/src/yb/integration-tests/create-table-itest.cc
++++ b/src/yb/integration-tests/create-table-itest.cc
+@@ -42,6 +42,8 @@ METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_Del
+ 
+ DECLARE_int32(ycql_num_tablets);
+ DECLARE_int32(yb_num_shards_per_tserver);
++DECLARE_int32(raft_heartbeat_interval_ms);
++DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+ 
+ namespace yb {
+ 
+@@ -200,14 +202,16 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
+ }
+ 
+ // Ensure that, when a table is created,
+-// the tablets are well spread out across the machines in the cluster.
++// both the tablets and leaders are well spread out across the machines in the cluster.
+ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
+   const int kNumServers = 10;
+   const int kNumTablets = 20;
++  const int kReplicationFactor = 3;
+   vector<string> ts_flags;
+   vector<string> master_flags;
+   ts_flags.push_back("--never_fsync");  // run faster on slow disks
+   master_flags.push_back("--enable_load_balancing=false");  // disable load balancing moves
++  master_flags.push_back(Format("--replication_factor=$0", kReplicationFactor));
+   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumServers));
+ 
+   ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+@@ -219,12 +223,55 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
+             .num_tablets(kNumTablets)
+             .Create());
+ 
+-  // Load should be equal on all the 10 servers without any deviation.
+-  for (int ts_idx = 0; ts_idx < kNumServers; ts_idx++) {
+-    auto num_replicas = inspect_->ListTabletsOnTS(ts_idx).size();
+-    LOG(INFO) << "TS " << ts_idx << " has " << num_replicas << " tablets";
+-    ASSERT_EQ(num_replicas, 6);
++  // Validate that both the tablets and leaders are evenly distributed among the tservers.
++  const int kExpectedTablets = kNumTablets * kReplicationFactor / kNumServers;
++  const int kExpectedLeaders = kNumTablets / kNumServers;
++  ASSERT_OK(WaitFor([&]() -> Result<bool> {
++    for (int i = 0; i < kNumServers; i++) {
++      if (!VERIFY_RESULT(VerifyTServerTablets(
++          i, kExpectedTablets, kExpectedLeaders, kTableName.table_name(), true))) {
++        return false;
++      }
++    }
++    return true;
++  }, 30s * kTimeMultiplier, "Are tablets running", 1s));
++}
++
++TEST_F(CreateTableITest, CreateTableWithoutQuorum) {
++  const int kNumServers = 3;
++  const int kNumTablets = 1;
++  const int kReplicationFactor = 3;
++  vector<string> ts_flags;
++  vector<string> master_flags;
++  ts_flags.push_back("--never_fsync");  // run faster on slow disks
++  master_flags.push_back("--enable_load_balancing=false");  // disable load balancing moves
++  master_flags.push_back(Format("--replication_factor=$0", kReplicationFactor));
++  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumServers));
++
++  ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
++                                                kTableName.namespace_type()));
++
++  // Disable heartbeats on all but the first tserver. This ensures that the master does not receive
++  // a quorum of tserver heartbeats. This prevents the master from starting the initial leader
++  // election.
++  for (int i = 1; i < kNumServers; ++i) {
++    ASSERT_OK(
++      cluster_->SetFlag(cluster_->tablet_server(i), "TEST_tserver_disable_heartbeat", "true"));
+   }
++
++  // Create a table. Set a timeout long enough to ensure that the standard raft failure detection
++  // will run and elect a raft leader for the single tablet. When the raft leader is elected, the
++  // table will come online.
++  std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
++  table_creator->timeout(MonoDelta::FromMilliseconds(
++    4 *
++    FLAGS_raft_heartbeat_interval_ms *
++    static_cast<int>(FLAGS_leader_failure_max_missed_heartbeat_periods)));
++  client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
++  ASSERT_OK(table_creator->table_name(kTableName)
++            .schema(&client_schema)
++            .num_tablets(kNumTablets)
++            .Create());
+ }
+ 
+ TEST_F(CreateTableITest, TestNoAllocBlacklist) {
+diff --git a/src/yb/master/catalog_entity_info.cc b/src/yb/master/catalog_entity_info.cc
+index f3fff1ba97..cd8f1a93cf 100644
+--- a/src/yb/master/catalog_entity_info.cc
++++ b/src/yb/master/catalog_entity_info.cc
+@@ -253,6 +253,16 @@ uint32_t TabletInfo::reported_schema_version(const TableId& table_id) {
+   return reported_schema_version_[table_id];
+ }
+ 
++void TabletInfo::SetInitiaLeaderElectionProtege(const std::string& protege_uuid) {
++  std::lock_guard<simple_spinlock> l(lock_);
++  initial_leader_election_protege_ = protege_uuid;
++}
++
++std::string TabletInfo::InitiaLeaderElectionProtege() {
++  std::lock_guard<simple_spinlock> l(lock_);
++  return initial_leader_election_protege_;
++}
++
+ bool TabletInfo::colocated() const {
+   return LockForRead()->pb.colocated();
+ }
+diff --git a/src/yb/master/catalog_entity_info.h b/src/yb/master/catalog_entity_info.h
+index bdb85ce5d0..53165e5ded 100644
+--- a/src/yb/master/catalog_entity_info.h
++++ b/src/yb/master/catalog_entity_info.h
+@@ -251,6 +251,10 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
+   bool set_reported_schema_version(const TableId& table_id, uint32_t version);
+   uint32_t reported_schema_version(const TableId& table_id);
+ 
++  // Accessors for the initial leader election protege.
++  void SetInitiaLeaderElectionProtege(const std::string& protege_uuid) EXCLUDES(lock_);
++  std::string InitiaLeaderElectionProtege() EXCLUDES(lock_);
++
+   bool colocated() const;
+ 
+   // No synchronization needed.
+@@ -303,6 +307,9 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
+   // Reported schema version (in-memory only).
+   std::unordered_map<TableId, uint32_t> reported_schema_version_ GUARDED_BY(lock_) = {};
+ 
++  // The protege UUID to use for the initial leader election (in-memory only).
++  std::string initial_leader_election_protege_ GUARDED_BY(lock_);
++
+   LeaderStepDownFailureTimes leader_stepdown_failure_times_ GUARDED_BY(lock_);
+ 
+   std::atomic<bool> initiated_election_{false};
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index b4e7404521..56c08232d5 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -10297,6 +10297,33 @@ Status CatalogManager::ProcessPendingAssignmentsPerTable(
+   return SendCreateTabletRequests(deferred.needs_create_rpc);
+ }
+ 
++Status CatalogManager::SelectProtegeForTablet(
++    TabletInfo* tablet, consensus::RaftConfigPB* config, CMGlobalLoadState* global_state) {
++  // Find the tserver with the lowest pending protege load.
++  const std::string* ts_uuid = nullptr;
++  uint32_t min_protege_load = std::numeric_limits<uint32_t>::max();
++  for (const RaftPeerPB& peer : config->peers()) {
++    const uint32_t protege_load =
++        VERIFY_RESULT(global_state->GetGlobalProtegeLoad(peer.permanent_uuid()));
++    if (protege_load < min_protege_load) {
++      ts_uuid = &peer.permanent_uuid();
++      min_protege_load = protege_load;
++    }
++  }
++
++  if (ts_uuid == nullptr) {
++    DCHECK_EQ(config->peers_size(), 0);
++    DCHECK_EQ(min_protege_load, std::numeric_limits<uint32_t>::max());
++    return STATUS(NotFound, "Unable to locate protege for tablet", tablet->tablet_id());
++  }
++
++  tablet->SetInitiaLeaderElectionProtege(*ts_uuid);
++
++  ++global_state->per_ts_protege_load_[*ts_uuid];
++
++  return Status::OK();
++}
++
+ Status CatalogManager::SelectReplicasForTablet(
+     const TSDescriptorVector& ts_descs, TabletInfo* tablet,
+     CMPerTableLoadState* per_table_state, CMGlobalLoadState* global_state) {
+@@ -10317,7 +10344,7 @@ Status CatalogManager::SelectReplicasForTablet(
+           ->pb.mutable_committed_consensus_state();
+   VLOG_WITH_FUNC(3) << "Committed consensus state: " << AsString(cstate);
+   cstate->set_current_term(kMinimumTerm);
+-  consensus::RaftConfigPB *config = cstate->mutable_config();
++  consensus::RaftConfigPB* config = cstate->mutable_config();
+   config->set_opid_index(consensus::kInvalidOpIdIndex);
+ 
+   RETURN_NOT_OK(HandlePlacementUsingReplicationInfo(
+@@ -10330,6 +10357,14 @@ Status CatalogManager::SelectReplicasForTablet(
+   }
+   VLOG(0) << out.str();
+ 
++  // Select a protege for the initial leader election. The selected protege is stored in 'tablet'
++  // but is not used until the master starts the initial leader election. The master will start the
++  // initial leader after it receives a quorum of reports from bootstrapped replicas.
++  RETURN_NOT_OK(SelectProtegeForTablet(tablet, config, global_state));
++
++  LOG(INFO) << "Initial tserver protege for tablet " << tablet->tablet_id() << ": "
++            << tablet->InitiaLeaderElectionProtege();
++
+   VLOG_WITH_FUNC(3) << "Committed consensus state has been updated to: " << AsString(cstate);
+ 
+   return Status::OK();
+@@ -10571,7 +10606,17 @@ void CatalogManager::StartElectionIfReady(
+     return;
+   }
+ 
+-  const auto& protege = RandomElement(possible_leaders);
++  // The table creation path may store a protege hint in the tablet info.
++  std::string protege = tablet->InitiaLeaderElectionProtege();
++
++  // The 'protege' may not exist in 'possible_leaders'. In this scenario, select a random protege
++  // from the list of possible leaders. This can happen when:
++  //   1) The 'protege' is unconfigured (e.g. unset/empty).
++  //   2) The 'protege' corresponds to a tserver that is no longer serving a replica.
++  //   3) The 'protege' corresponds to a tserver that is not accepting leader load.
++  if (std::count(possible_leaders.begin(), possible_leaders.end(), protege) == 0) {
++    protege = RandomElement(possible_leaders);
++  }
+ 
+   LOG_WITH_PREFIX(INFO)
+       << "Starting election at " << tablet->tablet_id() << " in favor of " << protege;
+@@ -10587,7 +10632,7 @@ shared_ptr<TSDescriptor> CatalogManager::SelectReplica(
+     set<TabletServerId>* excluded,
+     CMPerTableLoadState* per_table_state, CMGlobalLoadState* global_state) {
+   shared_ptr<TSDescriptor> found_ts;
+-  for (const auto& sorted_load : per_table_state->sorted_load_) {
++  for (const auto& sorted_load : per_table_state->sorted_replica_load_) {
+     // Don't consider a tserver that has already been considered for this tablet.
+     if (excluded->count(sorted_load)) {
+       continue;
+@@ -10617,8 +10662,8 @@ void CatalogManager::SelectReplicas(
+         ts_descs, already_selected_ts, per_table_state, global_state);
+     InsertOrDie(already_selected_ts, ts->permanent_uuid());
+     // Update the load state at global and table level.
+-    per_table_state->per_ts_load_[ts->permanent_uuid()]++;
+-    global_state->per_ts_load_[ts->permanent_uuid()]++;
++    per_table_state->per_ts_replica_load_[ts->permanent_uuid()]++;
++    global_state->per_ts_replica_load_[ts->permanent_uuid()]++;
+     per_table_state->SortLoad();
+ 
+     // Increment the number of pending replicas so that we take this selection into
+@@ -11796,9 +11841,9 @@ void CatalogManager::InitializeTableLoadState(
+     const TableId& table_id, TSDescriptorVector ts_descs, CMPerTableLoadState* state) {
+   for (const auto& ts : ts_descs) {
+     // Touch every tserver with 0 load.
+-    state->per_ts_load_[ts->permanent_uuid()];
++    state->per_ts_replica_load_[ts->permanent_uuid()];
+     // Insert into the sorted list.
+-    state->sorted_load_.emplace_back(ts->permanent_uuid());
++    state->sorted_replica_load_.emplace_back(ts->permanent_uuid());
+   }
+ 
+   auto table_info = GetTableInfo(table_id);
+@@ -11813,7 +11858,8 @@ void CatalogManager::InitializeGlobalLoadState(
+     TSDescriptorVector ts_descs, CMGlobalLoadState* state) {
+   for (const auto& ts : ts_descs) {
+     // Touch every tserver with 0 load.
+-    state->per_ts_load_[ts->permanent_uuid()];
++    state->per_ts_replica_load_[ts->permanent_uuid()];
++    state->per_ts_protege_load_[ts->permanent_uuid()];
+   }
+ 
+   SharedLock l(mutex_);
+diff --git a/src/yb/master/catalog_manager.h b/src/yb/master/catalog_manager.h
+index 1116ccaeff..5d07c48c93 100644
+--- a/src/yb/master/catalog_manager.h
++++ b/src/yb/master/catalog_manager.h
+@@ -1217,6 +1217,11 @@ class CatalogManager :
+       std::set<TabletServerId>* excluded,
+       CMPerTableLoadState* per_table_state, CMGlobalLoadState* global_state);
+ 
++  // Select and assign a tablet server as the protege 'config'. This protege is selected from the
++  // set of tservers in 'global_state' that have the lowest current protege load.
++  Status SelectProtegeForTablet(
++      TabletInfo* tablet, consensus::RaftConfigPB *config, CMGlobalLoadState* global_state);
++
+   // Select N Replicas from online tablet servers (as specified by
+   // 'ts_descs') for the specified tablet and populate the consensus configuration
+   // object. If 'ts_descs' does not specify enough online tablet
+diff --git a/src/yb/master/catalog_manager_util.cc b/src/yb/master/catalog_manager_util.cc
+index 3b35bcdd13..e596821cc0 100644
+--- a/src/yb/master/catalog_manager_util.cc
++++ b/src/yb/master/catalog_manager_util.cc
+@@ -518,19 +518,31 @@ void CatalogManagerUtil::FillTableInfoPB(
+   partition_schema.ToPB(pb->mutable_partition_schema());
+ }
+ 
+-bool CMPerTableLoadState::CompareLoads(const TabletServerId &ts1, const TabletServerId &ts2) {
+-  if (per_ts_load_[ts1] != per_ts_load_[ts2]) {
+-    return per_ts_load_[ts1] < per_ts_load_[ts2];
++Result<bool> CMPerTableLoadState::CompareReplicaLoads(
++    const TabletServerId &ts1, const TabletServerId &ts2) {
++  auto ts1_load = per_ts_replica_load_.find(ts1);
++  auto ts2_load = per_ts_replica_load_.find(ts2);
++  SCHECK(ts1_load != per_ts_replica_load_.end(), IllegalState,
++         Format("per_ts_replica_load_ does not contain $0", ts1));
++  SCHECK(ts2_load != per_ts_replica_load_.end(), IllegalState,
++         Format("per_ts_replica_load_ does not contain $0", ts2));
++
++  if (ts1_load->second != ts2_load->second) {
++    return ts1_load->second < ts2_load->second;
+   }
+-  if (global_load_state_->GetGlobalLoad(ts1) == global_load_state_->GetGlobalLoad(ts2)) {
++
++  auto ts1_global_load = VERIFY_RESULT(global_load_state_->GetGlobalReplicaLoad(ts1));
++  auto ts2_global_load = VERIFY_RESULT(global_load_state_->GetGlobalReplicaLoad(ts2));
++
++  if (ts1_global_load == ts2_global_load) {
+     return ts1 < ts2;
+   }
+-  return global_load_state_->GetGlobalLoad(ts1) < global_load_state_->GetGlobalLoad(ts2);
++  return ts1_global_load < ts2_global_load;
+ }
+ 
+ void CMPerTableLoadState::SortLoad() {
+   Comparator comp(this);
+-  std::sort(sorted_load_.begin(), sorted_load_.end(), comp);
++  std::sort(sorted_replica_load_.begin(), sorted_replica_load_.end(), comp);
+ }
+ 
+ } // namespace master
+diff --git a/src/yb/master/catalog_manager_util.h b/src/yb/master/catalog_manager_util.h
+index bf8bedb693..5f1ef34ec8 100644
+--- a/src/yb/master/catalog_manager_util.h
++++ b/src/yb/master/catalog_manager_util.h
+@@ -17,6 +17,8 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include <glog/logging.h>
++
+ #include "yb/consensus/consensus_fwd.h"
+ #include "yb/master/catalog_entity_info.h"
+ #include "yb/master/master_error.h"
+@@ -128,11 +130,11 @@ class CatalogManagerUtil {
+ 
+       for (const auto& loc : *replica_locs) {
+         // Ignore replica if not present in the tserver list passed.
+-        if (state->per_ts_load_.count(loc.first) == 0) {
++        if (state->per_ts_replica_load_.count(loc.first) == 0) {
+           continue;
+         }
+         // Account for this load.
+-        state->per_ts_load_[loc.first]++;
++        state->per_ts_replica_load_[loc.first]++;
+       }
+     }
+   }
+@@ -182,10 +184,20 @@ class CatalogManagerUtil {
+ 
+ class CMGlobalLoadState {
+  public:
+-  uint32_t GetGlobalLoad(const TabletServerId& id) {
+-    return per_ts_load_[id];
++  Result<uint32_t> GetGlobalReplicaLoad(const TabletServerId& id) {
++    SCHECK_EQ(per_ts_replica_load_.count(id), 1, IllegalState,
++              Format("Could not locate tablet server $0", id));
++    return per_ts_replica_load_[id];
++  }
++
++  Result<uint32_t> GetGlobalProtegeLoad(const TabletServerId& id) {
++    SCHECK_EQ(per_ts_replica_load_.count(id), 1, IllegalState,
++              Format("Could not locate tablet server $0", id));
++    return per_ts_protege_load_[id];
+   }
+-  std::unordered_map<TabletServerId, uint32_t> per_ts_load_;
++
++  std::unordered_map<TabletServerId, uint32_t> per_ts_replica_load_;
++  std::unordered_map<TabletServerId, uint32_t> per_ts_protege_load_;
+ };
+ 
+ class CMPerTableLoadState {
+@@ -193,12 +205,12 @@ class CMPerTableLoadState {
+   explicit CMPerTableLoadState(CMGlobalLoadState* global_state)
+     : global_load_state_(global_state) {}
+ 
+-  bool CompareLoads(const TabletServerId& ts1, const TabletServerId& ts2);
++  Result<bool> CompareReplicaLoads(const TabletServerId& ts1, const TabletServerId& ts2);
+ 
+   void SortLoad();
+ 
+-  std::vector<TabletServerId> sorted_load_;
+-  std::unordered_map<TabletServerId, uint32_t> per_ts_load_;
++  std::vector<TabletServerId> sorted_replica_load_;
++  std::unordered_map<TabletServerId, uint32_t> per_ts_replica_load_;
+   CMGlobalLoadState* global_load_state_;
+ };
+ 
+@@ -206,7 +218,13 @@ struct Comparator {
+   explicit Comparator(CMPerTableLoadState* state) : state_(state) {}
+ 
+   bool operator()(const TabletServerId& id1, const TabletServerId& id2) {
+-    return state_->CompareLoads(id1, id2);
++    auto result = state_->CompareReplicaLoads(id1, id2);
++    if (!result.ok()) {
++      LOG(WARNING) << result.ToString();
++      return false;
++    }
++
++    return *result;
+   }
+ 
+   CMPerTableLoadState* state_;

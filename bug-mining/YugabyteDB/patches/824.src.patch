@@ -1,0 +1,2025 @@
+diff --git a/src/yb/client/batcher.cc b/src/yb/client/batcher.cc
+index 895e289e66..42d953ddce 100644
+--- a/src/yb/client/batcher.cc
++++ b/src/yb/client/batcher.cc
+@@ -262,7 +262,6 @@ void Batcher::FlushAsync(
+     }
+   }
+ 
+-  auto shared_this = shared_from_this();
+   for (auto& op : ops_queue_) {
+     VLOG_WITH_PREFIX(4) << "Looking up tablet for " << op.ToString()
+                         << " partition key: " << Slice(op.partition_key).ToDebugHexString();
+@@ -270,9 +269,7 @@ void Batcher::FlushAsync(
+     if (op.yb_op->tablet()) {
+       TabletLookupFinished(&op, op.yb_op->tablet());
+     } else {
+-      client_->data_->meta_cache_->LookupTabletByKey(
+-          op.yb_op->mutable_table(), op.partition_key, deadline_,
+-          std::bind(&Batcher::TabletLookupFinished, shared_this, &op, _1));
++      LookupTabletFor(&op);
+     }
+   }
+ }
+@@ -316,6 +313,16 @@ void Batcher::CombineError(const InFlightOp& in_flight_op) {
+   }
+ }
+ 
++void Batcher::LookupTabletFor(InFlightOp* op) {
++  auto shared_this = shared_from_this();
++  client_->data_->meta_cache_->LookupTabletByKey(
++      op->yb_op->mutable_table(), op->partition_key, deadline_,
++      [shared_this, op](const auto& lookup_result) {
++        shared_this->TabletLookupFinished(op, lookup_result);
++      },
++      FailOnPartitionListRefreshed::kTrue);
++}
++
+ void Batcher::TabletLookupFinished(
+     InFlightOp* op, Result<internal::RemoteTabletPtr> lookup_result) {
+   VLOG_WITH_PREFIX_AND_FUNC(lookup_result.ok() ? 4 : 3)
+@@ -324,7 +331,15 @@ void Batcher::TabletLookupFinished(
+   if (lookup_result.ok()) {
+     op->tablet = *lookup_result;
+   } else {
+-    op->error = lookup_result.status();
++    auto status = lookup_result.status();
++    if (ClientError(status) == ClientErrorCode::kTablePartitionListRefreshed) {
++      status = op->yb_op->GetPartitionKey(&op->partition_key);
++      if (status.ok()) {
++        LookupTabletFor(op);
++        return;
++      }
++    }
++    op->error = std::move(status);
+   }
+   if (--outstanding_lookups_ == 0) {
+     AllLookupsDone();
+diff --git a/src/yb/client/batcher.h b/src/yb/client/batcher.h
+index d3f9d2e436..66ec2f1952 100644
+--- a/src/yb/client/batcher.h
++++ b/src/yb/client/batcher.h
+@@ -282,7 +282,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+   // Process RPC status.
+   void ProcessRpcStatus(const AsyncRpc &rpc, const Status &s);
+ 
+-  // Async Callbacks.
++  // Tablet lookup and its async callbacks.
++  void LookupTabletFor(InFlightOp* op);
+   void TabletLookupFinished(InFlightOp* op, Result<internal::RemoteTabletPtr> result);
+ 
+   void TransactionReady(const Status& status);
+diff --git a/src/yb/client/client-test.cc b/src/yb/client/client-test.cc
+index 84bc9c7b13..558f3dd9a3 100644
+--- a/src/yb/client/client-test.cc
++++ b/src/yb/client/client-test.cc
+@@ -669,6 +669,92 @@ TEST_F(ClientTest, TestKeyRangeFiltering) {
+   }
+ }
+ 
++TEST_F(ClientTest, TestKeyRangeUpperBoundFiltering) {
++  ASSERT_NO_FATALS(CreateTable(kTable3Name, 8, &client_table3_));
++
++  std::shared_ptr<YBTable> table;
++  ASSERT_OK(client_->OpenTable(kTable3Name, &table));
++
++  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->
++            WaitUntilCatalogManagerIsLeaderAndReadyForTests());
++
++  auto tablets = ASSERT_RESULT(client_->LookupAllTabletsFuture(
++      table, CoarseMonoClock::Now() + MonoDelta::FromSeconds(kLookupWaitTimeSecs)).get());
++
++  std::vector<std::string> partitions;
++  partitions.reserve(tablets.size());
++  for (const auto& tablet : tablets) {
++    partitions.push_back(tablet->partition().partition_key_start());
++  }
++  std::sort(partitions.begin(), partitions.end());
++
++  // Special case: upper bound is not set, means upper bound is +Inf.
++  PgsqlReadRequestPB req;
++  auto wrapper = ASSERT_RESULT(TEST_FindPartitionKeyByUpperBound(partitions, req));
++  ASSERT_EQ(wrapper.get(), partitions.back());
++
++  // General cases.
++  for (bool is_inclusive : { true, false }) {
++    for (size_t idx = 0; idx < partitions.size(); ++idx) {
++      // Special case, tested seprately at the end.
++      if (idx == 0 && !is_inclusive) {
++        continue;
++      }
++
++      auto check_key = [&partitions, &req, idx, is_inclusive](const std::string& key) -> Status {
++        SCHECK_FORMAT((idx > 0 || is_inclusive), IllegalState, "", "");
++        req.clear_upper_bound();
++        req.mutable_upper_bound()->set_key(key);
++        req.mutable_upper_bound()->set_is_inclusive(is_inclusive);
++        auto* expected = is_inclusive ? &partitions[idx] : &partitions[idx - 1];
++        auto result = VERIFY_RESULT_REF(TEST_FindPartitionKeyByUpperBound(partitions, req));
++        SCHECK_EQ(*expected, result, IllegalState, Format(
++            "idx = $0, is_inclusive = $1, upper_bound = \"$2\"",
++            idx, is_inclusive, FormatBytesAsStr(req.upper_bound().key())));
++        return Status::OK();
++      };
++
++      // Get key and calculate bounds.
++      const auto& key = partitions[idx];
++      const uint16_t start = key.empty() ? 0 : PartitionSchema::DecodeMultiColumnHashValue(key);
++      const uint16_t last  = (idx < partitions.size() - 1 ?
++          PartitionSchema::DecodeMultiColumnHashValue(partitions[idx + 1]) :
++          std::numeric_limits<decltype(start)>::max()) - 1;
++
++      // 0. Special case: upper bound is empty means upper bound matches first partition start.
++      if (key.empty()) {
++        ASSERT_EQ(idx, 0);
++        ASSERT_OK(check_key(key));
++      }
++
++      // 1. Upper bound matches partition start.
++      ASSERT_OK(check_key(PartitionSchema::EncodeMultiColumnHashValue(start)));
++
++      // 2. Upper bound matches partition last key.
++      ASSERT_OK(check_key(PartitionSchema::EncodeMultiColumnHashValue(last)));
++
++      // 3. Upper bound matches some middle key from partition.
++      const auto middle = start + ((last - start) / 2);
++      ASSERT_OK(check_key(PartitionSchema::EncodeMultiColumnHashValue(middle)));
++    }
++  }
++
++  // Special case: upper_bound is exclusive and points to the first partition.
++  // Generates crash in DEBUG and returns InvalidArgument for release builds.
++  req.clear_upper_bound();
++  req.mutable_upper_bound()->set_key(partitions.front());
++  req.mutable_upper_bound()->set_is_inclusive(false);
++#ifndef NDEBUG
++  ASSERT_DEATH({
++#endif
++  auto result = TEST_FindPartitionKeyByUpperBound(partitions, req);
++  ASSERT_NOK(result);
++  ASSERT_TRUE(result.status().IsInvalidArgument());
++#ifndef NDEBUG
++  }, ".*Upped bound must not be exclusive when points to the first partition.*");
++#endif
++}
++
+ TEST_F(ClientTest, TestListTables) {
+   auto tables = ASSERT_RESULT(client_->ListTables());
+   std::sort(tables.begin(), tables.end(), [](const YBTableName& n1, const YBTableName& n2) {
+diff --git a/src/yb/client/client_error.cc b/src/yb/client/client_error.cc
+index 9f4d30109f..e050da270d 100644
+--- a/src/yb/client/client_error.cc
++++ b/src/yb/client/client_error.cc
+@@ -37,6 +37,7 @@ bool IsRetryableClientError(const Status& s) {
+       // again to cover desired key range.
+       return false;
+     case ClientErrorCode::kTablePartitionListIsStale:
++    case ClientErrorCode::kTablePartitionListRefreshed:
+     case ClientErrorCode::kExpiredRequestToBeRetried:
+     case ClientErrorCode::kTabletNotYetRunning:
+     case ClientErrorCode::kMetaCacheInvalidated:
+diff --git a/src/yb/client/client_error.h b/src/yb/client/client_error.h
+index 239ae85ce7..45d6997107 100644
+--- a/src/yb/client/client_error.h
++++ b/src/yb/client/client_error.h
+@@ -30,7 +30,8 @@ YB_DEFINE_ENUM(
+     (kTabletNotYetRunning)
+     (kTablePartitionListVersionDoesNotMatch)
+     (kMetaCacheInvalidated)
+-    );
++    (kTablePartitionListRefreshed)
++);
+ 
+ struct ClientErrorTag : IntegralErrorTag<ClientErrorCode> {
+   // It is part of the wire protocol and should not be changed once released.
+@@ -41,7 +42,7 @@ struct ClientErrorTag : IntegralErrorTag<ClientErrorCode> {
+   }
+ };
+ 
+-typedef StatusErrorCodeImpl<ClientErrorTag> ClientError;
++using ClientError = StatusErrorCodeImpl<ClientErrorTag>;
+ 
+ // Returns whether status is a client error that should be retried at YBSession level internally.
+ // If status is OK, also returns false.
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index 7528fb965a..e971ee81bc 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -1987,11 +1987,27 @@ bool MetaCache::DoLookupAllTablets(const std::shared_ptr<const YBTable>& table,
+ void MetaCache::LookupTabletByKey(const std::shared_ptr<YBTable>& table,
+                                   const PartitionKey& partition_key,
+                                   CoarseTimePoint deadline,
+-                                  LookupTabletCallback callback) {
++                                  LookupTabletCallback callback,
++                                  FailOnPartitionListRefreshed fail_on_partition_list_refreshed) {
+   if (table->ArePartitionsStale()) {
+     RefreshTablePartitions(
+-        std::bind(&MetaCache::LookupTabletByKey, this, table, partition_key, deadline, _1),
+-        table, std::move(callback));
++        table,
++        [this, table, partition_key, deadline, callback = std::move(callback),
++         fail_on_partition_list_refreshed](const auto& status) {
++          if (!status.ok()) {
++            callback(status);
++            return;
++          }
++          if (fail_on_partition_list_refreshed) {
++            callback(STATUS_EC_FORMAT(
++                TryAgain, ClientError(ClientErrorCode::kTablePartitionListRefreshed),
++                "Partition list for table $0 has been refreshed.", table->id()));
++            return;
++          }
++          LookupTabletByKey(
++              table, partition_key, deadline, std::move(callback),
++              fail_on_partition_list_refreshed);
++        });
+     return;
+   }
+ 
+@@ -2021,8 +2037,14 @@ void MetaCache::LookupAllTablets(const std::shared_ptr<YBTable>& table,
+                                  LookupTabletRangeCallback callback) {
+   if (table->ArePartitionsStale()) {
+     RefreshTablePartitions(
+-        std::bind(&MetaCache::LookupAllTablets, this, table, deadline, _1),
+-        table, std::move(callback));
++        table,
++        [this, table, deadline, callback = std::move(callback)](const auto& status) {
++          if (!status.ok()) {
++            callback(status);
++            return;
++          }
++          LookupAllTablets(table, deadline, std::move(callback));
++        });
+     return;
+   }
+ 
+@@ -2146,19 +2168,17 @@ void MetaCache::LookupTabletById(const TabletId& tablet_id,
+   LOG_IF(DFATAL, !result) << "Lookup was not started for tablet " << tablet_id;
+ }
+ 
+-template <class Func, class Callback>
+ void MetaCache::RefreshTablePartitions(
+-    Func&& func, const std::shared_ptr<YBTable>& table, Callback&& callback) {
+-  table->RefreshPartitions(client_,
+-      [this, func = std::move(func), table, callback = std::move(callback)](const Status& status) {
+-    if (!status.ok()) {
+-      callback(status);
+-      return;
+-    }
+-    InvalidateTableCache(*table);
+-    func(callback);
++    const std::shared_ptr<YBTable>& table, StdStatusCallback callback) {
++  table->RefreshPartitions(
++      client_,
++      [this, table, callback = std::move(callback)](
++          const Status& status) {
++        if (status.ok()) {
++          InvalidateTableCache(*table);
++        }
++        callback(status);
+   });
+-  return;
+ }
+ 
+ void MetaCache::MarkTSFailed(RemoteTabletServer* ts,
+diff --git a/src/yb/client/meta_cache.h b/src/yb/client/meta_cache.h
+index ebede59bb8..6fe4dc702d 100644
+--- a/src/yb/client/meta_cache.h
++++ b/src/yb/client/meta_cache.h
+@@ -71,6 +71,7 @@
+ #include "yb/util/metrics.h"
+ #include "yb/util/monotime.h"
+ #include "yb/util/semaphore.h"
++#include "yb/util/status_callback.h"
+ #include "yb/util/status_fwd.h"
+ #include "yb/util/memory/arena.h"
+ #include "yb/util/net/net_util.h"
+@@ -484,6 +485,8 @@ class LookupCallbackVisitor : public boost::static_visitor<> {
+   const boost::optional<Status> error_status_;
+ };
+ 
++YB_STRONGLY_TYPED_BOOL(FailOnPartitionListRefreshed);
++
+ // Manager of RemoteTablets and RemoteTabletServers. The client consults
+ // this class to look up a given tablet or server.
+ //
+@@ -502,7 +505,11 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+ 
+   // Look up which tablet hosts the given partition key for a table. When it is
+   // available, the tablet is stored in 'remote_tablet' (if not NULL) and the
+-  // callback is fired. Only tablets with non-failed LEADERs are considered.
++  // lookup callback is fired. Only tablets with non-failed LEADERs are considered.
++  // Partition list can be refreshed if repartitioning is being detected in durint the method
++  // executing (by checking ArePartitionsStale()). If `fail_on_partition_list_refreshed` is true
++  // the callback is fired with ClientErrorCode::kTablePartitionListRefreshed status after
++  // the partitions are being refreshed, or lookup is transparently retried in the other case.
+   //
+   // NOTE: the callback may be called from an IO thread or inline with this
+   // call if the cached data is already available.
+@@ -512,7 +519,9 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+   void LookupTabletByKey(const std::shared_ptr<YBTable>& table,
+                          const PartitionKey& partition_key,
+                          CoarseTimePoint deadline,
+-                         LookupTabletCallback callback);
++                         LookupTabletCallback callback,
++                         FailOnPartitionListRefreshed fail_on_partition_list_refreshed =
++                             FailOnPartitionListRefreshed::kFalse);
+ 
+   std::future<Result<internal::RemoteTabletPtr>> LookupTabletByKeyFuture(
+       const std::shared_ptr<YBTable>& table,
+@@ -658,9 +667,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+                           CoarseTimePoint deadline,
+                           LookupTabletRangeCallback* callback);
+ 
+-  template <class Func, class Callback>
+-  void RefreshTablePartitions(
+-      Func&& func, const std::shared_ptr<YBTable>& table, Callback&& callback);
++  void RefreshTablePartitions(const std::shared_ptr<YBTable>& table, StdStatusCallback callback);
+ 
+   Result<RemoteTabletPtr> ProcessTabletLocation(
+       const master::TabletLocationsPB& locations, ProcessedTablesMap* processed_tables,
+diff --git a/src/yb/client/table.cc b/src/yb/client/table.cc
+index 4cb28809ef..79c32f26ef 100644
+--- a/src/yb/client/table.cc
++++ b/src/yb/client/table.cc
+@@ -176,7 +176,7 @@ int32_t YBTable::GetPartitionCount() const {
+   return narrow_cast<int32_t>(partitions_->keys.size());
+ }
+ 
+-int32_t YBTable::GetPartitionListVersion() const {
++PartitionListVersion YBTable::GetPartitionListVersion() const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+   return partitions_->version;
+ }
+@@ -313,11 +313,11 @@ void YBTable::FetchPartitions(
+ //--------------------------------------------------------------------------------------------------
+ 
+ size_t FindPartitionStartIndex(const TablePartitionList& partitions,
+-                               const PartitionKey& partition_key,
++                               std::string_view partition_key,
+                                size_t group_by) {
+   auto it = std::lower_bound(partitions.begin(), partitions.end(), partition_key);
+   if (it == partitions.end() || *it > partition_key) {
+-    DCHECK(it != partitions.begin()) << "Could not find partition start while looking for "
++    CHECK(it != partitions.begin()) << "Could not find partition start while looking for "
+         << partition_key << " in " << yb::ToString(partitions);
+     --it;
+   }
+diff --git a/src/yb/client/table.h b/src/yb/client/table.h
+index 4c4bba53a1..e1cc28f0b8 100644
+--- a/src/yb/client/table.h
++++ b/src/yb/client/table.h
+@@ -94,7 +94,7 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+   VersionedTablePartitionListPtr GetVersionedPartitions() const;
+   TablePartitionList GetPartitionsCopy() const;
+   int32_t GetPartitionCount() const;
+-  int32_t GetPartitionListVersion() const;
++  PartitionListVersion GetPartitionListVersion() const;
+ 
+   // Indexes available on the table.
+   const IndexMap& index_map() const;
+@@ -161,7 +161,7 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+ };
+ 
+ size_t FindPartitionStartIndex(
+-    const TablePartitionList& partitions, const PartitionKey& partition_key, size_t group_by = 1);
++    const TablePartitionList& partitions, std::string_view partition_key, size_t group_by = 1);
+ 
+ PartitionKeyPtr FindPartitionStart(
+     const VersionedTablePartitionListPtr& versioned_partitions, const PartitionKey& partition_key,
+diff --git a/src/yb/client/yb_op.cc b/src/yb/client/yb_op.cc
+index 35ea435132..e32e8a7b1b 100644
+--- a/src/yb/client/yb_op.cc
++++ b/src/yb/client/yb_op.cc
+@@ -104,6 +104,24 @@ void SetKey(const Slice& value, PgsqlPartitionBound* bound) {
+   bound->set_key(value.cdata(), value.size());
+ }
+ 
++template <typename Req>
++Result<const PartitionKey&> FindPartitionKeyByUpperBound(
++    std::reference_wrapper<const TablePartitionList> partition_list, const Req& request) {
++  const auto& partitions = partition_list.get();
++  if (!request.has_upper_bound()) {
++    return partitions.back();
++  }
++
++  auto idx = FindPartitionStartIndex(
++      partitions, static_cast<std::string_view>(request.upper_bound().key()));
++  if (!request.upper_bound().is_inclusive()) {
++    RSTATUS_DCHECK_NE(idx, 0U, InvalidArgument,
++                      "Upped bound must not be exclusive when points to the first partition.");
++    --idx;
++  }
++  return partitions[idx];
++}
++
+ template<class Req>
+ Status InitHashPartitionKey(
+     const Schema& schema, const PartitionSchema& partition_schema, Req* request) {
+@@ -254,7 +272,7 @@ Status SetRangePartitionBounds(const Schema& schema,
+ 
+ template<class Req>
+ Status InitRangePartitionKey(
+-    const Schema& schema, const std::string& last_partition, Req* request) {
++    const Schema& schema, const TablePartitionList& partitions, Req* request) {
+   // Seek a specific partition_key from read_request.
+   // 1. Not specified range condition - Full scan.
+   // 2. paging_state -- Set by server to continue the same request.
+@@ -266,6 +284,10 @@ Status InitRangePartitionKey(
+       request->paging_state().has_next_partition_key()) {
+     // If this is a subsequent query, use the partition key from the paging state.
+     SetPartitionKey(request->paging_state().next_partition_key(), request);
++  } else if (!request->is_forward_scan()) {
++    // A special case for backward scan: partition is selected on base of upper bound.
++    const auto& key = VERIFY_RESULT_REF(FindPartitionKeyByUpperBound(partitions, *request));
++    SetPartitionKey(key, request);
+   } else if (request->has_lower_bound()) {
+       // There are two cases here.
+       // Case 1: batching ybctids
+@@ -289,7 +311,7 @@ Status InitRangePartitionKey(
+   } else {
+     // Evaluate condition to return partition_key and set the upper bound.
+     string max_key;
+-    RETURN_NOT_OK(SetRangePartitionBounds(schema, last_partition, request, &max_key));
++    RETURN_NOT_OK(SetRangePartitionBounds(schema, partitions.back(), request, &max_key));
+     if (!max_key.empty()) {
+       SetKey(max_key, request->mutable_upper_bound());
+       request->mutable_upper_bound()->set_is_inclusive(true);
+@@ -357,12 +379,12 @@ Result<std::string> GetRangePartitionKey(
+ template<class Req>
+ Status InitReadPartitionKey(
+     const Schema& schema, const PartitionSchema& partition_schema,
+-    const std::string& last_partition, Req* request) {
++    const TablePartitionList& partitions, Req* request) {
+   if (schema.num_hash_key_columns() > 0) {
+     return InitHashPartitionKey(schema, partition_schema, request);
+   }
+ 
+-  return InitRangePartitionKey(schema, last_partition, request);
++  return InitRangePartitionKey(schema, partitions, request);
+ }
+ 
+ template<class Req>
+@@ -1004,10 +1026,18 @@ void YBPgsqlReadOp::SetUsedReadTime(const ReadHybridTime& used_time) {
+ 
+ Status YBPgsqlReadOp::GetPartitionKey(std::string* partition_key) const {
+   if (!request_holder_) {
++    // This instance's partition_key may have stale value in case of backward scan and dynamically
++    // changed partitions. New key is calculated on-the-fly.
++    if (table_->partition_schema().IsRangePartitioning() && !request_->is_forward_scan()) {
++      *partition_key = VERIFY_RESULT_REF(
++          FindPartitionKeyByUpperBound(*table_->GetPartitionsShared(), *request_));
++      return Status::OK();
++    }
+     return YBPgsqlOp::GetPartitionKey(partition_key);
+   }
++
+   RETURN_NOT_OK(InitReadPartitionKey(
+-      table_->InternalSchema(), table_->partition_schema(), table_->GetPartitionsShared()->back(),
++      table_->InternalSchema(), table_->partition_schema(), *(table_->GetPartitionsShared()),
+       request_));
+   *partition_key = std::move(*request_->mutable_partition_key());
+   return Status::OK();
+@@ -1108,8 +1138,8 @@ bool YBPgsqlReadOp::should_add_intents(IsolationLevel isolation_level) {
+ 
+ Status InitPartitionKey(
+     const Schema& schema, const PartitionSchema& partition_schema,
+-    const std::string& last_partition, LWPgsqlReadRequestPB* request) {
+-  return InitReadPartitionKey(schema, partition_schema, last_partition, request);
++    const TablePartitionList& partitions, LWPgsqlReadRequestPB* request) {
++  return InitReadPartitionKey(schema, partition_schema, partitions, request);
+ }
+ 
+ Status InitPartitionKey(
+@@ -1131,5 +1161,10 @@ Status GetRangePartitionBounds(const Schema& schema,
+   return DoGetRangePartitionBounds(schema, request, lower_bound, upper_bound);
+ }
+ 
++Result<const PartitionKey&> TEST_FindPartitionKeyByUpperBound(
++    const TablePartitionList& partitions, const PgsqlReadRequestPB& request) {
++  return FindPartitionKeyByUpperBound(partitions, request);
++}
++
+ }  // namespace client
+ }  // namespace yb
+diff --git a/src/yb/client/yb_op.h b/src/yb/client/yb_op.h
+index 6ce713b168..6e0eed0647 100644
+--- a/src/yb/client/yb_op.h
++++ b/src/yb/client/yb_op.h
+@@ -482,7 +482,7 @@ class YBPgsqlOp : public YBOperation {
+  protected:
+   std::unique_ptr<PgsqlResponsePB> response_;
+   int64_t sidecar_index_ = -1;
+-  std::string partition_key_;
++  std::string partition_key_; // May contain stale value, see YBPgsqlReadOp::GetPartitionKey().
+   rpc::Sidecars& sidecars_;
+ };
+ 
+@@ -611,7 +611,7 @@ class YBNoOp {
+ 
+ Status InitPartitionKey(
+     const Schema& schema, const PartitionSchema& partition_schema,
+-    const std::string& last_partition, LWPgsqlReadRequestPB* request);
++    const TablePartitionList& partitions, LWPgsqlReadRequestPB* request);
+ 
+ Status InitPartitionKey(
+     const Schema& schema, const PartitionSchema& partition_schema, LWPgsqlWriteRequestPB* request);
+@@ -628,5 +628,9 @@ Status GetRangePartitionBounds(
+     std::vector<docdb::KeyEntryValue>* lower_bound,
+     std::vector<docdb::KeyEntryValue>* upper_bound);
+ 
++
++Result<const PartitionKey&> TEST_FindPartitionKeyByUpperBound(
++    const TablePartitionList& partitions, const PgsqlReadRequestPB& request);
++
+ }  // namespace client
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/cluster_itest_util.cc b/src/yb/integration-tests/cluster_itest_util.cc
+index 740d72116c..001a6a7e79 100644
+--- a/src/yb/integration-tests/cluster_itest_util.cc
++++ b/src/yb/integration-tests/cluster_itest_util.cc
+@@ -1470,5 +1470,16 @@ Result<OpId> GetLastOpIdForReplica(
+   return VERIFY_RESULT(GetLastOpIdForEachReplica(tablet_id, {replica}, opid_type, timeout))[0];
+ }
+ 
++Status WaitForTabletIsDeletedOrHidden(
++    master::CatalogManagerIf* catalog_manager, const TabletId& tablet_id, MonoDelta timeout) {
++  auto tablet_info = VERIFY_RESULT(catalog_manager->GetTabletInfo(tablet_id));
++  return LoggedWaitFor([&tablet_info] {
++      const auto tablet_lock = tablet_info->LockForRead();
++      return tablet_lock->is_deleted() || tablet_lock->is_hidden();
++    },
++    timeout,
++    Format("Wait for tablet is deleted or hidden: $0", tablet_id));
++}
++
+ } // namespace itest
+ } // namespace yb
+diff --git a/src/yb/integration-tests/cluster_itest_util.h b/src/yb/integration-tests/cluster_itest_util.h
+index dd6f260603..72d32a3ffc 100644
+--- a/src/yb/integration-tests/cluster_itest_util.h
++++ b/src/yb/integration-tests/cluster_itest_util.h
+@@ -542,5 +542,8 @@ Status GetLastOpIdForMasterReplica(
+     const MonoDelta& timeout,
+     OpIdPB* op_id);
+ 
++Status WaitForTabletIsDeletedOrHidden(
++    master::CatalogManagerIf* catalog_manager, const TabletId& tablet_id, MonoDelta timeout);
++
+ } // namespace itest
+ } // namespace yb
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 08e3ba4d99..d8df0d6714 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -151,6 +151,36 @@ std::string GetFsRoot(const MiniClusterOptions& options) {
+   return JoinPathSegments(GetTestDataDirectory(), GetClusterDataDirName(options));
+ }
+ 
++template <typename PeersGetter>
++Status WaitAllReplicasRunning(MiniCluster* cluster, MonoDelta timeout, PeersGetter peers_getter) {
++  return LoggedWaitFor([cluster, list_peers = std::move(peers_getter)] {
++    std::unordered_set<std::string> tablet_ids;
++    auto peers = list_peers();
++    for (const auto& peer : peers) {
++      if (peer->state() != tablet::RaftGroupStatePB::RUNNING) {
++        return false;
++      }
++      tablet_ids.insert(peer->tablet_id());
++    }
++    auto replication_factor = cluster->num_tablet_servers();
++    return tablet_ids.size() * replication_factor == peers.size();
++  }, timeout, "Wait all replicas to be ready");
++}
++
++bool IsActive(tablet::TabletDataState tablet_data_state) {
++  return tablet_data_state != tablet::TabletDataState::TABLET_DATA_SPLIT_COMPLETED &&
++         tablet_data_state != tablet::TabletDataState::TABLET_DATA_TOMBSTONED &&
++         tablet_data_state != tablet::TabletDataState::TABLET_DATA_DELETED;
++}
++
++bool IsActive(const tablet::TabletPeer& peer) {
++  return IsActive(peer.tablet_metadata()->tablet_data_state());
++}
++
++bool IsForTable(const tablet::TabletPeer& peer, const TableId& table_id) {
++  return peer.tablet_metadata()->table_id() == table_id;
++}
++
+ } // namespace
+ 
+ MiniCluster::MiniCluster(const MiniClusterOptions& options)
+@@ -771,7 +801,7 @@ void StepDownRandomTablet(MiniCluster* cluster) {
+ std::unordered_set<string> ListTabletIdsForTable(MiniCluster* cluster, const string& table_id) {
+   std::unordered_set<string> tablet_ids;
+   for (auto peer : ListTabletPeers(cluster, ListPeersFilter::kAll)) {
+-    if (peer->tablet_metadata()->table_id() == table_id) {
++    if (IsForTable(*peer, table_id)) {
+       tablet_ids.insert(peer->tablet_id());
+     }
+   }
+@@ -807,8 +837,7 @@ std::vector<tablet::TabletPeerPtr> ListTabletPeers(MiniCluster* cluster, ListPee
+ }
+ 
+ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+-    MiniCluster* cluster,
+-    const std::function<bool(const std::shared_ptr<tablet::TabletPeer>&)>& filter) {
++    MiniCluster* cluster, TabletPeerFilter filter) {
+   std::vector<tablet::TabletPeerPtr> result;
+ 
+   for (size_t i = 0; i != cluster->num_tablet_servers(); ++i) {
+@@ -832,11 +861,44 @@ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+   return result;
+ }
+ 
++Result<std::vector<tablet::TabletPeerPtr>> ListTabletPeers(
++    MiniCluster* cluster, const TabletId& tablet_id, TabletPeerFilter filter) {
++  auto peers = ListTabletPeers(
++      cluster, [&tablet_id, filter = std::move(filter)](const auto& peer) {
++        return (peer->tablet_id() == tablet_id) && (!filter || filter(peer));
++      });
++
++  // Sanity check to make sure table is the same accross all peers.
++  TableId table_id;
++  std::string table_name;
++  for (const auto& peer : peers) {
++    const auto& metadata = *peer->tablet_metadata();
++    if (table_id.empty()) {
++      table_id = metadata.table_id();
++      table_name = metadata.table_name();
++    } else if (table_id != metadata.table_id()) {
++      return STATUS_FORMAT(
++          IllegalState,
++          "Tablet $0 peer $1 table $2 ($3) does not match expected table $4 ($5).",
++          tablet_id, peer->permanent_uuid(), metadata.table_id(),
++          metadata.table_name(), table_name, table_id);
++    }
++  }
++
++  return peers;
++}
++
++Result<std::vector<tablet::TabletPeerPtr>> ListTabletActivePeers(
++    MiniCluster* cluster, const TabletId& tablet_id) {
++  return ListTabletPeers(cluster, tablet_id, [](const auto& peer) {
++    return IsActive(*peer);
++  });
++}
++
+ std::vector<tablet::TabletPeerPtr> ListTableActiveTabletLeadersPeers(
+     MiniCluster* cluster, const TableId& table_id) {
+   return ListTabletPeers(cluster, [&table_id](const auto& peer) {
+-    return peer->tablet_metadata() &&
+-           peer->tablet_metadata()->table_id() == table_id &&
++    return peer->tablet_metadata() && IsForTable(*peer, table_id) &&
+            peer->tablet_metadata()->tablet_data_state() !=
+                tablet::TabletDataState::TABLET_DATA_SPLIT_COMPLETED &&
+            peer->consensus()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER;
+@@ -845,31 +907,16 @@ std::vector<tablet::TabletPeerPtr> ListTableActiveTabletLeadersPeers(
+ 
+ std::vector<tablet::TabletPeerPtr> ListTableTabletPeers(
+       MiniCluster* cluster, const TableId& table_id) {
+-  return ListTabletPeers(cluster, [table_id](const std::shared_ptr<tablet::TabletPeer>& peer) {
+-    return peer->tablet_metadata()->table_id() == table_id;
++  return ListTabletPeers(cluster, [&table_id](const tablet::TabletPeerPtr& peer) {
++    return IsForTable(*peer, table_id);
+   });
+ }
+ 
+-namespace {
+-
+-bool IsActive(tablet::TabletDataState tablet_data_state) {
+-  return tablet_data_state != tablet::TabletDataState::TABLET_DATA_SPLIT_COMPLETED &&
+-         tablet_data_state != tablet::TabletDataState::TABLET_DATA_TOMBSTONED &&
+-         tablet_data_state != tablet::TabletDataState::TABLET_DATA_DELETED;
+-}
+-
+-} // namespace
+-
+ std::vector<tablet::TabletPeerPtr> ListTableActiveTabletPeers(
+     MiniCluster* cluster, const TableId& table_id) {
+-  std::vector<tablet::TabletPeerPtr> result;
+-  for (auto peer : ListTableTabletPeers(cluster, table_id)) {
+-    const auto tablet_meta = peer->tablet_metadata();
+-    if (IsActive(tablet_meta->tablet_data_state())) {
+-      result.push_back(peer);
+-    }
+-  }
+-  return result;
++  return ListTabletPeers(cluster, [&table_id](const tablet::TabletPeerPtr& peer) {
++    return IsForTable(*peer, table_id) && IsActive(*peer);
++  });
+ }
+ 
+ std::vector<tablet::TabletPeerPtr> ListActiveTabletLeadersPeers(MiniCluster* cluster) {
+@@ -982,18 +1029,19 @@ std::thread RestartsThread(
+ }
+ 
+ Status WaitAllReplicasReady(MiniCluster* cluster, MonoDelta timeout) {
+-  return WaitFor([cluster] {
+-    std::unordered_set<std::string> tablet_ids;
+-    auto peers = ListTabletPeers(cluster, ListPeersFilter::kAll);
+-    for (const auto& peer : peers) {
+-      if (peer->state() != tablet::RaftGroupStatePB::RUNNING) {
+-        return false;
+-      }
+-      tablet_ids.insert(peer->tablet_id());
+-    }
+-    auto replication_factor = cluster->num_tablet_servers();
+-    return tablet_ids.size() * replication_factor == peers.size();
+-  }, timeout, "Wait all replicas to be ready");
++  return WaitAllReplicasRunning(
++      cluster, timeout,
++      [cluster]() {
++        return ListTabletPeers(cluster, ListPeersFilter::kAll);
++  });
++}
++
++Status WaitAllReplicasReady(MiniCluster* cluster, const TableId& table_id, MonoDelta timeout) {
++  return WaitAllReplicasRunning(
++      cluster, timeout,
++      [cluster, &table_id](){
++        return ListTableTabletPeers(cluster, table_id);
++  });
+ }
+ 
+ Status WaitAllReplicasHaveIndex(MiniCluster* cluster, int64_t index, MonoDelta timeout) {
+@@ -1093,7 +1141,7 @@ size_t CountIntents(MiniCluster* cluster, const TabletPeerFilter& filter) {
+     if (!participant) {
+       continue;
+     }
+-    if (filter && !filter(peer.get())) {
++    if (filter && !filter(peer)) {
+       continue;
+     }
+     auto intents_count_result = participant->TEST_CountIntents();
+@@ -1256,6 +1304,46 @@ Status WaitForAnySstFiles(tablet::TabletPeerPtr peer, MonoDelta timeout) {
+     Format("Wait for SST files of peer: $0", peer->permanent_uuid()));
+ }
+ 
++Status WaitForAnySstFiles(MiniCluster* cluster, const TabletId& tablet_id, MonoDelta timeout) {
++  const auto peers = VERIFY_RESULT(ListTabletActivePeers(cluster, tablet_id));
++  SCHECK_EQ(peers.size(), cluster->num_tablet_servers(), IllegalState, "");
++  for (const auto& peer : peers) {
++    RETURN_NOT_OK(WaitForAnySstFiles(peer, timeout));
++  }
++  return Status::OK();
++}
++
++Status WaitForPeersAreFullyCompacted(
++    MiniCluster* cluster, const std::vector<TabletId>& tablet_ids, MonoDelta timeout) {
++  std::unordered_set<TabletId> ids(tablet_ids.begin(), tablet_ids.end());
++  auto peers = ListTabletPeers(cluster, [&ids](const tablet::TabletPeerPtr& peer) {
++    return ids.contains(peer->tablet_id());
++  });
++
++  std::stringstream description;
++  description << "Waiting for peers [" << CollectionToString(ids) << "] are fully compacted.";
++
++  const auto s = LoggedWaitFor([&peers, &ids](){
++    for (size_t n = 0; n < peers.size(); ++n) {
++      const auto peer = peers[n];
++      if (!peer) {
++        continue;
++      }
++      if (peer->tablet_metadata()->has_been_fully_compacted()) {
++        ids.erase(peer->tablet_id());
++        peers[n] = nullptr;
++      }
++    }
++    return ids.empty();
++  }, timeout, description.str());
++
++  if (!s.ok() && !ids.empty()) {
++    LOG(ERROR) <<
++      "Failed to wait for peers [" << CollectionToString(ids) << "] are fully compacted.";
++  }
++  return s;
++}
++
+ void ActivateCompactionTimeLogging(MiniCluster* cluster) {
+   class CompactionListener : public rocksdb::EventListener {
+    public:
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 7f5d2af8e6..513cc3c2b7 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -269,18 +269,25 @@ void StepDownRandomTablet(MiniCluster* cluster);
+ 
+ YB_DEFINE_ENUM(ListPeersFilter, (kAll)(kLeaders)(kNonLeaders));
+ 
++using TabletPeerFilter = std::function<bool(const tablet::TabletPeerPtr&)>;
++
+ std::unordered_set<std::string> ListTabletIdsForTable(
+     MiniCluster* cluster, const std::string& table_id);
+ 
+ std::unordered_set<std::string> ListActiveTabletIdsForTable(
+     MiniCluster* cluster, const std::string& table_id);
+ 
+-std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
++std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+     MiniCluster* cluster, ListPeersFilter filter);
+ 
+-std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
+-    MiniCluster* cluster,
+-    const std::function<bool(const std::shared_ptr<tablet::TabletPeer>&)>& filter);
++std::vector<tablet::TabletPeerPtr> ListTabletPeers(
++    MiniCluster* cluster, TabletPeerFilter filter);
++
++Result<std::vector<tablet::TabletPeerPtr>> ListTabletPeers(
++    MiniCluster* cluster, const TabletId& tablet_id, TabletPeerFilter filter = TabletPeerFilter());
++
++Result<std::vector<tablet::TabletPeerPtr>> ListTabletActivePeers(
++    MiniCluster* cluster, const TabletId& tablet_id);
+ 
+ std::vector<tablet::TabletPeerPtr> ListTableTabletPeers(
+     MiniCluster* cluster, const TableId& table_id);
+@@ -321,8 +328,11 @@ Status StepDown(
+ 
+ // Waits until all tablet peers of the specified cluster are in the Running state.
+ // And total number of those peers equals to the number of tablet servers for each known tablet.
++// Additionally checks peers for the specified table if table_id is specified.
+ Status WaitAllReplicasReady(MiniCluster* cluster, MonoDelta timeout);
+ 
++Status WaitAllReplicasReady(MiniCluster* cluster, const TableId& table_id, MonoDelta timeout);
++
+ // Waits until all tablet peers of specified cluster have the specified index in their log.
+ // And total number of those peers equals to the number of tablet servers for each known tablet.
+ Status WaitAllReplicasHaveIndex(MiniCluster* cluster, int64_t index, MonoDelta timeout);
+@@ -341,7 +351,6 @@ Result<scoped_refptr<master::TableInfo>> FindTable(
+ 
+ Status WaitForInitDb(MiniCluster* cluster);
+ 
+-using TabletPeerFilter = std::function<bool(const tablet::TabletPeer*)>;
+ size_t CountIntents(MiniCluster* cluster, const TabletPeerFilter& filter = TabletPeerFilter());
+ 
+ tserver::MiniTabletServer* FindTabletLeader(MiniCluster* cluster, const TabletId& tablet_id);
+@@ -368,6 +377,14 @@ Status WaitAllReplicasSynchronizedWithLeader(
+ Status WaitForAnySstFiles(
+     tablet::TabletPeerPtr peer, MonoDelta timeout = MonoDelta::FromSeconds(5) * kTimeMultiplier);
+ 
++Status WaitForAnySstFiles(
++    MiniCluster* cluster, const TabletId& tablet_id,
++    MonoDelta timeout = MonoDelta::FromSeconds(5) * kTimeMultiplier);
++
++Status WaitForPeersAreFullyCompacted(
++    MiniCluster* cluster, const std::vector<TabletId>& tablet_ids,
++    MonoDelta timeout = MonoDelta::FromSeconds(15) * kTimeMultiplier);
++
+ // Activate compaction time logging on existing cluster tablet server.
+ // Multiple calls will result in duplicate logging.
+ void ActivateCompactionTimeLogging(MiniCluster* cluster);
+diff --git a/src/yb/integration-tests/tablet-split-itest-base.cc b/src/yb/integration-tests/tablet-split-itest-base.cc
+index 32bb48e8c5..c8e10b03a0 100644
+--- a/src/yb/integration-tests/tablet-split-itest-base.cc
++++ b/src/yb/integration-tests/tablet-split-itest-base.cc
+@@ -453,7 +453,8 @@ Result<TabletId> TabletSplitITest::CreateSingleTabletAndSplit(
+   return SplitTabletAndValidate(split_hash_code, num_rows);
+ }
+ 
+-Result<tserver::GetSplitKeyResponsePB> TabletSplitITest::GetSplitKey(const std::string& tablet_id) {
++Result<tserver::GetSplitKeyResponsePB> TabletSplitITest::SendTServerRpcSyncGetSplitKey(
++    const TabletId& tablet_id) {
+   auto tserver = cluster_->mini_tablet_server(0);
+   auto ts_service_proxy = std::make_unique<tserver::TabletServerServiceProxy>(
+       proxy_cache_.get(), HostPort::FromBoundEndpoint(tserver->bound_rpc_addr()));
+@@ -466,8 +467,8 @@ Result<tserver::GetSplitKeyResponsePB> TabletSplitITest::GetSplitKey(const std::
+   return resp;
+ }
+ 
+-Result<master::SplitTabletResponsePB> TabletSplitITest::SendMasterSplitTabletRpcSync(
+-    const std::string& tablet_id) {
++Result<master::SplitTabletResponsePB> TabletSplitITest::SendMasterRpcSyncSplitTablet(
++    const TabletId& tablet_id) {
+   auto master_admin_proxy = master::MasterAdminProxy(
+       proxy_cache_.get(), VERIFY_RESULT(cluster_->GetLeaderMiniMaster())->bound_rpc_addr());
+ 
+@@ -578,21 +579,6 @@ Result<TabletId> TabletSplitITest::SplitSingleTablet(docdb::DocKeyHash split_has
+   return source_tablet_id;
+ }
+ 
+-Result<master::SplitTabletResponsePB> TabletSplitITest::SplitSingleTablet(
+-    const TabletId& tablet_id) {
+-  auto master_admin_proxy = std::make_unique<master::MasterAdminProxy>(
+-      proxy_cache_.get(), client_->GetMasterLeaderAddress());
+-  rpc::RpcController controller;
+-  controller.set_timeout(kRpcTimeout);
+-
+-  master::SplitTabletRequestPB req;
+-  master::SplitTabletResponsePB resp;
+-  req.set_tablet_id(tablet_id);
+-
+-  RETURN_NOT_OK(master_admin_proxy->SplitTablet(req, &resp, &controller));
+-  return resp;
+-}
+-
+ Result<TabletId> TabletSplitITest::SplitTabletAndValidate(
+     docdb::DocKeyHash split_hash_code,
+     size_t num_rows,
+diff --git a/src/yb/integration-tests/tablet-split-itest-base.h b/src/yb/integration-tests/tablet-split-itest-base.h
+index 36781f1e35..58249023a8 100644
+--- a/src/yb/integration-tests/tablet-split-itest-base.h
++++ b/src/yb/integration-tests/tablet-split-itest-base.h
+@@ -157,9 +157,6 @@ class TabletSplitITest : public TabletSplitITestBase<MiniCluster> {
+ 
+   Result<TabletId> CreateSingleTabletAndSplit(uint32_t num_rows, bool wait_for_intents = true);
+ 
+-  Result<tserver::GetSplitKeyResponsePB> GetSplitKey(const std::string& tablet_id);
+-  Result<master::SplitTabletResponsePB> SendMasterSplitTabletRpcSync(const std::string& tablet_id);
+-
+   Result<master::CatalogManagerIf*> catalog_manager() {
+     return &CHECK_NOTNULL(VERIFY_RESULT(cluster_->GetLeaderMiniMaster()))->catalog_manager();
+   }
+@@ -174,9 +171,11 @@ class TabletSplitITest : public TabletSplitITestBase<MiniCluster> {
+       size_t num_replicas_online = 0, const client::YBTableName& table = client::kTableName,
+       bool core_dump_on_failure = true);
+ 
+-  Result<TabletId> SplitSingleTablet(docdb::DocKeyHash split_hash_code);
++  Result<tserver::GetSplitKeyResponsePB> SendTServerRpcSyncGetSplitKey(const TabletId& tablet_id);
+ 
+-  Result<master::SplitTabletResponsePB> SplitSingleTablet(const TabletId& tablet_id);
++  Result<master::SplitTabletResponsePB> SendMasterRpcSyncSplitTablet(const TabletId& tablet_id);
++
++  Result<TabletId> SplitSingleTablet(docdb::DocKeyHash split_hash_code);
+ 
+   Result<TabletId> SplitTabletAndValidate(
+       docdb::DocKeyHash split_hash_code,
+@@ -237,7 +236,8 @@ class TabletSplitExternalMiniClusterITest : public TabletSplitITestBase<External
+ 
+   Result<std::set<TabletId>> GetTestTableTabletIds();
+ 
+-  Result<std::vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>> ListTablets(size_t tserver_idx);
++  Result<std::vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>> ListTablets(
++      size_t tserver_idx);
+ 
+   Result<std::vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>> ListTablets();
+ 
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index 79724ba671..9a7a881cf4 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -2070,7 +2070,7 @@ TEST_F(TabletSplitSingleServerITest, TabletServerGetSplitKey) {
+   auto expected_middle_key_hash = CHECK_RESULT(docdb::DocKey::DecodeHash(middle_key));
+ 
+   // Send RPC.
+-  auto resp = ASSERT_RESULT(GetSplitKey(source_tablet_id));
++  auto resp = ASSERT_RESULT(SendTServerRpcSyncGetSplitKey(source_tablet_id));
+ 
+   // Validate response.
+   CHECK(!resp.has_error()) << resp.error().DebugString();
+@@ -2098,7 +2098,7 @@ TEST_F(TabletSplitSingleServerITest, SplitKeyNotSupportedForTTLTablets) {
+   ASSERT_OK(tablet_peer->shared_tablet()->Flush(tablet::FlushMode::kSync));
+   tablet->TEST_ForceRocksDBCompact();
+ 
+-  auto resp = ASSERT_RESULT(GetSplitKey(source_tablet_id));
++  auto resp = ASSERT_RESULT(SendTServerRpcSyncGetSplitKey(source_tablet_id));
+   EXPECT_FALSE(resp.has_error());
+ 
+   // Alter the table with a table TTL, and call GetSplitKey RPC, expecting a
+@@ -2106,7 +2106,7 @@ TEST_F(TabletSplitSingleServerITest, SplitKeyNotSupportedForTTLTablets) {
+   // Amount of time for the TTL is irrelevant, so long as it's larger than 0.
+   ASSERT_OK(AlterTableSetDefaultTTL(1));
+ 
+-  resp = ASSERT_RESULT(GetSplitKey(source_tablet_id));
++  resp = ASSERT_RESULT(SendTServerRpcSyncGetSplitKey(source_tablet_id));
+ 
+   // Validate response
+   EXPECT_TRUE(resp.has_error());
+@@ -2267,7 +2267,7 @@ TEST_F(TabletSplitSingleServerITest, TabletServerOrphanedPostSplitData) {
+ 
+   for (const auto& peer : peers) {
+       // Send RPC to child tablet.
+-      auto resp = ASSERT_RESULT(GetSplitKey(peer->tablet_id()));
++      auto resp = ASSERT_RESULT(SendTServerRpcSyncGetSplitKey(peer->tablet_id()));
+ 
+       // Validate response
+       EXPECT_TRUE(resp.has_error());
+@@ -2345,7 +2345,7 @@ Status TabletSplitSingleServerITest::TestSplitBeforeParentDeletion(bool hide_onl
+   const TabletId parent_id = VERIFY_RESULT(SplitTabletAndValidate(split_hash_code, kNumRows));
+   auto child_ids = ListActiveTabletIdsForTable(cluster_.get(), table_->id());
+ 
+-  auto resp = VERIFY_RESULT(SplitSingleTablet(*child_ids.begin()));
++  auto resp = VERIFY_RESULT(SendMasterRpcSyncSplitTablet(*child_ids.begin()));
+   SCHECK(resp.has_error(), RuntimeError,
+          "Splitting should fail while parent tablet is not hidden / deleted.");
+ 
+@@ -2363,7 +2363,7 @@ Status TabletSplitSingleServerITest::TestSplitBeforeParentDeletion(bool hide_onl
+     auto parent_lock = parent.get()->LockForRead();
+     return hide_only ? parent_lock->is_hidden() : parent_lock->is_deleted();
+   }, 10s * kTimeMultiplier, "Wait for parent to be hidden / deleted."));
+-  resp = VERIFY_RESULT(SplitSingleTablet(*child_ids.begin()));
++  resp = VERIFY_RESULT(SendMasterRpcSyncSplitTablet(*child_ids.begin()));
+   SCHECK(!resp.has_error(), RuntimeError,
+          "Splitting should succeed once parent tablet is hidden / deleted.");
+   return Status::OK();
+@@ -3069,8 +3069,8 @@ TEST_P(TabletSplitSingleServerITestWithPartition, TestSplitEncodedKeyAfterBreakI
+   // Keep keys to compare later, and split
+   const auto source_tablet_id =
+       ASSERT_RESULT(GetSingleTestTabletInfo(ASSERT_RESULT(catalog_manager())))->id();
+-  const auto key_response = ASSERT_RESULT(GetSplitKey(source_tablet_id));
+-  ASSERT_FALSE(ASSERT_RESULT(SendMasterSplitTabletRpcSync(source_tablet_id)).has_error());
++  const auto key_response = ASSERT_RESULT(SendTServerRpcSyncGetSplitKey(source_tablet_id));
++  ASSERT_FALSE(ASSERT_RESULT(SendMasterRpcSyncSplitTablet(source_tablet_id)).has_error());
+ 
+   // Split should return an OK status, so, let's try to wait for child tablets. The wait must fail
+   // as master error has been simulated in the middle.
+@@ -3087,7 +3087,7 @@ TEST_P(TabletSplitSingleServerITestWithPartition, TestSplitEncodedKeyAfterBreakI
+   ASSERT_OK(cluster_->RestartSync());
+ 
+   // Split should pass without any error.
+-  const auto response = ASSERT_RESULT(SendMasterSplitTabletRpcSync(source_tablet_id));
++  const auto response = ASSERT_RESULT(SendMasterRpcSyncSplitTablet(source_tablet_id));
+   ASSERT_FALSE(response.has_error()) << response.error().ShortDebugString();
+   ASSERT_OK(WaitForTabletSplitCompletion(2 /* expected_non_split_tablets */));
+ 
+@@ -3148,7 +3148,7 @@ class TabletSplitSystemRecordsITest :
+     LOG(INFO) << "System record middle key result: " << middle_key.status().ToString();
+ 
+     // Test that tablet GetSplitKey RPC returns the same message.
+-    auto response = VERIFY_RESULT(GetSplitKey(tablet->tablet_id()));
++    auto response = VERIFY_RESULT(SendTServerRpcSyncGetSplitKey(tablet->tablet_id()));
+     SCHECK_EQ(response.has_error(), true, IllegalState,
+               "GetSplitKey RPC unexpectedly succeeded.");
+     const Status op_status = StatusFromPB(response.error().status());
+@@ -3369,7 +3369,7 @@ class TabletSplitSingleBlockITest :
+ 
+     // Check empty case.
+     LOG(INFO) << "Sending GetSplitKey Rpc";
+-    auto key_resp = VERIFY_RESULT(GetSplitKey(source_tablet_id));
++    auto key_resp = VERIFY_RESULT(SendTServerRpcSyncGetSplitKey(source_tablet_id));
+     SCHECK(key_resp.has_error(), IllegalState, "Error is expected");
+ 
+     // Write a few records.
+@@ -3385,7 +3385,7 @@ class TabletSplitSingleBlockITest :
+ 
+     // Send RPC for tablet splitting and validate resposnse.
+     LOG(INFO) << "Sending sync SPLIT Rpc";
+-    auto resp = VERIFY_RESULT(SendMasterSplitTabletRpcSync(source_tablet_id));
++    auto resp = VERIFY_RESULT(SendMasterRpcSyncSplitTablet(source_tablet_id));
+     SCHECK(!resp.has_error(), IllegalState, resp.error().DebugString());
+ 
+     RETURN_NOT_OK(WaitForTabletSplitCompletion(/* expected_non_split_tablets = */ 2));
+diff --git a/src/yb/yql/pggate/pg_doc_op.cc b/src/yb/yql/pggate/pg_doc_op.cc
+index 69c464a2a5..8dbd8c8cda 100644
+--- a/src/yb/yql/pggate/pg_doc_op.cc
++++ b/src/yb/yql/pggate/pg_doc_op.cc
+@@ -803,7 +803,6 @@ Status PgDocReadOp::CompleteProcessResponse() {
+ 
+   for (size_t op_index = 0; op_index < send_count; op_index++) {
+     auto& read_op = GetReadOp(op_index);
+-    RETURN_NOT_OK(ReviewResponsePagingState(*table_, &read_op));
+ 
+     // Check for completion.
+     bool has_more_arg = false;
+@@ -813,7 +812,7 @@ Status PgDocReadOp::CompleteProcessResponse() {
+     // Save the backfill_spec if tablet server wants to return it.
+     if (res.is_backfill_batch_done()) {
+       out_param_backfill_spec_ = res.backfill_spec().ToBuffer();
+-    } else if (PrepareNextRequest(&read_op)) {
++    } else if (VERIFY_RESULT(PrepareNextRequest(*table_, &read_op))) {
+       has_more_arg = true;
+     }
+ 
+diff --git a/src/yb/yql/pggate/pg_op.cc b/src/yb/yql/pggate/pg_op.cc
+index e58efa5260..9b906bac11 100644
+--- a/src/yb/yql/pggate/pg_op.cc
++++ b/src/yb/yql/pggate/pg_op.cc
+@@ -34,72 +34,62 @@
+ namespace yb {
+ namespace pggate {
+ 
+-Status ReviewResponsePagingState(const PgTableDesc& table, PgsqlReadOp* op) {
+-  auto* response = op->response();
+-  if (table.num_hash_key_columns() > 0 ||
+-      op->read_request().is_forward_scan() ||
+-      !response ||
+-      !response->has_paging_state() ||
+-      !response->paging_state().has_next_partition_key() ||
+-      response->paging_state().has_next_row_key()) {
+-    return Status::OK();
+-  }
+-  // Backward scan of range key only table. next_row_key is not specified in paging state.
+-  // In this case next_partition_key must be corrected as now it points to the partition start key
+-  // of already scanned tablet. Partition start key of the preceding tablet must be used instead.
+-  // Also lower bound is checked here because DocDB can check upper bound only.
+-  const auto& current_next_partition_key = response->paging_state().next_partition_key();
+-  std::vector<docdb::KeyEntryValue> lower_bound, upper_bound;
+-  RETURN_NOT_OK(client::GetRangePartitionBounds(
+-      table.schema(), op->read_request(), &lower_bound, &upper_bound));
+-  if (!lower_bound.empty()) {
+-    docdb::DocKey current_key(table.schema());
+-    VERIFY_RESULT(current_key.DecodeFrom(
+-        current_next_partition_key, docdb::DocKeyPart::kWholeDocKey, docdb::AllowSpecial::kTrue));
+-    if (current_key.CompareTo(docdb::DocKey(std::move(lower_bound))) < 0) {
+-      response->clear_paging_state();
+-      return Status::OK();
+-    }
++Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) {
++  // Set up paging state for next request.
++  auto& res = *read_op->response();
++  if (!res.has_paging_state()) {
++    return false;
+   }
+-  const auto& partitions = table.GetPartitions();
+-  const auto idx = client::FindPartitionStartIndex(
+-      partitions, current_next_partition_key.ToBuffer());
+-  SCHECK_GT(
+-      idx, 0ULL,
+-      IllegalState, "Paging state for backward scan cannot point to first partition");
+-  SCHECK_EQ(
+-      partitions[idx], current_next_partition_key,
+-      IllegalState, "Paging state for backward scan must point to partition start key");
+-  const auto& next_partition_key = partitions[idx - 1];
+-  response->mutable_paging_state()->dup_next_partition_key(next_partition_key);
+-  return Status::OK();
+-}
++  auto& paging_state = *res.mutable_paging_state();
+ 
+-bool PrepareNextRequest(PgsqlReadOp* read_op) {
+-  // Set up paging state for next request.
+   // A query request can be nested, and paging state belong to the innermost query which is
+   // the read operator that is operated first and feeds data to other queries.
+   // Recursive Proto Message:
+   //     PgsqlReadRequestPB { PgsqlReadRequestPB index_request; }
+-  auto& res = *read_op->response();
+-  if (!res.has_paging_state()) {
+-    return false;
+-  }
+-  auto* req = &read_op->read_request();
++  auto& top_level_req = read_op->read_request();
++  auto* req = &top_level_req;
+   while (req->has_index_request()) {
+     req = req->mutable_index_request();
+   }
+ 
++  // Backward scan for range partitioned tables has a special case on DocDB side: paging_state is
++  // not reused, and upper_bound is configured instead to contiune reading from the correct tablet.
++  // This approach is not appicable for index read requests.
++  if (&top_level_req == req &&
++      !top_level_req.is_forward_scan() &&
++      table.num_hash_key_columns() == 0 &&
++      paging_state.has_next_partition_key() &&
++      !paging_state.has_next_row_key()) {
++    const auto& current_next_partition_key = paging_state.next_partition_key();
++
++    // Need to check lower bound here because DocDB can check upper bound only.
++    std::vector<docdb::KeyEntryValue> lower_bound, _;
++    RETURN_NOT_OK(client::GetRangePartitionBounds(table.schema(), top_level_req, &lower_bound, &_));
++    if (!lower_bound.empty()) {
++      docdb::DocKey current_key(table.schema());
++      VERIFY_RESULT(current_key.DecodeFrom(
++          current_next_partition_key, docdb::DocKeyPart::kWholeDocKey, docdb::AllowSpecial::kTrue));
++      if (current_key.CompareTo(docdb::DocKey(std::move(lower_bound))) < 0) {
++        return false; // No need to contiue, lower bound was reached.
++      }
++    }
++
++    // Setting up upper bound for backward scan for the next request, returning false to indicate
++    // paging state should not be used for the next request.
++    top_level_req.clear_paging_state();
++    top_level_req.mutable_upper_bound()->dup_key(current_next_partition_key);
++    top_level_req.mutable_upper_bound()->set_is_inclusive(false);
++  } else {
++    req->ref_paging_state(&paging_state);
++  }
++
+   // Parse/Analysis/Rewrite catalog version has already been checked on the first request.
+   // The docdb layer will check the target table's schema version is compatible.
+   // This allows long-running queries to continue in the presence of other DDL statements
+   // as long as they do not affect the table(s) being queried.
+   req->clear_ysql_catalog_version();
+-  req->clear_paging_state();
+   req->clear_backfill_spec();
+ 
+-  *req->mutable_paging_state() = std::move(*res.mutable_paging_state());
+-  const auto& paging_state = req->paging_state();
+   if (paging_state.has_read_time()) {
+     read_op->set_read_time(ReadHybridTime::FromPB(paging_state.read_time()));
+   }
+@@ -139,7 +129,7 @@ PgsqlReadOp::PgsqlReadOp(ThreadSafeArena* arena, const PgTableDesc& desc, bool i
+ 
+ Status PgsqlReadOp::InitPartitionKey(const PgTableDesc& table) {
+   return client::InitPartitionKey(
+-       table.schema(), table.partition_schema(), table.LastPartition(), &read_request_);
++       table.schema(), table.partition_schema(), table.GetPartitions(), &read_request_);
+ }
+ 
+ PgsqlOpPtr PgsqlReadOp::DeepCopy(const std::shared_ptr<void>& shared_ptr) const {
+diff --git a/src/yb/yql/pggate/pg_op.h b/src/yb/yql/pggate/pg_op.h
+index 2e9a21728e..a28bb52dea 100644
+--- a/src/yb/yql/pggate/pg_op.h
++++ b/src/yb/yql/pggate/pg_op.h
+@@ -178,9 +178,8 @@ class PgsqlWriteOp : public PgsqlOp {
+   HybridTime write_time_;
+ };
+ 
+-Status ReviewResponsePagingState(const PgTableDesc& table, PgsqlReadOp* op);
+ 
+-bool PrepareNextRequest(PgsqlReadOp* read_op);
++Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op);
+ 
+ }  // namespace pggate
+ }  // namespace yb
+diff --git a/src/yb/yql/pggate/pg_sys_table_prefetcher.cc b/src/yb/yql/pggate/pg_sys_table_prefetcher.cc
+index 0b8dcabfef..7e2e1966be 100644
+--- a/src/yb/yql/pggate/pg_sys_table_prefetcher.cc
++++ b/src/yb/yql/pggate/pg_sys_table_prefetcher.cc
+@@ -354,7 +354,7 @@ class Loader {
+                        op_info.index ? op_info.index->id() : PgObjectId(),
+                        &op_info.index_targets,
+                        std::move(sidecar));
+-            return !PrepareNextRequest(op_info.operation.get());
++            return !VERIFY_RESULT(PrepareNextRequest(*op_info.table, op_info.operation.get()));
+           }, true /* bad_status_value */);
+       op_info_.erase(
+           std::remove_if(op_info_.begin(), op_info_.end(), remove_predicate), op_info_.end());
+diff --git a/src/yb/yql/pggate/pg_tabledesc.cc b/src/yb/yql/pggate/pg_tabledesc.cc
+index a47f2bba8a..79d262f586 100644
+--- a/src/yb/yql/pggate/pg_tabledesc.cc
++++ b/src/yb/yql/pggate/pg_tabledesc.cc
+@@ -103,14 +103,14 @@ const std::vector<std::string>& PgTableDesc::GetPartitions() const {
+   return table_partitions_->keys;
+ }
+ 
+-const std::string& PgTableDesc::LastPartition() const {
+-  return table_partitions_->keys.back();
+-}
+-
+ size_t PgTableDesc::GetPartitionCount() const {
+   return table_partitions_->keys.size();
+ }
+ 
++client::PartitionListVersion PgTableDesc::GetPartitionListVersion() const {
++  return table_partitions_->version;
++}
++
+ Result<string> PgTableDesc::DecodeYbctid(const Slice& ybctid) const {
+   // TODO(neil) If a partition schema can have both hash and range partitioning, this function needs
+   // to be updated to return appropriate primary key.
+diff --git a/src/yb/yql/pggate/pg_tabledesc.h b/src/yb/yql/pggate/pg_tabledesc.h
+index 65a22cbd95..8b481a7124 100644
+--- a/src/yb/yql/pggate/pg_tabledesc.h
++++ b/src/yb/yql/pggate/pg_tabledesc.h
+@@ -67,10 +67,10 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
+ 
+   const std::vector<std::string>& GetPartitions() const;
+ 
+-  const std::string& LastPartition() const;
+-
+   size_t GetPartitionCount() const;
+ 
++  client::PartitionListVersion GetPartitionListVersion() const;
++
+   // When reading a row given its associated ybctid, the ybctid value is decoded to the row.
+   Result<std::string> DecodeYbctid(const Slice& ybctid) const;
+ 
+diff --git a/src/yb/yql/pgwrapper/geo_transactions_test_base.cc b/src/yb/yql/pgwrapper/geo_transactions_test_base.cc
+index 341815eee8..7d5ee57ca3 100644
+--- a/src/yb/yql/pgwrapper/geo_transactions_test_base.cc
++++ b/src/yb/yql/pgwrapper/geo_transactions_test_base.cc
+@@ -75,7 +75,6 @@ void GeoTransactionsTestBase::SetUp() {
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_moves_per_table) = 10;
+ 
+   pgwrapper::PgMiniTestBase::SetUp();
+-  client_ = ASSERT_RESULT(cluster_->CreateClient());
+   transaction_pool_ = nullptr;
+   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+     auto mini_ts = cluster_->mini_tablet_server(i);
+diff --git a/src/yb/yql/pgwrapper/geo_transactions_test_base.h b/src/yb/yql/pgwrapper/geo_transactions_test_base.h
+index f1b1b98411..07db74d516 100644
+--- a/src/yb/yql/pgwrapper/geo_transactions_test_base.h
++++ b/src/yb/yql/pgwrapper/geo_transactions_test_base.h
+@@ -73,7 +73,6 @@ class GeoTransactionsTestBase : public pgwrapper::PgMiniTestBase {
+     const std::optional<std::string>& region_str, const std::optional<std::string>& zone_str,
+     bool shutdown);
+ 
+-  std::unique_ptr<YBClient> client_;
+   TransactionManager* transaction_manager_;
+   TransactionPool* transaction_pool_;
+   size_t tables_per_region_ = 0;
+diff --git a/src/yb/yql/pgwrapper/pg_load_balancer-test.cc b/src/yb/yql/pgwrapper/pg_load_balancer-test.cc
+index 265341bc9c..1960369544 100644
+--- a/src/yb/yql/pgwrapper/pg_load_balancer-test.cc
++++ b/src/yb/yql/pgwrapper/pg_load_balancer-test.cc
+@@ -58,8 +58,6 @@ TEST_F(PgLoadBalancerTest, YB_DISABLE_TEST_IN_TSAN(LoadBalanceDuringLongRunningT
+ 
+   auto conn = ASSERT_RESULT(Connect());
+ 
+-  auto client = ASSERT_RESULT(cluster_->CreateClient());
+-
+   ASSERT_OK(conn.Execute("CREATE TABLE t(k INT, v INT) SPLIT INTO 2 TABLETS;"));
+ 
+   ASSERT_OK(conn.Execute(
+@@ -76,7 +74,7 @@ TEST_F(PgLoadBalancerTest, YB_DISABLE_TEST_IN_TSAN(LoadBalanceDuringLongRunningT
+   ASSERT_OK(cluster_->AddTabletServer());
+ 
+   ASSERT_OK(WaitFor([&]() -> Result<bool> {
+-    auto x = client->IsLoadBalanced(2);
++    auto x = client_->IsLoadBalanced(2);
+     return x;
+   }, 15s * kTimeMultiplier, "Wait for load balancer to balance to second tserver."));
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_mini_test_base.cc b/src/yb/yql/pgwrapper/pg_mini_test_base.cc
+index 3b0f9b6dcb..0a22bee720 100644
+--- a/src/yb/yql/pgwrapper/pg_mini_test_base.cc
++++ b/src/yb/yql/pgwrapper/pg_mini_test_base.cc
+@@ -17,6 +17,7 @@
+ 
+ #include "yb/gutil/casts.h"
+ 
++#include "yb/master/mini_master.h"
+ #include "yb/master/sys_catalog_initialization.h"
+ 
+ #include "yb/tserver/mini_tablet_server.h"
+@@ -57,7 +58,7 @@ void PgMiniTestBase::SetUp() {
+ 
+ 
+   master::SetDefaultInitialSysCatalogSnapshotFlags();
+-  YBMiniClusterTestBase::SetUp();
++  MiniClusterTestWithClient::SetUp();
+ 
+   MiniClusterOptions mini_cluster_opt = MiniClusterOptions {
+       .num_masters = NumMasters(),
+@@ -85,13 +86,14 @@ void PgMiniTestBase::SetUp() {
+   ASSERT_OK(pg_supervisor_->Start());
+ 
+   DontVerifyClusterBeforeNextTearDown();
++
++  ASSERT_OK(MiniClusterTestWithClient<MiniCluster>::CreateClient());
+ }
+ 
+ Result<TableId> PgMiniTestBase::GetTableIDFromTableName(const std::string table_name) {
+   // Get YBClient handler and tablet ID. Using this we can get the number of tablets before starting
+   // the test and before the test ends. With this we can ensure that tablet splitting has occurred.
+-  auto client = VERIFY_RESULT(cluster_->CreateClient());
+-  const auto tables = VERIFY_RESULT(client->ListTables());
++  const auto tables = VERIFY_RESULT(client_->ListTables());
+   for (const auto& table : tables) {
+     if (table.has_table() && table.table_name() == table_name) {
+       return table.table_id();
+@@ -100,6 +102,10 @@ Result<TableId> PgMiniTestBase::GetTableIDFromTableName(const std::string table_
+   return STATUS_FORMAT(NotFound, "Didn't find table with name: $0.", table_name);
+ }
+ 
++Result<master::CatalogManagerIf*> PgMiniTestBase::catalog_manager() const {
++  return &CHECK_NOTNULL(VERIFY_RESULT(cluster_->GetLeaderMiniMaster()))->catalog_manager();
++}
++
+ Result<PgProcessConf> PgMiniTestBase::CreatePgProcessConf(uint16_t port) {
+   auto pg_ts = RandomElement(cluster_->mini_tablet_servers());
+   PgProcessConf pg_process_conf = VERIFY_RESULT(PgProcessConf::CreateValidateAndRunInitDb(
+diff --git a/src/yb/yql/pgwrapper/pg_mini_test_base.h b/src/yb/yql/pgwrapper/pg_mini_test_base.h
+index 0562a007d6..824e0bed81 100644
+--- a/src/yb/yql/pgwrapper/pg_mini_test_base.h
++++ b/src/yb/yql/pgwrapper/pg_mini_test_base.h
+@@ -30,7 +30,7 @@ class RpcServerBase;
+ 
+ namespace pgwrapper {
+ 
+-class PgMiniTestBase : public YBMiniClusterTestBase<MiniCluster> {
++class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
+  protected:
+   // This allows modifying flags before we start the postgres process in SetUp.
+   virtual void BeforePgProcessStart() {
+@@ -79,6 +79,8 @@ class PgMiniTestBase : public YBMiniClusterTestBase<MiniCluster> {
+ 
+   Result<TableId> GetTableIDFromTableName(const std::string table_name);
+ 
++  Result<master::CatalogManagerIf*> catalog_manager() const;
++
+  private:
+   Result<PgProcessConf> CreatePgProcessConf(uint16_t port);
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_tablet_split-test.cc b/src/yb/yql/pgwrapper/pg_tablet_split-test.cc
+index e5ccc73133..865ced8dd2 100644
+--- a/src/yb/yql/pgwrapper/pg_tablet_split-test.cc
++++ b/src/yb/yql/pgwrapper/pg_tablet_split-test.cc
+@@ -19,7 +19,7 @@
+ 
+ #include "yb/gutil/dynamic_annotations.h"
+ 
+-#include "yb/master/catalog_manager.h"
++#include "yb/master/catalog_entity_info.h"
+ #include "yb/master/catalog_manager_if.h"
+ #include "yb/master/master_admin.pb.h"
+ #include "yb/master/mini_master.h"
+@@ -37,6 +37,7 @@
+ 
+ #include "yb/util/backoff_waiter.h"
+ #include "yb/util/monotime.h"
++#include "yb/util/range.h"
+ #include "yb/util/string_case.h"
+ #include "yb/util/test_macros.h"
+ #include "yb/util/test_thread_holder.h"
+@@ -57,15 +58,38 @@ namespace pgwrapper {
+ using TabletRecordsInfo =
+     std::unordered_map<std::string, std::tuple<docdb::KeyBounds, ssize_t>>;
+ 
+-class PgTabletSplitTest : public PgTabletSplitTestBase {};
++class PgTabletSplitTest : public PgTabletSplitTestBase {
++ protected:
++  void SetUp() override {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
+ 
+-TEST_F(PgTabletSplitTest, YB_DISABLE_TEST_IN_TSAN(SplitDuringLongRunningTransaction)) {
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
++    PgTabletSplitTestBase::SetUp();
++  }
+ 
+-  auto conn = ASSERT_RESULT(Connect());
++  // Splits the last tablet for specified number of times.
++  Status DoLastTabletSplitForTableWithSingleTablet(
++      const std::string& table_name, size_t splits_number) {
++    const auto table_id = VERIFY_RESULT(GetTableIDFromTableName(table_name));
++    const auto peers = ListTableActiveTabletLeadersPeers(cluster_.get(), table_id);
++    SCHECK_EQ(peers.size(), 1, IllegalState, "");
++
++    RETURN_NOT_OK(WaitForAnySstFiles(cluster_.get(), peers.front()->tablet_id()));
++
++    TabletSelector selector(splits_number, SelectLastTabletPolicy());
++    selector.verifier = [&selector](const PartitionKeyTabletMap& tablets) -> Status {
++      SCHECK_EQ(tablets.size(), selector.selections_count, IllegalState,
++                "Number of tablets does not match number of selection.");
++      return Status::OK();
++    };
++
++    return InvokeSplitsAndWaitForCompletion(
++        table_id, [&selector](const auto& tablets) { return selector(tablets); });
++  }
++};
+ 
+-  auto client = ASSERT_RESULT(cluster_->CreateClient());
++TEST_F(PgTabletSplitTest, YB_DISABLE_TEST_IN_TSAN(SplitDuringLongRunningTransaction)) {
++  auto conn = ASSERT_RESULT(Connect());
+ 
+   ASSERT_OK(conn.Execute("CREATE TABLE t(k INT, v INT) SPLIT INTO 1 TABLETS;"));
+ 
+@@ -103,7 +127,6 @@ TEST_F(PgTabletSplitTest, YB_DISABLE_TEST_IN_TSAN(SplitKeyMatchesPartitionBound)
+   // file as it's hard to create a table of such structure with the functionality inside
+   // tablet-split-itest.cc.
+   auto conn = ASSERT_RESULT(Connect());
+-  auto client = ASSERT_RESULT(cluster_->CreateClient());
+ 
+   // Create a table with combined key; this allows to have a unique DocKey with the same HASH.
+   // Setting table's partitioning explicitly to have one of bounds be specified for each tablet.
+@@ -184,8 +207,8 @@ class PgPartitioningVersionTest :
+                       expected_partitioning_version, partitioning_version));
+ 
+     // Make sure SST files appear to be able to split
+-    RETURN_NOT_OK(WaitForAnySstFiles(peer));
+-    return InvokeSplitTabletRpcAndWaitForSplitCompleted(peer);
++    RETURN_NOT_OK(WaitForAnySstFiles(cluster_.get(), peer->tablet_id()));
++    return InvokeSplitTabletRpcAndWaitForSplitCompleted(peer->tablet_id());
+   }
+ 
+   TabletRecordsInfo GetTabletRecordsInfo(
+@@ -322,8 +345,6 @@ class PgPartitioningVersionTest :
+ // execution path in context of table/tablet validation.
+ TEST_P(PgPartitioningVersionTest, ManualSplit) {
+   const auto expected_partitioning_version = GetParam();
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_partitioning_version) = expected_partitioning_version;
+ 
+   constexpr auto kNumRows = 1000;
+@@ -389,8 +410,6 @@ TEST_P(PgPartitioningVersionTest, IndexRowsPersistenceAfterManualSplit) {
+   // The purpose of the test is to verify operations are forwarded to the correct tablets based on
+   // partition_key when it contains NULLs in user columns.
+   const auto expected_partitioning_version = GetParam();
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_partitioning_version) = expected_partitioning_version;
+   if (expected_partitioning_version == 0) {
+     // Allow tablet splitting even for partitioning_version == 0
+@@ -441,7 +460,7 @@ TEST_P(PgPartitioningVersionTest, IndexRowsPersistenceAfterManualSplit) {
+       LOG(INFO) << "Split key: " << AsString(split_key);
+ 
+       // Split index table.
+-      ASSERT_OK(InvokeSplitTabletRpcAndWaitForSplitCompleted(parent_peer));
++      ASSERT_OK(InvokeSplitTabletRpcAndWaitForSplitCompleted(parent_peer->tablet_id()));
+       ASSERT_EQ(kNumRows, ASSERT_RESULT(FetchTableRowsCount(&conn, table_name)));
+ 
+       // Keep current numbers of records persisted in tablets for further analyses.
+@@ -498,8 +517,6 @@ TEST_P(PgPartitioningVersionTest, UniqueIndexRowsPersistenceAfterManualSplit) {
+   // The purpose of the test is to verify operations are forwarded to the correct tablets based on
+   // partition_key, where `ybuniqueidxkeysuffix` value is set to null.
+   const auto expected_partitioning_version = GetParam();
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_partitioning_version) = expected_partitioning_version;
+   if (expected_partitioning_version == 0) {
+     // Allow tablet splitting even for partitioning_version == 0
+@@ -554,7 +571,7 @@ TEST_P(PgPartitioningVersionTest, UniqueIndexRowsPersistenceAfterManualSplit) {
+     LOG(INFO) << "Split key values: t0 = \"" << idx1_t0 << "\", i0 = " << idx1_i0;
+ 
+     // Split unique index table (idx1).
+-    ASSERT_OK(InvokeSplitTabletRpcAndWaitForSplitCompleted(parent_peer));
++    ASSERT_OK(InvokeSplitTabletRpcAndWaitForSplitCompleted(parent_peer->tablet_id()));
+     ASSERT_EQ(kNumRows, ASSERT_RESULT(FetchTableRowsCount(&conn, table_name)));
+ 
+     // Turn compaction off to make all subsequent deletes are kept in regular db.
+@@ -594,8 +611,6 @@ TEST_P(PgPartitioningVersionTest, UniqueIndexRowsPersistenceAfterManualSplit) {
+ 
+ TEST_P(PgPartitioningVersionTest, SplitAt) {
+   const auto expected_partitioning_version = GetParam();
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cleanup_split_tablets_interval_sec) = 1;
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_partitioning_version) = expected_partitioning_version;
+ 
+   constexpr auto kNumRows = 1000;
+@@ -641,6 +656,172 @@ TEST_P(PgPartitioningVersionTest, SplitAt) {
+       adjust_partitions(expected_partitioning_version, {{"\"800\""}, {"\"600\""}, {"\"400\""}})));
+ }
+ 
++class PgRangePartitionedTableSplitTest : public PgTabletSplitTest {
++ protected:
++  Status CreateTable(
++      PGConn* conn, const std::string& table_name, size_t rows_number,
++      std::string split_statement = std::string()) {
++    RETURN_NOT_OK(conn->Execute(Format("DROP TABLE IF EXISTS $0", table_name)));
++
++    RETURN_NOT_OK(conn->Execute(Format(
++       "CREATE TABLE $0(k INT GENERATED ALWAYS AS IDENTITY, v INT, PRIMARY KEY (k ASC)) $1",
++       table_name, split_statement)));
++
++    RETURN_NOT_OK(conn->Execute(Format(
++        "INSERT INTO $0(v) SELECT i FROM generate_series(1, $1) as i",
++        table_name, rows_number)));
++
++    return cluster_->FlushTablets();
++  }
++
++  std::string PrepareSelectResult(int lower_bound, int upper_bound) {
++    std::stringstream expected;
++    if (lower_bound < upper_bound) {
++      for (auto n = lower_bound + 1; n < upper_bound; ++n) {
++        if (expected.tellp()) {
++          expected << pgwrapper::DefaultRowSeparator();
++        }
++        expected << n;
++      }
++    } else {
++      for (auto n = upper_bound - 1; n > lower_bound; --n) {
++        if (expected.tellp()) {
++          expected << pgwrapper::DefaultRowSeparator();
++        }
++        expected << n;
++      }
++    }
++    return expected.str();
++  }
++};
++
++TEST_F(PgRangePartitionedTableSplitTest, YB_DISABLE_TEST_IN_TSAN(SelectMinMaxAfterSplit)) {
++  constexpr auto kNumRows = 4000;
++  constexpr auto kNumSplits = 3;
++  const auto table_name = "t";
++
++  auto conn = ASSERT_RESULT(Connect());
++
++  for (const auto& column : {"k", "v"} ) {
++    for (const auto& aggregate : { "min", "max" }) {
++      ASSERT_OK(CreateTable(&conn, table_name, kNumRows));
++      ASSERT_OK(DoLastTabletSplitForTableWithSingleTablet(table_name, kNumSplits));
++
++      const bool is_min = ToLowerCase(aggregate) == "min";
++      const auto expected = std::to_string(is_min ? 1 : kNumRows);
++
++      // Executing in a loop to check the result after possible cache update.
++      for ([[maybe_unused]] auto _ : Range(5)) {
++        const auto query = Format(
++            "SELECT $0($1) FROM $2", aggregate, column, table_name);
++        LOG(INFO) << "Query: " << query;
++        const auto result = ASSERT_RESULT(conn.FetchAllAsString(query));
++        ASSERT_EQ(result, expected);
++      }
++    }
++  }
++}
++
++TEST_F(PgRangePartitionedTableSplitTest, YB_DISABLE_TEST_IN_TSAN(SelectRangeAfterManualSplit)) {
++  constexpr auto kNumRows = 4000;
++  constexpr auto kNumSplits = 3;
++  const auto table_name = "t";
++
++  auto conn = ASSERT_RESULT(Connect());
++
++  for (const auto& column : {"k", "v"} ) {
++    for (const auto& sort_order : { "ASC", "DESC" }) {
++      ASSERT_OK(CreateTable(&conn, table_name, kNumRows));
++      ASSERT_OK(DoLastTabletSplitForTableWithSingleTablet(table_name, kNumSplits));
++
++      const bool is_asc_ordering = ToLowerCase(sort_order) == "asc";
++      const auto lower_bound = is_asc_ordering ? 1 : kNumRows;
++      const auto upper_bound = is_asc_ordering ? kNumRows : 1;
++      const auto expected = PrepareSelectResult(lower_bound, upper_bound);
++
++      // Executing in a loop to check the result after possible cache update.
++      for ([[maybe_unused]] auto _ : Range(5)) {
++        const auto query = Format(
++            "SELECT $0 FROM $1 WHERE $0 > $2 and $0 < $3 ORDER BY $0 $4",
++            column, table_name, lower_bound, upper_bound, sort_order);
++        LOG(INFO) << "Query: " << query;
++        const auto result = ASSERT_RESULT(conn.FetchAllAsString(query));
++        ASSERT_EQ(result, expected);
++      }
++    }
++  }
++}
++
++TEST_F(PgRangePartitionedTableSplitTest,
++       YB_DISABLE_TEST_IN_TSAN(SelectMiddleRangeAfterManualSplit)) {
++  // The intent of the test is to select a range that covers only a middle tablet, and to make sure
++  // we get the expected result when middle tablet has been split.
++  constexpr size_t kNumRows = 4000;
++  constexpr size_t kMiddlePoint = kNumRows / 3;
++  const auto table_name = "t";
++  const auto split_clause = Format("SPLIT AT VALUES(($0), ($1))", kMiddlePoint, 2 * kMiddlePoint);
++
++  auto conn = ASSERT_RESULT(Connect());
++
++  for (const auto& column : {"k", "v"} ) {
++    for (const auto& sort_order : { "ASC", "DESC" }) {
++      ASSERT_OK(CreateTable(&conn, table_name, kNumRows, split_clause));
++
++      const auto table_id = ASSERT_RESULT(GetTableIDFromTableName(table_name));
++      const auto table = ASSERT_RESULT(catalog_manager())->GetTableInfo(table_id);
++      const auto tablets = GetTabletsByPartitionKey(table);
++      ASSERT_EQ(tablets.size(), 3);
++
++      // Exptract middle tablet bounds.
++      const auto parse_partition_key = [](const std::string& key) -> Result<int> {
++        docdb::SubDocKey doc_key;
++        RETURN_NOT_OK(doc_key.FullyDecodeFrom(key, docdb::HybridTimeRequired::kFalse));
++        SCHECK_EQ(doc_key.doc_key().range_group().size(), 1, IllegalState, "");
++        SCHECK_EQ(doc_key.doc_key().range_group().at(0).IsInt32(), true, IllegalState, "");
++        return doc_key.doc_key().range_group().at(0).GetInt32();
++      };
++      int partition_start = 0;
++      int partition_end = 0;
++
++      // Wrapping into a block to unlock tablet after parsing is done.
++      {
++        const auto middle_tablet = (++tablets.begin())->second;
++        const auto& partition = middle_tablet->LockForRead()->pb.partition();
++        ASSERT_TRUE(partition.has_partition_key_start());
++        ASSERT_TRUE(partition.has_partition_key_end());
++        partition_start = ASSERT_RESULT(parse_partition_key(partition.partition_key_start()));
++        partition_end = ASSERT_RESULT(parse_partition_key(partition.partition_key_end()));
++      }
++
++      // Wait for SST files appear
++      for (const auto& t : tablets) {
++        ASSERT_OK(WaitForAnySstFiles(cluster_.get(), t.second->tablet_id()));
++      }
++
++      // Split middle tablet
++      ASSERT_OK(InvokeSplitsAndWaitForCompletion(
++          table_id, TabletSelector(1, SelectMiddleTabletPolicy())));
++
++      // Prepare expected result.
++      const bool is_asc_ordering = ToLowerCase(sort_order) == "asc";
++      const auto lower_bound = is_asc_ordering ? partition_start : partition_end;
++      const auto upper_bound = is_asc_ordering ? partition_end : partition_start;
++      const auto expected = PrepareSelectResult(lower_bound, upper_bound);
++
++      // Executing in a loop to check the result after possible cache update.
++      for ([[maybe_unused]] auto _ : Range(5)) {
++        const auto query = Format(
++            "SELECT $0 FROM $1 WHERE $0 > $2 and $0 < $3 ORDER BY $0 $4",
++            column, table_name, lower_bound, upper_bound, sort_order);
++        LOG(INFO) << "Query: " << query;
++        const auto result = ASSERT_RESULT(conn.FetchAllAsString(query));
++        ASSERT_EQ(result, expected);
++      }
++    }
++  }
++}
++
++
+ INSTANTIATE_TEST_CASE_P(
+     PgTabletSplitTest,
+     PgPartitioningVersionTest,
+diff --git a/src/yb/yql/pgwrapper/pg_tablet_split_test_base.cc b/src/yb/yql/pgwrapper/pg_tablet_split_test_base.cc
+index 9da166058c..cbdf2cc5f3 100644
+--- a/src/yb/yql/pgwrapper/pg_tablet_split_test_base.cc
++++ b/src/yb/yql/pgwrapper/pg_tablet_split_test_base.cc
+@@ -21,13 +21,20 @@
+ 
+ #include "yb/gutil/dynamic_annotations.h"
+ 
++#include "yb/integration-tests/cluster_itest_util.h"
++
++#include "yb/master/catalog_entity_info.h"
+ #include "yb/master/catalog_manager.h"
+ #include "yb/master/catalog_manager_if.h"
+ #include "yb/master/master_admin.pb.h"
++#include "yb/master/master_admin.proxy.h"
+ #include "yb/master/mini_master.h"
+ 
+ #include "yb/rocksdb/db.h"
+ 
++#include "yb/rpc/messenger.h"
++#include "yb/rpc/proxy.h"
++
+ #include "yb/tablet/tablet.h"
+ #include "yb/tablet/tablet_metadata.h"
+ #include "yb/tablet/tablet_peer.h"
+@@ -50,24 +57,92 @@ using namespace std::literals;
+ namespace yb {
+ namespace pgwrapper {
+ 
++namespace {
++
++constexpr std::chrono::duration<int64> kRpcTimeout = std::chrono::seconds(60) * kTimeMultiplier;
++
++const std::string empty_partition_key;
++
++bool IsTabletInCollection(const master::TabletInfoPtr& tablet, const master::TabletInfos& tablets) {
++  return tablets.end() != std::find_if(
++      tablets.begin(), tablets.end(),
++      [&tablet](const master::TabletInfoPtr& p) { return p->tablet_id() == tablet->tablet_id(); });
++}
++
++} // namespace
++
++Result<master::TabletInfoPtr> SelectFirstTabletPolicy::operator()(
++    const PartitionKeyTabletMap& tablets) {
++  if (tablets.empty()) {
++    return nullptr;
++  }
++  return tablets.begin()->second;
++}
++
++Result<master::TabletInfoPtr> SelectLastTabletPolicy::operator()(
++    const PartitionKeyTabletMap& tablets) {
++  if (tablets.empty()) {
++    return nullptr;
++  }
++  return tablets.rbegin()->second;
++}
++
++Result<master::TabletInfoPtr> SelectMiddleTabletPolicy::operator()(
++    const PartitionKeyTabletMap& tablets) {
++  if (tablets.empty()) {
++    return nullptr;
++  }
++  const size_t middle_pos = (tablets.size() - 1) / 2;
++  auto it = tablets.begin();
++  std::advance(it, middle_pos);
++  return it->second;
++}
++
++TabletSelector::TabletSelector(
++    size_t max_tablet_selections, SelectTabletCallback selector_policy,
++    VerifyTabletsCallback tablet_verifier)
++  : max_selections(max_tablet_selections), selections_count(0)
++  , policy(std::move(selector_policy))
++  , verifier(std::move(tablet_verifier)) {
++}
++
++Result<master::TabletInfoPtr> TabletSelector::operator()(const PartitionKeyTabletMap& tablets) {
++  if (selections_count++ >= max_selections) {
++    return nullptr;
++  }
++  RETURN_NOT_OK(verifier(tablets));
++  return policy(tablets);
++}
++
++
++PgTabletSplitTestBase::PgTabletSplitTestBase() = default;
++PgTabletSplitTestBase::~PgTabletSplitTestBase() = default;
++
++void PgTabletSplitTestBase::SetUp() {
++  PgMiniTestBase::SetUp();
++  proxy_cache_ = std::make_unique<rpc::ProxyCache>(client_->messenger());
++}
++
+ Status PgTabletSplitTestBase::SplitSingleTablet(const TableId& table_id) {
+-  auto master = VERIFY_RESULT(cluster_->GetLeaderMiniMaster());
+   auto tablets = ListTableActiveTabletLeadersPeers(cluster_.get(), table_id);
+   if (tablets.size() != 1) {
+     return STATUS_FORMAT(InternalError, "Expected single tablet, found $0.", tablets.size());
+   }
+-  auto tablet_id = tablets.at(0)->tablet_id();
+-
+-  return master->catalog_manager().SplitTablet(tablet_id, master::ManualSplit::kTrue);
++  auto tablet_id = tablets.front()->tablet_id();
++  return VERIFY_RESULT(catalog_manager())->SplitTablet(tablet_id, master::ManualSplit::kTrue);
+ }
+ 
+ Status PgTabletSplitTestBase::InvokeSplitTabletRpc(const std::string& tablet_id) {
++  auto master_admin_proxy = master::MasterAdminProxy(
++      proxy_cache_.get(), VERIFY_RESULT(cluster_->GetLeaderMiniMaster())->bound_rpc_addr());
++
+   master::SplitTabletRequestPB req;
+   req.set_tablet_id(tablet_id);
+-  master::SplitTabletResponsePB resp;
+ 
+-  auto master = VERIFY_RESULT(cluster_->GetLeaderMiniMaster());
+-  RETURN_NOT_OK(master->catalog_manager_impl().SplitTablet(&req, &resp, nullptr));
++  rpc::RpcController controller;
++  controller.set_timeout(kRpcTimeout);
++  master::SplitTabletResponsePB resp;
++  RETURN_NOT_OK(master_admin_proxy.SplitTablet(req, &resp, &controller));
+   if (resp.has_error()) {
+     RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+   }
+@@ -75,14 +150,45 @@ Status PgTabletSplitTestBase::InvokeSplitTabletRpc(const std::string& tablet_id)
+ }
+ 
+ Status PgTabletSplitTestBase::InvokeSplitTabletRpcAndWaitForSplitCompleted(
+-    tablet::TabletPeerPtr peer) {
+-  SCHECK_NOTNULL(peer.get());
+-  RETURN_NOT_OK(InvokeSplitTabletRpc(peer->tablet_id()));
+-  return WaitFor([&]() -> Result<bool> {
+-    const auto leaders =
+-        ListTableActiveTabletLeadersPeers(cluster_.get(), peer->tablet_metadata()->table_id());
+-    return leaders.size() == 2;
+-  }, 15s * kTimeMultiplier, "Wait for split completion.");
++    const std::string& tablet_id) {
++  const auto catalog_mgr = VERIFY_RESULT(catalog_manager());
++  const auto tablet = VERIFY_RESULT(catalog_mgr->GetTabletInfo(tablet_id));
++
++  // Get current number of tablets for the table.
++  const auto table = catalog_mgr->GetTableInfo(tablet->table()->id());
++
++  return DoInvokeSplitTabletRpcAndWaitForCompletion(table, tablet);
++}
++
++Status PgTabletSplitTestBase::InvokeSplitsAndWaitForCompletion(
++    const TableId& table_id, SelectTabletCallback select_tablet) {
++  // Get initial tables.
++  const auto catalog_mgr = VERIFY_RESULT(catalog_manager());
++  const auto table = catalog_mgr->GetTableInfo(table_id);
++
++  // Loop while a tablet can be picked.
++  master::TabletInfoPtr parent;
++  while (true) {
++    // Get tablets and sort, we assume partition_key cannot be changed as we are holding a
++    // string_view to partition_key_start.
++    const auto tablets = GetTabletsByPartitionKey(table);
++    const auto tablet  = VERIFY_RESULT(select_tablet(tablets));
++    if (!tablet) {
++      break;
++    }
++
++    // Wait for parent tablet is deleted. This may be required by a series of splits.
++    if (parent) {
++      RETURN_NOT_OK(itest::WaitForTabletIsDeletedOrHidden(
++          catalog_mgr, parent->tablet_id(), MonoDelta::FromSeconds(5) * kTimeMultiplier));
++    }
++    parent = tablet;
++
++    // Invoke split tablet RPC and wait for the split is done.
++    RETURN_NOT_OK(DoInvokeSplitTabletRpcAndWaitForCompletion(table, tablet));
++  }
++
++  return Status::OK();
+ }
+ 
+ Status PgTabletSplitTestBase::DisableCompaction(std::vector<tablet::TabletPeerPtr>* peers) {
+@@ -98,5 +204,54 @@ size_t PgTabletSplitTestBase::NumTabletServers() {
+   return 1;
+ }
+ 
++Status PgTabletSplitTestBase::DoInvokeSplitTabletRpcAndWaitForCompletion(
++    const master::TableInfoPtr& table, const master::TabletInfoPtr& tablet) {
++  // Keep current tablets.
++  const auto tablets = table->GetTablets();
++
++  // Sanity check that tablet belongs to the table.
++  if (!IsTabletInCollection(tablet, tablets)) {
++    return STATUS(InvalidArgument, "The tablet does not belong to table's tablets list.");
++  }
++
++  // Send split RPC.
++  RETURN_NOT_OK(InvokeSplitTabletRpc(tablet->tablet_id()));
++
++  // Wait for new tablets are added.
++  RETURN_NOT_OK(WaitForTableActiveTabletLeadersPeers(
++      cluster_.get(), table->id(), tablets.size() + 1));
++
++  // Wait until split is replicated across all tablet servers.
++    RETURN_NOT_OK(WaitAllReplicasReady(
++        cluster_.get(), table->id(), MonoDelta::FromSeconds(20) * kTimeMultiplier));
++
++  // Select new tablets ids
++  const auto all_tablets = table->GetTablets();
++  std::vector<TabletId> new_tablet_ids;
++  new_tablet_ids.reserve(all_tablets.size());
++  for (const auto& t : all_tablets) {
++    if (!IsTabletInCollection(t, tablets)) {
++      new_tablet_ids.push_back(t->tablet_id());
++    }
++  }
++
++  // Wait for new peers are fully compacted.
++  return WaitForPeersAreFullyCompacted(cluster_.get(), new_tablet_ids);
++}
++
++PartitionKeyTabletMap GetTabletsByPartitionKey(const master::TableInfoPtr& table) {
++  // Get tablets and sort, we assume partition_key cannot be changed as we are holding a
++  // string_view to partition_key_start.
++  PartitionKeyTabletMap tablets;
++  for (auto& t : table->GetTablets()) {
++    const auto& partition = t->LockForRead()->pb.partition();
++    const auto& partition_key =
++        partition.has_partition_key_start() ? partition.partition_key_start()
++                                            : empty_partition_key;
++    tablets.emplace(partition_key, t);
++  }
++  return tablets;
++}
++
+ } // namespace pgwrapper
+ } // namespace yb
+diff --git a/src/yb/yql/pgwrapper/pg_tablet_split_test_base.h b/src/yb/yql/pgwrapper/pg_tablet_split_test_base.h
+index c3e6244db6..5bdcc78c1e 100644
+--- a/src/yb/yql/pgwrapper/pg_tablet_split_test_base.h
++++ b/src/yb/yql/pgwrapper/pg_tablet_split_test_base.h
+@@ -15,19 +15,66 @@
+ 
+ #include "yb/yql/pgwrapper/pg_mini_test_base.h"
+ 
++#include "yb/master/master_fwd.h"
++
++
+ namespace yb {
+ namespace pgwrapper {
+ 
++using PartitionKeyTabletMap = std::map<std::string_view, master::TabletInfoPtr>;
++using VerifyTabletsCallback = std::function<Status(const PartitionKeyTabletMap&)>;
++using SelectTabletCallback =
++    std::function<Result<master::TabletInfoPtr>(const PartitionKeyTabletMap& tablets)>;
++
++struct SelectFirstTabletPolicy {
++  Result<master::TabletInfoPtr> operator()(const PartitionKeyTabletMap& tablets);
++};
++
++struct SelectLastTabletPolicy {
++  Result<master::TabletInfoPtr> operator()(const PartitionKeyTabletMap& tablets);
++};
++
++struct SelectMiddleTabletPolicy {
++  Result<master::TabletInfoPtr> operator()(const PartitionKeyTabletMap& tablets);
++};
++
++struct TabletSelector {
++  const size_t max_selections;
++  size_t selections_count;
++  SelectTabletCallback policy;
++  VerifyTabletsCallback verifier;
++
++  explicit TabletSelector(size_t max_selections,
++      SelectTabletCallback selector = SelectFirstTabletPolicy(),
++      VerifyTabletsCallback verifier = [](const auto&) { return Status::OK(); });
++  Result<master::TabletInfoPtr> operator()(const PartitionKeyTabletMap& tablets);
++};
++
+ class PgTabletSplitTestBase : public PgMiniTestBase {
++ public:
++  PgTabletSplitTestBase();
++  ~PgTabletSplitTestBase();
++
+  protected:
++  void SetUp() override;
++
+   Status SplitSingleTablet(const TableId& table_id);
+   Status InvokeSplitTabletRpc(const std::string& tablet_id);
+-  Status InvokeSplitTabletRpcAndWaitForSplitCompleted(tablet::TabletPeerPtr peer);
++  Status InvokeSplitTabletRpcAndWaitForSplitCompleted(const std::string& tablet_id);
++  Status InvokeSplitsAndWaitForCompletion(
++      const TableId& table_id, SelectTabletCallback select_tablet);
+   Status DisableCompaction(std::vector<tablet::TabletPeerPtr>* peers);
+ 
+  private:
+   virtual size_t NumTabletServers() override;
++
++  Status DoInvokeSplitTabletRpcAndWaitForCompletion(
++    const master::TableInfoPtr& table_info, const master::TabletInfoPtr& tablet_info);
++
++  std::unique_ptr<rpc::ProxyCache> proxy_cache_;
+ };
+ 
++PartitionKeyTabletMap GetTabletsByPartitionKey(const master::TableInfoPtr& table);
++
+ } // namespace pgwrapper
+ } // namespace yb
+diff --git a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+index 2ae46db3a7..6261b68737 100644
+--- a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
++++ b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+@@ -667,9 +667,8 @@ TEST_F(PgConcurrentBlockedWaitersTest, YB_DISABLE_TEST_IN_TSAN(LongPauseRetrySin
+ class PgLeaderChangeWaitQueuesTest : public PgConcurrentBlockedWaitersTest {
+  protected:
+   Status WaitForLoadBalance(int num_tablet_servers) {
+-    auto client = VERIFY_RESULT(cluster_->CreateClient());
+     return WaitFor(
+-      [&]() -> Result<bool> { return client->IsLoadBalanced(num_tablet_servers); },
++      [&]() -> Result<bool> { return client_->IsLoadBalanced(num_tablet_servers); },
+       60s * kTimeMultiplier,
+       Format("Wait for load balancer to balance to $0 tservers.", num_tablet_servers));
+   }

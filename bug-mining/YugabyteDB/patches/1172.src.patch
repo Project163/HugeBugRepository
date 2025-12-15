@@ -1,0 +1,395 @@
+diff --git a/src/postgres/src/backend/executor/nodeValuesscan.c b/src/postgres/src/backend/executor/nodeValuesscan.c
+index fa49d0470f..5ba7e2f06f 100644
+--- a/src/postgres/src/backend/executor/nodeValuesscan.c
++++ b/src/postgres/src/backend/executor/nodeValuesscan.c
+@@ -26,6 +26,7 @@
+ #include "executor/executor.h"
+ #include "executor/nodeValuesscan.h"
+ #include "jit/jit.h"
++#include "optimizer/clauses.h"
+ #include "utils/expandeddatum.h"
+ 
+ 
+@@ -50,7 +51,7 @@ ValuesNext(ValuesScanState *node)
+ 	EState	   *estate;
+ 	ExprContext *econtext;
+ 	ScanDirection direction;
+-	List	   *exprlist;
++	int			curr_idx;
+ 
+ 	/*
+ 	 * get information from the estate and scan state
+@@ -67,19 +68,11 @@ ValuesNext(ValuesScanState *node)
+ 	{
+ 		if (node->curr_idx < node->array_len)
+ 			node->curr_idx++;
+-		if (node->curr_idx < node->array_len)
+-			exprlist = node->exprlists[node->curr_idx];
+-		else
+-			exprlist = NIL;
+ 	}
+ 	else
+ 	{
+ 		if (node->curr_idx >= 0)
+ 			node->curr_idx--;
+-		if (node->curr_idx >= 0)
+-			exprlist = node->exprlists[node->curr_idx];
+-		else
+-			exprlist = NIL;
+ 	}
+ 
+ 	/*
+@@ -90,16 +83,16 @@ ValuesNext(ValuesScanState *node)
+ 	 */
+ 	ExecClearTuple(slot);
+ 
+-	if (exprlist)
++	curr_idx = node->curr_idx;
++	if (curr_idx >= 0 && curr_idx < node->array_len)
+ 	{
++		List	   *exprlist = node->exprlists[curr_idx];
++		List	   *exprstatelist = node->exprstatelists[curr_idx];
+ 		MemoryContext oldContext;
+-		List	   *oldsubplans;
+-		List	   *exprstatelist;
+ 		Datum	   *values;
+ 		bool	   *isnull;
+ 		ListCell   *lc;
+ 		int			resind;
+-		int			saved_jit_flags;
+ 
+ 		/*
+ 		 * Get rid of any prior cycle's leftovers.  We use ReScanExprContext
+@@ -109,38 +102,32 @@ ValuesNext(ValuesScanState *node)
+ 		ReScanExprContext(econtext);
+ 
+ 		/*
+-		 * Build the expression eval state in the econtext's per-tuple memory.
+-		 * This is a tad unusual, but we want to delete the eval state again
+-		 * when we move to the next row, to avoid growth of memory
+-		 * requirements over a long values list.
++		 * Do per-VALUES-row work in the per-tuple context.
+ 		 */
+ 		oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+ 
+ 		/*
+-		 * The expressions might contain SubPlans (this is currently only
+-		 * possible if there's a sub-select containing a LATERAL reference,
+-		 * otherwise sub-selects in a VALUES list should be InitPlans). Those
+-		 * subplans will want to hook themselves into our subPlan list, which
+-		 * would result in a corrupted list after we delete the eval state. We
+-		 * can work around this by saving and restoring the subPlan list.
+-		 * (There's no need for the functionality that would be enabled by
+-		 * having the list entries, since the SubPlans aren't going to be
+-		 * re-executed anyway.)
+-		 */
+-		oldsubplans = node->ss.ps.subPlan;
+-		node->ss.ps.subPlan = NIL;
+-
+-		/*
+-		 * As the expressions are only ever used once, disable JIT for them.
+-		 * This is worthwhile because it's common to insert significant
+-		 * amounts of data via VALUES().
++		 * Unless we already made the expression eval state for this row,
++		 * build it in the econtext's per-tuple memory.  This is a tad
++		 * unusual, but we want to delete the eval state again when we move to
++		 * the next row, to avoid growth of memory requirements over a long
++		 * values list.  For rows in which that won't work, we already built
++		 * the eval state at plan startup.
+ 		 */
+-		saved_jit_flags = econtext->ecxt_estate->es_jit_flags;
+-		econtext->ecxt_estate->es_jit_flags = PGJIT_NONE;
+-		exprstatelist = ExecInitExprList(exprlist, &node->ss.ps);
+-		econtext->ecxt_estate->es_jit_flags = saved_jit_flags;
+-
+-		node->ss.ps.subPlan = oldsubplans;
++		if (exprstatelist == NIL)
++		{
++			/*
++			 * Pass parent as NULL, not my plan node, because we don't want
++			 * anything in this transient state linking into permanent state.
++			 * The only expression type that might wish to do so is a SubPlan,
++			 * and we already checked that there aren't any.
++			 *
++			 * Note that passing parent = NULL also disables JIT compilation
++			 * of the expressions, which is a win, because they're only going
++			 * to be used once under normal circumstances.
++			 */
++			exprstatelist = ExecInitExprList(exprlist, NULL);
++		}
+ 
+ 		/* parser should have checked all sublists are the same length */
+ 		Assert(list_length(exprstatelist) == slot->tts_tupleDescriptor->natts);
+@@ -281,13 +268,52 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
+ 	scanstate->curr_idx = -1;
+ 	scanstate->array_len = list_length(node->values_lists);
+ 
+-	/* convert list of sublists into array of sublists for easy addressing */
++	/*
++	 * Convert the list of expression sublists into an array for easier
++	 * addressing at runtime.  Also, detect whether any sublists contain
++	 * SubPlans; for just those sublists, go ahead and do expression
++	 * initialization.  (This avoids problems with SubPlans wanting to connect
++	 * themselves up to the outer plan tree.  Notably, EXPLAIN won't see the
++	 * subplans otherwise; also we will have troubles with dangling pointers
++	 * and/or leaked resources if we try to handle SubPlans the same as
++	 * simpler expressions.)
++	 */
+ 	scanstate->exprlists = (List **)
+ 		palloc(scanstate->array_len * sizeof(List *));
++	scanstate->exprstatelists = (List **)
++		palloc0(scanstate->array_len * sizeof(List *));
+ 	i = 0;
+ 	foreach(vtl, node->values_lists)
+ 	{
+-		scanstate->exprlists[i++] = (List *) lfirst(vtl);
++		List	   *exprs = castNode(List, lfirst(vtl));
++
++		scanstate->exprlists[i] = exprs;
++
++		/*
++		 * We can avoid the cost of a contain_subplans() scan in the simple
++		 * case where there are no SubPlans anywhere.
++		 */
++		if (estate->es_subplanstates &&
++			contain_subplans((Node *) exprs))
++		{
++			int			saved_jit_flags;
++
++			/*
++			 * As these expressions are only used once, disable JIT for them.
++			 * This is worthwhile because it's common to insert significant
++			 * amounts of data via VALUES().  Note that this doesn't prevent
++			 * use of JIT *within* a subplan, since that's initialized
++			 * separately; this just affects the upper-level subexpressions.
++			 */
++			saved_jit_flags = estate->es_jit_flags;
++			estate->es_jit_flags = PGJIT_NONE;
++
++			scanstate->exprstatelists[i] = ExecInitExprList(exprs,
++															&scanstate->ss.ps);
++
++			estate->es_jit_flags = saved_jit_flags;
++		}
++		i++;
+ 	}
+ 
+ 	return scanstate;
+diff --git a/src/postgres/src/include/nodes/execnodes.h b/src/postgres/src/include/nodes/execnodes.h
+index 89d698c838..1f164249e2 100644
+--- a/src/postgres/src/include/nodes/execnodes.h
++++ b/src/postgres/src/include/nodes/execnodes.h
+@@ -1718,7 +1718,8 @@ typedef struct FunctionScanState
+  *
+  *		rowcontext			per-expression-list context
+  *		exprlists			array of expression lists being evaluated
+- *		array_len			size of array
++ *		exprstatelists		array of expression state lists, for SubPlans only
++ *		array_len			size of above arrays
+  *		curr_idx			current array index (0-based)
+  *
+  *	Note: ss.ps.ps_ExprContext is used to evaluate any qual or projection
+@@ -1726,6 +1727,12 @@ typedef struct FunctionScanState
+  *	rowcontext, in which to build the executor expression state for each
+  *	Values sublist.  Resetting this context lets us get rid of expression
+  *	state for each row, avoiding major memory leakage over a long values list.
++ *	However, that doesn't work for sublists containing SubPlans, because a
++ *	SubPlan has to be connected up to the outer plan tree to work properly.
++ *	Therefore, for only those sublists containing SubPlans, we do expression
++ *	state construction at executor start, and store those pointers in
++ *	exprstatelists[].  NULL entries in that array correspond to simple
++ *	subexpressions that are handled as described above.
+  * ----------------
+  */
+ typedef struct ValuesScanState
+@@ -1735,6 +1742,8 @@ typedef struct ValuesScanState
+ 	List	  **exprlists;
+ 	int			array_len;
+ 	int			curr_idx;
++	/* in back branches, put this at the end to avoid ABI break: */
++	List	  **exprstatelists;
+ } ValuesScanState;
+ 
+ /* ----------------
+diff --git a/src/postgres/src/test/regress/expected/subselect.out b/src/postgres/src/test/regress/expected/subselect.out
+index a288c6d33b..55107f6796 100644
+--- a/src/postgres/src/test/regress/expected/subselect.out
++++ b/src/postgres/src/test/regress/expected/subselect.out
+@@ -894,6 +894,33 @@ where s.i < 10 and (select val.x) < 110;
+   10
+ (17 rows)
+ 
++-- another variant of that (bug #16213)
++explain (verbose, costs off)
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++               QUERY PLAN               
++----------------------------------------
++ Values Scan on "*VALUES*"
++   Output: "*VALUES*".column1
++   SubPlan 1
++     ->  Values Scan on "*VALUES*_1"
++           Output: "*VALUES*_1".column1
++(5 rows)
++
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++ column1 
++---------
++ t
++ f
++(2 rows)
++
+ --
+ -- Check sane behavior with nested IN SubLinks
+ --
+diff --git a/src/postgres/src/test/regress/expected/yb_dml.out b/src/postgres/src/test/regress/expected/yb_dml.out
+new file mode 100644
+index 0000000000..4bdbf71eb3
+--- /dev/null
++++ b/src/postgres/src/test/regress/expected/yb_dml.out
+@@ -0,0 +1,20 @@
++--
++-- Yugabyte-owned file for testing DML queries that do not fall into more
++-- specific buckets (yb_dml_*.sql).
++--
++-- GH-22967: Test that a Value Scan fed by a Sub Plan does not cause an INSERT
++-- to crash. The query relies on the fact the EXISTS .. IN expression does not
++-- get constant-folded and is evaluated in its own Sub Plan.
++CREATE TABLE GH_22967 (k INT4 PRIMARY KEY);
++EXPLAIN (COSTS OFF) INSERT INTO GH_22967 VALUES ((EXISTS(SELECT 1) in (SELECT true))::INT4), (-10);
++           QUERY PLAN
++---------------------------------
++ Insert on gh_22967
++   InitPlan 1 (returns $0)
++     ->  Result
++   ->  Values Scan on "*VALUES*"
++         SubPlan 2
++           ->  Result
++(6 rows)
++
++INSERT INTO GH_22967 VALUES ((EXISTS(SELECT 1) in (SELECT true))::INT4), (-10);
+diff --git a/src/postgres/src/test/regress/expected/yb_pg_subselect.out b/src/postgres/src/test/regress/expected/yb_pg_subselect.out
+new file mode 100644
+index 0000000000..76cd9d058f
+--- /dev/null
++++ b/src/postgres/src/test/regress/expected/yb_pg_subselect.out
+@@ -0,0 +1,29 @@
++--
++-- SUBSELECT
++--
++-- another variant of that (bug #16213)
++explain (verbose, costs off)
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++               QUERY PLAN               
++----------------------------------------
++ Values Scan on "*VALUES*"
++   Output: "*VALUES*".column1
++   SubPlan 1
++     ->  Values Scan on "*VALUES*_1"
++           Output: "*VALUES*_1".column1
++(5 rows)
++
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++ column1 
++---------
++ t
++ f
++(2 rows)
+diff --git a/src/postgres/src/test/regress/sql/subselect.sql b/src/postgres/src/test/regress/sql/subselect.sql
+index 22c77f9854..97e3bd06de 100644
+--- a/src/postgres/src/test/regress/sql/subselect.sql
++++ b/src/postgres/src/test/regress/sql/subselect.sql
+@@ -492,6 +492,20 @@ select val.x
+   ) as val(x)
+ where s.i < 10 and (select val.x) < 110;
+ 
++-- another variant of that (bug #16213)
++explain (verbose, costs off)
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++
+ --
+ -- Check sane behavior with nested IN SubLinks
+ --
+diff --git a/src/postgres/src/test/regress/sql/yb_dml.sql b/src/postgres/src/test/regress/sql/yb_dml.sql
+new file mode 100644
+index 0000000000..8fd3188e9c
+--- /dev/null
++++ b/src/postgres/src/test/regress/sql/yb_dml.sql
+@@ -0,0 +1,11 @@
++--
++-- Yugabyte-owned file for testing DML queries that do not fall into more
++-- specific buckets (yb_dml_*.sql).
++--
++
++-- GH-22967: Test that a Value Scan fed by a Sub Plan does not cause an INSERT
++-- to crash. The query relies on the fact the EXISTS .. IN expression does not
++-- get constant-folded and is evaluated in its own Sub Plan.
++CREATE TABLE GH_22967 (k INT4 PRIMARY KEY);
++EXPLAIN (COSTS OFF) INSERT INTO GH_22967 VALUES ((EXISTS(SELECT 1) in (SELECT true))::INT4), (-10);
++INSERT INTO GH_22967 VALUES ((EXISTS(SELECT 1) in (SELECT true))::INT4), (-10);
+diff --git a/src/postgres/src/test/regress/sql/yb_pg_subselect.sql b/src/postgres/src/test/regress/sql/yb_pg_subselect.sql
+new file mode 100644
+index 0000000000..1dd8a1276d
+--- /dev/null
++++ b/src/postgres/src/test/regress/sql/yb_pg_subselect.sql
+@@ -0,0 +1,17 @@
++--
++-- SUBSELECT
++--
++
++-- another variant of that (bug #16213)
++explain (verbose, costs off)
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
++
++select * from
++(values
++  (3 not in (select * from (values (1), (2)) ss1)),
++  (false)
++) ss;
+diff --git a/src/postgres/src/test/regress/yb_pg_dml_serial_schedule b/src/postgres/src/test/regress/yb_pg_dml_serial_schedule
+index aadfdf3f50..8248c332ef 100644
+--- a/src/postgres/src/test/regress/yb_pg_dml_serial_schedule
++++ b/src/postgres/src/test/regress/yb_pg_dml_serial_schedule
+@@ -13,3 +13,4 @@ test: yb_dml_insert_conflict
+ test: yb_dml_read_time
+ test: yb_dml_pushdown
+ test: yb_dml_scankey
++test: yb_dml
+diff --git a/src/postgres/src/test/regress/yb_pg_select_schedule b/src/postgres/src/test/regress/yb_pg_select_schedule
+index 328c2217d5..c77aa1d22f 100644
+--- a/src/postgres/src/test/regress/yb_pg_select_schedule
++++ b/src/postgres/src/test/regress/yb_pg_select_schedule
+@@ -14,3 +14,4 @@ test: yb_dep_onek2
+ test: yb_pg_select
+ test: yb_pg_select_distinct
+ test: yb_pg_select_distinct_on
++test: yb_pg_subselect

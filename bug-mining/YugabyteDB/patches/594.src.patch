@@ -1,0 +1,1143 @@
+diff --git a/ent/src/yb/cdc/cdc_service.cc b/ent/src/yb/cdc/cdc_service.cc
+index 4ed81c84d5..72c2ea6575 100644
+--- a/ent/src/yb/cdc/cdc_service.cc
++++ b/ent/src/yb/cdc/cdc_service.cc
+@@ -126,7 +126,7 @@ DEFINE_double(cdc_get_changes_free_rpc_ratio, .10,
+               "When the TServer only has this percentage of RPCs remaining because the rest are "
+               "GetChanges, reject additional requests to throttle/backoff and prevent deadlocks.");
+ 
+-DEFINE_bool(enable_update_local_peer_min_index, true,
++DEFINE_bool(enable_update_local_peer_min_index, false,
+             "Enable each local peer to update its own log checkpoint instead of the leader "
+             "updating all peers.");
+ 
+@@ -667,6 +667,13 @@ CHECKED_STATUS VerifyArg(const SetCDCCheckpointRequestPB& req) {
+     return STATUS(InvalidArgument, "Stream ID is required to set checkpoint");
+   }
+ 
++  if (req.has_checkpoint()) {
++    OpId op_id = OpId::FromPB(req.checkpoint().op_id());
++    if (op_id.term < OpId::Invalid().term || op_id.index < OpId::Invalid().index) {
++      LOG(WARNING) << "Received Invalid OpId " << op_id;
++      return STATUS_FORMAT(InvalidArgument, "Valid OpId is required to set checkpoint : $0", op_id);
++    }
++  }
+   return Status::OK();
+ }
+ 
+@@ -706,7 +713,10 @@ void CDCServiceImpl::CreateEntryInCdcStateTable(
+     const CDCStreamId& stream_id,
+     const TableId& table_id,
+     const TabletId& tablet_id) {
+-  OpId op_id;
++  // For CDCSDK the initial checkpoint for each tablet will be maintained
++  // in cdc_state table as -1.-1(Invaild). Checkpoint will be updated when client call
++  // setCDCCheckpoint.
++  OpId op_id = OpId::Invalid();
+ 
+   const auto cdc_state_table_op = cdc_state_table->NewWriteOp(
+       QLWriteRequestPB::QL_STMT_INSERT);
+@@ -914,18 +924,18 @@ Result<SetCDCCheckpointResponsePB> CDCServiceImpl::SetCDCCheckpoint(
+ 
+   ProducerTabletInfo producer_tablet{"" /* UUID */, req.stream_id(), req.tablet_id()};
+   OpId checkpoint;
+-  bool set_latest_entry = req.has_bootstrap();
++  bool set_latest_entry = req.bootstrap();
+ 
+   if (set_latest_entry) {
+     checkpoint = tablet_peer->log()->GetLatestEntryOpId();
+   } else {
+     checkpoint = OpId::FromPB(req.checkpoint().op_id());
+   }
+-
+   auto session = client()->NewSession();
+   session->SetDeadline(deadline);
+   RETURN_NOT_OK_SET_CODE(
+-      UpdateCheckpoint(producer_tablet, checkpoint, checkpoint, session, GetCurrentTimeMicros()),
++      UpdateCheckpoint(
++          producer_tablet, checkpoint, checkpoint, session, GetCurrentTimeMicros(), true),
+       CDCError(CDCErrorPB::INTERNAL_ERROR));
+ 
+   if (req.has_initial_checkpoint() || set_latest_entry) {
+@@ -1120,6 +1130,19 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
+     if (record.source_type == XCLUSTER) {
+       op_id = *result;
+     } else {
++      // This is the initial checkpoint set in cdc_state table, during create of CDCSDK
++      // create stream, so throw an exeception to client to call setCDCCheckpoint or  take Snapshot.
++      if (*result == OpId::Invalid()) {
++        SetupErrorAndRespond(
++            resp->mutable_error(),
++            STATUS_FORMAT(
++                InvalidArgument,
++                "Invalid checkpoint $0 for tablet $1. Hint: set checkpoint explicitly or take "
++                    "snapshot",
++                *result, req->tablet_id()),
++            CDCErrorPB::INTERNAL_ERROR, &context);
++        return;
++      }
+       result->ToPB(&cdc_sdk_op_id);
+       op_id = OpId::FromPB(cdc_sdk_op_id);
+     }
+@@ -1237,10 +1260,24 @@ Status CDCServiceImpl::UpdatePeersCdcMinReplicatedIndex(
+   return Status::OK();
+ }
+ 
+-void CDCServiceImpl::ComputeLagMetric(int64_t last_replicated_micros,
+-                                      int64_t metric_last_timestamp_micros,
+-                                      int64_t cdc_state_last_replication_time_micros,
+-                                      scoped_refptr<AtomicGauge<int64_t>> metric) {
++void CDCServiceImpl::RetainIntents(
++    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const OpId& cdc_sdk_op_id) {
++  if (cdc_sdk_op_id == OpId::Invalid()) {
++    return;
++  }
++
++  auto txn_participant = tablet_peer->tablet()->transaction_participant();
++  if (txn_participant) {
++    txn_participant->SetRetainOpId(cdc_sdk_op_id);
++  }
++}
++
++void CDCServiceImpl::ComputeLagMetric(
++    int64_t last_replicated_micros,
++    int64_t metric_last_timestamp_micros,
++    int64_t cdc_state_last_replication_time_micros,
++    scoped_refptr<AtomicGauge<int64_t>>
++        metric) {
+   if (metric_last_timestamp_micros == 0) {
+     // The tablet metric timestamp is uninitialized, so try to use last replicated time in cdc
+     // state.
+@@ -1407,15 +1444,30 @@ MicrosTime CDCServiceImpl::GetLastReplicatedTime(
+   return status.ok() ? data.log_ht.GetPhysicalValueMicros() : 0;
+ }
+ 
+-void PopulateTabletMinCheckpoint(const string& tablet_id,
+-                                 const OpId& checkpoint,
+-                                 CDCRequestSource cdc_source_type,
+-                                 TabletOpIdMap* tablet_min_checkpoint_index) {
++void SetMinCDCSDKCheckpoint(const OpId& checkpoint, OpId* cdc_sdk_op_id) {
++  if (*cdc_sdk_op_id != OpId::Invalid()) {
++    *cdc_sdk_op_id = min(*cdc_sdk_op_id, checkpoint);
++  } else {
++    *cdc_sdk_op_id = checkpoint;
++  }
++}
++
++void PopulateTabletMinCheckpoint(
++    const string& tablet_id, const OpId& checkpoint, CDCRequestSource cdc_source_type,
++    TabletOpIdMap* tablet_min_checkpoint_index) {
+   auto& tablet_op_id = (*tablet_min_checkpoint_index)[tablet_id];
+-  tablet_op_id.cdc_op_id = min(tablet_op_id.cdc_op_id, checkpoint);
+ 
++  tablet_op_id.cdc_op_id = min(tablet_op_id.cdc_op_id, checkpoint);
++  // Case:1  2 different CDCSDK stream(stream-1 and stream-2) on same tablet_id.
++  //        for stream-1 there is get changes call and stream-2 there is not get change
++  //        call(i.e initial checkpoint is -1.-1).
++  //
++  // Case:2 for the same tablet_id we read CDC stream-1 and we set cdc_sdk_op_id = Invalid(-1.-1)
++  //       then we read CDCSDK stream-2 which have valid checkpoint detail in cdc_state table,
++  //       update cdc_sdk_op_id to checkpoint.
++  //
+   if (cdc_source_type == CDCSDK) {
+-    tablet_op_id.cdc_sdk_op_id = min(tablet_op_id.cdc_sdk_op_id, checkpoint);
++    SetMinCDCSDKCheckpoint(checkpoint, &tablet_op_id.cdc_sdk_op_id);
+   }
+ }
+ 
+@@ -1429,7 +1481,7 @@ Status CDCServiceImpl::SetInitialCheckPoint(
+   TabletOpIdMap& tablet_min_checkpoint_map = *result;
+   auto& tablet_op_id = tablet_min_checkpoint_map[tablet_id];
+   tablet_op_id.cdc_op_id = min(checkpoint, tablet_op_id.cdc_op_id);
+-  tablet_op_id.cdc_sdk_op_id = min(checkpoint, tablet_op_id.cdc_sdk_op_id);
++  SetMinCDCSDKCheckpoint(checkpoint, &tablet_op_id.cdc_sdk_op_id);
+ 
+   // Update the minimum checkpoint op_id on LEADER for log cache eviction for all stream type.
+   RETURN_NOT_OK_SET_CODE(
+@@ -1437,14 +1489,10 @@ Status CDCServiceImpl::SetInitialCheckPoint(
+       CDCError(CDCErrorPB::INTERNAL_ERROR));
+ 
+   // Update the minimum checkpoint op_id for LEADER for intent cleanup for CDCSDK Stream type.
+-  auto txn_participant = tablet_peer->tablet()->transaction_participant();
+-  if (txn_participant == nullptr) {
+-    return STATUS_FORMAT(
+-        InternalError, "Cannot read data as the transaction participant context is null");
+-  }
+-  txn_participant->SetRetainOpId(tablet_op_id.cdc_sdk_op_id);
+-  // Even if the flag is enable_update_local_peer_min_index is set, for the first time
+-  // we need to set it to follower too.
++  RetainIntents(tablet_peer, tablet_op_id.cdc_sdk_op_id);
++
++  //  Even if the flag is enable_update_local_peer_min_index is set, for the first time
++  //  we need to set it to follower too.
+   return UpdatePeersCdcMinReplicatedIndex(tablet_id, tablet_op_id);
+ }
+ 
+@@ -1468,8 +1516,10 @@ Result<TabletOpIdMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
+     LOG(WARNING) << "Scan of table " << kCdcStateTableName.table_name() << " failed: " << status;
+     failer_status = status;
+   };
+-  options.columns = std::vector<std::string>{master::kCdcTabletId, master::kCdcStreamId,
+-      master::kCdcCheckpoint, master::kCdcLastReplicationTime};
++  options.columns = std::vector<std::string>{
++      master::kCdcTabletId, master::kCdcStreamId, master::kCdcCheckpoint,
++      master::kCdcLastReplicationTime};
++
+   for (const auto& row : client::TableRange(**cdc_state_table_result, options)) {
+     count++;
+     auto tablet_id = row.column(master::kCdcTabletIdIdx).string_value();
+@@ -1505,7 +1555,11 @@ Result<TabletOpIdMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
+     if (!input_tablet_id.empty() && input_tablet_id != tablet_id) {
+       continue;
+     }
+-    PopulateTabletMinCheckpoint(tablet_id, *result, record.source_type, &tablet_min_checkpoint_map);
++    // Ignoring those non-bootstarped CDCSDK stream
++    if (*result != OpId::Invalid()) {
++      PopulateTabletMinCheckpoint(
++          tablet_id, *result, record.source_type, &tablet_min_checkpoint_map);
++    }
+   }
+ 
+   if (!failer_status.ok()) {
+@@ -1558,11 +1612,7 @@ void CDCServiceImpl::UpdateTabletPeersWithMinReplicatedIndex(
+           UpdatePeersCdcMinReplicatedIndex(tablet_id, tablet.second),
+           "UpdatePeersCdcMinReplicatedIndex failed");
+     } else {
+-      auto txn_participant = tablet_peer->tablet()->transaction_participant();
+-      if (txn_participant == nullptr) {
+-        continue;
+-      }
+-      txn_participant->SetRetainOpId(tablet.second.cdc_sdk_op_id);
++      RetainIntents(tablet_peer, tablet.second.cdc_sdk_op_id);
+     }
+   }
+ }
+@@ -1859,11 +1909,8 @@ Status CDCServiceImpl::UpdateCdcReplicatedIndexEntry(
+     return STATUS(TryAgain, "Tablet peer is not ready to set its log cdc index");
+   }
+   RETURN_NOT_OK(tablet_peer->set_cdc_min_replicated_index(replicated_index));
+-  auto txn_participant = tablet_peer->tablet()->transaction_participant();
+-  if (txn_participant == nullptr) {
+-    return STATUS(InternalError, "Cannot read data as the transaction participant context is null");
+-  }
+-  txn_participant->SetRetainOpId(cdc_sdk_replicated_op);
++
++  RetainIntents(tablet_peer, cdc_sdk_replicated_op);
+ 
+   return Status::OK();
+ }
+@@ -2524,14 +2571,16 @@ void CDCServiceImpl::UpdateCDCTabletMetrics(
+   }
+ }
+ 
+-Status CDCServiceImpl::UpdateCheckpoint(const ProducerTabletInfo& producer_tablet,
+-                                        const OpId& sent_op_id,
+-                                        const OpId& commit_op_id,
+-                                        const client::YBSessionPtr& session,
+-                                        uint64_t last_record_hybrid_time) {
++Status CDCServiceImpl::UpdateCheckpoint(
++    const ProducerTabletInfo& producer_tablet,
++    const OpId& sent_op_id,
++    const OpId& commit_op_id,
++    const client::YBSessionPtr& session,
++    uint64_t last_record_hybrid_time,
++    const bool force_update) {
+   bool update_cdc_state = impl_->UpdateCheckpoint(producer_tablet, sent_op_id, commit_op_id);
+ 
+-  if (update_cdc_state) {
++  if (update_cdc_state || force_update) {
+     auto cdc_state = VERIFY_RESULT(GetCdcStateTable());
+     const auto op = cdc_state->NewUpdateOp();
+     auto* const req = op->mutable_request();
+diff --git a/ent/src/yb/cdc/cdc_service.h b/ent/src/yb/cdc/cdc_service.h
+index 3ca78aa727..d7859b763f 100644
+--- a/ent/src/yb/cdc/cdc_service.h
++++ b/ent/src/yb/cdc/cdc_service.h
+@@ -81,7 +81,7 @@ struct TabletCheckpoint {
+ // log cache eviction as well as for intent cleanup.
+ struct TabletCDCCheckpointInfo {
+   OpId cdc_op_id = OpId::Max();
+-  OpId cdc_sdk_op_id = OpId::Max();
++  OpId cdc_sdk_op_id = OpId::Invalid();
+ };
+ 
+ using TabletOpIdMap = std::unordered_map<TabletId, TabletCDCCheckpointInfo>;
+@@ -169,6 +169,9 @@ class CDCServiceImpl : public CDCServiceIf {
+   // Returns true if this server has received a GetChanges call.
+   bool CDCEnabled();
+ 
++  void RetainIntents(
++      const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const OpId& cdc_sdk_op_id);
++
+  private:
+   FRIEND_TEST(CDCServiceTest, TestMetricsOnDeletedReplication);
+   FRIEND_TEST(CDCServiceTestMultipleServersOneTablet, TestMetricsAfterServerFailure);
+@@ -192,7 +195,8 @@ class CDCServiceImpl : public CDCServiceIf {
+                                   const OpId& sent_op_id,
+                                   const OpId& commit_op_id,
+                                   const client::YBSessionPtr& session,
+-                                  uint64_t last_record_hybrid_time);
++                                  uint64_t last_record_hybrid_time,
++                                  bool force_update = false);
+ 
+   Result<google::protobuf::RepeatedPtrField<master::TabletLocationsPB>> GetTablets(
+       const CDCStreamId& stream_id);
+diff --git a/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc b/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
+index 441e28c470..5649a567ca 100644
+--- a/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
++++ b/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
+@@ -214,26 +214,52 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+       SetCDCCheckpointRequestPB* set_checkpoint_req,
+       const CDCStreamId stream_id,
+       google::protobuf::RepeatedPtrField<master::TabletLocationsPB>
+-          tablets) {
++          tablets,
++      const OpId& op_id,
++      bool initial_checkpoint) {
+     set_checkpoint_req->set_stream_id(stream_id);
+-    set_checkpoint_req->set_initial_checkpoint(true);
++    set_checkpoint_req->set_initial_checkpoint(initial_checkpoint);
+     set_checkpoint_req->set_tablet_id(tablets.Get(0).tablet_id());
+-    set_checkpoint_req->mutable_checkpoint()->mutable_op_id()->set_term(0);
+-    set_checkpoint_req->mutable_checkpoint()->mutable_op_id()->set_index(0);
++    set_checkpoint_req->mutable_checkpoint()->mutable_op_id()->set_term(op_id.term);
++    set_checkpoint_req->mutable_checkpoint()->mutable_op_id()->set_index(op_id.index);
+   }
+ 
+-  CHECKED_STATUS SetInitialCheckpoint(
+-      const CDCStreamId& stream_id,
+-      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets) {
++  Result <SetCDCCheckpointResponsePB> SetCDCCheckpoint(
++               const CDCStreamId& stream_id,
++               const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets,
++               const OpId& op_id = OpId::Min(),
++               bool initial_checkpoint = true) {
+     RpcController set_checkpoint_rpc;
+     SetCDCCheckpointRequestPB set_checkpoint_req;
+     SetCDCCheckpointResponsePB set_checkpoint_resp;
+     auto deadline = CoarseMonoClock::now() + test_client()->default_rpc_timeout();
+     set_checkpoint_rpc.set_deadline(deadline);
+-    PrepareSetCheckpointRequest(&set_checkpoint_req, stream_id, tablets);
++    PrepareSetCheckpointRequest(&set_checkpoint_req, stream_id, tablets, op_id, initial_checkpoint);
++    Status st =
++        cdc_proxy_->SetCDCCheckpoint(set_checkpoint_req, &set_checkpoint_resp, &set_checkpoint_rpc);
+ 
+-    return cdc_proxy_->SetCDCCheckpoint(
+-        set_checkpoint_req, &set_checkpoint_resp, &set_checkpoint_rpc);
++    RETURN_NOT_OK(st);
++    return set_checkpoint_resp;
++  }
++
++  Result<std::vector<OpId>> GetCDCCheckpoint(
++      const CDCStreamId& stream_id,
++      const google::protobuf::RepeatedPtrField<master::TabletLocationsPB>& tablets) {
++    RpcController get_checkpoint_rpc;
++    GetCheckpointRequestPB get_checkpoint_req;
++    GetCheckpointResponsePB get_checkpoint_resp;
++    auto deadline = CoarseMonoClock::now() + test_client()->default_rpc_timeout();
++    get_checkpoint_rpc.set_deadline(deadline);
++
++    std::vector<OpId> op_ids;
++    for (auto tablet : tablets) {
++      get_checkpoint_req.set_stream_id(stream_id);
++      get_checkpoint_req.set_tablet_id(tablets.Get(0).tablet_id());
++      RETURN_NOT_OK(
++          cdc_proxy_->GetCheckpoint(get_checkpoint_req, &get_checkpoint_resp, &get_checkpoint_rpc));
++      op_ids.push_back(OpId::FromPB(get_checkpoint_resp.checkpoint().op_id()));
++    }
++    return op_ids;
+   }
+ 
+   void AssertKeyValue(const CDCSDKProtoRecordPB& record, const int32_t& key, const int32_t& value) {
+@@ -282,8 +308,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+     std::string table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+     CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+ 
+-    ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
+-
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++    ASSERT_FALSE(resp.has_error());
+     WriteRows(0 /* start */, 1 /* end */, &test_cluster_);
+ 
+     const uint32_t expected_records_size = 1;
+@@ -324,7 +350,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+ 
+     TabletId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+     CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream(CDCCheckpointType::IMPLICIT));
+-    ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++    ASSERT_FALSE(resp.has_error());
+ 
+     // Call GetChanges once to set the initial value in the cdc_state table.
+     GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+@@ -385,8 +412,27 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+ 
+     TabletId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+     CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream(CDCCheckpointType::IMPLICIT));
+-    ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++    ASSERT_FALSE(resp.has_error());
++    auto checkpoints = ASSERT_RESULT(GetCDCCheckpoint(stream_id, tablets));
++    for (auto op_id : checkpoints) {
++      ASSERT_EQ(OpId(0, 0), op_id);
++    }
++
++    resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId(1, 3)));
++    ASSERT_FALSE(resp.has_error());
++
++    checkpoints = ASSERT_RESULT(GetCDCCheckpoint(stream_id, tablets));
++
++    for (auto op_id : checkpoints) {
++      ASSERT_EQ(OpId(1, 3), op_id);
++    }
+ 
++    resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId(1, -3)));
++    ASSERT_TRUE(resp.has_error());
++
++    resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets, OpId(-2, 1)));
++    ASSERT_TRUE(resp.has_error());
+   }
+ 
+   Result<GetChangesResponsePB> VerifyIfDDLRecordPresent(
+@@ -503,8 +549,8 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(MultiRowInsertion)) {
+   std::string table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+   CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+ 
+-  ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
+-
++  auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++  ASSERT_FALSE(resp.has_error());
+   WriteRows(0 /* start */, 10 /* end */, &test_cluster_);
+ 
+   // Records will follow this structure: {key, value}.
+@@ -548,14 +594,13 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestNeedSchemaInfoFlag)) {
+   std::string table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+   CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+ 
+-  ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
+-
++  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++  ASSERT_FALSE(set_resp.has_error());
+   // This will write one row with PK = 0.
+   WriteRows(0 /* start */, 1 /* end */, &test_cluster_);
+ 
+   // This is the first call to GetChanges, we will get a DDL record.
+-  GetChangesResponsePB resp =
+-      ASSERT_RESULT(VerifyIfDDLRecordPresent(stream_id, tablets, false, true));
++  auto resp = ASSERT_RESULT(VerifyIfDDLRecordPresent(stream_id, tablets, false, true));
+ 
+   // Write another row to the database with PK = 1.
+   WriteRows(1 /* start */, 2 /* end */, &test_cluster_);
+@@ -584,8 +629,8 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestTruncateTable)) {
+ 
+   TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
+   CDCStreamId stream_id = ASSERT_RESULT(CreateDBStream());
+-  ASSERT_OK(SetInitialCheckpoint(stream_id, tablets));
+-
++  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
++  ASSERT_FALSE(set_resp.has_error());
+   WriteRows(0 /* start */, 1 /* end */, &test_cluster_);
+   ASSERT_OK(TruncateTable(&test_cluster_, {table_id}));
+   WriteRows(1 /* start */, 2 /* end */, &test_cluster_);
+diff --git a/ent/src/yb/integration-tests/twodc-test.cc b/ent/src/yb/integration-tests/twodc-test.cc
+index 3d86e3db8c..82a7155aa3 100644
+--- a/ent/src/yb/integration-tests/twodc-test.cc
++++ b/ent/src/yb/integration-tests/twodc-test.cc
+@@ -125,6 +125,7 @@ class TwoDCTest : public TwoDCTestBase, public testing::WithParamInterface<TwoDC
+     FLAGS_cdc_max_apply_batch_num_records = GetParam().batch_size;
+     FLAGS_cdc_enable_replicate_intents = GetParam().enable_replicate_intents;
+     FLAGS_yb_num_shards_per_tserver = 1;
++    bool transactional_table = GetParam().transactional_table;
+     num_tservers = std::max(num_tservers, replication_factor);
+ 
+     MiniClusterOptions opts;
+@@ -153,7 +154,7 @@ class TwoDCTest : public TwoDCTestBase, public testing::WithParamInterface<TwoDC
+ 
+     // Create transactional table.
+     TableProperties table_properties;
+-    table_properties.SetTransactional(true);
++    table_properties.SetTransactional(transactional_table);
+     b.SetTableProperties(table_properties);
+     CHECK_OK(b.Build(&schema_));
+ 
+@@ -294,9 +295,9 @@ class TwoDCTest : public TwoDCTestBase, public testing::WithParamInterface<TwoDC
+     }
+   }
+ 
+-  void WriteTransactionalWorkload(uint32_t start, uint32_t end, YBClient* client,
+-                                  client::TransactionManager* txn_mgr, const YBTableName& table,
+-                                  bool delete_op = false) {
++  void WriteTransactionalWorkload(
++      uint32_t start, uint32_t end, YBClient* client, client::TransactionManager* txn_mgr,
++      const YBTableName& table, bool delete_op = false) {
+     auto pair = ASSERT_RESULT(CreateSessionWithTransaction(client, txn_mgr));
+     ASSERT_NO_FATALS(WriteIntents(start, end, client, pair.first, table, delete_op));
+     ASSERT_OK(pair.second->CommitFuture().get());
+@@ -308,9 +309,11 @@ class TwoDCTest : public TwoDCTestBase, public testing::WithParamInterface<TwoDC
+   YBSchema schema_;
+ };
+ 
+-INSTANTIATE_TEST_CASE_P(TwoDCTestParams, TwoDCTest,
+-                        ::testing::Values(TwoDCTestParams(1, true), TwoDCTestParams(1, false),
+-                                          TwoDCTestParams(0, true), TwoDCTestParams(0, false)));
++INSTANTIATE_TEST_CASE_P(
++    TwoDCTestParams, TwoDCTest,
++    ::testing::Values(
++        TwoDCTestParams(1, true, true), TwoDCTestParams(1, false, false),
++        TwoDCTestParams(0, true, true), TwoDCTestParams(0, false, false)));
+ 
+ TEST_P(TwoDCTest, SetupUniverseReplication) {
+   auto tables = ASSERT_RESULT(SetUpWithParams({8, 4}, {6, 6}, 3));
+@@ -465,7 +468,7 @@ TEST_P(TwoDCTest, SetupUniverseReplicationWithProducerBootstrapId) {
+   std::vector<std::shared_ptr<client::YBTable>> consumer_tables;
+   producer_tables.reserve(tables.size() / 2);
+   consumer_tables.reserve(tables.size() / 2);
+-  for (size_t i = 0; i < tables.size(); i ++) {
++  for (size_t i = 0; i < tables.size(); i++) {
+     if (i % 2 == 0) {
+       producer_tables.push_back(tables[i]);
+     } else {
+@@ -1096,7 +1099,15 @@ TEST_P(TwoDCTest, ApplyOperations) {
+   ASSERT_OK(DeleteUniverseReplication(kUniverseId));
+ }
+ 
+-TEST_P(TwoDCTest, ApplyOperationsWithTransactions) {
++class TwoDCTestWithTransactionalWrite : public TwoDCTest {};
++
++INSTANTIATE_TEST_CASE_P(
++    TwoDCTestParams, TwoDCTestWithTransactionalWrite,
++    ::testing::Values(
++        TwoDCTestParams(1, true, true), TwoDCTestParams(1, false, true),
++        TwoDCTestParams(0, true, true), TwoDCTestParams(0, false, true)));
++
++TEST_P(TwoDCTestWithTransactionalWrite, ApplyOperationsWithTransactions) {
+   uint32_t replication_factor = NonTsanVsTsan(3, 1);
+   auto tables = ASSERT_RESULT(SetUpWithParams({2}, {2}, replication_factor));
+ 
+@@ -1129,8 +1140,9 @@ TEST_P(TwoDCTest, ApplyOperationsWithTransactions) {
+ class TwoDCTestWithEnableIntentsReplication : public TwoDCTest {
+ };
+ 
+-INSTANTIATE_TEST_CASE_P(TwoDCTestParams, TwoDCTestWithEnableIntentsReplication,
+-                        ::testing::Values(TwoDCTestParams(0, true), TwoDCTestParams(1, true)));
++INSTANTIATE_TEST_CASE_P(
++    TwoDCTestParams, TwoDCTestWithEnableIntentsReplication,
++    ::testing::Values(TwoDCTestParams(0, true, true), TwoDCTestParams(1, true, true)));
+ 
+ TEST_P(TwoDCTestWithEnableIntentsReplication, UpdateWithinTransaction) {
+   constexpr int kNumTablets = 1;
+diff --git a/ent/src/yb/integration-tests/twodc_test_base.h b/ent/src/yb/integration-tests/twodc_test_base.h
+index 60437dba53..6aeb464a3f 100644
+--- a/ent/src/yb/integration-tests/twodc_test_base.h
++++ b/ent/src/yb/integration-tests/twodc_test_base.h
+@@ -46,11 +46,14 @@ static const std::string kUniverseId = "test_universe";
+ static const std::string kNamespaceName = "test_namespace";
+ 
+ struct TwoDCTestParams {
+-  TwoDCTestParams(int batch_size_, bool enable_replicate_intents_) :
+-      batch_size(batch_size_), enable_replicate_intents(enable_replicate_intents_) {}
++  TwoDCTestParams(int batch_size_, bool enable_replicate_intents_, bool transactional_table_)
++      : batch_size(batch_size_),
++        enable_replicate_intents(enable_replicate_intents_),
++        transactional_table(transactional_table_) {}
+ 
+   int batch_size;
+   bool enable_replicate_intents;
++  bool transactional_table;
+ };
+ 
+ class TwoDCTestBase : public YBTest {
+diff --git a/ent/src/yb/integration-tests/twodc_ysql-test.cc b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+index e4caa96a60..cfbfbe48c6 100644
+--- a/ent/src/yb/integration-tests/twodc_ysql-test.cc
++++ b/ent/src/yb/integration-tests/twodc_ysql-test.cc
+@@ -503,10 +503,11 @@ class TwoDCYsqlTest : public TwoDCTestBase, public testing::WithParamInterface<T
+     return Status::OK();
+   }
+ };
+-INSTANTIATE_TEST_CASE_P(TwoDCTestParams, TwoDCYsqlTest,
+-                        ::testing::Values(TwoDCTestParams(1, true), TwoDCTestParams(1, false),
+-                                          TwoDCTestParams(0, true), TwoDCTestParams(0, false)));
+-
++INSTANTIATE_TEST_CASE_P(
++    TwoDCTestParams, TwoDCYsqlTest,
++    ::testing::Values(
++        TwoDCTestParams(1, true, true), TwoDCTestParams(1, false, false),
++        TwoDCTestParams(0, true, true), TwoDCTestParams(0, false, false)));
+ 
+ TEST_P(TwoDCYsqlTest, SetupUniverseReplication) {
+   YB_SKIP_TEST_IN_TSAN();
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/TestCheckpoint.java b/java/yb-cdc/src/test/java/org/yb/cdc/TestCheckpoint.java
+index fdfd212661..1fe6a2b6ee 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/TestCheckpoint.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/TestCheckpoint.java
+@@ -18,7 +18,6 @@ import org.junit.runner.RunWith;
+ import org.yb.cdc.common.CDCBaseClass;
+ import org.yb.cdc.util.CDCSubscriber;
+ import org.yb.client.GetCheckpointResponse;
+-import org.yb.client.SetCheckpointResponse;
+ 
+ import static org.yb.AssertionWrappers.*;
+ import org.junit.Before;
+@@ -77,10 +76,7 @@ public class TestCheckpoint extends CDCBaseClass {
+ 
+       long cpTerm = 2;
+       long cpIndex = 9;
+-      SetCheckpointResponse setResp = testSubscriber.setCheckpoint(cpTerm, cpIndex, true);
+-      if (setResp == null) {
+-        LOG.error("Cannot set checkpoint, null response received as SetCheckpointResponse");
+-      }
++      testSubscriber.setCheckpoint(cpTerm, cpIndex, true);
+ 
+       resp = testSubscriber.getCheckpoint();
+ 
+@@ -110,23 +106,26 @@ public class TestCheckpoint extends CDCBaseClass {
+       assertEquals(1, rowsAffected2);
+ 
+       GetCheckpointResponse respBeforeSetting = testSubscriber.getCheckpoint();
+-      if(respBeforeSetting == null) {
++      LOG.info("The checkpoint received before setting is " + respBeforeSetting.getTerm() + " "
++       + respBeforeSetting.getTerm());
++      if (respBeforeSetting == null) {
+         LOG.error("Null response received as GetCheckpointResponse");
+         fail();
+       }
+ 
+-      SetCheckpointResponse setResp = testSubscriber.setCheckpoint(1, -3, true);
+-
+-      GetCheckpointResponse respAfterSetting = testSubscriber.getCheckpoint();
+-
+-      // Now even if the checkpoint is set negatively,
+-      // it would remain the same as the one before setting it explicitly
+-      // since a negative index is illegal.
+-      assertEquals(respBeforeSetting.getTerm(), respAfterSetting.getTerm());
+-      assertEquals(respBeforeSetting.getIndex(), respAfterSetting.getIndex());
+-    } catch (Exception e) {
+-      LOG.error("Test to verify failure while setting checkpoint with negative index " +
+-        "failed with exception", e);
++      boolean exceptionReceived = false;
++      try {
++        testSubscriber.setCheckpoint(1, -3, true);
++      }
++      catch (Exception e) {
++        LOG.info("Received expected exception ", e);
++        exceptionReceived = true;
++      }
++      if (!exceptionReceived) {
++        fail();
++      }
++    }
++    catch (Exception e) {
+       fail();
+     }
+   }
+@@ -150,7 +149,7 @@ public class TestCheckpoint extends CDCBaseClass {
+       long cpTerm = 1;
+       long cpIndex = 7;
+ 
+-      SetCheckpointResponse resp = testSubscriber.setCheckpoint(cpTerm, cpIndex, true);
++      testSubscriber.setCheckpoint(cpTerm, cpIndex, true);
+ 
+       // Checkpoint will be set to the specified value,
+       // we are just checking if checkpoint can be set in IMPLICIT mode.
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/util/CDCSubscriber.java b/java/yb-cdc/src/test/java/org/yb/cdc/util/CDCSubscriber.java
+index b29646fe5d..6f97145cc6 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/util/CDCSubscriber.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/util/CDCSubscriber.java
+@@ -226,10 +226,8 @@ public class CDCSubscriber {
+       LOG.debug("Using an old cached DB stream id");
+     }
+ 
++    setCheckpoint(0, 0, true);
+     LOG.info("DB Stream id: " + dbStreamId);
+-
+-    // Calling the GetChangesResponse to make sure it's setting the checkpoint to the beginning.
+-    getResponseFromCDC(new ArrayList<>());
+   }
+ 
+   /**
+@@ -281,7 +279,6 @@ public class CDCSubscriber {
+       LOG.error("Invalid format specified, please specify one from JSON or PROTO");
+       throw new RuntimeException("Invalid format specified, specify one from JSON or PROTO");
+     }
+-
+     setFormat(recordFormat);
+     createStreamUtil("");
+   }
+@@ -355,9 +352,15 @@ public class CDCSubscriber {
+       return null;
+     }
+ 
+-    LOG.debug("Tablet ID for getting checkpoint: " + tabletId);
+-
+-    return syncClient.getCheckpoint(table, streamId, tabletId);
++    if (tabletId == null) {
++      List<LocatedTablet> locatedTablets = table.getTabletsLocations(30000);
++      for (LocatedTablet tablet : locatedTablets) {
++        LOG.debug("Tablet ID for getting checkpoint: " + new String(tablet.getTabletId()));
++        this.tabletId = new String(tablet.getTabletId());
++        return syncClient.getCheckpoint(table, streamId, this.tabletId);
++      }
++    }
++    return syncClient.getCheckpoint(table, streamId, this.tabletId);
+   }
+ 
+   /**
+@@ -372,11 +375,10 @@ public class CDCSubscriber {
+    * @see GetDBStreamInfoResponse
+    * @see CdcService.TableInfo
+    */
+-  public SetCheckpointResponse setCheckpoint(long term, long index,
+-                                             boolean initialCheckpoint) throws Exception {
++  public void setCheckpoint(long term, long index, boolean initialCheckpoint) throws Exception {
+     if (syncClient == null) {
+       LOG.info("Cannot set checkpoint, YBClient not initialized");
+-      return null;
++      return;
+     }
+ 
+     GetDBStreamInfoResponse resp = syncClient.getDBStreamInfo(dbStreamId);
+@@ -387,12 +389,24 @@ public class CDCSubscriber {
+       LOG.debug("Table StreamID: " + streamId);
+     }
+     if (streamId.isEmpty()) {
+-      return null;
++      return;
+     }
+ 
+-    return syncClient.commitCheckpoint(table, streamId, tabletId, term, index, initialCheckpoint);
+-  }
++    if (this.tabletId == null) {
++      List<LocatedTablet> locatedTablets = table.getTabletsLocations(30000);
+ 
++      for (LocatedTablet tablet : locatedTablets) {
++        this.tabletId = new String(tablet.getTabletId());
++        syncClient.commitCheckpoint(table, streamId, this.tabletId, term, index,
++            initialCheckpoint);
++        LOG.info("Set the checkpoint term : " + term + ", index: " + index);
++      }
++    } else {
++        syncClient.commitCheckpoint(table, streamId, this.tabletId, term, index,
++            initialCheckpoint);
++        LOG.info("Set the checkpoint term : " + term + ", index: " + index);
++    }
++  }
+   /**
+    * This is used to create a stream to verify the snapshot feature of CDC.<br><br>
+    *
+@@ -471,6 +485,8 @@ public class CDCSubscriber {
+     }
+ 
+     for (String tabletId : tabletIds) {
++      syncClient.commitCheckpoint(table, dbStreamId, tabletId, 0, 0, true);
++
+       GetChangesResponse changesResponse =
+         syncClient.getChangesCDCSDK(
+           table, dbStreamId, tabletId,
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/Test3IntCol.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/Test3IntCol.java
+index 2944a2f9a7..2c14bc941f 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/Test3IntCol.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/Test3IntCol.java
+@@ -40,8 +40,6 @@ public class Test3IntCol extends CDCBaseClass {
+     CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+     testSubscriber.createStream("proto");
+ 
+-    testSubscriber.setCheckpoint(0, 0, true);
+-
+     if (!sqlScript.isEmpty()) {
+       TestUtils.runSqlScript(connection, sqlScript);
+     } else {
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestAllDatatypes.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestAllDatatypes.java
+index 576128d5da..78c9993282 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestAllDatatypes.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestAllDatatypes.java
+@@ -107,103 +107,70 @@ public class TestAllDatatypes extends CDCBaseClass {
+ 
+       CDCSubscriber bitSub = new CDCSubscriber("testbit", getMasterAddresses());
+       bitSub.createStream("proto");
+-      bitSub.setCheckpoint(0,0, true);
+       CDCSubscriber booleanSub = new CDCSubscriber("testboolean", getMasterAddresses());
+       booleanSub.createStream("proto");
+-      booleanSub.setCheckpoint(0, 0, true);
+       CDCSubscriber boxSub = new CDCSubscriber("testbox", getMasterAddresses());
+       boxSub.createStream("proto");
+-      boxSub.setCheckpoint(0, 0, true);
+       CDCSubscriber byteaSub = new CDCSubscriber("testbytea", getMasterAddresses());
+       byteaSub.createStream("proto");
+-      byteaSub.setCheckpoint(0, 0, true);
+       CDCSubscriber cidrSub = new CDCSubscriber("testcidr", getMasterAddresses());
+       cidrSub.createStream("proto");
+-      cidrSub.setCheckpoint(0, 0, true);
+       CDCSubscriber circleSub = new CDCSubscriber("testcircle", getMasterAddresses());
+       circleSub.createStream("proto");
+-      circleSub.setCheckpoint(0, 0, true);
+       CDCSubscriber dateSub = new CDCSubscriber("testdate", getMasterAddresses());
+       dateSub.createStream("proto");
+-      dateSub.setCheckpoint(0, 0, true);
+       CDCSubscriber doubleSub = new CDCSubscriber("testdouble", getMasterAddresses());
+       doubleSub.createStream("proto");
+-      doubleSub.setCheckpoint(0, 0, true);
+       CDCSubscriber inetSub = new CDCSubscriber("testinet", getMasterAddresses());
+       inetSub.createStream("proto");
+-      inetSub.setCheckpoint(0, 0, true);
+       CDCSubscriber intSub = new CDCSubscriber("testint", getMasterAddresses());
+       intSub.createStream("proto");
+-      intSub.setCheckpoint(0, 0, true);
+       CDCSubscriber jsonSub = new CDCSubscriber("testjson", getMasterAddresses());
+       jsonSub.createStream("proto");
+-      jsonSub.setCheckpoint(0, 0, true);
+       CDCSubscriber jsonbSub = new CDCSubscriber("testjsonb", getMasterAddresses());
+       jsonbSub.createStream("proto");
+-      jsonbSub.setCheckpoint(0, 0, true);
+       CDCSubscriber lineSub = new CDCSubscriber("testline", getMasterAddresses());
+       lineSub.createStream("proto");
+-      lineSub.setCheckpoint(0, 0, true);
+       CDCSubscriber lsegSub = new CDCSubscriber("testlseg", getMasterAddresses());
+       lsegSub.createStream("proto");
+-      lsegSub.setCheckpoint(0, 0, true);
+       CDCSubscriber macaddr8Sub = new CDCSubscriber("testmacaddr8", getMasterAddresses());
+       macaddr8Sub.createStream("proto");
+-      macaddr8Sub.setCheckpoint(0, 0, true);
+       CDCSubscriber macaddrSub = new CDCSubscriber("testmacaddr", getMasterAddresses());
+       macaddrSub.createStream("proto");
+-      macaddrSub.setCheckpoint(0, 0, true);
+       CDCSubscriber moneySub = new CDCSubscriber("testmoney", getMasterAddresses());
+       moneySub.createStream("proto");
+-      moneySub.setCheckpoint(0, 0, true);
+       CDCSubscriber numericSub = new CDCSubscriber("testnumeric", getMasterAddresses());
+       numericSub.createStream("proto");
+-      numericSub.setCheckpoint(0, 0, true);
+       CDCSubscriber pathSub = new CDCSubscriber("testpath", getMasterAddresses());
+       pathSub.createStream("proto");
+-      pathSub.setCheckpoint(0, 0, true);
+       CDCSubscriber pointSub = new CDCSubscriber("testpoint", getMasterAddresses());
+       pointSub.createStream("proto");
+-      pointSub.setCheckpoint(0, 0, true);
+       CDCSubscriber polygonSub = new CDCSubscriber("testpolygon", getMasterAddresses());
+       polygonSub.createStream("proto");
+-      polygonSub.setCheckpoint(0, 0, true);
+       CDCSubscriber textSub = new CDCSubscriber("testtext", getMasterAddresses());
+       textSub.createStream("proto");
+-      textSub.setCheckpoint(0, 0, true);
+       CDCSubscriber timeSub = new CDCSubscriber("testtime", getMasterAddresses());
+       timeSub.createStream("proto");
+-      timeSub.setCheckpoint(0, 0, true);
+       CDCSubscriber timestampSub = new CDCSubscriber("testtimestamp", getMasterAddresses());
+       timestampSub.createStream("proto");
+-      timestampSub.setCheckpoint(0, 0, true);
+       CDCSubscriber timetzSub = new CDCSubscriber("testtimetz", getMasterAddresses());
+       timetzSub.createStream("proto");
+-      timetzSub.setCheckpoint(0, 0, true);
+       CDCSubscriber uuidSub = new CDCSubscriber("testuuid", getMasterAddresses());
+       uuidSub.createStream("proto");
+-      uuidSub.setCheckpoint(0, 0, true);
+       CDCSubscriber varbitSub = new CDCSubscriber("testvarbit", getMasterAddresses());
+       varbitSub.createStream("proto");
+-      varbitSub.setCheckpoint(0, 0, true);
+       CDCSubscriber tstzSub = new CDCSubscriber("testtstz", getMasterAddresses());
+       tstzSub.createStream("proto");
+-      tstzSub.setCheckpoint(0, 0, true);
+       CDCSubscriber int4rangeSub = new CDCSubscriber("testint4range", getMasterAddresses());
+       int4rangeSub.createStream("proto");
+-      int4rangeSub.setCheckpoint(0, 0, true);
+       CDCSubscriber int8rangeSub = new CDCSubscriber("testint8range", getMasterAddresses());
+       int8rangeSub.createStream("proto");
+-      int8rangeSub.setCheckpoint(0, 0, true);
+       CDCSubscriber tsrangeSub = new CDCSubscriber("testtsrange", getMasterAddresses());
+       tsrangeSub.createStream("proto");
+-      tsrangeSub.setCheckpoint(0, 0, true);
+       CDCSubscriber tstzrangeSub = new CDCSubscriber("testtstzrange", getMasterAddresses());
+       tstzrangeSub.createStream("proto");
+-      tstzrangeSub.setCheckpoint(0, 0, true);
+       CDCSubscriber daterangeSub = new CDCSubscriber("testdaterange", getMasterAddresses());
+       daterangeSub.createStream("proto");
+-      daterangeSub.setCheckpoint(0, 0, true);
+ 
+       TestUtils.runSqlScript(connection, "sql_datatype_script/complete_datatype_test.sql");
+ 
+@@ -566,7 +533,6 @@ public class TestAllDatatypes extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber("testdefault", getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+       assertEquals(1, statement.executeUpdate("insert into testdefault values (1);"));
+ 
+       List<CdcService.CDCSDKProtoRecordPB> outputList = new ArrayList<>();
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestArrayTypes.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestArrayTypes.java
+index a42288636a..77ae163f77 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestArrayTypes.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestArrayTypes.java
+@@ -112,7 +112,6 @@ public class TestArrayTypes extends CDCBaseClass {
+       assertFalse(statement.execute(HelperValues.createTableWithMultiDimensionalArrayColumns));
+       CDCSubscriber testSubscriber = new CDCSubscriber("testmulti", getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       String varBit = "'{{1011, 011101, 1101110111}, {1011, 011101, 1101110111}}'::varbit(10)[]";
+       String booleanVal = "'{{FALSE, TRUE, TRUE, FALSE}, {FALSE, TRUE, TRUE, FALSE}}'::boolean[]";
+@@ -229,7 +228,6 @@ public class TestArrayTypes extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber("testsingle", getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+       String insertIntoTable = "insert into testsingle values (1, " +
+         "'{1011, 011101, 1101110111}', " +
+         "'{FALSE, TRUE, TRUE, FALSE}', " +
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestBase.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestBase.java
+index 36b820fd7c..dc92bd6f23 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestBase.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestBase.java
+@@ -27,7 +27,6 @@ import org.yb.cdc.common.CDCBaseClass;
+ import org.yb.cdc.util.CDCSubscriber;
+ import org.yb.cdc.common.ExpectedRecordYSQL;
+ import org.yb.cdc.util.TestUtils;
+-import org.yb.client.SetCheckpointResponse;
+ import org.yb.util.YBTestRunnerNonTsanOnly;
+ 
+ import java.sql.*;
+@@ -43,8 +42,6 @@ public class TestBase extends CDCBaseClass {
+     CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+     testSubscriber.createStream("proto");
+ 
+-    testSubscriber.setCheckpoint(0, 0, true);
+-
+     if (!sqlScript.isEmpty()) {
+       TestUtils.runSqlScript(connection, sqlScript);
+     } else {
+@@ -149,7 +146,6 @@ public class TestBase extends CDCBaseClass {
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+ 
+-      testSubscriber.setCheckpoint(0, 0, true);
+       assertEquals(1, statement.executeUpdate("INSERT INTO test VALUES (1, 2);"));
+       assertFalse(statement.execute("BEGIN;"));
+       assertEquals(1, statement.executeUpdate("INSERT INTO test VALUES (1, 3) ON CONFLICT (a) " +
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestCompoundKey.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestCompoundKey.java
+index 3e99e0d601..ddb40af1d1 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestCompoundKey.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestCompoundKey.java
+@@ -15,7 +15,7 @@ package org.yb.cdc.ysql;
+ 
+ import org.apache.log4j.Logger;
+ 
+-import static org.yb.AssertionWrappers.*;;
++import static org.yb.AssertionWrappers.*;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+@@ -39,7 +39,6 @@ public class TestCompoundKey extends CDCBaseClass {
+                                           String sqlScript) throws Exception {
+     CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+     testSubscriber.createStream("proto");
+-    testSubscriber.setCheckpoint(0, 0, true);
+ 
+     if (!sqlScript.isEmpty()) {
+       TestUtils.runSqlScript(connection, sqlScript);
+@@ -226,7 +225,6 @@ public class TestCompoundKey extends CDCBaseClass {
+     try {
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       ExpectedRecordCPKProto[] expectedRecords = {
+         new ExpectedRecordCPKProto(1, 2, 3, 4, Op.INSERT),
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestDDL.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestDDL.java
+index e8b2fb2fed..3f9b5cbadd 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestDDL.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestDDL.java
+@@ -47,7 +47,6 @@ public class TestDDL extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       List<CdcService.CDCSDKProtoRecordPB> outputList = new ArrayList<>();
+       // We are expecting 2 DDL records, the first one with 3 columns which will be added with the
+@@ -88,7 +87,6 @@ public class TestDDL extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       int dummyInsert = statement.executeUpdate("insert into test values (1, 2);");
+       assertEquals(1, dummyInsert);
+@@ -138,7 +136,6 @@ public class TestDDL extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       assertEquals(1, statement.executeUpdate("insert into test values (1);"));
+       assertEquals(1, statement.executeUpdate("insert into test values (2, 3);"));
+@@ -175,7 +172,6 @@ public class TestDDL extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       int dummyInsert = statement.executeUpdate("insert into test values (1);");
+       assertEquals(1, dummyInsert);
+@@ -214,7 +210,6 @@ public class TestDDL extends CDCBaseClass {
+ 
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       // We expect 2 DDL records, the first one would have the old table name while the second
+       // one will have the new table name. The record for the first DDL record would be added
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestLargeTabletCount.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestLargeTabletCount.java
+index a1c4fe79e9..910f509a2e 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestLargeTabletCount.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestLargeTabletCount.java
+@@ -48,7 +48,6 @@ public class TestLargeTabletCount extends CDCBaseClass {
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.setNumberOfTablets(12);
+       testSubscriber.createStream("proto");
+-      testSubscriber.setCheckpoint(0, 0, true);
+ 
+       int ins1 = statement.executeUpdate("insert into test values (1, 2);");
+       int ins2 = statement.executeUpdate("insert into test values (22, 33);");
+diff --git a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestNullValues.java b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestNullValues.java
+index dcd509dab1..606faaf6ba 100644
+--- a/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestNullValues.java
++++ b/java/yb-cdc/src/test/java/org/yb/cdc/ysql/TestNullValues.java
+@@ -70,7 +70,6 @@ public class TestNullValues extends CDCBaseClass {
+       // Creating one stream.
+       CDCSubscriber testSubscriberProto = new CDCSubscriber(getMasterAddresses());
+       testSubscriberProto.createStream("proto");
+-      testSubscriberProto.setCheckpoint(0, 0, true);
+ 
+       int dummyInsert = statement.executeUpdate(String.format("insert into test values (%d);",
+         DEFAULT_KEY_VALUE));
+@@ -316,10 +315,6 @@ public class TestNullValues extends CDCBaseClass {
+       CDCSubscriber testSubscriber = new CDCSubscriber(getMasterAddresses());
+       testSubscriber.createStream("proto");
+ 
+-      // Set initial checkpoint flag as true, this will update the
+-      // consumed op_id for the tablet in server.
+-      testSubscriber.setCheckpoint(0, 0, true);
+-
+       // Insert a row with value of one column
+       statement.execute("BEGIN;");
+       statement.execute("INSERT INTO test (a, c) VALUES (1, 3);");
+diff --git a/java/yb-client/src/main/java/org/yb/client/AsyncYBClient.java b/java/yb-client/src/main/java/org/yb/client/AsyncYBClient.java
+index a3f13ea2d2..22e4623cad 100644
+--- a/java/yb-client/src/main/java/org/yb/client/AsyncYBClient.java
++++ b/java/yb-client/src/main/java/org/yb/client/AsyncYBClient.java
+@@ -485,6 +485,22 @@ public class AsyncYBClient implements AutoCloseable {
+     return d;
+   }
+ 
++  public Deferred<SetCheckpointResponse> setCheckpointWithBootstrap(YBTable table,
++                                                                    String streamId,
++                                                                    String tabletId,
++                                                                    long term,
++                                                                    long index,
++                                                                    boolean initialCheckpoint,
++                                                                    boolean bootstrap) {
++    checkIsClosed();
++    SetCheckpointRequest rpc = new SetCheckpointRequest(table, streamId,
++        tabletId, term, index, initialCheckpoint, bootstrap);
++    Deferred d = rpc.getDeferred();
++    rpc.setTimeoutMillis(defaultOperationTimeoutMs);
++    sendRpcToTablet(rpc);
++    return d;
++  }
++
+   /**
+    * Check if the server is ready to serve requests.
+    * @param hp host port of the server.
+diff --git a/java/yb-client/src/main/java/org/yb/client/SetCheckpointRequest.java b/java/yb-client/src/main/java/org/yb/client/SetCheckpointRequest.java
+index 1272347963..27177381a0 100644
+--- a/java/yb-client/src/main/java/org/yb/client/SetCheckpointRequest.java
++++ b/java/yb-client/src/main/java/org/yb/client/SetCheckpointRequest.java
+@@ -26,6 +26,7 @@ public class SetCheckpointRequest extends YRpc<SetCheckpointResponse>{
+   private long index;
+   private long term;
+   private  boolean initialCheckpoint;
++  private boolean bootstrap = false;
+ 
+   public SetCheckpointRequest(YBTable table, String streamId,
+                               String tabletId, long term, long index, boolean initialCheckpoint) {
+@@ -37,6 +38,18 @@ public class SetCheckpointRequest extends YRpc<SetCheckpointResponse>{
+     this.initialCheckpoint = initialCheckpoint;
+   }
+ 
++  public SetCheckpointRequest(YBTable table, String streamId,
++                              String tabletId, long term, long index, boolean initialCheckpoint,
++                              boolean bootstrap) {
++    super(table);
++    this.streamId = streamId;
++    this.tabletId = tabletId;
++    this.term = term;
++    this.index = index;
++    this.initialCheckpoint = initialCheckpoint;
++    this.bootstrap = bootstrap;
++  }
++
+   @Override
+   ChannelBuffer serialize(Message header) {
+     assert header.isInitialized();
+@@ -49,6 +62,7 @@ public class SetCheckpointRequest extends YRpc<SetCheckpointResponse>{
+     builder.setCheckpoint(cBuilder.setOpId(Opid.OpIdPB.newBuilder().setIndex(this.index)
+       .setTerm(this.term).build()).build());
+     builder.setInitialCheckpoint(this.initialCheckpoint);
++    builder.setBootstrap(this.bootstrap);
+     return toChannelBuffer(header, builder.build());
+   }
+ 
+diff --git a/java/yb-client/src/main/java/org/yb/client/YBClient.java b/java/yb-client/src/main/java/org/yb/client/YBClient.java
+index e2402db959..2e2bf49735 100644
+--- a/java/yb-client/src/main/java/org/yb/client/YBClient.java
++++ b/java/yb-client/src/main/java/org/yb/client/YBClient.java
+@@ -1549,6 +1549,27 @@ public class YBClient implements AutoCloseable {
+     return d.join(2 * getDefaultAdminOperationTimeoutMs());
+   }
+ 
++  public SetCheckpointResponse bootstrapTablet(YBTable table, String streamId,
++                                               String tabletId,
++                                               long term,
++                                               long index,
++                                               boolean initialCheckpoint,
++                                               boolean bootstrap) throws Exception {
++    Deferred<SetCheckpointResponse> d = asyncClient.setCheckpointWithBootstrap(table, streamId,
++        tabletId, term, index, initialCheckpoint, bootstrap);
++    d.addErrback(new Callback<Exception, Exception>() {
++      @Override
++      public Exception call(Exception o) throws Exception {
++        o.printStackTrace();
++        throw o;
++      }
++    });
++    d.addCallback(setCheckpointResponse -> {
++      return setCheckpointResponse;
++    });
++    return d.join(2 * getDefaultAdminOperationTimeoutMs());
++  }
++
+   public DeleteUniverseReplicationResponse deleteUniverseReplication(
+     String replicationGroupName) throws Exception {
+     Deferred<DeleteUniverseReplicationResponse> d =
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index 46bed1b9bc..ef3638fde3 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -1473,7 +1473,8 @@ class TransactionParticipant::Impl
+   }
+ 
+   OpId GetLatestCheckPoint() REQUIRES(mutex_) {
+-    return CoarseMonoClock::Now() < cdc_sdk_min_checkpint_op_id_expiration_
++    return CoarseMonoClock::Now() < cdc_sdk_min_checkpint_op_id_expiration_ &&
++                   cdc_sdk_min_checkpint_op_id_ != OpId::Invalid()
+                ? cdc_sdk_min_checkpint_op_id_
+                : OpId::Max();
+   }
+@@ -1581,7 +1582,7 @@ class TransactionParticipant::Impl
+ 
+   rpc::Poller poller_;
+ 
+-  OpId cdc_sdk_min_checkpint_op_id_ = OpId::Max();
++  OpId cdc_sdk_min_checkpint_op_id_ = OpId::Invalid();
+   CoarseTimePoint cdc_sdk_min_checkpint_op_id_expiration_ = CoarseTimePoint::min();
+ };
+ 

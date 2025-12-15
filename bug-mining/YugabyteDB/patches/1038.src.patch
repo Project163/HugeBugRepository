@@ -1,0 +1,695 @@
+diff --git a/src/yb/client/transaction.cc b/src/yb/client/transaction.cc
+index 20b1268299..1cd704fb0c 100644
+--- a/src/yb/client/transaction.cc
++++ b/src/yb/client/transaction.cc
+@@ -487,11 +487,16 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+               prev_tablet_id = &tablet_id;
+               tablets_[tablet_id].has_metadata = true;
+             }
++            // 'num_completed_batches' for the involved tablet should be updated only when the op
++            // performs a write at the tablet (explicit write/read with explicit locks), which is
++            // checked for in the above 'if' clause. Else, we could run into scenarios where a txn
++            // promotion request is sent to a participant which hasn't yet registered the txn, and
++            // would lead to a 40001 being returned to pg.
++            ++tablets_[tablet_id].num_completed_batches;
+           }
+           if (transaction_status_move_tablets_.count(tablet_id)) {
+             schedule_status_moved = true;
+           }
+-          ++tablets_[tablet_id].num_completed_batches;
+         }
+       } else {
+         const TransactionError txn_err(status);
+@@ -1205,6 +1210,11 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+       return;
+     }
+ 
++    // TODO: In case of transaction promotion, DoCommit is called only after we hearback on all
++    // sent transation status move requests. So either the promotion went through, in which case
++    // transaction participants of all involved tablets check the txn's state against the new
++    // status tablet, or the promotion failed, in which case we anyways abort the transaction.
++    // TBD if we do require a successfull PENDING heartbeat to go through.
+     if (old_status_tablet_ && last_old_heartbeat_failed_.load(std::memory_order_acquire)) {
+       auto rpc = PrepareOldStatusTabletFinalHeartbeat(deadline, seal_only, status, transaction);
+       lock.unlock();
+@@ -1715,10 +1725,7 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+     VLOG_WITH_PREFIX(4) << __func__ << "(" << TransactionStatus_Name(status) << ", "
+                         << send_to_new_tablet << ")";
+ 
+-    auto old_status_tablet_state = old_status_tablet_state_.load(std::memory_order_acquire);
+-    if (!send_to_new_tablet &&
+-        old_status_tablet_state != OldTransactionState::kNone &&
+-        old_status_tablet_state != OldTransactionState::kRunning) {
++    if (!ShouldContinueHeartbeats(send_to_new_tablet)) {
+       VLOG_WITH_PREFIX(1) << "Old status tablet is no longer in use, cancelling heartbeat";
+       return;
+     }
+@@ -1771,6 +1778,34 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+     FATAL_INVALID_ENUM_VALUE(TransactionState, current_state);
+   }
+ 
++  // Returns whether the heartbeater thread should continue heartbeating.
++  //
++  // When 'send_to_new_tablet' is true, we should continue sending/processing heartbeat requests/
++  // responses as they are with the new status tablet stored in 'status_tablet_'.
++  //
++  // When 'send_to_new_tablet' is false, we should continue heartbeats in the following cases:
++  // 1. Heartbeating to 'status_tablet_':
++  //    - happens when the transaction started off as a global txn. In this case
++  //      'old_status_tablet_state_' remains in 'kNone'.
++  //    - transaction started off as local, and promotion hasn't been kicked off yet (new status
++  //      tablet hasn't been picked yet). 'old_status_tablet_state_' remains in 'kNone' until the
++  //      'status_tablet_' switch happens.
++  // 2. Heartbeating to 'old_status_tablet_':
++  //    - transaction started off as local, and was promoted. 'old_status_tablet_state_' remains
++  //      in 'kRunning' until abort is sent to 'old_status_tablet_'.
++  // Once an abort request is sent to the old status tablet, 'old_status_tablet_state_' transitions
++  // to 'kAborting', and to 'kAborted' from there. Hence, we should not process heartbeat responses
++  // or initiate new heartbeat requests when not in ('kNone', 'kRunning') states, as they wouldn't
++  // reflect the actual status of the transaction.
++  bool ShouldContinueHeartbeats(SendHeartbeatToNewTablet send_to_new_tablet) {
++    if (send_to_new_tablet) {
++      return true;
++    }
++    auto old_status_tablet_state = old_status_tablet_state_.load(std::memory_order_acquire);
++    return old_status_tablet_state == OldTransactionState::kNone ||
++           old_status_tablet_state == OldTransactionState::kRunning;
++  }
++
+   void HeartbeatDone(Status status,
+                      const tserver::UpdateTransactionRequestPB& request,
+                      const tserver::UpdateTransactionResponsePB& response,
+@@ -1800,6 +1835,20 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+                         << TransactionStatus_Name(transaction_status) << ", "
+                         << send_to_new_tablet << ")";
+ 
++    if (!ShouldContinueHeartbeats(send_to_new_tablet)) {
++      // It could have happended that all UpdateTransactionStatusLocation requests went through
++      // and we issued an abort to the old status tablet. We should ignore any heartbeat response
++      // we receive after that. Since the promotion went through, the involved txn participants
++      // would check against the latest status tablet for any course of action. So we need not
++      // be concerned on whether this was a genuine heartbeat error and can safely exit without
++      // error handling or cleanup (they will be handled by the other heartbeater thread hitting
++      // the new status tablet in 'status_tablet_').
++      VLOG_WITH_PREFIX_AND_FUNC(1)
++          << "Skipping cleanup because the heartbeat response from the old status tablet was "
++          << "received after sending abort to old status tablet. "
++          << old_status_tablet_state_.load(std::memory_order_relaxed);
++      return;
++    }
+     if (!send_to_new_tablet) {
+       last_old_heartbeat_failed_.store(!status.ok(), std::memory_order_release);
+     }
+diff --git a/src/yb/tablet/running_transaction.cc b/src/yb/tablet/running_transaction.cc
+index e7fcde934c..e3ffe2144e 100644
+--- a/src/yb/tablet/running_transaction.cc
++++ b/src/yb/tablet/running_transaction.cc
+@@ -13,6 +13,8 @@
+ 
+ #include "yb/tablet/running_transaction.h"
+ 
++#include <glog/logging.h>
++
+ #include "yb/client/transaction_rpc.h"
+ 
+ #include "yb/common/hybrid_time.h"
+@@ -41,6 +43,9 @@ DEFINE_UNKNOWN_int64(transaction_abort_check_interval_ms, 5000 * yb::kTimeMultip
+ DEFINE_UNKNOWN_int64(transaction_abort_check_timeout_ms, 30000 * yb::kTimeMultiplier,
+              "Timeout used when checking for aborted transactions.");
+ 
++DEFINE_test_flag(bool, pause_sending_txn_status_requests, false,
++                 "When set, hold off sending transaction status requests until the flag is reset.");
++
+ namespace yb {
+ namespace tablet {
+ 
+@@ -146,9 +151,9 @@ void RunningTransaction::RequestStatusAt(const StatusRequest& request,
+       "Existing status knowledge ($0, $1) does not satisfy requested: $2, sending: $3",
+       TransactionStatus_Name(last_known_status_), last_known_status_hybrid_time_, request,
+       request_id);
+-
++  auto status_tablet = shared_self->status_tablet();
+   lock->unlock();
+-  SendStatusRequest(request_id, shared_self);
++  SendStatusRequest(status_tablet, request_id, shared_self);
+ }
+ 
+ bool RunningTransaction::WasAborted() const {
+@@ -176,13 +181,15 @@ void RunningTransaction::Abort(client::YBClient* client,
+   }
+   bool was_empty = abort_waiters_.empty();
+   abort_waiters_.push_back(std::move(callback));
++  auto status_tablet = this->status_tablet();
++  abort_request_in_progress_ = true;
+   lock->unlock();
+   VLOG_WITH_PREFIX(3) << "Abort request: " << was_empty;
+   if (!was_empty) {
+     return;
+   }
+   tserver::AbortTransactionRequestPB req;
+-  req.set_tablet_id(metadata_.status_tablet);
++  req.set_tablet_id(status_tablet);
+   req.set_transaction_id(metadata_.transaction_id.data(), metadata_.transaction_id.size());
+   req.set_propagated_hybrid_time(context_.participant_context_.Now().ToUint64());
+   context_.rpcs_.RegisterAndStart(
+@@ -191,7 +198,8 @@ void RunningTransaction::Abort(client::YBClient* client,
+           nullptr /* tablet */,
+           client,
+           &req,
+-          std::bind(&RunningTransaction::AbortReceived, this, _1, _2, shared_from_this())),
++          std::bind(&RunningTransaction::AbortReceived, this, status_tablet,
++                    _1, _2, shared_from_this())),
+       &abort_handle_);
+ }
+ 
+@@ -229,13 +237,20 @@ boost::optional<TransactionStatus> RunningTransaction::GetStatusAt(
+         return TransactionStatus::PENDING;
+       }
+       return boost::none;
++    case TransactionStatus::CREATED: {
++      // This can happen in case of transaction promotion. The first status request to the old
++      // status tablet could have arrived and the transaction could have undergone promoted in
++      // the interim. In that case, we just return the past known status (which could be CREATED
++      // if this was the first ever txn status request).
++      return boost::none;
++    }
+     default:
+       FATAL_INVALID_ENUM_VALUE(TransactionStatus, last_known_status);
+   }
+ }
+ 
+ void RunningTransaction::SendStatusRequest(
+-    int64_t serial_no, const RunningTransactionPtr& shared_self) {
++    const TabletId& status_tablet, int64_t serial_no, const RunningTransactionPtr& shared_self) {
+   TRACE_FUNC();
+   VTRACE(1, yb::ToString(metadata_.transaction_id));
+   auto* client = context_.participant_context_.client_future().get();
+@@ -243,9 +258,18 @@ void RunningTransaction::SendStatusRequest(
+     LOG(WARNING) << "Shutting down. Cannot get GetTransactionStatus: " << metadata_;
+     return;
+   }
++  if (PREDICT_FALSE(FLAGS_TEST_pause_sending_txn_status_requests)) {
++    VLOG_WITH_PREFIX_AND_FUNC(4) << "FLAGS_TEST_pause_sending_txn_status_requests set. Holding "
++                                 << "off sending transaction status requests until flag is reset.";
++    while (FLAGS_TEST_pause_sending_txn_status_requests) {
++      SleepFor(10ms);
++    }
++    VLOG_WITH_PREFIX_AND_FUNC(4) << "Resume sending transaction status requests "
++                                 << "against status tablet: " << status_tablet;
++  }
+   outstanding_status_requests_.fetch_add(1, std::memory_order_relaxed);
+   tserver::GetTransactionStatusRequestPB req;
+-  req.set_tablet_id(metadata_.status_tablet);
++  req.set_tablet_id(status_tablet);
+   req.add_transaction_id()->assign(
+       pointer_cast<const char*>(metadata_.transaction_id.data()), metadata_.transaction_id.size());
+   req.set_propagated_hybrid_time(context_.participant_context_.Now().ToUint64());
+@@ -255,11 +279,13 @@ void RunningTransaction::SendStatusRequest(
+           nullptr /* tablet */,
+           client,
+           &req,
+-          std::bind(&RunningTransaction::StatusReceived, this, _1, _2, serial_no, shared_self)),
++          std::bind(&RunningTransaction::StatusReceived, this, status_tablet, _1, _2, serial_no,
++                    shared_self)),
+       &get_status_handle_);
+ }
+ 
+ void RunningTransaction::StatusReceived(
++    const TabletId& status_tablet,
+     const Status& status,
+     const tserver::GetTransactionStatusResponsePB& response,
+     int64_t serial_no,
+@@ -268,17 +294,25 @@ void RunningTransaction::StatusReceived(
+   if (delay_usec > 0) {
+     context_.delayer().Delay(
+         MonoTime::Now() + MonoDelta::FromMicroseconds(delay_usec),
+-        std::bind(&RunningTransaction::DoStatusReceived, this, status, response,
++        std::bind(&RunningTransaction::DoStatusReceived, this, status_tablet, status, response,
+                   serial_no, shared_self));
+   } else {
+-    DoStatusReceived(status, response, serial_no, shared_self);
++    DoStatusReceived(status_tablet, status, response, serial_no, shared_self);
+   }
+ }
+ 
+ bool RunningTransaction::UpdateStatus(
+-    TransactionStatus transaction_status, HybridTime time_of_status,
++    const TabletId& status_tablet, TransactionStatus transaction_status, HybridTime time_of_status,
+     HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
+     const Status& expected_deadlock_status) {
++  if (status_tablet != this->status_tablet()) {
++    // Can happen in case of transaction promotion, should be okay to return an existing older
++    // status as the subsequent requests would return the latest status.
++    VLOG_WITH_PREFIX_AND_FUNC(4) << "Passed in status tablet isn't the current active status "
++                                 << "tablet of the txn. Not updating the txn status.";
++    return last_known_status_ == TransactionStatus::ABORTED;
++  }
++
+   if (!local_commit_time_ && transaction_status != TransactionStatus::ABORTED) {
+     // If we've already committed locally, then last_known_aborted_subtxn_set_ is already set
+     // properly. Otherwise, we should update it here.
+@@ -312,13 +346,14 @@ bool RunningTransaction::UpdateStatus(
+   return transaction_status == TransactionStatus::ABORTED;
+ }
+ 
+-void RunningTransaction::DoStatusReceived(const Status& status,
++void RunningTransaction::DoStatusReceived(const TabletId& status_tablet,
++                                          const Status& status,
+                                           const tserver::GetTransactionStatusResponsePB& response,
+                                           int64_t serial_no,
+                                           const RunningTransactionPtr& shared_self) {
+   TRACE("$0: $1", __func__, response.ShortDebugString());
+   VLOG_WITH_PREFIX(4) << __func__ << "(" << status << ", " << response.ShortDebugString() << ", "
+-                      << serial_no << ")";
++                      << serial_no << ")" << " from status tablet: " << status_tablet;
+ 
+   outstanding_status_requests_.fetch_sub(1, std::memory_order_relaxed);
+   if (response.has_propagated_hybrid_time()) {
+@@ -333,6 +368,7 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+   SubtxnSet aborted_subtxn_set;
+   const bool ok = status.ok();
+   int64_t new_request_id = -1;
++  TabletId current_status_tablet;
+   {
+     MinRunningNotifier min_running_notifier(&context_.applier_);
+     std::unique_lock<std::mutex> lock(context_.mutex_);
+@@ -381,8 +417,8 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+     auto coordinator_safe_time = response.coordinator_safe_time().size() == 1
+         ? HybridTime::FromPB(response.coordinator_safe_time(0)) : HybridTime();
+     auto did_abort_txn = UpdateStatus(
+-        transaction_status, time_of_status, coordinator_safe_time, aborted_subtxn_set,
+-        expected_deadlock_status);
++        status_tablet, transaction_status, time_of_status, coordinator_safe_time,
++        aborted_subtxn_set, expected_deadlock_status);
+     if (did_abort_txn) {
+       context_.NotifyAbortedTransactionIncrement(id());
+       context_.EnqueueRemoveUnlocked(
+@@ -399,9 +435,10 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+       new_request_id = context_.NextRequestIdUnlocked();
+       VLOG_WITH_PREFIX(4) << "Waiters still present, send new status request: " << new_request_id;
+     }
++    current_status_tablet = shared_self->status_tablet();
+   }
+   if (new_request_id >= 0) {
+-    SendStatusRequest(new_request_id, shared_self);
++    SendStatusRequest(current_status_tablet, new_request_id, shared_self);
+   }
+   NotifyWaiters(
+       serial_no, time_of_status, transaction_status, aborted_subtxn_set, status_waiters,
+@@ -482,7 +519,8 @@ Result<TransactionStatusResult> RunningTransaction::MakeAbortResult(
+   return TransactionStatusResult{response.status(), status_time, SubtxnSet()};
+ }
+ 
+-void RunningTransaction::AbortReceived(const Status& status,
++void RunningTransaction::AbortReceived(const TabletId& status_tablet,
++                                       const Status& status,
+                                        const tserver::AbortTransactionResponsePB& response,
+                                        const RunningTransactionPtr& shared_self) {
+   if (response.has_propagated_hybrid_time()) {
+@@ -497,6 +535,15 @@ void RunningTransaction::AbortReceived(const Status& status,
+   {
+     MinRunningNotifier min_running_notifier(&context_.applier_);
+     std::lock_guard lock(context_.mutex_);
++    LOG_IF(DFATAL, !abort_request_in_progress_)
++        << "AbortReceived executed with abort_request_in_progress_ unset. Could lead to data "
++        << "inconsistentcy issues in case of Geo-Partition workloads.";
++    abort_request_in_progress_ = false;
++
++    LOG_IF(DFATAL, status_tablet != shared_self->status_tablet())
++        << "Status Tablet switched while Abort txn request was in progress. This might lead "
++        << "to data consistency issues.";
++
+     context_.rpcs_.Unregister(&abort_handle_);
+     abort_waiters_.swap(abort_waiters);
+     // kMax status_time means that this status is not yet replicated and could be rejected.
+@@ -504,8 +551,8 @@ void RunningTransaction::AbortReceived(const Status& status,
+     if (result.ok() && result->status_time != HybridTime::kMax) {
+       auto coordinator_safe_time = HybridTime::FromPB(response.coordinator_safe_time());
+       if (UpdateStatus(
+-          result->status, result->status_time, coordinator_safe_time, result->aborted_subtxn_set,
+-          result->expected_deadlock_status)) {
++          status_tablet, result->status, result->status_time, coordinator_safe_time,
++          result->aborted_subtxn_set, result->expected_deadlock_status)) {
+         context_.NotifyAbortedTransactionIncrement(id());
+         context_.EnqueueRemoveUnlocked(
+             id(), RemoveReason::kAbortReceived, &min_running_notifier,
+diff --git a/src/yb/tablet/running_transaction.h b/src/yb/tablet/running_transaction.h
+index 1773ef8628..abf439a3b3 100644
+--- a/src/yb/tablet/running_transaction.h
++++ b/src/yb/tablet/running_transaction.h
+@@ -56,8 +56,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+   }
+ 
+   MUST_USE_RESULT bool UpdateStatus(
+-      TransactionStatus transaction_status, HybridTime time_of_status,
+-      HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
++      const TabletId& status_tablet, TransactionStatus transaction_status,
++      HybridTime time_of_status, HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
+       const Status& expected_deadlock_status);
+ 
+   void UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode);
+@@ -106,6 +106,18 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+              TransactionStatusCallback callback,
+              std::unique_lock<std::mutex>* lock);
+ 
++  Status CheckPromotionAllowed() {
++    if (last_known_status_ == TransactionStatus::ABORTED) {
++      return STATUS_FORMAT(
++          IllegalState, Format("Transaction $0 in ABORTED state. Cannot be promoted.", id()));
++    }
++    if (abort_request_in_progress_) {
++      return STATUS_FORMAT(
++          IllegalState, Format("Request to abort txn $0 in progress. Cannot be promoted.", id()));
++    }
++    return Status::OK();
++  }
++
+   std::string ToString() const;
+   void ScheduleRemoveIntents(const RunningTransactionPtr& shared_self, RemoveReason reason);
+ 
+@@ -136,14 +148,17 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+       HybridTime last_known_status_hybrid_time,
+       TransactionStatus last_known_status);
+ 
+-  void SendStatusRequest(int64_t serial_no, const RunningTransactionPtr& shared_self);
++  void SendStatusRequest(
++      const TabletId& status_tablet, int64_t serial_no, const RunningTransactionPtr& shared_self);
+ 
+-  void StatusReceived(const Status& status,
++  void StatusReceived(const TabletId& status_tablet,
++                      const Status& status,
+                       const tserver::GetTransactionStatusResponsePB& response,
+                       int64_t serial_no,
+                       const RunningTransactionPtr& shared_self);
+ 
+-  void DoStatusReceived(const Status& status,
++  void DoStatusReceived(const TabletId& status_tablet,
++                        const Status& status,
+                         const tserver::GetTransactionStatusResponsePB& response,
+                         int64_t serial_no,
+                         const RunningTransactionPtr& shared_self);
+@@ -164,7 +179,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+       const Status& status,
+       const tserver::AbortTransactionResponsePB& response);
+ 
+-  void AbortReceived(const Status& status,
++  void AbortReceived(const TabletId& status_tablet,
++                     const Status& status,
+                      const tserver::AbortTransactionResponsePB& response,
+                      const RunningTransactionPtr& shared_self);
+ 
+@@ -195,6 +211,10 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+ 
+   // Time of the next check whether this transaction has been aborted.
+   HybridTime abort_check_ht_;
++  // Is true if an external request to abort the transaction is in progress i.e. AbortTransaction
++  // rpc to the transaction coordinator is in progress. Gets set in RunningTransaction::Abort and
++  // reset in RunningTransaction::AbortReceived.
++  bool abort_request_in_progress_ = false;
+ 
+   // Number of outstanding status request rpcs.
+   std::atomic<int64_t> outstanding_status_requests_{0};
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index 42eca599fb..5e4e66efe2 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -1051,7 +1051,7 @@ class TransactionParticipant::Impl
+           &participant_context_, &rpcs_, FLAGS_max_transactions_in_status_request,
+           [this, resolve_at, &recheck_ids, &committed_ids](
+               const std::vector <TransactionStatusInfo>& status_infos) {
+-            std::vector<std::pair<TransactionId, Status>> aborted;
++            std::vector<TransactionStatusInfo> aborted;
+             for (const auto& info : status_infos) {
+               VLOG_WITH_PREFIX(4) << "Transaction status: " << info.ToString();
+               if (info.status == TransactionStatus::COMMITTED) {
+@@ -1061,7 +1061,7 @@ class TransactionParticipant::Impl
+                   committed_ids.push_back(info.transaction_id);
+                 }
+               } else if (info.status == TransactionStatus::ABORTED) {
+-                aborted.push_back({info.transaction_id, info.expected_deadlock_status});
++                aborted.push_back(info);
+               } else {
+                 LOG_IF_WITH_PREFIX(DFATAL, info.status != TransactionStatus::PENDING)
+                     << "Transaction is in unexpected state: " << info.ToString();
+@@ -1073,10 +1073,20 @@ class TransactionParticipant::Impl
+             if (!aborted.empty()) {
+               MinRunningNotifier min_running_notifier(&applier_);
+               std::lock_guard lock(mutex_);
+-              for (const auto& [id, expected_deadlock_status] : aborted) {
++              for (const auto& info : aborted) {
++                // TODO: Refactor so that the clean up code can use the established iterator
++                // instead of executing find again.
++                auto it = transactions_.find(info.transaction_id);
++                if (it != transactions_.end() && (*it)->status_tablet() != info.status_tablet) {
++                  VLOG_WITH_PREFIX(2) << "Dropping Aborted status for txn "
++                                      << info.transaction_id.ToString()
++                                      << " from old status tablet " << info.status_tablet
++                                      << ". New status tablet " << (*it)->status_tablet();
++                  continue;
++                }
+                 EnqueueRemoveUnlocked(
+-                    id, RemoveReason::kStatusReceived, &min_running_notifier,
+-                    expected_deadlock_status);
++                    info.transaction_id, RemoveReason::kStatusReceived, &min_running_notifier,
++                    info.expected_deadlock_status);
+               }
+             }
+           });
+@@ -1248,6 +1258,8 @@ class TransactionParticipant::Impl
+       }
+ 
+       auto& transaction = *it;
++      RETURN_NOT_OK_SET_CODE(transaction->CheckPromotionAllowed(),
++                             PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));
+       metadata = transaction->metadata();
+       VLOG_WITH_PREFIX(2) << "Update transaction status location for transaction: "
+                           << metadata.transaction_id << " from tablet " << metadata.status_tablet
+@@ -1679,8 +1691,8 @@ class TransactionParticipant::Impl
+         continue;
+       }
+       if ((**it).UpdateStatus(
+-          info.status, info.status_ht, info.coordinator_safe_time, info.aborted_subtxn_set,
+-          info.expected_deadlock_status)) {
++          info.status_tablet, info.status, info.status_ht, info.coordinator_safe_time,
++          info.aborted_subtxn_set, info.expected_deadlock_status)) {
+         NotifyAbortedTransactionIncrement(info.transaction_id);
+         EnqueueRemoveUnlocked(
+             info.transaction_id, RemoveReason::kStatusReceived, &min_running_notifier,
+diff --git a/src/yb/tablet/transaction_status_resolver.cc b/src/yb/tablet/transaction_status_resolver.cc
+index 13dfcfe71f..1b91c2ddb2 100644
+--- a/src/yb/tablet/transaction_status_resolver.cc
++++ b/src/yb/tablet/transaction_status_resolver.cc
+@@ -197,6 +197,7 @@ class TransactionStatusResolver::Impl {
+     status_infos_.resize(request_size);
+     for (size_t i = 0; i != request_size; ++i) {
+       auto& status_info = status_infos_[i];
++      status_info.status_tablet = it->first;
+       status_info.transaction_id = queue.front();
+       status_info.status = TransactionStatus::ABORTED;
+       status_info.status_ht = HybridTime::kMax;
+@@ -257,6 +258,7 @@ class TransactionStatusResolver::Impl {
+     status_infos_.resize(response.status().size());
+     for (int i = 0; i != response.status().size(); ++i) {
+       auto& status_info = status_infos_[i];
++      status_info.status_tablet = it->first;
+       status_info.transaction_id = queue.front();
+       status_info.status = response.status(i);
+       if (response.deadlock_reason().size() > i &&
+diff --git a/src/yb/tablet/transaction_status_resolver.h b/src/yb/tablet/transaction_status_resolver.h
+index 91b5fe17c2..b01daf95c5 100644
+--- a/src/yb/tablet/transaction_status_resolver.h
++++ b/src/yb/tablet/transaction_status_resolver.h
+@@ -28,6 +28,7 @@ namespace yb {
+ namespace tablet {
+ 
+ struct TransactionStatusInfo {
++  TabletId status_tablet;
+   TransactionId transaction_id = TransactionId::Nil();
+   TransactionStatus status;
+   SubtxnSet aborted_subtxn_set;
+@@ -38,7 +39,8 @@ struct TransactionStatusInfo {
+   Status expected_deadlock_status = Status::OK();
+ 
+   std::string ToString() const {
+-    return YB_STRUCT_TO_STRING(transaction_id, status, status_ht, coordinator_safe_time);
++    return YB_STRUCT_TO_STRING(
++        status_tablet, transaction_id, status, status_ht, coordinator_safe_time);
+   }
+ };
+ 
+diff --git a/src/yb/yql/pgwrapper/geo_transactions_promotion-test.cc b/src/yb/yql/pgwrapper/geo_transactions_promotion-test.cc
+index a51245850b..158bd4ad80 100644
+--- a/src/yb/yql/pgwrapper/geo_transactions_promotion-test.cc
++++ b/src/yb/yql/pgwrapper/geo_transactions_promotion-test.cc
+@@ -22,12 +22,14 @@
+ #include "yb/yql/pgwrapper/geo_transactions_test_base.h"
+ 
+ DECLARE_bool(TEST_consider_all_local_transaction_tables_local);
++DECLARE_bool(TEST_pause_sending_txn_status_requests);
+ DECLARE_bool(TEST_select_all_status_tablets);
+ DECLARE_bool(TEST_txn_status_moved_rpc_force_fail);
+ DECLARE_bool(auto_create_local_transaction_tables);
+ DECLARE_bool(auto_promote_nonlocal_transactions_to_global);
+ DECLARE_bool(enable_wait_queues);
+ DECLARE_bool(force_global_transactions);
++DECLARE_bool(yb_enable_read_committed_isolation);
+ DECLARE_double(transaction_max_missed_heartbeat_periods);
+ DECLARE_int32(TEST_old_txn_status_abort_delay_ms);
+ DECLARE_int32(TEST_transaction_inject_flushed_delay_ms);
+@@ -827,5 +829,156 @@ TEST_F(GeoPartitionedDeadlockTest, YB_DISABLE_TEST_IN_TSAN(TestDeadlockAcrossTab
+   thread_holder.WaitAndStop(35s * kTimeMultiplier);
+ }
+ 
++class GeoPartitionedReadCommiittedTest : public GeoTransactionsTestBase {
++ protected:
++  void SetUp() override {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_read_committed_isolation) = true;
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = false;
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_create_local_transaction_tables) = true;
++    GeoTransactionsTestBase::SetUp();
++    SetupTablespaces();
++  }
++
++  // Sets up a partitioned table with primary key(state, country) partitioned on state into 3
++  // partitions. partition P_i hosts states S_(2*i-1), S_(2*i). Partitioned table P1 is split
++  // into 2 tablets and the other partitioned tables are split into 1 tablet.
++  void SetUpPartitionedTable(const std::string& table_name) {
++    auto current_version = GetCurrentVersion();
++    auto conn = ASSERT_RESULT(Connect());
++    ASSERT_OK(conn.ExecuteFormat(
++        "CREATE TABLE $0(people int, state VARCHAR, country VARCHAR, $1) PARTITION BY LIST (state)",
++        table_name, "PRIMARY KEY(state, country)"));
++
++    std::vector<std::string> partition_list;
++    partition_list.reserve(NumRegions());
++    for (size_t i = 1; i <= NumRegions(); i++) {
++      partition_list.push_back(Format("('S$0', 'S$1')", 2*i - 1, 2*i));
++    }
++    for (size_t i = 1; i <= NumRegions(); i++) {
++      auto num_tablets = Format("SPLIT INTO $0 TABLETS", i == 1 ? 2 : 1);
++      ASSERT_OK(conn.ExecuteFormat(
++          "CREATE TABLE $0$1 PARTITION OF $0 FOR VALUES IN $2 TABLESPACE tablespace$1 $3",
++          table_name, i, partition_list[i - 1], num_tablets));
++
++      if (ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables)) {
++        WaitForStatusTabletsVersion(current_version + 1);
++        ++current_version;
++      }
++    }
++    ASSERT_OK(conn.ExecuteFormat(
++          "CREATE TABLE $0_defaut PARTITION OF $0 DEFAULT TABLESPACE tablespace$1", table_name, 3));
++
++    // For states S[1-6], insert countries C[0-10].
++    for (size_t i = 0; i <= 10; i++) {
++      for (size_t j = 1; j <= 2 * NumRegions(); j++) {
++        ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES(0, 'S$1', 'C$2')", table_name, j, i));
++      }
++    }
++  }
++};
++
++// The below test helps assert that transaction promotion requests are sent only to involved
++// tablets that have already processed a write of the transaction (explicit write/read with locks).
++TEST_F(GeoPartitionedReadCommiittedTest, TestPromotionAmidstConflicts) {
++  auto table_name = "foo";
++  SetUpPartitionedTable(table_name);
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
++
++  TestThreadHolder thread_holder;
++  const auto num_sessions = 5;
++  const auto num_iterations = 20;
++  for (int i = 1; i <= num_sessions; i++) {
++    thread_holder.AddThreadFunctor([this, i, table_name] {
++      for (int j = 1; j <= num_iterations; j++) {
++        auto conn = ASSERT_RESULT(Connect());
++        ASSERT_OK(conn.Execute("SET force_global_transaction = false"));
++        ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"));
++        // Start off as a local txn, hitting just one tablet of the local partition.
++        ASSERT_OK(conn.ExecuteFormat(
++            "UPDATE $0 SET people=people+1 WHERE country='C0' AND state='S$1'",
++            table_name, i%2 + 1));
++        // The below would trigger transaction promotion since it would launch read ops across all
++        // tablets. This would lead to transaction promotion amidst conflicting writes.
++        ASSERT_OK(conn.ExecuteFormat(
++            "UPDATE $0 SET people=people+1 WHERE country='C$1'", table_name, (j + 1)/2));
++        ASSERT_OK(conn.CommitTransaction());
++      }
++    });
++  }
++  thread_holder.WaitAndStop(60s * kTimeMultiplier);
++
++  // Assert that the conflicting updates above go through successfully.
++  auto conn = ASSERT_RESULT(Connect());
++  for (int i = 1; i <= num_iterations/2; i++) {
++    auto rows_res = ASSERT_RESULT(conn.FetchFormat(
++        Format("SELECT people FROM $0 WHERE country='C$1'", table_name, i)));
++    auto num_fetched_rows = PQntuples(rows_res.get());
++    for (int j = 0; j < num_fetched_rows; j++) {
++      ASSERT_EQ(num_sessions * 2, ASSERT_RESULT(pgwrapper::GetValue<int32>(rows_res.get(), j, 0)));
++    }
++  }
++}
++
++// The test asserts that the transaction participant ignores status responses from old status tablet
++// for transactions that underwent promotion. If not, the participant could end up cleaning intents
++// and silently let the commit go through, thus leading to data loss/inconsistency in case of
++// promoted transactions. Refer #19535 for details.
++TEST_F(GeoPartitionedReadCommiittedTest,
++       YB_DISABLE_TEST_IN_TSAN(TestParticipantIgnoresAbortFromOldStatusTablet)) {
++  auto table_name = "foo";
++  const auto kLocalState = "S1";
++  const auto kOtherState = "S6";
++  SetUpPartitionedTable(table_name);
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = false;
++
++  auto update_query = Format(
++      "UPDATE $0 SET people=people+1 WHERE country='C0' AND state='$1'", table_name, kLocalState);
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.Execute("SET force_global_transaction = false"));
++  ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"));
++  // Start off as a local txn. Will end up writing intents.
++  ASSERT_OK(conn.Execute(update_query));
++  // Delay sending all status requests for this txn from the txn participant end.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_sending_txn_status_requests) = true;
++
++  const auto num_sessions = 5;
++  CountDownLatch requested_status_of_txn_with_intents{num_sessions};
++  TestThreadHolder thread_holder;
++  for (int i = 0; i < num_sessions; i++) {
++    thread_holder.AddThreadFunctor(
++        [this, &requested_status_of_txn_with_intents, update_query] {
++      auto conn = ASSERT_RESULT(Connect());
++      ASSERT_OK(conn.Execute("SET force_global_transaction = false"));
++      ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED"));
++      // Try performing conflicting updates which end up requesting status of the txn with intents.
++      auto status_future = std::async(std::launch::async, [&conn, update_query]() {
++        return conn.Execute(update_query);
++      });
++      ASSERT_OK(WaitFor([&conn] () {
++        return conn.IsBusy();
++      }, 1s * kTimeMultiplier, "Wait for blocking request to be submitted to the query layer"));
++      requested_status_of_txn_with_intents.CountDown();
++      ASSERT_OK(status_future.get());
++      ASSERT_OK(conn.CommitTransaction());
++    });
++  }
++  // Wait for the status requests for this transaction to pile up with the current status tablet.
++  ASSERT_TRUE(requested_status_of_txn_with_intents.WaitFor(10s * kTimeMultiplier));
++  SleepFor(5s * kTimeMultiplier);
++  // Make the transaction undergo transaction promotion, which switches its status tablet.
++  ASSERT_OK(conn.ExecuteFormat(
++      "UPDATE $0 SET people=people+1 WHERE country='C1' AND state='$1'", table_name, kOtherState));
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_sending_txn_status_requests) = false;
++  // Wait for the piled up status requests to get executed and process the response from the old
++  // status tablet.
++  SleepFor(5s * kTimeMultiplier);
++  ASSERT_OK(conn.CommitTransaction());
++
++  thread_holder.WaitAndStop(60s * kTimeMultiplier);
++  auto res = ASSERT_RESULT(conn.FetchValue<int32_t>(Format(
++      "SELECT people FROM $0 WHERE country='C0' AND state='$1'", table_name, kLocalState)));
++  ASSERT_EQ(res, num_sessions + 1);
++}
++
+ } // namespace client
+ } // namespace yb

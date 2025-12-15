@@ -1,0 +1,750 @@
+diff --git a/mypy/checker.py b/mypy/checker.py
+index 6ddd778b8..af4604faa 100644
+--- a/mypy/checker.py
++++ b/mypy/checker.py
+@@ -2228,6 +2228,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
+                 if not inferred.is_final:
+                     rvalue_type = remove_instance_last_known_values(rvalue_type)
+                 self.infer_variable_type(inferred, lvalue, rvalue_type, rvalue)
++            self.check_assignment_to_slots(lvalue)
+ 
+     # (type, operator) tuples for augmented assignments supported with partial types
+     partial_type_augmented_ops: Final = {
+@@ -2557,6 +2558,59 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
+                 if lv.node.is_final and not is_final_decl:
+                     self.msg.cant_assign_to_final(name, lv.node.info is None, s)
+ 
++    def check_assignment_to_slots(self, lvalue: Lvalue) -> None:
++        if not isinstance(lvalue, MemberExpr):
++            return
++
++        inst = get_proper_type(self.expr_checker.accept(lvalue.expr))
++        if not isinstance(inst, Instance):
++            return
++        if inst.type.slots is None:
++            return  # Slots do not exist, we can allow any assignment
++        if lvalue.name in inst.type.slots:
++            return  # We are assigning to an existing slot
++        for base_info in inst.type.mro[:-1]:
++            if base_info.names.get('__setattr__') is not None:
++                # When type has `__setattr__` defined,
++                # we can assign any dynamic value.
++                # We exclude object, because it always has `__setattr__`.
++                return
++
++        definition = inst.type.get(lvalue.name)
++        if definition is None:
++            # We don't want to duplicate
++            # `"SomeType" has no attribute "some_attr"`
++            # error twice.
++            return
++        if self.is_assignable_slot(lvalue, definition.type):
++            return
++
++        self.fail(
++            'Trying to assign name "{}" that is not in "__slots__" of type "{}"'.format(
++                lvalue.name, inst.type.fullname,
++            ),
++            lvalue,
++        )
++
++    def is_assignable_slot(self, lvalue: Lvalue, typ: Optional[Type]) -> bool:
++        if getattr(lvalue, 'node', None):
++            return False  # This is a definition
++
++        typ = get_proper_type(typ)
++        if typ is None or isinstance(typ, AnyType):
++            return True  # Any can be literally anything, like `@propery`
++        if isinstance(typ, Instance):
++            # When working with instances, we need to know if they contain
++            # `__set__` special method. Like `@property` does.
++            # This makes assigning to properties possible,
++            # even without extra slot spec.
++            return typ.type.get('__set__') is not None
++        if isinstance(typ, FunctionLike):
++            return True  # Can be a property, or some other magic
++        if isinstance(typ, UnionType):
++            return all(self.is_assignable_slot(lvalue, u) for u in typ.items)
++        return False
++
+     def check_assignment_to_multiple_lvalues(self, lvalues: List[Lvalue], rvalue: Expression,
+                                              context: Context,
+                                              infer_lvalue_type: bool = True) -> None:
+diff --git a/mypy/nodes.py b/mypy/nodes.py
+index ce0286db8..e34a7f2ad 100644
+--- a/mypy/nodes.py
++++ b/mypy/nodes.py
+@@ -2298,6 +2298,10 @@ class TypeInfo(SymbolNode):
+     runtime_protocol = False               # Does this protocol support isinstance checks?
+     abstract_attributes: List[str]
+     deletable_attributes: List[str]  # Used by mypyc only
++    # Does this type have concrete `__slots__` defined?
++    # If class does not have `__slots__` defined then it is `None`,
++    # if it has empty `__slots__` then it is an empty set.
++    slots: Optional[Set[str]]
+ 
+     # The attributes 'assuming' and 'assuming_proper' represent structural subtype matrices.
+     #
+@@ -2401,6 +2405,7 @@ class TypeInfo(SymbolNode):
+         self.is_abstract = False
+         self.abstract_attributes = []
+         self.deletable_attributes = []
++        self.slots = None
+         self.assuming = []
+         self.assuming_proper = []
+         self.inferring = []
+diff --git a/mypy/semanal.py b/mypy/semanal.py
+index 9597e4a21..6e3258672 100644
+--- a/mypy/semanal.py
++++ b/mypy/semanal.py
+@@ -2048,6 +2048,7 @@ class SemanticAnalyzer(NodeVisitor[None],
+             self.process_module_assignment(s.lvalues, s.rvalue, s)
+         self.process__all__(s)
+         self.process__deletable__(s)
++        self.process__slots__(s)
+ 
+     def analyze_identity_global_assignment(self, s: AssignmentStmt) -> bool:
+         """Special case 'X = X' in global scope.
+@@ -3365,6 +3366,62 @@ class SemanticAnalyzer(NodeVisitor[None],
+             assert self.type
+             self.type.deletable_attributes = attrs
+ 
++    def process__slots__(self, s: AssignmentStmt) -> None:
++        """
++        Processing ``__slots__`` if defined in type.
++
++        See: https://docs.python.org/3/reference/datamodel.html#slots
++        """
++        # Later we can support `__slots__` defined as `__slots__ = other = ('a', 'b')`
++        if (isinstance(self.type, TypeInfo) and
++                len(s.lvalues) == 1 and isinstance(s.lvalues[0], NameExpr) and
++                s.lvalues[0].name == '__slots__' and s.lvalues[0].kind == MDEF):
++
++            # We understand `__slots__` defined as string, tuple, list, set, and dict:
++            if not isinstance(s.rvalue, (StrExpr, ListExpr, TupleExpr, SetExpr, DictExpr)):
++                # For example, `__slots__` can be defined as a variable,
++                # we don't support it for now.
++                return
++
++            if any(p.slots is None for p in self.type.mro[1:-1]):
++                # At least one type in mro (excluding `self` and `object`)
++                # does not have concrete `__slots__` defined. Ignoring.
++                return
++
++            concrete_slots = True
++            rvalue: List[Expression] = []
++            if isinstance(s.rvalue, StrExpr):
++                rvalue.append(s.rvalue)
++            elif isinstance(s.rvalue, (ListExpr, TupleExpr, SetExpr)):
++                rvalue.extend(s.rvalue.items)
++            else:
++                # We have a special treatment of `dict` with possible `{**kwargs}` usage.
++                # In this case we consider all `__slots__` to be non-concrete.
++                for key, _ in s.rvalue.items:
++                    if concrete_slots and key is not None:
++                        rvalue.append(key)
++                    else:
++                        concrete_slots = False
++
++            slots = []
++            for item in rvalue:
++                # Special case for `'__dict__'` value:
++                # when specified it will still allow any attribute assignment.
++                if isinstance(item, StrExpr) and item.value != '__dict__':
++                    slots.append(item.value)
++                else:
++                    concrete_slots = False
++            if not concrete_slots:
++                # Some slot items are dynamic, we don't want any false positives,
++                # so, we just pretend that this type does not have any slots at all.
++                return
++
++            # We need to copy all slots from super types:
++            for super_type in self.type.mro[1:-1]:
++                assert super_type.slots is not None
++                slots.extend(super_type.slots)
++            self.type.slots = set(slots)
++
+     #
+     # Misc statements
+     #
+diff --git a/mypy/test/testcheck.py b/mypy/test/testcheck.py
+index 7b63f60ad..c71b9aeea 100644
+--- a/mypy/test/testcheck.py
++++ b/mypy/test/testcheck.py
+@@ -95,6 +95,7 @@ typecheck_files = [
+     'check-typeguard.test',
+     'check-functools.test',
+     'check-singledispatch.test',
++    'check-slots.test',
+ ]
+ 
+ # Tests that use Python 3.8-only AST features (like expression-scoped ignores):
+diff --git a/test-data/unit/check-slots.test b/test-data/unit/check-slots.test
+new file mode 100644
+index 000000000..96e4eba3c
+--- /dev/null
++++ b/test-data/unit/check-slots.test
+@@ -0,0 +1,519 @@
++[case testSlotsDefinitionWithStrAndListAndTuple]
++class A:
++    __slots__ = "a"
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2  # E: Trying to assign name "b" that is not in "__slots__" of type "__main__.A"
++
++class B:
++    __slots__ = ("a", "b")
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.c = 3  # E: Trying to assign name "c" that is not in "__slots__" of type "__main__.B"
++
++class C:
++    __slots__ = ['c']
++    def __init__(self) -> None:
++        self.a = 1  # E: Trying to assign name "a" that is not in "__slots__" of type "__main__.C"
++        self.c = 3
++
++class WithVariable:
++    __fields__ = ['a', 'b']
++    __slots__ = __fields__
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.c = 3
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/list.pyi]
++
++
++[case testSlotsDefinitionWithDict]
++class D:
++    __slots__ = {'key': 'docs'}
++    def __init__(self) -> None:
++        self.key = 1
++        self.missing = 2  # E: Trying to assign name "missing" that is not in "__slots__" of type "__main__.D"
++[builtins fixtures/dict.pyi]
++
++
++[case testSlotsDefinitionWithDynamicDict]
++slot_kwargs = {'b': 'docs'}
++class WithDictKwargs:
++    __slots__ = {'a': 'docs', **slot_kwargs}
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.c = 3
++[builtins fixtures/dict.pyi]
++
++
++[case testSlotsDefinitionWithSet]
++class E:
++    __slots__ = {'e'}
++    def __init__(self) -> None:
++        self.e = 1
++        self.missing = 2  # E: Trying to assign name "missing" that is not in "__slots__" of type "__main__.E"
++[builtins fixtures/set.pyi]
++
++
++[case testSlotsDefinitionOutsideOfClass]
++__slots__ = ("a", "b")
++class A:
++    def __init__(self) -> None:
++        self.x = 1
++        self.y = 2
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsDefinitionWithClassVar]
++class A:
++    __slots__ = ('a',)
++    b = 4
++
++    def __init__(self) -> None:
++        self.a = 1
++
++        # You cannot override class-level variables, but you can use them:
++        b = self.b
++        self.b = 2  # E: Trying to assign name "b" that is not in "__slots__" of type "__main__.A"
++
++        self.c = 3  # E: Trying to assign name "c" that is not in "__slots__" of type "__main__.A"
++
++A.b = 1
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsDefinitionMultipleVars1]
++class A:
++    __slots__ = __fields__ = ("a", "b")
++    def __init__(self) -> None:
++        self.x = 1
++        self.y = 2
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsDefinitionMultipleVars2]
++class A:
++    __fields__ = __slots__ = ("a", "b")
++    def __init__(self) -> None:
++        self.x = 1
++        self.y = 2
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentEmptySlots]
++class A:
++    __slots__ = ()
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++
++a = A()
++a.a = 1
++a.b = 2
++a.missing = 2
++[out]
++main:4: error: Trying to assign name "a" that is not in "__slots__" of type "__main__.A"
++main:5: error: Trying to assign name "b" that is not in "__slots__" of type "__main__.A"
++main:8: error: Trying to assign name "a" that is not in "__slots__" of type "__main__.A"
++main:9: error: Trying to assign name "b" that is not in "__slots__" of type "__main__.A"
++main:10: error: "A" has no attribute "missing"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithSuper]
++class A:
++    __slots__ = ("a",)
++class B(A):
++    __slots__ = ("b", "c")
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self._one = 1
++
++b = B()
++b.a = 1
++b.b = 2
++b.c = 3
++b._one = 1
++b._two = 2
++[out]
++main:9: error: Trying to assign name "_one" that is not in "__slots__" of type "__main__.B"
++main:14: error: "B" has no attribute "c"
++main:15: error: Trying to assign name "_one" that is not in "__slots__" of type "__main__.B"
++main:16: error: "B" has no attribute "_two"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithSuperDuplicateSlots]
++class A:
++    __slots__ = ("a",)
++class B(A):
++    __slots__ = ("a", "b",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self._one = 1  # E: Trying to assign name "_one" that is not in "__slots__" of type "__main__.B"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithMixin]
++class A:
++    __slots__ = ("a",)
++class Mixin:
++    __slots__ = ("m",)
++class B(A, Mixin):
++    __slots__ = ("b",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.m = 2
++        self._one = 1
++
++b = B()
++b.a = 1
++b.m = 2
++b.b = 2
++b._two = 2
++[out]
++main:11: error: Trying to assign name "_one" that is not in "__slots__" of type "__main__.B"
++main:16: error: "B" has no attribute "b"
++main:17: error: "B" has no attribute "_two"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithSlottedSuperButNoChildSlots]
++class A:
++    __slots__ = ("a",)
++class B(A):
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 1
++
++b = B()
++b.a = 1
++b.b = 2
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithoutSuperSlots]
++class A:
++    pass  # no slots
++class B(A):
++    __slots__ = ("a", "b")
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++
++b = B()
++b.a = 1
++b.b = 2
++b.missing = 3
++b.extra = 4  # E: "B" has no attribute "extra"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithoutSuperMixingSlots]
++class A:
++    __slots__ = ()
++class Mixin:
++    pass  # no slots
++class B(A, Mixin):
++    __slots__ = ("a", "b")
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++
++b = B()
++b.a = 1
++b.b = 2
++b.missing = 3
++b.extra = 4  # E: "B" has no attribute "extra"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithExplicitSetattr]
++class A:
++    __slots__ = ("a",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++
++    def __setattr__(self, k, v) -> None:
++        ...
++
++a = A()
++a.a = 1
++a.b = 2
++a.c = 3
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithParentSetattr]
++class Parent:
++    __slots__ = ()
++
++    def __setattr__(self, k, v) -> None:
++        ...
++
++class A(Parent):
++    __slots__ = ("a",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++
++a = A()
++a.a = 1
++a.b = 2
++a.c = 3
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithProps]
++from typing import Any
++
++custom_prop: Any
++
++class A:
++    __slots__ = ("a",)
++
++    @property
++    def first(self) -> int:
++        ...
++
++    @first.setter
++    def first(self, arg: int) -> None:
++        ...
++
++class B(A):
++    __slots__ = ("b",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.c = 3
++
++    @property
++    def second(self) -> int:
++        ...
++
++    @second.setter
++    def second(self, arg: int) -> None:
++        ...
++
++    def get_third(self) -> int:
++        ...
++
++    def set_third(self, arg: int) -> None:
++        ...
++
++    third = custom_prop(get_third, set_third)
++
++b = B()
++b.a = 1
++b.b = 2
++b.c = 3
++b.first = 1
++b.second = 2
++b.third = 3
++b.extra = 'extra'
++[out]
++main:22: error: Trying to assign name "c" that is not in "__slots__" of type "__main__.B"
++main:43: error: Trying to assign name "c" that is not in "__slots__" of type "__main__.B"
++main:47: error: "B" has no attribute "extra"
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/property.pyi]
++
++
++[case testSlotsAssignmentWithUnionProps]
++from typing import Any, Callable, Union
++
++custom_obj: Any
++
++class custom_property(object):
++    def __set__(self, *args, **kwargs):
++        ...
++
++class A:
++    __slots__ = ("a",)
++
++    def __init__(self) -> None:
++        self.a = 1
++
++    b: custom_property
++    c: Union[Any, custom_property]
++    d: Union[Callable, custom_property]
++    e: Callable
++
++a = A()
++a.a = 1
++a.b = custom_obj
++a.c = custom_obj
++a.d = custom_obj
++a.e = custom_obj
++[out]
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/dict.pyi]
++
++
++[case testSlotsAssignmentWithMethodReassign]
++class A:
++    __slots__ = ()
++
++    def __init__(self) -> None:
++        self.method = lambda: None  # E: Cannot assign to a method
++
++    def method(self) -> None:
++        ...
++
++a = A()
++a.method = lambda: None  # E: Cannot assign to a method
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithExplicitDict]
++class A:
++    __slots__ = ("a",)
++class B(A):
++    __slots__ = ("__dict__",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++
++b = B()
++b.a = 1
++b.b = 2
++b.c = 3  # E: "B" has no attribute "c"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithExplicitSuperDict]
++class A:
++    __slots__ = ("__dict__",)
++class B(A):
++    __slots__ = ("a",)
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++
++b = B()
++b.a = 1
++b.b = 2
++b.c = 3  # E: "B" has no attribute "c"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentWithVariable]
++slot_name = "b"
++class A:
++    __slots__ = ("a", slot_name)
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.c = 3
++
++a = A()
++a.a = 1
++a.b = 2
++a.c = 3
++a.d = 4  # E: "A" has no attribute "d"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentMultipleLeftValues]
++class A:
++    __slots__ = ("a", "b")
++    def __init__(self) -> None:
++        self.a, self.b, self.c = (1, 2, 3)  # E: Trying to assign name "c" that is not in "__slots__" of type "__main__.A"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsAssignmentMultipleAssignments]
++class A:
++    __slots__ = ("a",)
++    def __init__(self) -> None:
++        self.a = self.b = self.c = 1
++[out]
++main:4: error: Trying to assign name "b" that is not in "__slots__" of type "__main__.A"
++main:4: error: Trying to assign name "c" that is not in "__slots__" of type "__main__.A"
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsWithTupleCall]
++class A:
++    # TODO: for now this way of writing tuples are not recognised
++    __slots__ = tuple(("a", "b"))
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++[builtins fixtures/tuple.pyi]
++
++
++[case testSlotsWithListCall]
++class A:
++    # TODO: for now this way of writing lists are not recognised
++    __slots__ = list(("a", "b"))
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/list.pyi]
++
++
++[case testSlotsWithSetCall]
++class A:
++    # TODO: for now this way of writing sets are not recognised
++    __slots__ = set(("a", "b"))
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/set.pyi]
++
++
++[case testSlotsWithDictCall]
++class A:
++    # TODO: for now this way of writing dicts are not recognised
++    __slots__ = dict((("a", "docs"), ("b", "docs")))
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++[builtins fixtures/tuple.pyi]
++[builtins fixtures/dict.pyi]
++
++
++[case testSlotsWithAny]
++from typing import Any
++
++some_obj: Any
++
++class A:
++    # You can do anything with `Any`:
++    __slots__ = some_obj
++
++    def __init__(self) -> None:
++        self.a = 1
++        self.b = 2
++        self.missing = 3
++[builtins fixtures/tuple.pyi]
+diff --git a/test-data/unit/fixtures/set.pyi b/test-data/unit/fixtures/set.pyi
+index c2e1f6f75..9852bbc9f 100644
+--- a/test-data/unit/fixtures/set.pyi
++++ b/test-data/unit/fixtures/set.pyi
+@@ -17,6 +17,7 @@ class bool: pass
+ class ellipsis: pass
+ 
+ class set(Iterable[T], Generic[T]):
++    def __init__(self, iterable: Iterable[T] = ...) -> None: ...
+     def __iter__(self) -> Iterator[T]: pass
+     def __contains__(self, item: object) -> bool: pass
+     def __ior__(self, x: Set[T]) -> None: pass
+diff --git a/test-data/unit/fixtures/tuple.pyi b/test-data/unit/fixtures/tuple.pyi
+index 36c53de61..5f7fb01f4 100644
+--- a/test-data/unit/fixtures/tuple.pyi
++++ b/test-data/unit/fixtures/tuple.pyi
+@@ -1,7 +1,8 @@
+ # Builtins stub used in tuple-related test cases.
+ 
+-from typing import Iterable, Iterator, TypeVar, Generic, Sequence, Any, overload, Tuple
++from typing import Iterable, Iterator, TypeVar, Generic, Sequence, Any, overload, Tuple, Type
+ 
++T = TypeVar("T")
+ Tco = TypeVar('Tco', covariant=True)
+ 
+ class object:
+@@ -11,6 +12,7 @@ class type:
+     def __init__(self, *a: object) -> None: pass
+     def __call__(self, *a: object) -> object: pass
+ class tuple(Sequence[Tco], Generic[Tco]):
++    def __new__(cls: Type[T], iterable: Iterable[Tco] = ...) -> T: ...
+     def __iter__(self) -> Iterator[Tco]: pass
+     def __contains__(self, item: object) -> bool: pass
+     def __getitem__(self, x: int) -> Tco: pass
+@@ -31,8 +33,6 @@ class str: pass # For convenience
+ class bytes: pass
+ class unicode: pass
+ 
+-T = TypeVar('T')
+-
+ class list(Sequence[T], Generic[T]):
+     @overload
+     def __getitem__(self, i: int) -> T: ...

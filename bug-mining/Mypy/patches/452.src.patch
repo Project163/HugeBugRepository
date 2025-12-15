@@ -1,0 +1,358 @@
+diff --git a/lib-rt/CPy.h b/lib-rt/CPy.h
+index ee1795547..a63114c0d 100644
+--- a/lib-rt/CPy.h
++++ b/lib-rt/CPy.h
+@@ -8,6 +8,9 @@
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
++#if 0
++} // why isn't emacs smart enough to not indent this
++#endif
+ 
+ #define likely(x)       __builtin_expect((x),1)
+ #define unlikely(x)     __builtin_expect((x),0)
+@@ -39,7 +42,7 @@ static void CPyDebug_Print(const char *msg) {
+ // implementation. We don't do any bounds checking so we'd better be pretty sure
+ // we know that it is there.
+ static inline CPyVTableItem *CPy_FindTraitVtable(PyTypeObject *trait, CPyVTableItem *vtable) {
+-	int i;
++    int i;
+     for (i = -2; ; i -= 2) {
+         if ((PyTypeObject *)vtable[i] == trait) {
+             return (CPyVTableItem *)vtable[i + 1];
+@@ -534,6 +537,16 @@ static void CPy_AddTraceback(const char *filename, const char *funcname, int lin
+     Py_DECREF(frame_obj);
+ }
+ 
++static void CPy_CatchError(PyObject **p_type, PyObject **p_value, PyObject **p_traceback) {
++    PyErr_Fetch(p_type, p_value, p_traceback);
++    // SetExcInfo steals references, so incref them
++    Py_XINCREF(*p_type);
++    Py_XINCREF(*p_value);
++    Py_XINCREF(*p_traceback);
++    PyErr_Clear();
++    PyErr_SetExcInfo(*p_type, *p_value, *p_traceback);
++}
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/mypyc/emitfunc.py b/mypyc/emitfunc.py
+index 493a515d3..a5e162fcc 100644
+--- a/mypyc/emitfunc.py
++++ b/mypyc/emitfunc.py
+@@ -43,6 +43,8 @@ def generate_native_function(fn: FuncIR,
+     body.indent()
+ 
+     for r, i in fn.env.indexes.items():
++        if isinstance(r.type, RTuple):
++            emitter.declare_tuple_struct(r.type)
+         if i < len(fn.args):
+             continue  # skip the arguments
+         ctype = emitter.ctype_spaced(r.type)
+diff --git a/mypyc/genops.py b/mypyc/genops.py
+index e1e956734..0e804f35e 100644
+--- a/mypyc/genops.py
++++ b/mypyc/genops.py
+@@ -62,6 +62,7 @@ from mypyc.ops_misc import (
+ )
+ from mypyc.ops_exc import (
+     no_err_occurred_op, raise_exception_op, clear_exception_op,
++    error_catch_op, clear_exc_info_op,
+ )
+ from mypyc.subtype import is_subtype
+ from mypyc.sametype import is_same_type, is_same_method_signature
+@@ -1510,6 +1511,31 @@ class IRBuilder(NodeVisitor[Value]):
+         self.add(Unreachable())
+         return INVALID_VALUE
+ 
++    class ExceptNonlocalControl(NonlocalControl):
++        """Nonlocal control for except blocks.
++
++        Just makes sure that sys.exc_info always gets cleared when we leave.
++        This is super annoying.
++        """
++        def __init__(self, outer: NonlocalControl, line: int) -> None:
++            self.outer = outer
++            self.line = line
++
++        def gen_cleanup(self, builder: 'IRBuilder') -> None:
++            # TODO: skip generating the clear if we just generated one
++            builder.primitive_op(clear_exc_info_op, [], self.line)
++
++        def gen_break(self, builder: 'IRBuilder') -> None:
++            self.gen_cleanup(builder)
++            self.outer.gen_break(builder)
++
++        def gen_continue(self, builder: 'IRBuilder') -> None:
++            self.gen_cleanup(builder)
++            self.outer.gen_continue(builder)
++
++        def gen_return(self, builder: 'IRBuilder', value: Value) -> None:
++            self.outer.gen_return(builder, value)
++
+     def visit_try_stmt(self, t: TryStmt) -> Value:
+         assert len(t.handlers) == 1 and t.types[0] is None and t.vars[0] is None, (
+             "Only bare except supported")
+@@ -1518,16 +1544,24 @@ class IRBuilder(NodeVisitor[Value]):
+ 
+         except_entry, exit_block = BasicBlock(), BasicBlock()
+ 
++        # Compile the try block with an error handler
+         self.error_handlers.append(except_entry)
+         self.goto_and_activate(BasicBlock())
+         self.accept(t.body)
+         self.add(Goto(exit_block))
+         self.error_handlers.pop()
+ 
++        # Compile the except block with the nonlocal control flow overridden to clear exc_info
+         self.activate_block(except_entry)
+         except_body = t.handlers[0]
+-        self.primitive_op(clear_exception_op, [], except_body.line)
++        self.primitive_op(error_catch_op, [], except_body.line)  # TODO: use this value
++
++        self.nonlocal_control.append(
++            IRBuilder.ExceptNonlocalControl(self.nonlocal_control[-1], except_body.line))
+         self.accept(except_body)
++        self.nonlocal_control.pop()
++
++        self.primitive_op(clear_exc_info_op, [], except_body.line)
+         self.add(Goto(exit_block))
+ 
+         self.activate_block(exit_block)
+diff --git a/mypyc/ops_exc.py b/mypyc/ops_exc.py
+index 55703a9be..364c9279f 100644
+--- a/mypyc/ops_exc.py
++++ b/mypyc/ops_exc.py
+@@ -4,6 +4,7 @@ from typing import List
+ 
+ from mypyc.ops import (
+     EmitterInterface, PrimitiveOp, none_rprimitive, bool_rprimitive, object_rprimitive,
++    void_rtype,
+     exc_rtuple,
+     ERR_NEVER, ERR_MAGIC, ERR_FALSE
+ )
+@@ -21,16 +22,29 @@ raise_exception_op = custom_op(
+     format_str = 'raise_exception({args[0]}, {args[1]}); {dest} = 0',
+     emit=simple_emit('PyErr_SetObject({args[0]}, {args[1]}); {dest} = 0;'))
+ 
+-# This having a return value is pretty ugly
+ clear_exception_op = custom_op(
+     arg_types=[],
+-    result_type=bool_rprimitive,
++    result_type=void_rtype,
+     error_kind=ERR_NEVER,
+-    format_str = 'clear_exception(); {dest} = 0',
+-    emit=simple_emit('PyErr_Clear(); {dest} = 0; (void){dest};'))
++    format_str = 'clear_exception',
++    emit=simple_emit('PyErr_Clear();'))
+ 
+ no_err_occurred_op = func_op(name='no_err_occurred',
+                              arg_types=[],
+                              result_type=bool_rprimitive,
+                              error_kind=ERR_FALSE,
+                              emit=simple_emit('{dest} = (PyErr_Occurred() == NULL);'))
++
++error_catch_op = custom_op(
++    arg_types=[],
++    result_type=exc_rtuple,
++    error_kind=ERR_NEVER,
++    format_str = '{dest} = err_catch',
++    emit=simple_emit('CPy_CatchError(&{dest}.f0, &{dest}.f1, &{dest}.f2);'))
++
++clear_exc_info_op = custom_op(
++    arg_types=[],
++    result_type=void_rtype,
++    error_kind=ERR_NEVER,
++    format_str = 'clear_exc_info',
++    emit=simple_emit('PyErr_SetExcInfo(NULL, NULL, NULL);'))
+diff --git a/test-data/exceptions.test b/test-data/exceptions.test
+index 95d21722d..8bdd3994c 100644
+--- a/test-data/exceptions.test
++++ b/test-data/exceptions.test
+@@ -159,7 +159,8 @@ L2:
+ L3:
+     goto L8
+ L4:
+-    clear_exception(); r4 = 0
++    r4 = err_catch
++    dec_ref r4
+     r5 = unicode_1 :: static  ('weeee')
+     r6 = builtins.module :: static
+     r7 = unicode_2 :: static  ('print')
+@@ -173,6 +174,7 @@ L6:
+     r10 = cast(None, r9)
+     if is_error(r10) goto L9 (error at g:5) else goto L11
+ L7:
++    clear_exc_info
+ L8:
+     r11 = None
+     return r11
+diff --git a/test-data/genops-try.test b/test-data/genops-try.test
+index 8a7cc94ce..08b02be99 100644
+--- a/test-data/genops-try.test
++++ b/test-data/genops-try.test
+@@ -9,7 +9,7 @@ def g():
+     r0 :: object
+     r1 :: str
+     r2, r3 :: object
+-    r4 :: bool
++    r4 :: tuple[object, object, object]
+     r5 :: str
+     r6 :: object
+     r7 :: str
+@@ -23,13 +23,14 @@ L1:
+     r3 = py_call(r2)
+     goto L3
+ L2: (handler for L1)
+-    clear_exception(); r4 = 0
++    r4 = err_catch
+     r5 = unicode_1 :: static  ('weeee')
+     r6 = builtins.module :: static
+     r7 = unicode_2 :: static  ('print')
+     r8 = getattr r6, r7
+     r9 = py_call(r8, r5)
+     r10 = cast(None, r9)
++    clear_exc_info
+ L3:
+     r11 = None
+     return r11
+@@ -50,7 +51,7 @@ def g(b):
+     r1 :: str
+     r2, r3 :: object
+     r4, r5 :: str
+-    r6 :: bool
++    r6 :: tuple[object, object, object]
+     r7 :: str
+     r8 :: object
+     r9 :: str
+@@ -71,13 +72,14 @@ L3:
+ L4:
+     goto L6
+ L5: (handler for L1, L2, L3, L4)
+-    clear_exception(); r6 = 0
++    r6 = err_catch
+     r7 = unicode_2 :: static  ('weeee')
+     r8 = builtins.module :: static
+     r9 = unicode_3 :: static  ('print')
+     r10 = getattr r8, r9
+     r11 = py_call(r10, r7)
+     r12 = cast(None, r11)
++    clear_exc_info
+ L6:
+     r13 = None
+     return r13
+@@ -102,13 +104,13 @@ def g():
+     r6 :: object
+     r7 :: str
+     r8, r9 :: object
+-    r10 :: bool
++    r10 :: tuple[object, object, object]
+     r11 :: str
+     r12 :: object
+     r13 :: str
+     r14, r15 :: object
+     r16 :: None
+-    r17 :: bool
++    r17 :: tuple[object, object, object]
+     r18 :: str
+     r19 :: object
+     r20 :: str
+@@ -129,23 +131,25 @@ L2:
+     r9 = py_call(r8)
+     goto L4
+ L3: (handler for L2)
+-    clear_exception(); r10 = 0
++    r10 = err_catch
+     r11 = unicode_3 :: static  ('b')
+     r12 = builtins.module :: static
+     r13 = unicode_1 :: static  ('print')
+     r14 = getattr r12, r13
+     r15 = py_call(r14, r11)
+     r16 = cast(None, r15)
++    clear_exc_info
+ L4:
+     goto L6
+ L5: (handler for L1, L3, L4)
+-    clear_exception(); r17 = 0
++    r17 = err_catch
+     r18 = unicode_4 :: static  ('weeee')
+     r19 = builtins.module :: static
+     r20 = unicode_1 :: static  ('print')
+     r21 = getattr r19, r20
+     r22 = py_call(r21, r18)
+     r23 = cast(None, r22)
++    clear_exc_info
+ L6:
+     r24 = None
+     return r24
+diff --git a/test-data/run.test b/test-data/run.test
+index a129e77c0..edae40771 100644
+--- a/test-data/run.test
++++ b/test-data/run.test
+@@ -455,6 +455,7 @@ Traceback (most recent call last):
+ Exception
+ 
+ [case testTryExcept]
++import wrapsys
+ def g(b: bool) -> None:
+     try:
+         if b:
+@@ -464,13 +465,55 @@ def g(b: bool) -> None:
+             raise Exception('hi')
+     except:
+         print("caught!")
++
++def r(b: bool) -> None:
++    if b:
++        x = [0]
++        x[1]
++    else:
++        raise Exception('hi')
++
++def f(b: bool) -> None:
++    try:
++        r(b)
++    except:
++        print(str(wrapsys.exc_info()[1]))
++    print(str(wrapsys.exc_info()[1]))
++
++def h() -> None:
++    while True:
++        try:
++            raise Exception('gonna break')
++        except:
++            print(str(wrapsys.exc_info()[1]))
++            break
++    print(str(wrapsys.exc_info()[1]))
++
++[file wrapsys.py]
++# This is a gross hack around some limitations of the test system/mypyc.
++from typing import Any
++import sys
++def exc_info() -> Any:
++    return sys.exc_info()  # type: ignore
++
+ [file driver.py]
+-from native import g
++from native import g, f, h
+ g(True)
+ g(False)
++
++f(True)
++f(False)
++
++h()
+ [out]
+ caught!
+ caught!
++list index out of range
++None
++hi
++None
++gonna break
++None
+ 
+ [case testGenericEquality]
+ def eq(a: object, b: object) -> bool:

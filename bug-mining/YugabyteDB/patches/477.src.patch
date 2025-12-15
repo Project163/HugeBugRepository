@@ -1,0 +1,184 @@
+diff --git a/src/yb/client/snapshot-txn-test.cc b/src/yb/client/snapshot-txn-test.cc
+index ea399e3b3c..3fb2310ee4 100644
+--- a/src/yb/client/snapshot-txn-test.cc
++++ b/src/yb/client/snapshot-txn-test.cc
+@@ -44,6 +44,7 @@ DECLARE_int32(TEST_inject_status_resolver_delay_ms);
+ DECLARE_int32(log_min_seconds_to_retain);
+ DECLARE_int32(txn_max_apply_batch_records);
+ DECLARE_uint64(max_transactions_in_status_request);
++DECLARE_bool(TEST_disallow_lmp_failures);
+ 
+ namespace yb {
+ namespace client {
+@@ -295,6 +296,7 @@ void SnapshotTxnTest::TestBankAccounts(BankAccountsOptions options, CoarseDurati
+ }
+ 
+ TEST_F(SnapshotTxnTest, BankAccounts) {
++  FLAGS_TEST_disallow_lmp_failures = true;
+   TestBankAccounts({}, 30s, RegularBuildVsSanitizers(10, 1) /* minimal_updates_per_second */);
+ }
+ 
+diff --git a/src/yb/consensus/consensus_peers.cc b/src/yb/consensus/consensus_peers.cc
+index 13a71ee432..003a5d2bb3 100644
+--- a/src/yb/consensus/consensus_peers.cc
++++ b/src/yb/consensus/consensus_peers.cc
+@@ -304,6 +304,7 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
+   // If the queue is empty, check if we were told to send a status-only message (which is what
+   // happens during heartbeats). If not, just return.
+   if (PREDICT_FALSE(!req_has_ops && trigger_mode == RequestTriggerMode::kNonEmptyOnly)) {
++    queue_->RequestWasNotSent(peer_pb_.permanent_uuid());
+     return;
+   }
+ 
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index b7cfc0b509..f70aff58f0 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -117,6 +117,9 @@ DEFINE_int32(consensus_lagging_follower_threshold, 10,
+ TAG_FLAG(consensus_lagging_follower_threshold, advanced);
+ TAG_FLAG(consensus_lagging_follower_threshold, runtime);
+ 
++DEFINE_test_flag(bool, disallow_lmp_failures, false,
++                 "Whether we disallow PRECEDING_ENTRY_DIDNT_MATCH failures for non new peers.");
++
+ namespace {
+ 
+ constexpr const auto kMinRpcThrottleThresholdBytes = 16;
+@@ -182,6 +185,12 @@ void PeerMessageQueue::TrackedPeer::ResetLeaderLeases() {
+   leader_ht_lease_expiration.Reset();
+ }
+ 
++void PeerMessageQueue::TrackedPeer::ResetLastRequest() {
++  // Reset so that next transmission is not considered a re-transmission.
++  last_num_messages_sent = -1;
++  current_retransmissions = -1;
++}
++
+ #define INSTANTIATE_METRIC(x) \
+   x.Instantiate(metric_entity, 0)
+ PeerMessageQueue::Metrics::Metrics(const scoped_refptr<MetricEntity>& metric_entity)
+@@ -479,20 +488,22 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
+       peer->leader_lease_expiration.last_sent =
+           CoarseMonoClock::Now() + leader_lease_duration_ms * 1ms - kCoarseClockPrecision * 2;
+       peer->leader_ht_lease_expiration.last_sent = ht_lease_expiration_micros;
++      preceding_id = peer->last_received;
+     } else {
+       now_ht = clock_->Now();
+       request->clear_leader_lease_duration_ms();
+       request->clear_ht_lease_expiration();
+       peer->leader_lease_expiration.Reset();
+       peer->leader_ht_lease_expiration.Reset();
++
++      // This is initialized to the queue's last appended op but gets set to the id of the
++      // log entry preceding the first one in 'messages' if messages are found for the peer.
++      // Just because we don't know actual state of a new peer.
++      preceding_id = queue_state_.last_appended;
+     }
+ 
+     request->set_propagated_hybrid_time(now_ht.ToUint64());
+ 
+-    // This is initialized to the queue's last appended op but gets set to the id of the
+-    // log entry preceding the first one in 'messages' if messages are found for the peer.
+-    preceding_id = queue_state_.last_appended;
+-
+     // NOTE: committed_op_id may be overwritten later.
+     queue_state_.committed_op_id.ToPB(request->mutable_committed_op_id());
+ 
+@@ -1026,6 +1037,20 @@ void PeerMessageQueue::NotifyPeerIsResponsiveDespiteError(const std::string& pee
+   peer->last_successful_communication_time = MonoTime::Now();
+ }
+ 
++void PeerMessageQueue::RequestWasNotSent(const std::string& peer_uuid) {
++  LockGuard scoped_lock(queue_lock_);
++  DCHECK_NE(State::kQueueConstructed, queue_state_.state);
++
++  TrackedPeer* peer = FindPtrOrNull(peers_map_, peer_uuid);
++  if (PREDICT_FALSE(queue_state_.state != State::kQueueOpen || peer == nullptr)) {
++    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Queue is closed or peer was untracked.";
++    return;
++  }
++
++  peer->ResetLastRequest();
++}
++
++
+ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
+                                         const ConsensusResponsePB& response) {
+   DCHECK(response.IsInitialized()) << "Error: Uninitialized: "
+@@ -1082,9 +1107,7 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
+     peer->is_new = false;
+     peer->last_successful_communication_time = MonoTime::Now();
+ 
+-    // Reset so that next transmission is not considered a re-transmission.
+-    peer->last_num_messages_sent = -1;
+-    peer->current_retransmissions = -1;
++    peer->ResetLastRequest();
+ 
+     if (response.has_status()) {
+       const auto& status = response.status();
+@@ -1138,6 +1161,7 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
+             } else {
+               LOG_WITH_PREFIX_UNLOCKED(INFO) << "Got LMP mismatch error from peer: "
+                                              << peer->ToString();
++              CHECK(!FLAGS_TEST_disallow_lmp_failures);
+             }
+             return true;
+           }
+diff --git a/src/yb/consensus/consensus_queue.h b/src/yb/consensus/consensus_queue.h
+index 95d0fd5439..0148f89df1 100644
+--- a/src/yb/consensus/consensus_queue.h
++++ b/src/yb/consensus/consensus_queue.h
+@@ -132,6 +132,8 @@ class PeerMessageQueue {
+ 
+     void ResetLeaderLeases();
+ 
++    void ResetLastRequest();
++
+     // UUID of the peer.
+     const std::string uuid;
+ 
+@@ -294,6 +296,8 @@ class PeerMessageQueue {
+   virtual bool ResponseFromPeer(const std::string& peer_uuid,
+                                 const ConsensusResponsePB& response);
+ 
++  void RequestWasNotSent(const std::string& peer_uuid);
++
+   // Closes the queue, peers are still allowed to call UntrackPeer() and ResponseFromPeer() but no
+   // additional peers can be tracked or messages queued.
+   virtual void Close();
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index a18d0eb8eb..b63ff96c6d 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1644,6 +1644,15 @@ struct ReadContext {
+     return tablet->IsTransactionalRequest(req->pgsql_batch_size() > 0);
+   }
+ 
++  ReadHybridTime FormRestartReadHybridTime(const HybridTime& restart_time)  const {
++    DCHECK_GT(restart_time, read_time.read);
++    VLOG(1) << "Restart read required at: " << restart_time << ", original: " << read_time;
++    auto result = read_time;
++    result.read = restart_time;
++    result.local_limit = safe_ht_to_read;
++    return result;
++  }
++
+   CHECKED_STATUS PickReadTime(server::Clock* clock) {
+     auto result = DoPickReadTime(clock);
+     if (!result.ok()) {
+@@ -1675,15 +1684,6 @@ struct ReadContext {
+     }
+     return Status::OK();
+   }
+-
+-  ReadHybridTime FormRestartReadHybridTime(const HybridTime& restart_time)  const {
+-    DCHECK_GT(restart_time, read_time.read);
+-    VLOG(1) << "Restart read required at: " << restart_time << ", original: " << read_time;
+-    auto result = read_time;
+-    result.read = restart_time;
+-    result.local_limit = safe_ht_to_read;
+-    return result;
+-  }
+ };
+ 
+ // Used when we write intents during read, i.e. for serializable isolation.

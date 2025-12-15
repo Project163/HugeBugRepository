@@ -1,0 +1,137 @@
+diff --git a/src/yb/consensus/log-test.cc b/src/yb/consensus/log-test.cc
+index 49f1fd7e2c..208934181e 100644
+--- a/src/yb/consensus/log-test.cc
++++ b/src/yb/consensus/log-test.cc
+@@ -220,7 +220,7 @@ void LogTest::DoReuseLastSegmentTest(bool durable_wal_write) {
+   // log_->Close() simulates crash now
+   FLAGS_TEST_simulate_abrupt_server_restart = true;
+   FLAGS_TEST_skip_file_close = true;
+-  FLAGS_reuse_unclosed_segment_threshold = 512_KB;
++  FLAGS_reuse_unclosed_segment_threshold_bytes = 512_KB;
+   // Restore value options_.durable_wal_write back later.
+   bool temp = options_.durable_wal_write;
+   options_.durable_wal_write = durable_wal_write;
+diff --git a/src/yb/integration-tests/raft_consensus-itest.cc b/src/yb/integration-tests/raft_consensus-itest.cc
+index 60a3956187..0d831baf7b 100644
+--- a/src/yb/integration-tests/raft_consensus-itest.cc
++++ b/src/yb/integration-tests/raft_consensus-itest.cc
+@@ -40,8 +40,11 @@
+ #include <gtest/gtest.h>
+ 
+ #include "yb/client/client.h"
++#include "yb/client/client-test-util.h"
+ #include "yb/client/error.h"
++#include "yb/client/schema.h"
+ #include "yb/client/session.h"
++#include "yb/client/table_creator.h"
+ #include "yb/client/table_handle.h"
+ #include "yb/client/yb_op.h"
+ 
+@@ -2004,6 +2007,68 @@ TEST_F(RaftConsensusITest, TestReplicaBehaviorViaRPC) {
+   }
+ }
+ 
++TEST_F(RaftConsensusITest, TestExpiredOperationWithSchemaChange) {
++  FLAGS_num_tablet_servers = 3;
++
++  vector<string> ts_flags = {
++    "--enable_leader_failure_detection=false"s,
++  };
++  vector<string> master_flags = {
++    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
++    "--use_create_table_leader_hint=false"s,
++  };
++  ASSERT_NO_FATALS(BuildAndStart(ts_flags, master_flags));
++
++  vector<TServerDetails*> tservers = TServerDetailsVector(tablet_servers_);
++
++  // Become leader.
++  ASSERT_OK(StartElection(tservers[0], tablet_id_, MonoDelta::FromSeconds(10)));
++  ASSERT_OK(WaitUntilLeader(tservers[0], tablet_id_, MonoDelta::FromSeconds(10)));
++  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(10), tablet_servers_, tablet_id_, 1));
++
++  // Make the the prepare thread to delay.
++  auto* const ts = cluster_->tablet_server(0);
++  ASSERT_OK(cluster_->SetFlag(ts, "TEST_block_prepare_batch", "true"));
++  // And the following write will also get delayed in prepare phase.
++  ASSERT_NOK(WriteSimpleTestRow(
++      tservers[0], tablet_id_, kTestRowKey, kTestRowIntVal, "foo", MonoDelta::FromSeconds(2)));
++
++  LOG(INFO) << "Stepping down leader " << tservers[0];
++  // Step down and verify that leadership gracefully transitions to a new leader
++  // despite failure detection being disabled.
++  bool allow_graceful_leader_transfer = true;
++  ASSERT_OK(LeaderStepDown(
++      tservers[0], tablet_id_, nullptr, MonoDelta::FromSeconds(10),
++      !allow_graceful_leader_transfer));
++  TServerDetails* new_leader_ts = nullptr;
++  ASSERT_OK(
++      FindTabletLeader(tablet_servers_, tablet_id_, MonoDelta::FromSeconds(10), &new_leader_ts));
++  ASSERT_TRUE(new_leader_ts != nullptr);
++  LOG(INFO) << "Identified new leader " << new_leader_ts;
++
++  // Schema change.
++  client::YBTableName index_name(YQL_DATABASE_CQL, "test", "TestExpiredOperationWithSchemaChange");
++  ASSERT_OK(client_->CreateNamespaceIfNotExists(index_name.namespace_name()));
++  auto client_schema = client::YBSchemaFromSchema(GetSimpleTestSchema());
++  client::TableHandle table;
++  ASSERT_OK(table.Open(kTableName, client_.get()));
++  std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
++  ASSERT_OK(table_creator->table_name(index_name)
++      .table_type(client::YBTableType::YQL_TABLE_TYPE)
++      .indexed_table_id(table->id())
++      .schema(&client_schema)
++      .hash_schema(dockv::YBHashSchema::kMultiColumnHash)
++      .timeout(MonoDelta::FromSeconds(10))
++      .wait(true)
++      .TEST_use_old_style_create_request()
++      .Create());
++
++  // The previous delayed write operation's term and schema version is less than the current.
++  // Because of smaller term, we expect WriteQuery::Finish() will skip CHECK on schema version.
++  ASSERT_OK(cluster_->SetFlag(ts, "TEST_block_prepare_batch", "false"));
++  SleepFor(MonoDelta::FromMilliseconds(1000));
++}
++
+ TEST_F(RaftConsensusITest, TestLeaderStepDown) {
+   FLAGS_num_tablet_servers = 3;
+ 
+diff --git a/src/yb/tablet/preparer.cc b/src/yb/tablet/preparer.cc
+index 74e1844e6a..d4bb651315 100644
+--- a/src/yb/tablet/preparer.cc
++++ b/src/yb/tablet/preparer.cc
+@@ -44,6 +44,9 @@ DEFINE_UNKNOWN_double(estimated_replicate_msg_size_percentage, 0.95,
+ DEFINE_test_flag(int32, preparer_batch_inject_latency_ms, 0,
+                  "Inject latency before replicating batch.");
+ 
++DEFINE_test_flag(bool, block_prepare_batch, false,
++                 "pause the prepare task.");
++
+ DECLARE_int32(protobuf_message_total_bytes_limit);
+ DECLARE_uint64(rpc_max_message_size);
+ 
+@@ -203,6 +206,9 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
+ 
+ void PreparerImpl::Run() {
+   VLOG(2) << "Starting prepare task:" << this;
++  while (GetAtomicFlag(&FLAGS_TEST_block_prepare_batch)) {
++      std::this_thread::sleep_for(100ms);
++  }
+   for (;;) {
+     while (OperationDriver *item = queue_.Pop()) {
+       active_tasks_.fetch_sub(1, std::memory_order_release);
+diff --git a/src/yb/tablet/write_query.cc b/src/yb/tablet/write_query.cc
+index ea75031446..43fdb59f7f 100644
+--- a/src/yb/tablet/write_query.cc
++++ b/src/yb/tablet/write_query.cc
+@@ -225,7 +225,9 @@ void WriteQuery::Finished(WriteOperation* operation, const Status& status) {
+   auto& metadata = *tablet->metadata();
+ 
+   for (const auto& sv : operation->request()->write_batch().table_schema_version()) {
+-    CHECK_LE(metadata.schema_version(), sv.schema_version());
++    if (!status.IsAborted()) {
++      CHECK_LE(metadata.schema_version(), sv.schema_version()) << ", status: " << status;
++    }
+   }
+ 
+   Complete(status);

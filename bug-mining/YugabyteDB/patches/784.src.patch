@@ -1,0 +1,586 @@
+diff --git a/src/yb/client/async_rpc.cc b/src/yb/client/async_rpc.cc
+index d773e6d622..e93751512c 100644
+--- a/src/yb/client/async_rpc.cc
++++ b/src/yb/client/async_rpc.cc
+@@ -35,11 +35,13 @@
+ #include "yb/tserver/tserver_service.proxy.h"
+ 
+ #include "yb/util/cast.h"
++#include "yb/util/debug-util.h"
+ #include "yb/util/flag_tags.h"
+ #include "yb/util/logging.h"
+ #include "yb/util/metrics.h"
+ #include "yb/util/result.h"
+ #include "yb/util/status_log.h"
++#include "yb/util/sync_point.h"
+ #include "yb/util/trace.h"
+ #include "yb/util/yb_pg_errcodes.h"
+ 
+@@ -94,6 +96,9 @@ DEFINE_CAPABILITY(PickReadTimeAtTabletServer, 0x8284d67b);
+ 
+ DECLARE_bool(collect_end_to_end_traces);
+ 
++DEFINE_test_flag(bool, asyncrpc_finished_set_timedout, false,
++                 "Whether to reset asyncrpc response status to Timedout.");
++
+ using namespace std::placeholders;
+ 
+ namespace yb {
+@@ -125,8 +130,17 @@ bool LocalTabletServerOnly(const InFlightOps& ops) {
+           !FLAGS_forward_redis_requests);
+ }
+ 
++void FillRequestIds(const RetryableRequestId request_id,
++                    const RetryableRequestId min_running_request_id,
++                    InFlightOps* ops) {
++  for (auto& op : *ops) {
++    op.yb_op->set_request_id(request_id);
++    op.yb_op->set_min_running_request_id(min_running_request_id);
++  }
+ }
+ 
++} // namespace
++
+ AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& entity)
+     : remote_write_rpc_time(METRIC_handler_latency_yb_client_write_remote.Instantiate(entity)),
+       remote_read_rpc_time(METRIC_handler_latency_yb_client_read_remote.Instantiate(entity)),
+@@ -211,6 +225,15 @@ std::shared_ptr<const YBTable> AsyncRpc::table() const {
+ 
+ void AsyncRpc::Finished(const Status& status) {
+   Status new_status = status;
++  if (status.ok()) {
++    if (PREDICT_FALSE(ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_asyncrpc_finished_set_timedout))) {
++      new_status = STATUS(
++          TimedOut, "Fake TimedOut for testing due to FLAGS_TEST_asyncrpc_finished_set_timedout");
++      TEST_SYNC_POINT("AsyncRpc::Finished:SetTimedOut:1");
++      TEST_SYNC_POINT("AsyncRpc::Finished:SetTimedOut:2");
++    }
++
++  }
+   if (tablet_invoker_.Done(&new_status)) {
+     if (tablet().is_split() ||
+         ClientError(new_status) == ClientErrorCode::kTablePartitionListIsStale) {
+@@ -518,18 +541,20 @@ WriteRpc::WriteRpc(const AsyncRpcData& data)
+     auto temp = client_id.ToUInt64Pair();
+     req_.set_client_id1(temp.first);
+     req_.set_client_id2(temp.second);
+-    auto request_pair = batcher_->NextRequestIdAndMinRunningRequestId(data.tablet->tablet_id());
+-    req_.set_request_id(request_pair.first);
+-    req_.set_min_running_request_id(request_pair.second);
++    const auto& first_yb_op = ops_.begin()->yb_op;
++    if (first_yb_op->request_id().has_value()) {
++      req_.set_request_id(first_yb_op->request_id().value());
++      req_.set_min_running_request_id(first_yb_op->min_running_request_id().value());
++    } else {
++      const auto request_pair = batcher_->NextRequestIdAndMinRunningRequestId();
++      req_.set_request_id(request_pair.first);
++      req_.set_min_running_request_id(request_pair.second);
++    }
++    FillRequestIds(req_.request_id(), req_.min_running_request_id(), &ops_);
+   }
+ }
+ 
+ WriteRpc::~WriteRpc() {
+-  // Check that we sent request id info, i.e. (client_id, request_id, min_running_request_id).
+-  if (req_.has_client_id1()) {
+-    batcher_->RequestFinished(tablet().tablet_id(), req_.request_id());
+-  }
+-
+   if (async_rpc_metrics_) {
+     scoped_refptr<Histogram> write_rpc_time = IsLocalCall() ?
+                                               async_rpc_metrics_->local_write_rpc_time :
+@@ -639,10 +664,6 @@ void WriteRpc::NotifyBatcher(const Status& status) {
+   batcher_->ProcessWriteResponse(*this, status);
+ }
+ 
+-bool WriteRpc::ShouldRetryExpiredRequest() {
+-  return req_.min_running_request_id() == kInitializeFromMinRunning;
+-}
+-
+ ReadRpc::ReadRpc(const AsyncRpcData& data, YBConsistencyLevel yb_consistency_level)
+     : AsyncRpcBase(data, yb_consistency_level) {
+   TRACE_TO(trace_, "ReadRpc initiated");
+diff --git a/src/yb/client/async_rpc.h b/src/yb/client/async_rpc.h
+index 024603134a..66538fc8fb 100644
+--- a/src/yb/client/async_rpc.h
++++ b/src/yb/client/async_rpc.h
+@@ -21,6 +21,7 @@
+ 
+ #include "yb/common/common_types.pb.h"
+ #include "yb/common/read_hybrid_time.h"
++#include "yb/common/retryable_request.h"
+ 
+ #include "yb/rpc/rpc_fwd.h"
+ 
+@@ -170,7 +171,6 @@ class WriteRpc : public AsyncRpcBase<tserver::WriteRequestPB, tserver::WriteResp
+   void SwapResponses() override;
+   void CallRemoteMethod() override;
+   void NotifyBatcher(const Status& status) override;
+-  bool ShouldRetryExpiredRequest() override;
+ };
+ 
+ class ReadRpc : public AsyncRpcBase<tserver::ReadRequestPB, tserver::ReadResponsePB> {
+diff --git a/src/yb/client/batcher.cc b/src/yb/client/batcher.cc
+index 08a623587f..afe2ba3803 100644
+--- a/src/yb/client/batcher.cc
++++ b/src/yb/client/batcher.cc
+@@ -144,6 +144,8 @@ Batcher::~Batcher() {
+       state_ == BatcherState::kComplete || state_ == BatcherState::kAborted ||
+       state_ == BatcherState::kGatheringOps)
+       << "Bad state: " << state_;
++
++  RequestsFinished();
+ }
+ 
+ void Batcher::Abort(const Status& status) {
+@@ -555,13 +557,14 @@ const ClientId& Batcher::client_id() const {
+   return client_->id();
+ }
+ 
+-std::pair<RetryableRequestId, RetryableRequestId> Batcher::NextRequestIdAndMinRunningRequestId(
+-    const TabletId& tablet_id) {
+-  return client_->NextRequestIdAndMinRunningRequestId(tablet_id);
++std::pair<RetryableRequestId, RetryableRequestId> Batcher::NextRequestIdAndMinRunningRequestId() {
++  const auto& pair = client_->NextRequestIdAndMinRunningRequestId();
++  RegisterRequest(pair.first);
++  return pair;
+ }
+ 
+-void Batcher::RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id) {
+-  client_->RequestFinished(tablet_id, request_id);
++void Batcher::RequestsFinished() {
++  client_->RequestsFinished(retryable_request_ids_);
+ }
+ 
+ std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
+diff --git a/src/yb/client/batcher.h b/src/yb/client/batcher.h
+index d3c7758614..cca69d495e 100644
+--- a/src/yb/client/batcher.h
++++ b/src/yb/client/batcher.h
+@@ -223,9 +223,17 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+ 
+   const ClientId& client_id() const;
+ 
+-  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId(
+-      const TabletId& tablet_id);
+-  void RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id);
++  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId();
++
++  void RequestsFinished();
++
++  void RegisterRequest(RetryableRequestId id) {
++    retryable_request_ids_.insert(id);
++  }
++
++  void RemoveRequest(RetryableRequestId id) {
++    retryable_request_ids_.erase(id);
++  }
+ 
+   void SetRejectionScoreSource(RejectionScoreSourcePtr rejection_score_source) {
+     rejection_score_source_ = rejection_score_source;
+@@ -331,6 +339,14 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+ 
+   RejectionScoreSourcePtr rejection_score_source_;
+ 
++  // Set of retryable request ids used in current batcher.
++  // When creating WriteRpc, new ids will be registered into this set.
++  // If the batcher has requests to be retried, request id is removed from current batcher
++  // and transmit to the retry batcher.
++  // At destruction of the batcher, all request ids in the set will be removed from the client
++  // running requests.
++  std::set<RetryableRequestId> retryable_request_ids_;
++
+   DISALLOW_COPY_AND_ASSIGN(Batcher);
+ };
+ 
+diff --git a/src/yb/client/client-internal.h b/src/yb/client/client-internal.h
+index dbfde8b789..d0bc0b1f89 100644
+--- a/src/yb/client/client-internal.h
++++ b/src/yb/client/client-internal.h
+@@ -523,7 +523,7 @@ class YBClient::Data {
+   };
+ 
+   simple_spinlock tablet_requests_mutex_;
+-  std::unordered_map<TabletId, TabletRequests> tablet_requests_;
++  TabletRequests requests_;
+ 
+   std::array<std::atomic<int>, 2> tserver_count_cached_;
+ 
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index 1986bebb14..fe1af61fbe 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -1903,41 +1903,28 @@ const CloudInfoPB& YBClient::cloud_info() const {
+   return data_->cloud_info_pb_;
+ }
+ 
+-std::pair<RetryableRequestId, RetryableRequestId> YBClient::NextRequestIdAndMinRunningRequestId(
+-    const TabletId& tablet_id) {
++std::pair<RetryableRequestId, RetryableRequestId> YBClient::NextRequestIdAndMinRunningRequestId() {
+   std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
+-  auto& tablet = data_->tablet_requests_[tablet_id];
+-  if (tablet.request_id_seq == kInitializeFromMinRunning) {
+-    return std::make_pair(kInitializeFromMinRunning, kInitializeFromMinRunning);
+-  }
+-  auto id = tablet.request_id_seq++;
+-  tablet.running_requests.insert(id);
+-  return std::make_pair(id, *tablet.running_requests.begin());
++  auto& requests = data_->requests_;
++  auto id = requests.request_id_seq++;
++  requests.running_requests.insert(id);
++  return std::make_pair(id, *requests.running_requests.begin());
+ }
+ 
+-void YBClient::RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id) {
+-  if (request_id == kInitializeFromMinRunning) {
++void YBClient::RequestsFinished(const std::set<RetryableRequestId>& request_ids) {
++  if (request_ids.empty()) {
+     return;
+   }
+   std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
+-  auto& tablet = data_->tablet_requests_[tablet_id];
+-  auto it = tablet.running_requests.find(request_id);
+-  if (it != tablet.running_requests.end()) {
+-    tablet.running_requests.erase(it);
+-  } else {
+-    LOG_WITH_PREFIX(DFATAL) << "RequestFinished called for an unknown request: "
+-                << tablet_id << ", " << request_id;
+-  }
+-}
+-
+-void YBClient::MaybeUpdateMinRunningRequestId(
+-    const TabletId& tablet_id, RetryableRequestId min_running_request_id) {
+-  std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
+-  auto& tablet = data_->tablet_requests_[tablet_id];
+-  if (tablet.request_id_seq == kInitializeFromMinRunning) {
+-    tablet.request_id_seq = min_running_request_id + (1 << 24);
+-    VLOG_WITH_PREFIX(1) << "Set request_id_seq for tablet " << tablet_id << " to "
+-                        << tablet.request_id_seq;
++  for (RetryableRequestId id : request_ids) {
++    auto& requests = data_->requests_.running_requests;
++    auto it = requests.find(id);
++    if (it != requests.end()) {
++      requests.erase(it);
++    } else {
++      LOG_WITH_PREFIX(DFATAL) << "RequestsFinished called for an unknown request: "
++                              << id;
++    }
+   }
+ }
+ 
+diff --git a/src/yb/client/client.h b/src/yb/client/client.h
+index 8c870cab3b..8a3841e2e0 100644
+--- a/src/yb/client/client.h
++++ b/src/yb/client/client.h
+@@ -789,12 +789,9 @@ class YBClient {
+ 
+   const CloudInfoPB& cloud_info() const;
+ 
+-  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId(
+-      const TabletId& tablet_id);
+-  void RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id);
++  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId();
+ 
+-  void MaybeUpdateMinRunningRequestId(
+-      const TabletId& tablet_id, RetryableRequestId min_running_request_id);
++  void RequestsFinished(const std::set<RetryableRequestId>& request_ids);
+ 
+   void Shutdown();
+ 
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index d8a6c6e0b9..50cae251c0 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -1086,7 +1086,6 @@ Result<RemoteTabletPtr> MetaCache::ProcessTabletLocation(
+       if (tablets_by_key) {
+         (*tablets_by_key)[partition.partition_key_start()] = remote;
+       }
+-      MaybeUpdateClientRequests(*remote);
+     }
+     remote->Refresh(ts_cache_, location.replicas());
+     remote->SetExpectedReplicas(location.expected_live_replicas(),
+@@ -1102,44 +1101,6 @@ Result<RemoteTabletPtr> MetaCache::ProcessTabletLocation(
+   return remote;
+ }
+ 
+-void MetaCache::MaybeUpdateClientRequests(const RemoteTablet& tablet) {
+-  VLOG_WITH_PREFIX_AND_FUNC(2) << "Tablet: " << tablet.tablet_id()
+-                    << " split parent: " << tablet.split_parent_tablet_id();
+-  if (tablet.split_parent_tablet_id().empty()) {
+-    VLOG_WITH_PREFIX(2) << "Tablet " << tablet.tablet_id() << " is not a result of split";
+-    return;
+-  }
+-  // TODO: MetaCache is a friend of Client and tablet_requests_mutex_ with tablet_requests_ are
+-  // public members of YBClient::Data. Consider refactoring that.
+-  std::lock_guard<simple_spinlock> request_lock(client_->data_->tablet_requests_mutex_);
+-  auto& tablet_requests = client_->data_->tablet_requests_;
+-  const auto requests_it = tablet_requests.find(tablet.split_parent_tablet_id());
+-  if (requests_it == tablet_requests.end()) {
+-    VLOG_WITH_PREFIX(2) << "Can't find request_id_seq for parent tablet "
+-                        << tablet.split_parent_tablet_id()
+-                        << " (split_depth: " << tablet.split_depth() - 1 << ")";
+-    // This can happen if client wasn't active (for example node was partitioned away) during
+-    // sequence of splits that resulted in `tablet` creation, so we don't have info about `tablet`
+-    // split parent.
+-    // In this case we set request_id_seq to special value and will reset it on getting
+-    // "request id is less than min" error. We will use min request ID plus 2^24 (there wouldn't be
+-    // 2^24 client requests in progress from the same client to the same tablet, so it is safe to do
+-    // this).
+-    tablet_requests.emplace(
+-        tablet.tablet_id(),
+-        YBClient::Data::TabletRequests {
+-            .request_id_seq = kInitializeFromMinRunning,
+-            .running_requests = {}
+-        });
+-    return;
+-  }
+-  VLOG_WITH_PREFIX(2) << "Setting request_id_seq for tablet " << tablet.tablet_id()
+-                      << " (split_depth: " << tablet.split_depth() << ") from tablet "
+-                      << tablet.split_parent_tablet_id() << " to "
+-                      << requests_it->second.request_id_seq;
+-  tablet_requests[tablet.tablet_id()].request_id_seq = requests_it->second.request_id_seq;
+-}
+-
+ std::unordered_map<TableId, TableData>::iterator MetaCache::InitTableDataUnlocked(
+     const TableId& table_id, const VersionedTablePartitionListPtr& partitions) {
+   VLOG_WITH_PREFIX_AND_FUNC(4) << Format(
+diff --git a/src/yb/client/meta_cache.h b/src/yb/client/meta_cache.h
+index 7f3a0a00a2..bf8e59d7b2 100644
+--- a/src/yb/client/meta_cache.h
++++ b/src/yb/client/meta_cache.h
+@@ -633,15 +633,6 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+   boost::optional<std::vector<RemoteTabletPtr>> FastLookupAllTabletsUnlocked(
+       const std::shared_ptr<const YBTable>& table) REQUIRES_SHARED(mutex_);
+ 
+-  // If `tablet` is a result of splitting of pre-split tablet for which we already have
+-  // TabletRequests structure inside YBClient - updates TabletRequests.request_id_seq for the
+-  // `tablet` based on value for pre-split tablet.
+-  // This is required for correct tracking of duplicate requests to post-split tablets, if we
+-  // start from scratch - tserver will treat these requests as duplicates/incorrect, because
+-  // on tserver side related structure for tracking duplicate requests is also copied from
+-  // pre-split tablet to post-split tablets.
+-  void MaybeUpdateClientRequests(const RemoteTablet& tablet);
+-
+   std::unordered_map<TableId, TableData>::iterator InitTableDataUnlocked(
+       const TableId& table_id, const VersionedTablePartitionListPtr& partitions)
+       REQUIRES_SHARED(mutex_);
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index 2245392d2f..339d981830 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -274,7 +274,6 @@ bool QLStressTest::CheckRetryableRequestsCountsAndLeaders(
+   size_t total_leaders = 0;
+   *total_entries = 0;
+   bool result = true;
+-  size_t replicated_limit = FLAGS_detect_duplicates_for_retryable_requests ? 1 : 0;
+   auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+   for (const auto& peer : peers) {
+     auto leader = peer->LeaderStatus() != consensus::LeaderStatus::NOT_LEADER;
+@@ -294,9 +293,13 @@ bool QLStressTest::CheckRetryableRequestsCountsAndLeaders(
+       *total_entries += tablet_entries;
+       ++total_leaders;
+     }
+-    // Last write request could be rejected as duplicate, so followers would not be able to
+-    // cleanup replicated requests.
+-    if (request_counts.running != 0 || (leader && request_counts.replicated > replicated_limit)) {
++
++    // When duplicates detection is enabled, we use the global min running request id shared by
++    // all tablets for the client so that cleanup of requests on one tablet can be withheld by
++    // requests on a different tablet. The upper bound of residual requests is not deterministic.
++    if (request_counts.running != 0 ||
++        (!FLAGS_detect_duplicates_for_retryable_requests &&
++         leader && request_counts.replicated > 0)) {
+       result = false;
+     }
+   }
+diff --git a/src/yb/client/session.cc b/src/yb/client/session.cc
+index e6638037d1..ceb6ce6179 100644
+--- a/src/yb/client/session.cc
++++ b/src/yb/client/session.cc
+@@ -187,6 +187,11 @@ void BatcherFlushDone(
+                       << " due to: " << error->status();
+     const auto op = error->shared_failed_op();
+     op->ResetTablet();
++    // Transmit failed request id to retry_batcher.
++    if (op->request_id().has_value()) {
++      done_batcher->RemoveRequest(op->request_id().value());
++      retry_batcher->RegisterRequest(op->request_id().value());
++    }
+     retry_batcher->Add(op);
+   }
+   FlushBatcherAsync(retry_batcher, std::move(callback), batcher_config,
+diff --git a/src/yb/client/tablet_rpc.cc b/src/yb/client/tablet_rpc.cc
+index 794b740d4c..f88f39b226 100644
+--- a/src/yb/client/tablet_rpc.cc
++++ b/src/yb/client/tablet_rpc.cc
+@@ -441,12 +441,6 @@ bool TabletInvoker::Done(Status* status) {
+         tablet_->MarkReplicaFailed(current_ts_, *status);
+       }
+     }
+-    if (status->IsExpired() && rpc_->ShouldRetryExpiredRequest()) {
+-      client_->MaybeUpdateMinRunningRequestId(
+-          tablet_->tablet_id(), MinRunningRequestIdStatusData(*status).value());
+-      *status = STATUS(
+-          TryAgain, status->message(), ClientError(ClientErrorCode::kExpiredRequestToBeRetried));
+-    }
+     std::string current_ts_string;
+     if (current_ts_) {
+       current_ts_string = Format("on tablet server $0", *current_ts_);
+diff --git a/src/yb/client/tablet_rpc.h b/src/yb/client/tablet_rpc.h
+index 3ab5dd0e0a..faef48b254 100644
+--- a/src/yb/client/tablet_rpc.h
++++ b/src/yb/client/tablet_rpc.h
+@@ -54,8 +54,6 @@ class TabletRpc {
+   // attempt_num starts with 1.
+   virtual void SendRpcToTserver(int attempt_num) = 0;
+ 
+-  virtual bool ShouldRetryExpiredRequest() { return false; }
+-
+  protected:
+   ~TabletRpc() {}
+ };
+diff --git a/src/yb/client/yb_op.h b/src/yb/client/yb_op.h
+index 0e1eeea570..fe24e9decb 100644
+--- a/src/yb/client/yb_op.h
++++ b/src/yb/client/yb_op.h
+@@ -42,6 +42,7 @@
+ #include "yb/common/common_types.pb.h"
+ #include "yb/common/partial_row.h"
+ #include "yb/common/read_hybrid_time.h"
++#include "yb/common/retryable_request.h"
+ #include "yb/common/transaction.pb.h"
+ 
+ #include "yb/docdb/docdb_fwd.h"
+@@ -133,6 +134,22 @@ class YBOperation {
+   // Resets tablet, so it will be re-resolved on applying this operation.
+   void ResetTablet();
+ 
++  std::optional<RetryableRequestId> request_id() const {
++    return request_id_;
++  }
++
++  void set_request_id(RetryableRequestId id) {
++    request_id_ = id;
++  }
++
++  std::optional<RetryableRequestId> min_running_request_id() const {
++    return min_running_request_id_;
++  }
++
++  void set_min_running_request_id(RetryableRequestId id) {
++    min_running_request_id_ = id;
++  }
++
+   // Returns the partition key of the operation.
+   virtual Status GetPartitionKey(std::string* partition_key) const = 0;
+ 
+@@ -171,6 +188,9 @@ class YBOperation {
+ 
+   boost::optional<PartitionListVersion> partition_list_version_;
+ 
++  std::optional<RetryableRequestId> request_id_;
++  std::optional<RetryableRequestId> min_running_request_id_;
++
+   DISALLOW_COPY_AND_ASSIGN(YBOperation);
+ };
+ 
+diff --git a/src/yb/common/retryable_request.h b/src/yb/common/retryable_request.h
+index 8dd6ece318..0fe3f3b3bf 100644
+--- a/src/yb/common/retryable_request.h
++++ b/src/yb/common/retryable_request.h
+@@ -36,10 +36,6 @@ namespace yb {
+ YB_STRONGLY_TYPED_UUID_DECL(ClientId);
+ typedef int64_t RetryableRequestId;
+ 
+-// Special value which is used to initialize starting RetryableRequestId for the client and tablet
+-// based on min running at server side.
+-constexpr RetryableRequestId kInitializeFromMinRunning = -1;
+-
+ struct MinRunningRequestIdTag : IntegralErrorTag<int64_t> {
+   // It is part of the wire protocol and should not be changed once released.
+   static constexpr uint8_t kCategory = 13;
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index cc1ec9eab6..37a1196247 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -90,6 +90,7 @@
+ #include "yb/util/status.h"
+ #include "yb/util/status_format.h"
+ #include "yb/util/status_log.h"
++#include "yb/util/sync_point.h"
+ #include "yb/util/tsan_util.h"
+ 
+ using std::string;
+@@ -155,6 +156,7 @@ DECLARE_bool(TEST_pause_before_send_hinted_election);
+ DECLARE_bool(TEST_skip_election_when_fail_detected);
+ DECLARE_int32(scheduled_full_compaction_frequency_hours);
+ DECLARE_int32(scheduled_full_compaction_jitter_factor_percentage);
++DECLARE_bool(TEST_asyncrpc_finished_set_timedout);
+ 
+ namespace yb {
+ class TabletSplitITestWithIsolationLevel : public TabletSplitITest,
+@@ -2447,6 +2449,64 @@ TEST_F(TabletSplitSingleServerITest, SplitBeforeParentHidden) {
+   ASSERT_OK(TestSplitBeforeParentDeletion(true /* hide_only */));
+ }
+ 
++TEST_F(TabletSplitSingleServerITest, TestRetryableWrite) {
++  // Test scenario of GH issue: https://github.com/yugabyte/yugabyte-db/issues/14005
++  // 1. Parent tablet leader received and replicated the WRITE_OP 1
++  //    but the client didn't get response.
++  // 2. The client retried WRITE_OP 1 and gets TABLET_SPLIT.
++  // 3. The client prepared WRITE_OP 2 to the child tablet and cause duplication.
++
++  auto kNumRows = 2;
++  CreateSingleTablet();
++
++  const auto split_hash_code = ASSERT_RESULT(WriteRowsAndGetMiddleHashCode(kNumRows));
++
++#ifndef NDEBUG
++  SyncPoint::GetInstance()->LoadDependency({
++      {"AsyncRpc::Finished:SetTimedOut:1",
++       "TabletSplitSingleServerITest::TestRetryableWrite:WaitForSetTimedOut"},
++      {"TabletSplitSingleServerITest::TestRetryableWrite:RowDeleted",
++       "AsyncRpc::Finished:SetTimedOut:2"}
++  });
++
++  SyncPoint::GetInstance()->EnableProcessing();
++#endif
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_asyncrpc_finished_set_timedout) = true;
++  // Start a new thread for writing a new row.
++  std::thread th([&] {
++    CHECK_OK(WriteRow(NewSession(), kNumRows + 1, kNumRows + 1));
++  });
++
++  // Wait for 1.4 is replicated.
++  auto peer = ASSERT_RESULT(GetSingleTabletLeaderPeer());
++  ASSERT_OK(WaitFor([&] {
++    return peer->raft_consensus()->GetLastCommittedOpId().index == kNumRows + 2;
++  }, 10s, "the third row is replicated"));
++
++  TEST_SYNC_POINT("TabletSplitSingleServerITest::TestRetryableWrite:WaitForSetTimedOut");
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_asyncrpc_finished_set_timedout) = false;
++
++  ASSERT_OK(SplitSingleTablet(split_hash_code));
++  ASSERT_OK(WaitForTabletSplitCompletion(2, 0, 1));
++
++  // Delete the new row, if retryable request causes duplication, will write it back.
++  ASSERT_OK(DeleteRow(NewSession(), kNumRows + 1));
++
++  TEST_SYNC_POINT("TabletSplitSingleServerITest::TestRetryableWrite:RowDeleted");
++
++  th.join();
++
++  // The new row should be deleted.
++  ASSERT_OK(CheckRowsCount(kNumRows));
++
++#ifndef NDEBUG
++     SyncPoint::GetInstance()->DisableProcessing();
++     SyncPoint::GetInstance()->ClearTrace();
++#endif // NDEBUG
++}
++
+ TEST_F(TabletSplitExternalMiniClusterITest, Simple) {
+   CreateSingleTablet();
+   CHECK_OK(WriteRowsAndFlush());

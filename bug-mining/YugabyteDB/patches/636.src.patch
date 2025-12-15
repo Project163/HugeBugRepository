@@ -1,0 +1,152 @@
+diff --git a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgMisc.java b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgMisc.java
+index 2fff1157a2..89f4325ac1 100644
+--- a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgMisc.java
++++ b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgMisc.java
+@@ -24,7 +24,9 @@ import org.slf4j.LoggerFactory;
+ import org.yb.util.YBTestRunnerNonTsanOnly;
+ 
+ import java.sql.Connection;
++import java.sql.PreparedStatement;
+ import java.sql.Statement;
++import java.sql.SQLWarning;
+ 
+ import static org.yb.AssertionWrappers.*;
+ 
+@@ -145,4 +147,82 @@ public class TestPgMisc extends BasePgSQLTest {
+       statement.execute(query);
+     }
+   }
++
++  /*
++   * Test to make sure that pg_hint_plan works consistently with interleaved extended queries.
++   * See issue #12741.
++   */
++  @Test
++  public void testPgHintPlanExtendedQuery() throws Exception {
++    try (Statement statement = connection.createStatement()) {
++      statement.executeUpdate("CREATE TABLE test_table(r1 int, r2 int," +
++                              "PRIMARY KEY(r1 asc, r2 asc))");
++      statement.executeUpdate("CREATE INDEX bad_index on test_table(r1 asc)");
++
++      String HINT_QUERY = "/*+IndexScan(test_table bad_index)*/ " +
++                          "SELECT count(*) FROM test_table " +
++                          "WHERE r1 <= 20 AND r2 <= ?";
++      PreparedStatement withhint = connection.prepareStatement(HINT_QUERY);
++      // Make sure we're always preparing statements at the server
++      com.yugabyte.jdbc.PgStatement pgstmt = (com.yugabyte.jdbc.PgStatement) withhint;
++      pgstmt.setPrepareThreshold(1);
++
++      // Make sure we set pg_hint_plan debug statements to WARNING so we can detect them
++      // here
++      statement.executeUpdate("SET pg_hint_plan.enable_hint TO ON;");
++      statement.executeUpdate("SET pg_hint_plan.debug_print TO ON;");
++      statement.executeUpdate("SET pg_hint_plan.message_level TO WARNING");
++
++      String EXPECTED_AVAILABLE_IDX_STRING = "available indexes for IndexScan(test_table): " +
++                                             "bad_index";
++      String EXPECTED_HINT_DEBUG_STRING = "pg_hint_plan:\n" +
++                                          "used hint:\n" +
++                                          "IndexScan(test_table bad_index)\n" +
++                                          "not used hint:\n" +
++                                          "duplication hint:\n" +
++                                          "error hint:\n";
++
++      withhint.setInt(1, 28);
++      withhint.executeQuery();
++
++      // The following checks are to make sure the hints were processed
++      SQLWarning warning = withhint.getWarnings();
++      assertTrue("Expected a SQL warning for hints", warning != null);
++      assertTrue(String.format("Unexpected Warning Message. Got: '%s', expected to contain : '%s",
++                               warning.getMessage(),
++                               EXPECTED_AVAILABLE_IDX_STRING),
++                 warning.getMessage().equals(EXPECTED_AVAILABLE_IDX_STRING));
++      warning = warning.getNextWarning();
++      assertTrue("Expected a SQL warning for hints", warning != null);
++      assertTrue(String.format("Unexpected Warning Message. Got: '%s', expected to contain : '%s",
++                               warning.getMessage(),
++                               EXPECTED_HINT_DEBUG_STRING),
++                 warning.getMessage().equals(EXPECTED_HINT_DEBUG_STRING));
++      withhint.clearWarnings();
++
++      // Execute a query with no hint. This should not affect hint processing for
++      // subsequent queries.
++      statement.executeQuery("SELECT 1;");
++      withhint.clearWarnings();
++
++      // This query should still process hints despite the preceding hintless query.
++      withhint.setInt(1, 30);
++      withhint.executeQuery();
++
++      warning = withhint.getWarnings();
++      assertTrue("Expected a SQL warning for hints", warning != null);
++      assertTrue(String.format("Unexpected Warning Message. Got: '%s', expected to contain : '%s",
++                               warning.getMessage(),
++                               EXPECTED_AVAILABLE_IDX_STRING),
++                 warning.getMessage().equals(EXPECTED_AVAILABLE_IDX_STRING));
++      warning = warning.getNextWarning();
++      assertTrue("Expected a SQL warning for hints", warning != null);
++      assertTrue(String.format("Unexpected Warning Message. Got: '%s', expected to contain : '%s",
++                               warning.getMessage(),
++                               EXPECTED_HINT_DEBUG_STRING),
++                 warning.getMessage().equals(EXPECTED_HINT_DEBUG_STRING));
++
++      statement.executeUpdate("DROP TABLE test_table;");
++    }
++  }
+ }
+diff --git a/src/postgres/third-party-extensions/pg_hint_plan/pg_hint_plan.c b/src/postgres/third-party-extensions/pg_hint_plan/pg_hint_plan.c
+index 1f95ac0b3d..37971a3c8e 100644
+--- a/src/postgres/third-party-extensions/pg_hint_plan/pg_hint_plan.c
++++ b/src/postgres/third-party-extensions/pg_hint_plan/pg_hint_plan.c
+@@ -506,6 +506,8 @@ static int set_config_int32_option(const char *name, int32 value,
+ static int set_config_double_option(const char *name, double value,
+ 									GucContext context);
+ 
++static void pg_hint_ExecutorEnd(QueryDesc *queryDesc);
++
+ /* GUC variables */
+ static bool	pg_hint_plan_enable_hint = true;
+ static int debug_level = 0;
+@@ -561,6 +563,7 @@ static planner_hook_type prev_planner = NULL;
+ static join_search_hook_type prev_join_search = NULL;
+ static set_rel_pathlist_hook_type prev_set_rel_pathlist = NULL;
+ static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
++static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+ 
+ /* Hold reference to currently active hint */
+ static HintState *current_hint_state = NULL;
+@@ -692,6 +695,8 @@ _PG_init(void)
+ 	set_rel_pathlist_hook = pg_hint_plan_set_rel_pathlist;
+ 	prev_ProcessUtility_hook = ProcessUtility_hook;
+ 	ProcessUtility_hook = pg_hint_plan_ProcessUtility;
++	prev_ExecutorEnd = ExecutorEnd_hook;
++	ExecutorEnd_hook = pg_hint_ExecutorEnd;
+ 
+ 	/* setup PL/pgSQL plugin hook */
+ 	var_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
+@@ -715,6 +720,7 @@ _PG_fini(void)
+ 	join_search_hook = prev_join_search;
+ 	set_rel_pathlist_hook = prev_set_rel_pathlist;
+ 	ProcessUtility_hook = prev_ProcessUtility_hook;
++	ExecutorEnd_hook = prev_ExecutorEnd;
+ 
+ 	/* uninstall PL/pgSQL plugin hook */
+ 	var_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
+@@ -4902,6 +4908,16 @@ void plpgsql_query_erase_callback(ResourceReleasePhase phase,
+ 	plpgsql_recurse_level = 0;
+ }
+ 
++static void pg_hint_ExecutorEnd(QueryDesc *queryDesc) {
++	if (plpgsql_recurse_level <= 0) {
++		current_hint_retrieved = false;
++	}
++	if (prev_ExecutorEnd)
++		prev_ExecutorEnd(queryDesc);
++	else
++		standard_ExecutorEnd(queryDesc);
++}
++
+ #define standard_join_search pg_hint_plan_standard_join_search
+ #define join_search_one_level pg_hint_plan_join_search_one_level
+ #define make_join_rel make_join_rel_wrapper

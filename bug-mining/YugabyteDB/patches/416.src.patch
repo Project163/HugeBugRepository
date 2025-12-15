@@ -1,0 +1,269 @@
+diff --git a/src/yb/consensus/consensus_types.h b/src/yb/consensus/consensus_types.h
+index 82555ae951..5800435ef4 100644
+--- a/src/yb/consensus/consensus_types.h
++++ b/src/yb/consensus/consensus_types.h
+@@ -19,6 +19,9 @@
+ #include "yb/consensus/consensus_fwd.h"
+ 
+ namespace yb {
++
++struct OpId;
++
+ namespace consensus {
+ 
+ // Used for a callback that sets a transaction's timestamp and starts the MVCC transaction for
+@@ -26,7 +29,12 @@ namespace consensus {
+ // log, so that timestamps always keep increasing in the log, unless entries are being overwritten.
+ class ConsensusAppendCallback {
+  public:
+-  virtual void HandleConsensusAppend() = 0;
++  // Invoked when appropriate operation was appended to consensus.
++  // op_id - assigned operation id.
++  // committed_op_id - committed operation id.
++  //
++  // Should initialize appropriate replicate message.
++  virtual void HandleConsensusAppend(const yb::OpId& op_id, const yb::OpId& committed_op_id) = 0;
+   virtual ~ConsensusAppendCallback() {}
+ };
+ 
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 10ab3373d4..cc734171ab 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -1008,25 +1008,24 @@ Status RaftConsensus::AppendNewRoundsToQueueUnlocked(
+ 
+   std::vector<ReplicateMsgPtr> replicate_msgs;
+   replicate_msgs.reserve(rounds.size());
++  const yb::OpId& committed_op_id = state_->GetCommittedOpIdUnlocked();
+ 
+   for (auto iter = rounds.begin(); iter != rounds.end(); ++iter) {
+     const ConsensusRoundPtr& round = *iter;
+ 
+-    state_->NewIdUnlocked(round->replicate_msg()->mutable_id());
+-
+-    ReplicateMsg* const replicate_msg = round->replicate_msg().get();
+-
+-    // In YB tables we include the last committed id into every REPLICATE log record so we can
+-    // perform local bootstrap more efficiently.
+-    state_->GetCommittedOpIdUnlocked().ToPB(replicate_msg->mutable_committed_op_id());
++    yb::OpId op_id = state_->NewIdUnlocked();
+ 
+     // We use this callback to transform write operations by substituting the hybrid_time into
+     // the write batch inside the write operation.
+     //
+     // TODO: we could allocate multiple HybridTimes in batch, only reading system clock once.
+     auto* const append_cb = round->append_callback();
+-    if (append_cb != nullptr) {
+-      append_cb->HandleConsensusAppend();
++    if (append_cb) {
++      append_cb->HandleConsensusAppend(op_id, committed_op_id);
++    } else {
++      // No op operation
++      op_id.ToPB(round->replicate_msg()->mutable_id());
++      committed_op_id.ToPB(round->replicate_msg()->mutable_committed_op_id());
+     }
+ 
+     Status s = state_->AddPendingOperation(round);
+diff --git a/src/yb/consensus/replica_state.cc b/src/yb/consensus/replica_state.cc
+index b368150255..663199de4f 100644
+--- a/src/yb/consensus/replica_state.cc
++++ b/src/yb/consensus/replica_state.cc
+@@ -1030,10 +1030,9 @@ OpId ReplicaState::GetLastPendingOperationOpIdUnlocked() const {
+       ? MinimumOpId() : pending_operations_.back()->id();
+ }
+ 
+-void ReplicaState::NewIdUnlocked(OpId* id) {
++yb::OpId ReplicaState::NewIdUnlocked() {
+   DCHECK(IsLocked());
+-  id->set_term(GetCurrentTermUnlocked());
+-  id->set_index(next_index_++);
++  return yb::OpId(GetCurrentTermUnlocked(), next_index_++);
+ }
+ 
+ void ReplicaState::CancelPendingOperation(const OpId& id, bool should_exist) {
+diff --git a/src/yb/consensus/replica_state.h b/src/yb/consensus/replica_state.h
+index 8978fb91bb..a76e23b96f 100644
+--- a/src/yb/consensus/replica_state.h
++++ b/src/yb/consensus/replica_state.h
+@@ -330,7 +330,7 @@ class ReplicaState {
+   // API to dump pending transactions. Added to debug ENG-520.
+   void DumpPendingOperationsUnlocked();
+ 
+-  void NewIdUnlocked(OpId* id);
++  yb::OpId NewIdUnlocked();
+ 
+   // Used when, for some reason, an operation that failed before it could be considered
+   // a part of the state machine. Basically restores the id gen to the state it was before
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index 17e12f74a8..648d26e1b0 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -201,7 +201,7 @@ DEFINE_int32(catalog_manager_report_batch_size, 1,
+             "The max number of tablets evaluated in the heartbeat as a single SysCatalog update.");
+ TAG_FLAG(catalog_manager_report_batch_size, advanced);
+ 
+-DEFINE_int32(master_failover_catchup_timeout_ms, 30 * 1000,  // 30 sec
++DEFINE_int32(master_failover_catchup_timeout_ms, 30 * 1000 * yb::kTimeMultiplier,  // 30 sec
+              "Amount of time to give a newly-elected leader master to load"
+              " the previous master's metadata and become active. If this time"
+              " is exceeded, the node crashes.");
+diff --git a/src/yb/tablet/operations/operation.cc b/src/yb/tablet/operations/operation.cc
+index 9810a543d3..3d594393d6 100644
+--- a/src/yb/tablet/operations/operation.cc
++++ b/src/yb/tablet/operations/operation.cc
+@@ -122,6 +122,20 @@ HybridTime OperationState::WriteHybridTime() const {
+   return hybrid_time();
+ }
+ 
++std::string OperationState::ConsensusRoundAsString() const {
++  std::lock_guard<simple_spinlock> l(mutex_);
++  return AsString(consensus_round());
++}
++
++void OperationState::LeaderInit(const OpId& op_id, const OpId& committed_op_id) {
++  std::lock_guard<simple_spinlock> l(mutex_);
++  auto* replicate_msg = consensus_round_->replicate_msg().get();
++  op_id.ToPB(replicate_msg->mutable_id());
++  committed_op_id.ToPB(replicate_msg->mutable_committed_op_id());
++  replicate_msg->set_hybrid_time(hybrid_time_.ToUint64());
++  replicate_msg->set_monotonic_counter(*tablet()->monotonic_counter());
++}
++
+ void ExclusiveSchemaOperationStateBase::AcquireSchemaLock(rw_semaphore* mutex) {
+   TRACE("Acquiring schema lock in exclusive mode");
+   schema_lock_ = std::unique_lock<rw_semaphore>(*mutex);
+@@ -133,10 +147,6 @@ void ExclusiveSchemaOperationStateBase::ReleaseSchemaLock() {
+   TRACE("Released schema lock");
+ }
+ 
+-std::string OperationState::ConsensusRoundAsString() const {
+-  return AsString(consensus_round());
+-}
+-
+ OperationCompletionCallback::OperationCompletionCallback()
+     : code_(tserver::TabletServerErrorPB::UNKNOWN_ERROR) {
+ }
+diff --git a/src/yb/tablet/operations/operation.h b/src/yb/tablet/operations/operation.h
+index c881072513..82a5b8b480 100644
+--- a/src/yb/tablet/operations/operation.h
++++ b/src/yb/tablet/operations/operation.h
+@@ -50,6 +50,8 @@
+ 
+ namespace yb {
+ 
++struct OpId;
++
+ namespace tablet {
+ 
+ class Tablet;
+@@ -231,6 +233,11 @@ class OperationState {
+   void CompleteWithStatus(const Status& status) const;
+   void SetError(const Status& status, tserver::TabletServerErrorPB::Code code) const;
+ 
++  // Initialize operation at leader side.
++  // op_id - operation id.
++  // committed_op_id - current committed operation id.
++  void LeaderInit(const OpId& op_id, const OpId& committed_op_id);
++
+   virtual ~OperationState();
+ 
+  protected:
+diff --git a/src/yb/tablet/operations/operation_driver.cc b/src/yb/tablet/operations/operation_driver.cc
+index e2c6bd0fc5..564be99b0d 100644
+--- a/src/yb/tablet/operations/operation_driver.cc
++++ b/src/yb/tablet/operations/operation_driver.cc
+@@ -182,16 +182,13 @@ void OperationDriver::ExecuteAsync() {
+   }
+ }
+ 
+-void OperationDriver::HandleConsensusAppend() {
++void OperationDriver::HandleConsensusAppend(
++    const yb::OpId& op_id, const yb::OpId& committed_op_id) {
++  ADOPT_TRACE(trace());
+   if (!StartOperation()) {
+     return;
+   }
+-  ADOPT_TRACE(trace());
+-  auto* const replicate_msg = operation_->state()->consensus_round()->replicate_msg().get();
+-  CHECK(!replicate_msg->has_hybrid_time());
+-  replicate_msg->set_hybrid_time(operation_->state()->hybrid_time().ToUint64());
+-  replicate_msg->set_monotonic_counter(
+-      *operation_->state()->tablet()->monotonic_counter());
++  operation_->state()->LeaderInit(op_id, committed_op_id);
+ }
+ 
+ void OperationDriver::PrepareAndStartTask() {
+diff --git a/src/yb/tablet/operations/operation_driver.h b/src/yb/tablet/operations/operation_driver.h
+index 1cd094d06d..0f5b34e3e2 100644
+--- a/src/yb/tablet/operations/operation_driver.h
++++ b/src/yb/tablet/operations/operation_driver.h
+@@ -167,7 +167,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+ 
+   Trace* trace() { return trace_.get(); }
+ 
+-  void HandleConsensusAppend() override;
++  void HandleConsensusAppend(const yb::OpId& op_id, const yb::OpId& committed_op_id) override;
+ 
+   bool is_leader_side() {
+     // TODO: switch state to an atomic.
+diff --git a/src/yb/tablet/operations/operation_tracker.cc b/src/yb/tablet/operations/operation_tracker.cc
+index d74b06d5ea..a05ec5001d 100644
+--- a/src/yb/tablet/operations/operation_tracker.cc
++++ b/src/yb/tablet/operations/operation_tracker.cc
+@@ -47,6 +47,7 @@
+ #include "yb/util/mem_tracker.h"
+ #include "yb/util/metrics.h"
+ #include "yb/util/monotime.h"
++#include "yb/util/tsan_util.h"
+ 
+ DEFINE_int64(tablet_operation_memory_limit_mb, 1024,
+              "Maximum amount of memory that may be consumed by all in-flight "
+@@ -99,6 +100,7 @@ METRIC_DEFINE_counter(tablet, operation_memory_pressure_rejections,
+                       "Number of operations rejected because the tablet's "
+                       "operation memory limit was reached.");
+ 
++using namespace std::literals;
+ using std::shared_ptr;
+ using std::vector;
+ 
+@@ -247,11 +249,11 @@ void OperationTracker::WaitForAllToFinish() const {
+ }
+ 
+ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
+-  const int complain_ms = 1000;
+-  int wait_time = 250;
++  const MonoDelta kComplainInterval = 1000ms * kTimeMultiplier;
++  MonoDelta wait_time = 250ms * kTimeMultiplier;
+   int num_complaints = 0;
+   MonoTime start_time = MonoTime::Now();
+-  while (1) {
++  for (;;) {
+     auto operations = GetPendingOperations();
+ 
+     if (operations.empty()) {
+@@ -264,20 +266,19 @@ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
+                                          "$0 operations pending. Waited for $1",
+                                          operations.size(), diff.ToString()));
+     }
+-    int64_t waited_ms = diff.ToMilliseconds();
+-    if (waited_ms / complain_ms > num_complaints) {
++    if (diff > kComplainInterval * num_complaints) {
+       LOG_WITH_PREFIX(WARNING)
+-          << Substitute("OperationTracker waiting for $0 outstanding operations to"
+-                        " complete now for $1 ms", operations.size(), waited_ms);
++          << Format("OperationTracker waiting for $0 outstanding operations to"
++                        " complete now for $1", operations.size(), diff);
+       num_complaints++;
+     }
+-    wait_time = std::min(wait_time * 5 / 4, 1000000);
++    wait_time = std::min<MonoDelta>(wait_time * 5 / 4, 1s);
+ 
+     LOG_WITH_PREFIX(INFO) << "Dumping currently running operations: ";
+     for (scoped_refptr<OperationDriver> driver : operations) {
+       LOG_WITH_PREFIX(INFO) << driver->ToString();
+     }
+-    SleepFor(MonoDelta::FromMicroseconds(wait_time));
++    SleepFor(wait_time);
+   }
+   return Status::OK();
+ }

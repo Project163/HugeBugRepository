@@ -1,0 +1,157 @@
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index 122085e3c6..8c217499a0 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -554,7 +554,8 @@ void LookupRpc::DoFinished(
+   }
+   // Prefer early failures over controller failures.
+   Status new_status = status;
+-  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
++  if (new_status.ok() &&
++      mutable_retrier()->HandleResponse(this, &new_status, rpc::RetryWhenBusy::kFalse)) {
+     return;
+   }
+ 
+@@ -584,10 +585,9 @@ void LookupRpc::DoFinished(
+     }
+   }
+ 
+-  if (new_status.IsNetworkError()) {
++  if (new_status.IsNetworkError() || new_status.IsRemoteError()) {
+     if (client()->IsMultiMaster()) {
+-      LOG(WARNING) << "Encountered a network error from the Master: "
+-                   << new_status.ToString() << ", retrying...";
++      LOG(WARNING) << "Encountered a error from the Master: " << new_status << ", retrying...";
+       ResetMasterLeaderAndRetry();
+       return;
+     }
+diff --git a/src/yb/integration-tests/client-stress-test.cc b/src/yb/integration-tests/client-stress-test.cc
+index 90bb7398f0..942882753a 100644
+--- a/src/yb/integration-tests/client-stress-test.cc
++++ b/src/yb/integration-tests/client-stress-test.cc
+@@ -36,6 +36,7 @@
+ #include "yb/client/client.h"
+ #include "yb/client/client-test-util.h"
+ #include "yb/client/table_handle.h"
++#include "yb/client/yb_op.h"
+ 
+ #include "yb/gutil/mathlimits.h"
+ #include "yb/gutil/strings/substitute.h"
+@@ -109,7 +110,7 @@ TEST_F(ClientStressTest, TestLookupTimeouts) {
+ }
+ 
+ // Override the base test to run in multi-master mode.
+-class ClientStressTest_MultiMaster: public ClientStressTest {
++class ClientStressTest_MultiMaster : public ClientStressTest {
+  protected:
+   ExternalMiniClusterOptions default_opts() override {
+     ExternalMiniClusterOptions result;
+@@ -322,4 +323,63 @@ TEST_F(ClientStressTest_LowMemory, TestMemoryThrottling) {
+   }
+ }
+ 
++namespace {
++
++class ClientStressTestSmallQueueMultiMasterWithTServers : public ClientStressTest {
++ protected:
++  ExternalMiniClusterOptions default_opts() override {
++    ExternalMiniClusterOptions result;
++    result.num_masters = 3;
++    result.master_rpc_ports = { 0, 0, 0 };
++    result.extra_master_flags = {
++        "--master_svc_queue_length=5"s, "--master_inject_latency_on_tablet_lookups_ms=50"s };
++    result.num_tablet_servers = 3;
++    return result;
++  }
++};
++
++} // namespace
++
++// Check behaviour of meta cache in case of server queue is full.
++TEST_F_EX(ClientStressTest, MasterQueueFull, ClientStressTestSmallQueueMultiMasterWithTServers) {
++  TestWorkload workload(cluster_.get());
++  workload.Setup();
++
++  struct Item {
++    client::YBClientPtr client;
++    std::unique_ptr<client::TableHandle> table;
++    client::YBSessionPtr session;
++    std::future<Status> future;
++  };
++
++  std::vector<Item> items;
++  constexpr size_t kNumRequests = 40;
++  while (items.size() != kNumRequests) {
++    Item item;
++    client::YBClientBuilder builder;
++    ASSERT_OK(cluster_->CreateClient(&builder, &item.client));
++    item.table = std::make_unique<client::TableHandle>();
++    ASSERT_OK(item.table->Open(TestWorkloadOptions::kDefaultTableName, item.client.get()));
++    item.session = std::make_shared<client::YBSession>(item.client);
++    ASSERT_OK(item.session->SetFlushMode(client::YBSession::MANUAL_FLUSH));
++    items.push_back(std::move(item));
++  }
++
++  int32_t key = 0;
++  const std::string kStringValue("string value");
++  for (auto& item : items) {
++    auto op = item.table->NewInsertOp();
++    auto req = op->mutable_request();
++    QLAddInt32HashValue(req, ++key);
++    item.table->AddInt32ColumnValue(req, item.table->schema().columns()[1].name(), -key);
++    item.table->AddStringColumnValue(req, item.table->schema().columns()[2].name(), kStringValue);
++    ASSERT_OK(item.session->Apply(op));
++    item.future = item.session->FlushFuture();
++  }
++
++  for (auto& item : items) {
++    ASSERT_OK(item.future.get());
++  }
++}
++
+ }  // namespace yb
+diff --git a/src/yb/rpc/rpc.cc b/src/yb/rpc/rpc.cc
+index 3af2330eff..dd6c8642b2 100644
+--- a/src/yb/rpc/rpc.cc
++++ b/src/yb/rpc/rpc.cc
+@@ -77,13 +77,14 @@ using strings::SubstituteAndAppend;
+ 
+ namespace rpc {
+ 
+-bool RpcRetrier::HandleResponse(RpcCommand* rpc, Status* out_status) {
++bool RpcRetrier::HandleResponse(
++    RpcCommand* rpc, Status* out_status, RetryWhenBusy retry_when_busy) {
+   ignore_result(DCHECK_NOTNULL(rpc));
+   ignore_result(DCHECK_NOTNULL(out_status));
+ 
+   // Always retry a TOO_BUSY error.
+   Status controller_status = controller_.status();
+-  if (controller_status.IsRemoteError()) {
++  if (controller_status.IsRemoteError() && retry_when_busy) {
+     const ErrorStatusPB* err = controller_.error_response();
+     if (err &&
+         err->has_code() &&
+diff --git a/src/yb/rpc/rpc.h b/src/yb/rpc/rpc.h
+index d919981daa..b436981500 100644
+--- a/src/yb/rpc/rpc.h
++++ b/src/yb/rpc/rpc.h
+@@ -80,6 +80,7 @@ class RpcCommand : public std::enable_shared_from_this<RpcCommand> {
+ 
+ YB_DEFINE_ENUM(RpcRetrierState, (kIdle)(kRunning)(kWaiting)(kFinished));
+ YB_DEFINE_ENUM(BackoffStrategy, (kLinear)(kExponential));
++YB_STRONGLY_TYPED_BOOL(RetryWhenBusy);
+ 
+ // Provides utilities for retrying failed RPCs.
+ //
+@@ -102,7 +103,10 @@ class RpcRetrier {
+   //
+   // Otherwise, returns false and writes the controller status to
+   // 'out_status'.
+-  bool HandleResponse(RpcCommand* rpc, Status* out_status);
++  // retry_when_busy should be set to false if user does not want to retry request when server
++  // returned that he is busy.
++  bool HandleResponse(RpcCommand* rpc, Status* out_status,
++                      RetryWhenBusy retry_when_busy = RetryWhenBusy::kTrue);
+ 
+   // Retries an RPC at some point in the near future. If 'why_status' is not OK,
+   // records it as the most recent error causing the RPC to retry. This is

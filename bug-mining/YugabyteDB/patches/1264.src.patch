@@ -1,0 +1,369 @@
+diff --git a/src/yb/tserver/pg_client_service.cc b/src/yb/tserver/pg_client_service.cc
+index 6ebb1423d7..bebf0fa229 100644
+--- a/src/yb/tserver/pg_client_service.cc
++++ b/src/yb/tserver/pg_client_service.cc
+@@ -200,14 +200,8 @@ class LockablePgClientSession : public PgClientSession {
+     auto exchange = VERIFY_RESULT(SharedExchange::Make(instance_id, id(), Create::kTrue));
+     exchange_.emplace(std::move(exchange), [this](size_t size) {
+       Touch();
+-      std::shared_ptr<CountDownLatch> latch;
+-      {
+-        std::unique_lock lock(mutex_);
+-        latch = ProcessSharedRequest(size, &exchange_->exchange());
+-      }
+-      if (latch) {
+-        latch->Wait();
+-      }
++      std::unique_lock lock(mutex_);
++      ProcessSharedRequest(size, &exchange_->exchange());
+     });
+     return Status::OK();
+   }
+@@ -219,6 +213,10 @@ class LockablePgClientSession : public PgClientSession {
+     PgClientSession::StartShutdown();
+   }
+ 
++  bool ReadyToShutdown() const {
++    return !exchange_ || exchange_->ReadyToShutdown();
++  }
++
+   void CompleteShutdown() override {
+     if (exchange_) {
+       exchange_->CompleteShutdown();
+@@ -1951,6 +1949,9 @@ class PgClientServiceImpl::Impl {
+     auto time = session_expiration_queue_.empty()
+         ? CoarseTimePoint(now + FLAGS_pg_client_session_expiration_ms * 1ms)
+         : session_expiration_queue_.top().first + 100ms;
++    if (!stopping_sessions_.empty()) {
++      time = std::min(time, now + 1s);
++    }
+     if (check_expired_sessions_time_ != CoarseTimePoint() && check_expired_sessions_time_ < time) {
+       return;
+     }
+@@ -1966,6 +1967,7 @@ class PgClientServiceImpl::Impl {
+   void CheckExpiredSessions() {
+     auto now = CoarseMonoClock::now();
+     std::vector<SessionInfoPtr> expired_sessions;
++    std::vector<SessionInfoPtr> ready_sessions;
+     {
+       std::lock_guard lock(mutex_);
+       check_expired_sessions_time_ = CoarseTimePoint();
+@@ -1987,17 +1989,41 @@ class PgClientServiceImpl::Impl {
+           }
+         }
+       }
+-      ScheduleCheckExpiredSessions(now);
+-    }
+-    if (expired_sessions.empty()) {
+-      return;
++      auto filter = [&ready_sessions](const auto& session) {
++        if (session->session().ReadyToShutdown()) {
++          ready_sessions.push_back(session);
++          return true;
++        }
++        return false;
++      };
++      stopping_sessions_.erase(
++          std::remove_if(stopping_sessions_.begin(), stopping_sessions_.end(), filter),
++          stopping_sessions_.end());
++      if (expired_sessions.empty() && ready_sessions.empty()) {
++        ScheduleCheckExpiredSessions(now);
++        return;
++      }
+     }
+     for (const auto& session : expired_sessions) {
+       session->session().StartShutdown();
+     }
+-    for (const auto& session : expired_sessions) {
++    std::vector<SessionInfoPtr> not_ready_sessions;
++    for (const auto& session : ready_sessions) {
+       session->session().CompleteShutdown();
+     }
++    for (const auto& session : expired_sessions) {
++      if (session->session().ReadyToShutdown()) {
++        session->session().CompleteShutdown();
++      } else {
++        not_ready_sessions.push_back(session);
++      }
++    }
++    {
++      std::lock_guard lock(mutex_);
++      stopping_sessions_.insert(
++          stopping_sessions_.end(), not_ready_sessions.begin(), not_ready_sessions.end());
++      ScheduleCheckExpiredSessions(now);
++    }
+     auto cdc_service = tablet_server_.GetCDCService();
+     // We only want to call this on tablet servers. On master, cdc_service will be null.
+     if (cdc_service) {
+@@ -2131,6 +2157,8 @@ class PgClientServiceImpl::Impl {
+           >
+       >
+   > sessions_ GUARDED_BY(mutex_);
++
++  std::vector<SessionInfoPtr> stopping_sessions_ GUARDED_BY(mutex_);
+ };
+ 
+ PgClientServiceImpl::PgClientServiceImpl(
+diff --git a/src/yb/tserver/pg_client_session.cc b/src/yb/tserver/pg_client_session.cc
+index 156d8d6742..692192cbe0 100644
+--- a/src/yb/tserver/pg_client_session.cc
++++ b/src/yb/tserver/pg_client_session.cc
+@@ -573,7 +573,7 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
+ 
+   CoarseTimePoint deadline;
+ 
+-  CountDownLatch latch{1};
++  std::atomic<bool> responded_{false};
+ 
+   SharedExchangeQuery(
+       std::shared_ptr<PgClientSession> session_, PgTableCache* table_cache_,
+@@ -584,6 +584,10 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
+         stats_exchange_response_size(stats_exchange_response_size_) {
+   }
+ 
++  ~SharedExchangeQuery() {
++    LOG_IF(DFATAL, !responded_.load()) << "Response did not send";
++  }
++
+   // Initialize query from data stored in exchange with specified size.
+   // The serialized query has the following format:
+   // 8 bytes - timeout in milliseconds.
+@@ -596,11 +600,13 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
+     return pb_util::ParseFromArray(&req, input, end - input);
+   }
+ 
+-  void Wait() {
+-    latch.Wait();
+-  }
+-
+   void SendResponse() override {
++    auto locked_session = session.lock();
++    if (!locked_session) {
++      responded_ = true;
++      return;
++    }
++
+     using google::protobuf::io::CodedOutputStream;
+     rpc::ResponseHeader header;
+     header.set_call_id(42);
+@@ -619,14 +625,10 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
+     auto* start = exchange->Obtain(full_size);
+     std::pair<uint64_t, std::byte*> shared_memory_segment(0, nullptr);
+     RefCntBuffer buffer;
+-    std::shared_ptr<PgClientSession> locked_session;
+     if (!start) {
+-      locked_session = session.lock();
+-      if (locked_session) {
+-        shared_memory_segment = locked_session->ObtainBigSharedMemorySegment(full_size);
+-        if (shared_memory_segment.second) {
+-          start = shared_memory_segment.second;
+-        }
++      shared_memory_segment = locked_session->ObtainBigSharedMemorySegment(full_size);
++      if (shared_memory_segment.second) {
++        start = shared_memory_segment.second;
+       }
+ 
+       if (!start) {
+@@ -650,13 +652,10 @@ struct SharedExchangeQuery : public SharedExchangeQueryParams, public PerformDat
+                           (shared_memory_segment.first << kBigSharedMemoryIdShift));
+       }
+     } else {
+-      if (!locked_session) {
+-        locked_session = session.lock();
+-      }
+-      auto id = locked_session ? locked_session->SaveData(buffer, std::move(sidecars.buffer())) : 0;
++      auto id = locked_session->SaveData(buffer, std::move(sidecars.buffer()));
+       exchange->Respond(kTooBigResponseMask | id);
+     }
+-    latch.CountDown();
++    responded_ = true;
+   }
+ };
+ 
+@@ -2241,12 +2240,11 @@ Status PgClientSession::CheckPlainSessionPendingUsedReadTime(uint64_t txn_serial
+   return Status::OK();
+ }
+ 
+-std::shared_ptr<CountDownLatch> PgClientSession::ProcessSharedRequest(
+-    size_t size, SharedExchange* exchange) {
++void PgClientSession::ProcessSharedRequest(size_t size, SharedExchange* exchange) {
+   auto shared_this = shared_this_.lock();
+   if (!shared_this) {
+     LOG_WITH_FUNC(DFATAL) << "Shared this is null in ProcessSharedRequest";
+-    return nullptr;
++    return;
+   }
+   auto data = std::make_shared<SharedExchangeQuery>(
+       shared_this, &table_cache_, exchange, stats_exchange_response_size_);
+@@ -2270,9 +2268,7 @@ std::shared_ptr<CountDownLatch> PgClientSession::ProcessSharedRequest(
+   if (!status.ok()) {
+     StatusToPB(status, data->resp.mutable_status());
+     data->SendResponse();
+-    return nullptr;
+   }
+-  return rpc::SharedField(data, &data->latch);
+ }
+ 
+ void PgClientSession::ScheduleBigSharedMemExpirationCheck(
+diff --git a/src/yb/tserver/pg_client_session.h b/src/yb/tserver/pg_client_session.h
+index d069ffc7d3..65b699ba72 100644
+--- a/src/yb/tserver/pg_client_session.h
++++ b/src/yb/tserver/pg_client_session.h
+@@ -155,7 +155,7 @@ class PgClientSession {
+ 
+   Status Perform(PgPerformRequestPB* req, PgPerformResponsePB* resp, rpc::RpcContext* context);
+ 
+-  std::shared_ptr<CountDownLatch> ProcessSharedRequest(size_t size, SharedExchange* exchange);
++  void ProcessSharedRequest(size_t size, SharedExchange* exchange);
+ 
+   #define PG_CLIENT_SESSION_METHOD_DECLARE(r, data, method) \
+   Status method( \
+diff --git a/src/yb/tserver/tserver_shared_mem.cc b/src/yb/tserver/tserver_shared_mem.cc
+index af0217eb34..6f0ef1d7a5 100644
+--- a/src/yb/tserver/tserver_shared_mem.cc
++++ b/src/yb/tserver/tserver_shared_mem.cc
+@@ -145,7 +145,7 @@ class Semaphore {
+ #endif
+ 
+ YB_DEFINE_ENUM(SharedExchangeState,
+-               (kIdle)(kRequestSent)(kResponseSent)(kShutdown));
++               (kIdle)(kRequestSent)(kProcessingRequest)(kResponseSent)(kShutdown));
+ 
+ class SharedExchangeHeader {
+  public:
+@@ -205,7 +205,7 @@ class SharedExchangeHeader {
+ 
+   void Respond(size_t size) {
+     auto state = state_.load(std::memory_order_acquire);
+-    if (state != SharedExchangeState::kRequestSent) {
++    if (state != SharedExchangeState::kProcessingRequest) {
+       LOG_IF(DFATAL, state != SharedExchangeState::kShutdown)
+           << "Respond in wrong state: " << AsString(state);
+       return;
+@@ -213,7 +213,7 @@ class SharedExchangeHeader {
+ 
+     data_size_ = size;
+     WARN_NOT_OK(
+-        TransferState(SharedExchangeState::kRequestSent, SharedExchangeState::kResponseSent),
++        TransferState(SharedExchangeState::kProcessingRequest, SharedExchangeState::kResponseSent),
+         "Transfer state failed");
+     WARN_NOT_OK(response_semaphore_.Post(), "Respond failed");
+   }
+@@ -222,6 +222,8 @@ class SharedExchangeHeader {
+     RETURN_NOT_OK(DoWait(
+         SharedExchangeState::kRequestSent, std::chrono::system_clock::time_point::max(),
+         &request_semaphore_));
++    RETURN_NOT_OK(TransferState(
++        SharedExchangeState::kRequestSent, SharedExchangeState::kProcessingRequest));
+     return data_size_;
+   }
+ 
+@@ -474,6 +476,7 @@ SharedExchangeThread::SharedExchangeThread(
+       }
+       listener(*query_size);
+     }
++    ready_to_complete_ = true;
+   }, &thread_));
+ }
+ 
+diff --git a/src/yb/tserver/tserver_shared_mem.h b/src/yb/tserver/tserver_shared_mem.h
+index 8ff2cf7f3b..7787f9b66b 100644
+--- a/src/yb/tserver/tserver_shared_mem.h
++++ b/src/yb/tserver/tserver_shared_mem.h
+@@ -185,12 +185,17 @@ class SharedExchangeThread {
+     return exchange_;
+   }
+ 
++  bool ReadyToShutdown() const {
++    return ready_to_complete_.load();
++  }
++
+   void StartShutdown();
+   void CompleteShutdown();
+ 
+  private:
+   SharedExchange exchange_;
+-  scoped_refptr<Thread> thread_;
++  ThreadPtr thread_;
++  std::atomic<bool> ready_to_complete_{false};
+ };
+ 
+ struct SharedExchangeMessage {
+diff --git a/src/yb/util/stack_trace.cc b/src/yb/util/stack_trace.cc
+index f7829ec089..aad40ff7b3 100644
+--- a/src/yb/util/stack_trace.cc
++++ b/src/yb/util/stack_trace.cc
+@@ -399,10 +399,10 @@ Result<StackTrace> ThreadStack(ThreadIdForStack tid) {
+ }
+ 
+ std::vector<Result<StackTrace>> ThreadStacks(const std::vector<ThreadIdForStack>& tids) {
+-  static const Status status = STATUS(
++  static const Status default_status = STATUS(
+       RuntimeError, "Thread did not respond: maybe it is blocking signals");
+ 
+-  std::vector<Result<StackTrace>> result(tids.size(), status);
++  std::vector<Result<StackTrace>> result(tids.size(), default_status);
+   std::lock_guard execution_lock(thread_stack_helper.mutex);
+ 
+   // Ensure that our signal handler is installed. We don't need any fancy GoogleOnce here
+@@ -419,17 +419,8 @@ std::vector<Result<StackTrace>> ThreadStacks(const std::vector<ThreadIdForStack>
+   thread_stack_helper.completion_flag.Reset();
+ 
+   for (size_t i = 0; i != tids.size(); ++i) {
+-    // We use the raw syscall here instead of kill() to ensure that we don't accidentally
+-    // send a signal to some other process in the case that the thread has exited and
+-    // the TID been recycled.
+-#if defined(__linux__)
+-    int res = narrow_cast<int>(syscall(SYS_tgkill, getpid(), tids[i], g_stack_trace_signum));
+-#else
+-    int res = pthread_kill(tids[i], g_stack_trace_signum);
+-#endif
+-    if (res != 0) {
+-      static const Status status = STATUS(
+-          RuntimeError, "Unable to deliver signal: process may have exited");
++    auto status = Thread::SendSignal(tids[i], g_stack_trace_signum);
++    if (!status.ok()) {
+       result[i] = status;
+       thread_stack_helper.left_to_collect.fetch_sub(1, std::memory_order_acq_rel);
+     }
+diff --git a/src/yb/util/thread.cc b/src/yb/util/thread.cc
+index 7fe784fcda..6ae8ae20f1 100644
+--- a/src/yb/util/thread.cc
++++ b/src/yb/util/thread.cc
+@@ -928,6 +928,23 @@ void Thread::FinishThread(void* arg) {
+   CHECK_OK(ThreadSignalMaskBlock({GetStackTraceSignal()}));
+ }
+ 
++Status Thread::SendSignal(ThreadIdForStack tid, int signal) {
++  // We use the raw syscall here instead of kill() to ensure that we don't accidentally
++  // send a signal to some other process in the case that the thread has exited and
++  // the TID been recycled.
++#if defined(__linux__)
++  int res = narrow_cast<int>(syscall(SYS_tgkill, getpid(), tid, signal));
++#else
++  int res = pthread_kill(tid, signal);
++#endif
++  if (res != 0) {
++    static const Status status = STATUS(
++        RuntimeError, "Unable to deliver signal: process may have exited");
++    return status;
++  }
++  return Status::OK();
++}
++
+ CDSAttacher::CDSAttacher() {
+   cds::threading::Manager::attachThread();
+ }
+diff --git a/src/yb/util/thread.h b/src/yb/util/thread.h
+index 1afcd2db1e..bcbdf6a2a2 100644
+--- a/src/yb/util/thread.h
++++ b/src/yb/util/thread.h
+@@ -257,6 +257,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
+   // This call is signal-safe.
+   static Thread* current_thread() { return tls_; }
+ 
++  static Status SendSignal(ThreadIdForStack tid, int signal);
++
+   // Returns a unique, stable identifier for this thread. Note that this is a static
+   // method and thus can be used on any thread, including the main thread of the
+   // process.

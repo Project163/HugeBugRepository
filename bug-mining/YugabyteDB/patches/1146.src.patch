@@ -1,0 +1,266 @@
+diff --git a/src/yb/integration-tests/xcluster/xcluster-test.cc b/src/yb/integration-tests/xcluster/xcluster-test.cc
+index a76eb7d87c..626da04759 100644
+--- a/src/yb/integration-tests/xcluster/xcluster-test.cc
++++ b/src/yb/integration-tests/xcluster/xcluster-test.cc
+@@ -146,6 +146,7 @@ DECLARE_bool(TEST_xcluster_fail_restore_consumer_snapshot);
+ DECLARE_bool(TEST_xcluster_simulate_get_changes_response_error);
+ DECLARE_double(TEST_xcluster_simulate_random_failure_after_apply);
+ DECLARE_uint32(cdcsdk_retention_barrier_no_revision_interval_secs);
++DECLARE_int32(heartbeat_interval_ms);
+ 
+ namespace yb {
+ 
+@@ -3903,6 +3904,37 @@ TEST_F_EX(XClusterTest, VerifyReplicationError, XClusterTestNoParam) {
+   ASSERT_EQ(2, xcluster_consumer->TEST_metric_replication_error_count()->value());
+ }
+ 
++// Make sure the full replication error report is sent to a new master leader even when the metric
++// collection is skipped on the very first heartbeat to the new master.
++TEST_F_EX(XClusterTest, ReplicationErrorAfterMasterFailover, XClusterTestNoParam) {
++  // Send metrics report including the xCluster status in every heartbeat.
++  const auto short_metric_report_interval_ms = 250;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = short_metric_report_interval_ms * 2;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) =
++      short_metric_report_interval_ms;
++
++  ASSERT_OK(SetUpWithParams(
++      {1}, {1}, /* replication_factor */ 1, /* num_masters */ 3, /* num_tservers */ 1));
++  ASSERT_OK(SetupReplication());
++  ASSERT_OK(CorrectlyPollingAllTablets(1));
++  const auto stream_id = ASSERT_RESULT(GetCDCStreamID(producer_table_->id()));
++  ASSERT_OK(VerifyReplicationError(consumer_table_->id(), stream_id, std::nullopt));
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) =
++      MonoTime::kMillisecondsPerHour;
++  SleepFor(FLAGS_heartbeat_interval_ms * 2ms);
++
++  ASSERT_OK(consumer_cluster()->StepDownMasterLeader());
++  ASSERT_OK(consumer_cluster()->WaitForAllTabletServers());
++
++  ASSERT_OK(VerifyReplicationError(
++      consumer_table_->id(), stream_id, ReplicationErrorPb::REPLICATION_ERROR_UNINITIALIZED));
++
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) =
++      short_metric_report_interval_ms;
++  ASSERT_OK(VerifyReplicationError(consumer_table_->id(), stream_id, std::nullopt));
++}
++
+ // Test deleting inbound replication group without performing source stream cleanup.
+ TEST_F_EX(XClusterTest, DeleteWithoutStreamCleanup, XClusterTestNoParam) {
+   constexpr int kNTabletsPerTable = 1;
+diff --git a/src/yb/tserver/heartbeater.cc b/src/yb/tserver/heartbeater.cc
+index 7dcd061fea..b45f487aab 100644
+--- a/src/yb/tserver/heartbeater.cc
++++ b/src/yb/tserver/heartbeater.cc
+@@ -34,7 +34,6 @@
+ 
+ #include <cstdint>
+ #include <iosfwd>
+-#include <map>
+ #include <memory>
+ #include <mutex>
+ #include <ostream>
+@@ -47,41 +46,24 @@
+ #include "yb/common/hybrid_time.h"
+ #include "yb/common/wire_protocol.h"
+ 
+-#include "yb/consensus/log_fwd.h"
+-
+-#include "yb/docdb/docdb.pb.h"
+-
+-#include "yb/gutil/atomicops.h"
+ #include "yb/gutil/bind.h"
+-#include "yb/gutil/macros.h"
+ #include "yb/gutil/ref_counted.h"
+-#include "yb/gutil/strings/substitute.h"
+ #include "yb/gutil/thread_annotations.h"
+ 
+ #include "yb/master/master_heartbeat.proxy.h"
+ #include "yb/master/master_rpc.h"
+ #include "yb/master/master_types.pb.h"
+ 
+-#include "yb/rocksdb/cache.h"
+-#include "yb/rocksdb/options.h"
+-#include "yb/rocksdb/statistics.h"
+-
+ #include "yb/rpc/rpc_fwd.h"
+ 
+ #include "yb/server/hybrid_clock.h"
+ #include "yb/server/server_base.proxy.h"
+ 
+-#include "yb/tablet/tablet_options.h"
+-
+ #include "yb/tserver/tablet_server.h"
+ #include "yb/tserver/ts_tablet_manager.h"
+ 
+ #include "yb/util/async_util.h"
+ #include "yb/util/callsite_profiling.h"
+-#include "yb/util/countdown_latch.h"
+-#include "yb/util/enums.h"
+-#include "yb/util/flags.h"
+-#include "yb/util/locks.h"
+ #include "yb/util/logging.h"
+ #include "yb/util/monotime.h"
+ #include "yb/util/net/net_util.h"
+@@ -89,7 +71,6 @@
+ #include "yb/util/status_format.h"
+ #include "yb/util/status_log.h"
+ #include "yb/util/status.h"
+-#include "yb/util/strongly_typed_bool.h"
+ #include "yb/util/thread.h"
+ #include "yb/util/threadpool.h"
+ 
+@@ -753,9 +734,13 @@ const std::string& HeartbeatDataProvider::LogPrefix() const {
+ 
+ void PeriodicalHeartbeatDataProvider::AddData(
+     const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) {
+-  if (prev_run_time_ + period_ < CoarseMonoClock::Now()) {
+-    DoAddData(last_resp, req);
++  // Save that fact that we will need to send a full report the next time we run.
++  needs_full_tablet_report_ |= last_resp.needs_full_tablet_report();
++
++  if (prev_run_time_ + Period() < CoarseMonoClock::Now()) {
++    DoAddData(needs_full_tablet_report_, req);
+     prev_run_time_ = CoarseMonoClock::Now();
++    needs_full_tablet_report_ = false;
+   }
+ }
+ 
+diff --git a/src/yb/tserver/heartbeater.h b/src/yb/tserver/heartbeater.h
+index c7de4ba4b9..6b18d79658 100644
+--- a/src/yb/tserver/heartbeater.h
++++ b/src/yb/tserver/heartbeater.h
+@@ -35,12 +35,9 @@
+ 
+ #include "yb/server/server_base_options.h"
+ 
+-#include "yb/gutil/macros.h"
+-#include "yb/master/master_fwd.h"
+ #include "yb/master/master_heartbeat.fwd.h"
+ #include "yb/tserver/tserver_fwd.h"
+ #include "yb/util/status_fwd.h"
+-#include "yb/util/net/net_util.h"
+ 
+ namespace yb {
+ namespace tserver {
+@@ -98,8 +95,7 @@ class Heartbeater {
+ 
+ class PeriodicalHeartbeatDataProvider : public HeartbeatDataProvider {
+  public:
+-  PeriodicalHeartbeatDataProvider(TabletServer* server, const MonoDelta& period) :
+-    HeartbeatDataProvider(server), period_(period) {}
++  explicit PeriodicalHeartbeatDataProvider(TabletServer* server) : HeartbeatDataProvider(server) {}
+ 
+   void AddData(
+       const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) override;
+@@ -107,11 +103,11 @@ class PeriodicalHeartbeatDataProvider : public HeartbeatDataProvider {
+   CoarseTimePoint prev_run_time() const { return prev_run_time_; }
+ 
+  private:
+-  virtual void DoAddData(
+-      const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) = 0;
++  virtual void DoAddData(bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) = 0;
++  virtual MonoDelta Period() const = 0;
+ 
+-  MonoDelta period_;
+   CoarseTimePoint prev_run_time_;
++  bool needs_full_tablet_report_ = false;
+ };
+ 
+ } // namespace tserver
+diff --git a/src/yb/tserver/tserver_metrics_heartbeat_data_provider.cc b/src/yb/tserver/tserver_metrics_heartbeat_data_provider.cc
+index 0b1751eda2..2bc62c3915 100644
+--- a/src/yb/tserver/tserver_metrics_heartbeat_data_provider.cc
++++ b/src/yb/tserver/tserver_metrics_heartbeat_data_provider.cc
+@@ -16,12 +16,9 @@
+ #include "yb/consensus/log.h"
+ #include "yb/consensus/raft_consensus.h"
+ 
+-#include "yb/docdb/docdb_rocksdb_util.h"
+-
+ #include "yb/master/master_heartbeat.pb.h"
+ 
+ #include "yb/tablet/tablet.h"
+-#include "yb/tablet/tablet_metadata.h"
+ #include "yb/tablet/tablet_peer.h"
+ 
+ #include "yb/tserver/xcluster_consumer_if.h"
+@@ -32,19 +29,17 @@
+ #include "yb/util/logging.h"
+ #include "yb/util/mem_tracker.h"
+ #include "yb/util/metrics.h"
+-#include "yb/util/flags.h"
+ 
+-DEFINE_UNKNOWN_int32(tserver_heartbeat_metrics_interval_ms, 5000,
+-             "Interval (in milliseconds) at which tserver sends its metrics in a heartbeat to "
+-             "master.");
++DEFINE_RUNTIME_int32(tserver_heartbeat_metrics_interval_ms, 5000,
++    "Interval (in milliseconds) at which tserver sends its metrics in a heartbeat to master.");
+ 
+-DEFINE_UNKNOWN_bool(tserver_heartbeat_metrics_add_drive_data, true,
++DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_drive_data, true,
+             "Add drive data to metrics which tserver sends to master");
+ 
+-DEFINE_UNKNOWN_bool(tserver_heartbeat_metrics_add_replication_status, true,
++DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_replication_status, true,
+             "Add replication status to metrics tserver sends to master");
+ 
+-DEFINE_UNKNOWN_bool(tserver_heartbeat_metrics_add_leader_info, true,
++DEFINE_RUNTIME_bool(tserver_heartbeat_metrics_add_leader_info, true,
+             "Add leader info to metrics tserver sends to master");
+ 
+ DECLARE_uint64(rocksdb_max_file_size_for_compaction);
+@@ -54,13 +49,15 @@ using namespace std::literals;
+ namespace yb {
+ namespace tserver {
+ 
+-TServerMetricsHeartbeatDataProvider::TServerMetricsHeartbeatDataProvider(TabletServer* server) :
+-  PeriodicalHeartbeatDataProvider(server,
+-      MonoDelta::FromMilliseconds(FLAGS_tserver_heartbeat_metrics_interval_ms)),
+-  start_time_(MonoTime::Now()) {}
++TServerMetricsHeartbeatDataProvider::TServerMetricsHeartbeatDataProvider(TabletServer* server)
++    : PeriodicalHeartbeatDataProvider(server), start_time_(MonoTime::Now()) {}
++
++MonoDelta TServerMetricsHeartbeatDataProvider::Period() const {
++  return MonoDelta::FromMilliseconds(FLAGS_tserver_heartbeat_metrics_interval_ms);
++}
+ 
+ void TServerMetricsHeartbeatDataProvider::DoAddData(
+-    const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) {
++    bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) {
+   // Get the total memory used.
+   size_t mem_usage = MemTracker::GetRootTracker()->GetUpdatedConsumption(true /* force */);
+   auto* metrics = req->mutable_metrics();
+@@ -127,7 +124,7 @@ void TServerMetricsHeartbeatDataProvider::DoAddData(
+   if (FLAGS_tserver_heartbeat_metrics_add_replication_status) {
+     auto xcluster_consumer = server().GetXClusterConsumer();
+     if (xcluster_consumer != nullptr) {
+-      xcluster_consumer->PopulateMasterHeartbeatRequest(req, last_resp.needs_full_tablet_report());
++      xcluster_consumer->PopulateMasterHeartbeatRequest(req, needs_full_tablet_report);
+     }
+   }
+ 
+diff --git a/src/yb/tserver/tserver_metrics_heartbeat_data_provider.h b/src/yb/tserver/tserver_metrics_heartbeat_data_provider.h
+index cbb3de5d1a..6a303791c3 100644
+--- a/src/yb/tserver/tserver_metrics_heartbeat_data_provider.h
++++ b/src/yb/tserver/tserver_metrics_heartbeat_data_provider.h
+@@ -13,8 +13,6 @@
+ 
+ #pragma once
+ 
+-#include <memory>
+-
+ #include "yb/tserver/heartbeater.h"
+ 
+ namespace yb {
+@@ -25,8 +23,8 @@ class TServerMetricsHeartbeatDataProvider : public PeriodicalHeartbeatDataProvid
+   explicit TServerMetricsHeartbeatDataProvider(TabletServer* server);
+ 
+  private:
+-  void DoAddData(
+-      const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) override;
++  void DoAddData(bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) override;
++  MonoDelta Period() const override;
+ 
+   uint64_t CalculateUptime();
+ 

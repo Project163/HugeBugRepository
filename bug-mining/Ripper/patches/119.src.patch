@@ -1,0 +1,764 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9f02626..0e9f381 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,12 @@ TODO.
+   available, however, it does increase compilation times substantially at the
+   moment.
+ 
++Performance improvements:
++
++* [PERF #497](https://github.com/BurntSushi/ripgrep/issues/497),
++  [PERF #838](https://github.com/BurntSushi/ripgrep/issues/838):
++  Make `rg -F -f dictionary-of-literals` much faster.
++
+ Feature enhancements:
+ 
+ * [FEATURE #1099](https://github.com/BurntSushi/ripgrep/pull/1099):
+diff --git a/Cargo.lock b/Cargo.lock
+index 9c633d4..1a895d1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -211,6 +211,7 @@ dependencies = [
+ name = "grep-regex"
+ version = "0.1.2"
+ dependencies = [
++ "aho-corasick 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)",
+  "grep-matcher 0.1.1",
+  "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
+  "regex 1.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+diff --git a/grep-regex/Cargo.toml b/grep-regex/Cargo.toml
+index 609ca16..dbbb546 100644
+--- a/grep-regex/Cargo.toml
++++ b/grep-regex/Cargo.toml
+@@ -13,8 +13,9 @@ keywords = ["regex", "grep", "search", "pattern", "line"]
+ license = "Unlicense/MIT"
+ 
+ [dependencies]
+-log = "0.4.5"
++aho-corasick = "0.7.3"
+ grep-matcher = { version = "0.1.1", path = "../grep-matcher" }
++log = "0.4.5"
+ regex = "1.1"
+ regex-syntax = "0.6.5"
+ thread_local = "0.3.6"
+diff --git a/grep-regex/src/config.rs b/grep-regex/src/config.rs
+index 4defc15..e04582e 100644
+--- a/grep-regex/src/config.rs
++++ b/grep-regex/src/config.rs
+@@ -1,12 +1,13 @@
+ use grep_matcher::{ByteSet, LineTerminator};
+ use regex::bytes::{Regex, RegexBuilder};
+ use regex_syntax::ast::{self, Ast};
+-use regex_syntax::hir::Hir;
++use regex_syntax::hir::{self, Hir};
+ 
+ use ast::AstAnalysis;
+ use crlf::crlfify;
+ use error::Error;
+ use literal::LiteralSets;
++use multi::alternation_literals;
+ use non_matching::non_matching_bytes;
+ use strip::strip_from_match;
+ 
+@@ -67,19 +68,17 @@ impl Config {
+     /// If there was a problem parsing the given expression then an error
+     /// is returned.
+     pub fn hir(&self, pattern: &str) -> Result<ConfiguredHIR, Error> {
+-        let analysis = self.analysis(pattern)?;
+-        let expr = ::regex_syntax::ParserBuilder::new()
+-            .nest_limit(self.nest_limit)
+-            .octal(self.octal)
++        let ast = self.ast(pattern)?;
++        let analysis = self.analysis(&ast)?;
++        let expr = hir::translate::TranslatorBuilder::new()
+             .allow_invalid_utf8(true)
+-            .ignore_whitespace(self.ignore_whitespace)
+-            .case_insensitive(self.is_case_insensitive(&analysis)?)
++            .case_insensitive(self.is_case_insensitive(&analysis))
+             .multi_line(self.multi_line)
+             .dot_matches_new_line(self.dot_matches_new_line)
+             .swap_greed(self.swap_greed)
+             .unicode(self.unicode)
+             .build()
+-            .parse(pattern)
++            .translate(pattern, &ast)
+             .map_err(Error::regex)?;
+         let expr = match self.line_terminator {
+             None => expr,
+@@ -99,21 +98,34 @@ impl Config {
+     fn is_case_insensitive(
+         &self,
+         analysis: &AstAnalysis,
+-    ) -> Result<bool, Error> {
++    ) -> bool {
+         if self.case_insensitive {
+-            return Ok(true);
++            return true;
+         }
+         if !self.case_smart {
+-            return Ok(false);
++            return false;
+         }
+-        Ok(analysis.any_literal() && !analysis.any_uppercase())
++        analysis.any_literal() && !analysis.any_uppercase()
++    }
++
++    /// Returns true if and only if this config is simple enough such that
++    /// if the pattern is a simple alternation of literals, then it can be
++    /// constructed via a plain Aho-Corasick automaton.
++    ///
++    /// Note that it is OK to return true even when settings like `multi_line`
++    /// are enabled, since if multi-line can impact the match semantics of a
++    /// regex, then it is by definition not a simple alternation of literals.
++    pub fn can_plain_aho_corasick(&self) -> bool {
++        !self.word
++        && !self.case_insensitive
++        && !self.case_smart
+     }
+ 
+     /// Perform analysis on the AST of this pattern.
+     ///
+     /// This returns an error if the given pattern failed to parse.
+-    fn analysis(&self, pattern: &str) -> Result<AstAnalysis, Error> {
+-        Ok(AstAnalysis::from_ast(&self.ast(pattern)?))
++    fn analysis(&self, ast: &Ast) -> Result<AstAnalysis, Error> {
++        Ok(AstAnalysis::from_ast(ast))
+     }
+ 
+     /// Parse the given pattern into its abstract syntax.
+@@ -173,6 +185,15 @@ impl ConfiguredHIR {
+         self.pattern_to_regex(&self.expr.to_string())
+     }
+ 
++    /// If this HIR corresponds to an alternation of literals with no
++    /// capturing groups, then this returns those literals.
++    pub fn alternation_literals(&self) -> Option<Vec<Vec<u8>>> {
++        if !self.config.can_plain_aho_corasick() {
++            return None;
++        }
++        alternation_literals(&self.expr)
++    }
++
+     /// Applies the given function to the concrete syntax of this HIR and then
+     /// generates a new HIR based on the result of the function in a way that
+     /// preserves the configuration.
+diff --git a/grep-regex/src/crlf.rs b/grep-regex/src/crlf.rs
+index 244f536..361e087 100644
+--- a/grep-regex/src/crlf.rs
++++ b/grep-regex/src/crlf.rs
+@@ -76,7 +76,9 @@ impl Matcher for CRLFMatcher {
+         caps: &mut RegexCaptures,
+     ) -> Result<bool, NoError> {
+         caps.strip_crlf(false);
+-        let r = self.regex.captures_read_at(caps.locations(), haystack, at);
++        let r = self.regex.captures_read_at(
++            caps.locations_mut(), haystack, at,
++        );
+         if !r.is_some() {
+             return Ok(false);
+         }
+diff --git a/grep-regex/src/lib.rs b/grep-regex/src/lib.rs
+index a578d0f..0d68c27 100644
+--- a/grep-regex/src/lib.rs
++++ b/grep-regex/src/lib.rs
+@@ -4,6 +4,7 @@ An implementation of `grep-matcher`'s `Matcher` trait for Rust's regex engine.
+ 
+ #![deny(missing_docs)]
+ 
++extern crate aho_corasick;
+ extern crate grep_matcher;
+ #[macro_use]
+ extern crate log;
+@@ -21,6 +22,7 @@ mod crlf;
+ mod error;
+ mod literal;
+ mod matcher;
++mod multi;
+ mod non_matching;
+ mod strip;
+ mod util;
+diff --git a/grep-regex/src/matcher.rs b/grep-regex/src/matcher.rs
+index d71f577..7f30252 100644
+--- a/grep-regex/src/matcher.rs
++++ b/grep-regex/src/matcher.rs
+@@ -8,6 +8,7 @@ use regex::bytes::{CaptureLocations, Regex};
+ use config::{Config, ConfiguredHIR};
+ use crlf::CRLFMatcher;
+ use error::Error;
++use multi::MultiLiteralMatcher;
+ use word::WordMatcher;
+ 
+ /// A builder for constructing a `Matcher` using regular expressions.
+@@ -52,7 +53,7 @@ impl RegexMatcherBuilder {
+         }
+ 
+         let matcher = RegexMatcherImpl::new(&chir)?;
+-        trace!("final regex: {:?}", matcher.regex().to_string());
++        trace!("final regex: {:?}", matcher.regex());
+         Ok(RegexMatcher {
+             config: self.config.clone(),
+             matcher: matcher,
+@@ -61,6 +62,29 @@ impl RegexMatcherBuilder {
+         })
+     }
+ 
++    /// Build a new matcher from a plain alternation of literals.
++    ///
++    /// Depending on the configuration set by the builder, this may be able to
++    /// build a matcher substantially faster than by joining the patterns with
++    /// a `|` and calling `build`.
++    pub fn build_literals<B: AsRef<str>>(
++        &self,
++        literals: &[B],
++    ) -> Result<RegexMatcher, Error> {
++        let slices: Vec<_> = literals.iter().map(|s| s.as_ref()).collect();
++        if !self.config.can_plain_aho_corasick() || literals.len() < 40 {
++            return self.build(&slices.join("|"));
++        }
++        let matcher = MultiLiteralMatcher::new(&slices)?;
++        let imp = RegexMatcherImpl::MultiLiteral(matcher);
++        Ok(RegexMatcher {
++            config: self.config.clone(),
++            matcher: imp,
++            fast_line_regex: None,
++            non_matching_bytes: ByteSet::empty(),
++        })
++    }
++
+     /// Set the value for the case insensitive (`i`) flag.
+     ///
+     /// When enabled, letters in the pattern will match both upper case and
+@@ -348,6 +372,8 @@ impl RegexMatcher {
+ enum RegexMatcherImpl {
+     /// The standard matcher used for all regular expressions.
+     Standard(StandardMatcher),
++    /// A matcher for an alternation of plain literals.
++    MultiLiteral(MultiLiteralMatcher),
+     /// A matcher that strips `\r` from the end of matches.
+     ///
+     /// This is only used when the CRLF hack is enabled and the regex is line
+@@ -370,16 +396,23 @@ impl RegexMatcherImpl {
+         } else if expr.needs_crlf_stripped() {
+             Ok(RegexMatcherImpl::CRLF(CRLFMatcher::new(expr)?))
+         } else {
++            if let Some(lits) = expr.alternation_literals() {
++                if lits.len() >= 40 {
++                    let matcher = MultiLiteralMatcher::new(&lits)?;
++                    return Ok(RegexMatcherImpl::MultiLiteral(matcher));
++                }
++            }
+             Ok(RegexMatcherImpl::Standard(StandardMatcher::new(expr)?))
+         }
+     }
+ 
+     /// Return the underlying regex object used.
+-    fn regex(&self) -> &Regex {
++    fn regex(&self) -> String {
+         match *self {
+-            RegexMatcherImpl::Word(ref x) => x.regex(),
+-            RegexMatcherImpl::CRLF(ref x) => x.regex(),
+-            RegexMatcherImpl::Standard(ref x) => &x.regex,
++            RegexMatcherImpl::Word(ref x) => x.regex().to_string(),
++            RegexMatcherImpl::CRLF(ref x) => x.regex().to_string(),
++            RegexMatcherImpl::MultiLiteral(_) => "<N/A>".to_string(),
++            RegexMatcherImpl::Standard(ref x) => x.regex.to_string(),
+         }
+     }
+ }
+@@ -399,6 +432,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.find_at(haystack, at),
++            MultiLiteral(ref m) => m.find_at(haystack, at),
+             CRLF(ref m) => m.find_at(haystack, at),
+             Word(ref m) => m.find_at(haystack, at),
+         }
+@@ -408,6 +442,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.new_captures(),
++            MultiLiteral(ref m) => m.new_captures(),
+             CRLF(ref m) => m.new_captures(),
+             Word(ref m) => m.new_captures(),
+         }
+@@ -417,6 +452,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.capture_count(),
++            MultiLiteral(ref m) => m.capture_count(),
+             CRLF(ref m) => m.capture_count(),
+             Word(ref m) => m.capture_count(),
+         }
+@@ -426,6 +462,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.capture_index(name),
++            MultiLiteral(ref m) => m.capture_index(name),
+             CRLF(ref m) => m.capture_index(name),
+             Word(ref m) => m.capture_index(name),
+         }
+@@ -435,6 +472,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.find(haystack),
++            MultiLiteral(ref m) => m.find(haystack),
+             CRLF(ref m) => m.find(haystack),
+             Word(ref m) => m.find(haystack),
+         }
+@@ -450,6 +488,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.find_iter(haystack, matched),
++            MultiLiteral(ref m) => m.find_iter(haystack, matched),
+             CRLF(ref m) => m.find_iter(haystack, matched),
+             Word(ref m) => m.find_iter(haystack, matched),
+         }
+@@ -465,6 +504,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.try_find_iter(haystack, matched),
++            MultiLiteral(ref m) => m.try_find_iter(haystack, matched),
+             CRLF(ref m) => m.try_find_iter(haystack, matched),
+             Word(ref m) => m.try_find_iter(haystack, matched),
+         }
+@@ -478,6 +518,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.captures(haystack, caps),
++            MultiLiteral(ref m) => m.captures(haystack, caps),
+             CRLF(ref m) => m.captures(haystack, caps),
+             Word(ref m) => m.captures(haystack, caps),
+         }
+@@ -494,6 +535,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.captures_iter(haystack, caps, matched),
++            MultiLiteral(ref m) => m.captures_iter(haystack, caps, matched),
+             CRLF(ref m) => m.captures_iter(haystack, caps, matched),
+             Word(ref m) => m.captures_iter(haystack, caps, matched),
+         }
+@@ -510,6 +552,9 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.try_captures_iter(haystack, caps, matched),
++            MultiLiteral(ref m) => {
++                m.try_captures_iter(haystack, caps, matched)
++            }
+             CRLF(ref m) => m.try_captures_iter(haystack, caps, matched),
+             Word(ref m) => m.try_captures_iter(haystack, caps, matched),
+         }
+@@ -524,6 +569,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.captures_at(haystack, at, caps),
++            MultiLiteral(ref m) => m.captures_at(haystack, at, caps),
+             CRLF(ref m) => m.captures_at(haystack, at, caps),
+             Word(ref m) => m.captures_at(haystack, at, caps),
+         }
+@@ -540,6 +586,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.replace(haystack, dst, append),
++            MultiLiteral(ref m) => m.replace(haystack, dst, append),
+             CRLF(ref m) => m.replace(haystack, dst, append),
+             Word(ref m) => m.replace(haystack, dst, append),
+         }
+@@ -559,6 +606,9 @@ impl Matcher for RegexMatcher {
+             Standard(ref m) => {
+                 m.replace_with_captures(haystack, caps, dst, append)
+             }
++            MultiLiteral(ref m) => {
++                m.replace_with_captures(haystack, caps, dst, append)
++            }
+             CRLF(ref m) => {
+                 m.replace_with_captures(haystack, caps, dst, append)
+             }
+@@ -572,6 +622,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.is_match(haystack),
++            MultiLiteral(ref m) => m.is_match(haystack),
+             CRLF(ref m) => m.is_match(haystack),
+             Word(ref m) => m.is_match(haystack),
+         }
+@@ -585,6 +636,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.is_match_at(haystack, at),
++            MultiLiteral(ref m) => m.is_match_at(haystack, at),
+             CRLF(ref m) => m.is_match_at(haystack, at),
+             Word(ref m) => m.is_match_at(haystack, at),
+         }
+@@ -597,6 +649,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.shortest_match(haystack),
++            MultiLiteral(ref m) => m.shortest_match(haystack),
+             CRLF(ref m) => m.shortest_match(haystack),
+             Word(ref m) => m.shortest_match(haystack),
+         }
+@@ -610,6 +663,7 @@ impl Matcher for RegexMatcher {
+         use self::RegexMatcherImpl::*;
+         match self.matcher {
+             Standard(ref m) => m.shortest_match_at(haystack, at),
++            MultiLiteral(ref m) => m.shortest_match_at(haystack, at),
+             CRLF(ref m) => m.shortest_match_at(haystack, at),
+             Word(ref m) => m.shortest_match_at(haystack, at),
+         }
+@@ -710,7 +764,9 @@ impl Matcher for StandardMatcher {
+         at: usize,
+         caps: &mut RegexCaptures,
+     ) -> Result<bool, NoError> {
+-        Ok(self.regex.captures_read_at(&mut caps.locs, haystack, at).is_some())
++        Ok(self.regex.captures_read_at(
++                &mut caps.locations_mut(), haystack, at,
++        ).is_some())
+     }
+ 
+     fn shortest_match_at(
+@@ -737,54 +793,84 @@ impl Matcher for StandardMatcher {
+ /// index of the group using the corresponding matcher's `capture_index`
+ /// method, and then use that index with `RegexCaptures::get`.
+ #[derive(Clone, Debug)]
+-pub struct RegexCaptures {
+-    /// Where the locations are stored.
+-    locs: CaptureLocations,
+-    /// These captures behave as if the capturing groups begin at the given
+-    /// offset. When set to `0`, this has no affect and capture groups are
+-    /// indexed like normal.
+-    ///
+-    /// This is useful when building matchers that wrap arbitrary regular
+-    /// expressions. For example, `WordMatcher` takes an existing regex `re`
+-    /// and creates `(?:^|\W)(re)(?:$|\W)`, but hides the fact that the regex
+-    /// has been wrapped from the caller. In order to do this, the matcher
+-    /// and the capturing groups must behave as if `(re)` is the `0`th capture
+-    /// group.
+-    offset: usize,
+-    /// When enable, the end of a match has `\r` stripped from it, if one
+-    /// exists.
+-    strip_crlf: bool,
++pub struct RegexCaptures(RegexCapturesImp);
++
++#[derive(Clone, Debug)]
++enum RegexCapturesImp {
++    AhoCorasick {
++        /// The start and end of the match, corresponding to capture group 0.
++        mat: Option<Match>,
++    },
++    Regex {
++        /// Where the locations are stored.
++        locs: CaptureLocations,
++        /// These captures behave as if the capturing groups begin at the given
++        /// offset. When set to `0`, this has no affect and capture groups are
++        /// indexed like normal.
++        ///
++        /// This is useful when building matchers that wrap arbitrary regular
++        /// expressions. For example, `WordMatcher` takes an existing regex
++        /// `re` and creates `(?:^|\W)(re)(?:$|\W)`, but hides the fact that
++        /// the regex has been wrapped from the caller. In order to do this,
++        /// the matcher and the capturing groups must behave as if `(re)` is
++        /// the `0`th capture group.
++        offset: usize,
++        /// When enable, the end of a match has `\r` stripped from it, if one
++        /// exists.
++        strip_crlf: bool,
++    },
+ }
+ 
+ impl Captures for RegexCaptures {
+     fn len(&self) -> usize {
+-        self.locs.len().checked_sub(self.offset).unwrap()
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { .. } => 1,
++            RegexCapturesImp::Regex { ref locs, offset, .. } => {
++                locs.len().checked_sub(offset).unwrap()
++            }
++        }
+     }
+ 
+     fn get(&self, i: usize) -> Option<Match> {
+-        if !self.strip_crlf {
+-            let actual = i.checked_add(self.offset).unwrap();
+-            return self.locs.pos(actual).map(|(s, e)| Match::new(s, e));
+-        }
+-
+-        // currently don't support capture offsetting with CRLF stripping
+-        assert_eq!(self.offset, 0);
+-        let m = match self.locs.pos(i).map(|(s, e)| Match::new(s, e)) {
+-            None => return None,
+-            Some(m) => m,
+-        };
+-        // If the end position of this match corresponds to the end position
+-        // of the overall match, then we apply our CRLF stripping. Otherwise,
+-        // we cannot assume stripping is correct.
+-        if i == 0 || m.end() == self.locs.pos(0).unwrap().1 {
+-            Some(m.with_end(m.end() - 1))
+-        } else {
+-            Some(m)
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { mat, .. } => {
++                if i == 0 {
++                    mat
++                } else {
++                    None
++                }
++            }
++            RegexCapturesImp::Regex { ref locs, offset, strip_crlf } => {
++                if !strip_crlf {
++                    let actual = i.checked_add(offset).unwrap();
++                    return locs.pos(actual).map(|(s, e)| Match::new(s, e));
++                }
++
++                // currently don't support capture offsetting with CRLF
++                // stripping
++                assert_eq!(offset, 0);
++                let m = match locs.pos(i).map(|(s, e)| Match::new(s, e)) {
++                    None => return None,
++                    Some(m) => m,
++                };
++                // If the end position of this match corresponds to the end
++                // position of the overall match, then we apply our CRLF
++                // stripping. Otherwise, we cannot assume stripping is correct.
++                if i == 0 || m.end() == locs.pos(0).unwrap().1 {
++                    Some(m.with_end(m.end() - 1))
++                } else {
++                    Some(m)
++                }
++            }
+         }
+     }
+ }
+ 
+ impl RegexCaptures {
++    pub(crate) fn simple() -> RegexCaptures {
++        RegexCaptures(RegexCapturesImp::AhoCorasick { mat: None })
++    }
++
+     pub(crate) fn new(locs: CaptureLocations) -> RegexCaptures {
+         RegexCaptures::with_offset(locs, 0)
+     }
+@@ -793,15 +879,53 @@ impl RegexCaptures {
+         locs: CaptureLocations,
+         offset: usize,
+     ) -> RegexCaptures {
+-        RegexCaptures { locs, offset, strip_crlf: false }
++        RegexCaptures(RegexCapturesImp::Regex {
++            locs, offset, strip_crlf: false,
++        })
++    }
++
++    pub(crate) fn locations(&self) -> &CaptureLocations {
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { .. } => {
++                panic!("getting locations for simple captures is invalid")
++            }
++            RegexCapturesImp::Regex { ref locs, .. } => {
++                locs
++            }
++        }
+     }
+ 
+-    pub(crate) fn locations(&mut self) -> &mut CaptureLocations {
+-        &mut self.locs
++    pub(crate) fn locations_mut(&mut self) -> &mut CaptureLocations {
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { .. } => {
++                panic!("getting locations for simple captures is invalid")
++            }
++            RegexCapturesImp::Regex { ref mut locs, .. } => {
++                locs
++            }
++        }
+     }
+ 
+     pub(crate) fn strip_crlf(&mut self, yes: bool) {
+-        self.strip_crlf = yes;
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { .. } => {
++                panic!("setting strip_crlf for simple captures is invalid")
++            }
++            RegexCapturesImp::Regex { ref mut strip_crlf, .. } => {
++                *strip_crlf = yes;
++            }
++        }
++    }
++
++    pub(crate) fn set_simple(&mut self, one: Option<Match>) {
++        match self.0 {
++            RegexCapturesImp::AhoCorasick { ref mut mat } => {
++                *mat = one;
++            }
++            RegexCapturesImp::Regex { .. } => {
++                panic!("setting simple captures for regex is invalid")
++            }
++        }
+     }
+ }
+ 
+diff --git a/grep-regex/src/multi.rs b/grep-regex/src/multi.rs
+new file mode 100644
+index 0000000..501e5ac
+--- /dev/null
++++ b/grep-regex/src/multi.rs
+@@ -0,0 +1,126 @@
++use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
++use grep_matcher::{Matcher, Match, NoError};
++use regex_syntax::hir::Hir;
++
++use error::Error;
++use matcher::RegexCaptures;
++
++/// A matcher for an alternation of literals.
++///
++/// Ideally, this optimization would be pushed down into the regex engine, but
++/// making this work correctly there would require quite a bit of refactoring.
++/// Moreover, doing it one layer above lets us do thing like, "if we
++/// specifically only want to search for literals, then don't bother with
++/// regex parsing at all."
++#[derive(Clone, Debug)]
++pub struct MultiLiteralMatcher {
++    /// The Aho-Corasick automaton.
++    ac: AhoCorasick,
++}
++
++impl MultiLiteralMatcher {
++    /// Create a new multi-literal matcher from the given literals.
++    pub fn new<B: AsRef<[u8]>>(
++        literals: &[B],
++    ) -> Result<MultiLiteralMatcher, Error> {
++        let ac = AhoCorasickBuilder::new()
++            .match_kind(MatchKind::LeftmostFirst)
++            .auto_configure(literals)
++            .build_with_size::<usize, _, _>(literals)
++            .map_err(Error::regex)?;
++        Ok(MultiLiteralMatcher { ac })
++    }
++}
++
++impl Matcher for MultiLiteralMatcher {
++    type Captures = RegexCaptures;
++    type Error = NoError;
++
++    fn find_at(
++        &self,
++        haystack: &[u8],
++        at: usize,
++    ) -> Result<Option<Match>, NoError> {
++        match self.ac.find(&haystack[at..]) {
++            None => Ok(None),
++            Some(m) => Ok(Some(Match::new(at + m.start(), at + m.end()))),
++        }
++    }
++
++    fn new_captures(&self) -> Result<RegexCaptures, NoError> {
++        Ok(RegexCaptures::simple())
++    }
++
++    fn capture_count(&self) -> usize {
++        1
++    }
++
++    fn capture_index(&self, _: &str) -> Option<usize> {
++        None
++    }
++
++    fn captures_at(
++        &self,
++        haystack: &[u8],
++        at: usize,
++        caps: &mut RegexCaptures,
++    ) -> Result<bool, NoError> {
++        caps.set_simple(None);
++        let mat = self.find_at(haystack, at)?;
++        caps.set_simple(mat);
++        Ok(mat.is_some())
++    }
++
++    // We specifically do not implement other methods like find_iter. Namely,
++    // the iter methods are guaranteed to be correct by virtue of implementing
++    // find_at above.
++}
++
++/// Alternation literals checks if the given HIR is a simple alternation of
++/// literals, and if so, returns them. Otherwise, this returns None.
++pub fn alternation_literals(expr: &Hir) -> Option<Vec<Vec<u8>>> {
++    use regex_syntax::hir::{HirKind, Literal};
++
++    // This is pretty hacky, but basically, if `is_alternation_literal` is
++    // true, then we can make several assumptions about the structure of our
++    // HIR. This is what justifies the `unreachable!` statements below.
++
++    if !expr.is_alternation_literal() {
++        return None;
++    }
++    let alts = match *expr.kind() {
++        HirKind::Alternation(ref alts) => alts,
++        _ => return None, // one literal isn't worth it
++    };
++
++    let extendlit = |lit: &Literal, dst: &mut Vec<u8>| {
++        match *lit {
++            Literal::Unicode(c) => {
++                let mut buf = [0; 4];
++                dst.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
++            }
++            Literal::Byte(b) => {
++                dst.push(b);
++            }
++        }
++    };
++
++    let mut lits = vec![];
++    for alt in alts {
++        let mut lit = vec![];
++        match *alt.kind() {
++            HirKind::Literal(ref x) => extendlit(x, &mut lit),
++            HirKind::Concat(ref exprs) => {
++                for e in exprs {
++                    match *e.kind() {
++                        HirKind::Literal(ref x) => extendlit(x, &mut lit),
++                        _ => unreachable!("expected literal, got {:?}", e),
++                    }
++                }
++            }
++            _ => unreachable!("expected literal or concat, got {:?}", alt),
++        }
++        lits.push(lit);
++    }
++    Some(lits)
++}
+diff --git a/grep-regex/src/word.rs b/grep-regex/src/word.rs
+index 86291f2..ff1e5dc 100644
+--- a/grep-regex/src/word.rs
++++ b/grep-regex/src/word.rs
+@@ -103,7 +103,9 @@ impl Matcher for WordMatcher {
+         at: usize,
+         caps: &mut RegexCaptures,
+     ) -> Result<bool, NoError> {
+-        let r = self.regex.captures_read_at(caps.locations(), haystack, at);
++        let r = self.regex.captures_read_at(
++            caps.locations_mut(), haystack, at,
++        );
+         Ok(r.is_some())
+     }
+ 
+diff --git a/src/args.rs b/src/args.rs
+index babaf09..61e1d4f 100644
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -656,7 +656,13 @@ impl ArgMatches {
+         if let Some(limit) = self.dfa_size_limit()? {
+             builder.dfa_size_limit(limit);
+         }
+-        match builder.build(&patterns.join("|")) {
++        let res =
++            if self.is_present("fixed-strings") {
++                builder.build_literals(patterns)
++            } else {
++                builder.build(&patterns.join("|"))
++            };
++        match res {
+             Ok(m) => Ok(m),
+             Err(err) => Err(From::from(suggest_multiline(err.to_string()))),
+         }

@@ -1,0 +1,952 @@
+diff --git a/doc/build/changelog/changelog_10.rst b/doc/build/changelog/changelog_10.rst
+index 85681fbba..48b94c07a 100644
+--- a/doc/build/changelog/changelog_10.rst
++++ b/doc/build/changelog/changelog_10.rst
+@@ -23,6 +23,16 @@
+     series as well.  For changes that are specific to 1.0 with an emphasis
+     on compatibility concerns, see :doc:`/changelog/migration_10`.
+ 
++    .. change::
++        :tags: feature, orm
++        :tickets: 3307
++
++        Mapped state internals have been reworked to allow for a 50% reduction
++        in callcounts specific to the "expiration" of objects, as in
++        the "auto expire" feature of :meth:`.Session.commit` and
++        for :meth:`.Session.expire_all`, as well as in the "cleanup" step
++        which occurs when object states are garbage collected.
++
+     .. change::
+         :tags: bug, mysql
+ 
+diff --git a/lib/sqlalchemy/orm/attributes.py b/lib/sqlalchemy/orm/attributes.py
+index e9c8c511a..a5af4e8ba 100644
+--- a/lib/sqlalchemy/orm/attributes.py
++++ b/lib/sqlalchemy/orm/attributes.py
+@@ -527,23 +527,6 @@ class AttributeImpl(object):
+ 
+             state.parents[id_] = False
+ 
+-    def set_callable(self, state, callable_):
+-        """Set a callable function for this attribute on the given object.
+-
+-        This callable will be executed when the attribute is next
+-        accessed, and is assumed to construct part of the instances
+-        previously stored state. When its value or values are loaded,
+-        they will be established as part of the instance's *committed
+-        state*.  While *trackparent* information will be assembled for
+-        these instances, attribute-level event handlers will not be
+-        fired.
+-
+-        The callable overrides the class level callable set in the
+-        ``InstrumentedAttribute`` constructor.
+-
+-        """
+-        state.callables[self.key] = callable_
+-
+     def get_history(self, state, dict_, passive=PASSIVE_OFF):
+         raise NotImplementedError()
+ 
+@@ -586,7 +569,9 @@ class AttributeImpl(object):
+                 if not passive & CALLABLES_OK:
+                     return PASSIVE_NO_RESULT
+ 
+-                if key in state.callables:
++                if key in state.expired_attributes:
++                    value = state._load_expired(state, passive)
++                elif key in state.callables:
+                     callable_ = state.callables[key]
+                     value = callable_(state, passive)
+                 elif self.callable_:
+diff --git a/lib/sqlalchemy/orm/identity.py b/lib/sqlalchemy/orm/identity.py
+index 24dd47859..769010950 100644
+--- a/lib/sqlalchemy/orm/identity.py
++++ b/lib/sqlalchemy/orm/identity.py
+@@ -44,7 +44,8 @@ class IdentityMap(object):
+ 
+     def _manage_removed_state(self, state):
+         del state._instance_dict
+-        self._modified.discard(state)
++        if state.modified:
++            self._modified.discard(state)
+ 
+     def _dirty_states(self):
+         return self._modified
+@@ -186,6 +187,9 @@ class WeakInstanceDict(IdentityMap):
+         else:
+             return list(self._dict.values())
+ 
++    def _fast_discard(self, state):
++        self._dict.pop(state.key, None)
++
+     def discard(self, state):
+         st = self._dict.pop(state.key, None)
+         if st:
+@@ -264,6 +268,9 @@ class StrongInstanceDict(IdentityMap):
+         self._dict[key] = state.obj()
+         state._instance_dict = self._wr
+ 
++    def _fast_discard(self, state):
++        self._dict.pop(state.key, None)
++
+     def discard(self, state):
+         obj = self._dict.pop(state.key, None)
+         if obj is not None:
+diff --git a/lib/sqlalchemy/orm/instrumentation.py b/lib/sqlalchemy/orm/instrumentation.py
+index ad7d2d53d..78a573cfd 100644
+--- a/lib/sqlalchemy/orm/instrumentation.py
++++ b/lib/sqlalchemy/orm/instrumentation.py
+@@ -35,6 +35,9 @@ from .. import util
+ from . import base
+ 
+ 
++_memoized_key_collection = util.group_expirable_memoized_property()
++
++
+ class ClassManager(dict):
+     """tracks state information at the class level."""
+ 
+@@ -92,6 +95,21 @@ class ClassManager(dict):
+     def is_mapped(self):
+         return 'mapper' in self.__dict__
+ 
++    @_memoized_key_collection
++    def _all_key_set(self):
++        return frozenset(self)
++
++    @_memoized_key_collection
++    def _collection_impl_keys(self):
++        return frozenset([
++            attr.key for attr in self.values() if attr.impl.collection])
++
++    @_memoized_key_collection
++    def _scalar_loader_impls(self):
++        return frozenset([
++            attr.impl for attr in
++            self.values() if attr.impl.accepts_scalar_loader])
++
+     @util.memoized_property
+     def mapper(self):
+         # raises unless self.mapper has been assigned
+@@ -195,6 +213,7 @@ class ClassManager(dict):
+         else:
+             self.local_attrs[key] = inst
+             self.install_descriptor(key, inst)
++        _memoized_key_collection.expire_instance(self)
+         self[key] = inst
+ 
+         for cls in self.class_.__subclasses__():
+@@ -223,6 +242,7 @@ class ClassManager(dict):
+         else:
+             del self.local_attrs[key]
+             self.uninstall_descriptor(key)
++        _memoized_key_collection.expire_instance(self)
+         del self[key]
+         for cls in self.class_.__subclasses__():
+             manager = manager_of_class(cls)
+diff --git a/lib/sqlalchemy/orm/loading.py b/lib/sqlalchemy/orm/loading.py
+index fdc787545..c59257039 100644
+--- a/lib/sqlalchemy/orm/loading.py
++++ b/lib/sqlalchemy/orm/loading.py
+@@ -146,7 +146,7 @@ def get_from_identity(session, key, passive):
+                 # expired state will be checked soon enough, if necessary
+                 return instance
+             try:
+-                state(state, passive)
++                state._load_expired(state, passive)
+             except orm_exc.ObjectDeletedError:
+                 session._remove_newly_deleted([state])
+                 return None
+@@ -411,11 +411,11 @@ def _populate_full(
+             for key, set_callable in populators["expire"]:
+                 dict_.pop(key, None)
+                 if set_callable:
+-                    state.callables[key] = state
++                    state.expired_attributes.add(key)
+         else:
+             for key, set_callable in populators["expire"]:
+                 if set_callable:
+-                    state.callables[key] = state
++                    state.expired_attributes.add(key)
+         for key, populator in populators["new"]:
+             populator(state, dict_, row)
+         for key, populator in populators["delayed"]:
+@@ -445,7 +445,7 @@ def _populate_partial(
+             if key in to_load:
+                 dict_.pop(key, None)
+                 if set_callable:
+-                    state.callables[key] = state
++                    state.expired_attributes.add(key)
+         for key, populator in populators["new"]:
+             if key in to_load:
+                 populator(state, dict_, row)
+diff --git a/lib/sqlalchemy/orm/session.py b/lib/sqlalchemy/orm/session.py
+index 3df6dce7a..c47026969 100644
+--- a/lib/sqlalchemy/orm/session.py
++++ b/lib/sqlalchemy/orm/session.py
+@@ -2691,9 +2691,13 @@ def make_transient(instance):
+     if s:
+         s._expunge_state(state)
+ 
+-    # remove expired state and
+-    # deferred callables
+-    state.callables.clear()
++    # remove expired state
++    state.expired_attributes.clear()
++
++    # remove deferred callables
++    if state.callables:
++        del state.callables
++
+     if state.key:
+         del state.key
+     if state.deleted:
+diff --git a/lib/sqlalchemy/orm/state.py b/lib/sqlalchemy/orm/state.py
+index 560149de5..7691c9826 100644
+--- a/lib/sqlalchemy/orm/state.py
++++ b/lib/sqlalchemy/orm/state.py
+@@ -60,12 +60,33 @@ class InstanceState(interfaces.InspectionAttr):
+     _load_pending = False
+     is_instance = True
+ 
++    callables = ()
++    """A namespace where a per-state loader callable can be associated.
++
++    In SQLAlchemy 1.0, this is only used for lazy loaders / deferred
++    loaders that were set up via query option.
++
++    Previously, callables was used also to indicate expired attributes
++    by storing a link to the InstanceState itself in this dictionary.
++    This role is now handled by the expired_attributes set.
++
++    """
++
+     def __init__(self, obj, manager):
+         self.class_ = obj.__class__
+         self.manager = manager
+         self.obj = weakref.ref(obj, self._cleanup)
+         self.committed_state = {}
+-        self.callables = {}
++        self.expired_attributes = set()
++
++    expired_attributes = None
++    """The set of keys which are 'expired' to be loaded by
++       the manager's deferred scalar loader, assuming no pending
++       changes.
++
++       see also the ``unmodified`` collection which is intersected
++       against this set when a refresh operation occurs."""
++
+ 
+     @util.memoized_property
+     def attrs(self):
+@@ -228,11 +249,25 @@ class InstanceState(interfaces.InspectionAttr):
+         del self.obj
+ 
+     def _cleanup(self, ref):
++        """Weakref callback cleanup.
++
++        This callable cleans out the state when it is being garbage
++        collected.
++
++        this _cleanup **assumes** that there are no strong refs to us!
++        Will not work otherwise!
++
++        """
+         instance_dict = self._instance_dict()
+         if instance_dict is not None:
+-            instance_dict.discard(self)
++            instance_dict._fast_discard(self)
++            del self._instance_dict
++
++            # we can't possibly be in instance_dict._modified
++            # b.c. this is weakref cleanup only, that set
++            # is strong referencing!
++            # assert self not in instance_dict._modified
+ 
+-        self.callables.clear()
+         self.session_id = self._strong_obj = None
+         del self.obj
+ 
+@@ -287,7 +322,7 @@ class InstanceState(interfaces.InspectionAttr):
+             (k, self.__dict__[k]) for k in (
+                 'committed_state', '_pending_mutations', 'modified',
+                 'expired', 'callables', 'key', 'parents', 'load_options',
+-                'class_',
++                'class_', 'expired_attributes'
+             ) if k in self.__dict__
+         )
+         if self.load_path:
+@@ -314,7 +349,18 @@ class InstanceState(interfaces.InspectionAttr):
+         self.parents = state_dict.get('parents', {})
+         self.modified = state_dict.get('modified', False)
+         self.expired = state_dict.get('expired', False)
+-        self.callables = state_dict.get('callables', {})
++        if 'callables' in state_dict:
++            self.callables = state_dict['callables']
++
++        try:
++            self.expired_attributes = state_dict['expired_attributes']
++        except KeyError:
++            self.expired_attributes = set()
++            # 0.9 and earlier compat
++            for k in list(self.callables):
++                if self.callables[k] is self:
++                    self.expired_attributes.add(k)
++                    del self.callables[k]
+ 
+         self.__dict__.update([
+             (k, state_dict[k]) for k in (
+@@ -341,57 +387,73 @@ class InstanceState(interfaces.InspectionAttr):
+         old = dict_.pop(key, None)
+         if old is not None and self.manager[key].impl.collection:
+             self.manager[key].impl._invalidate_collection(old)
+-        self.callables.pop(key, None)
++        self.expired_attributes.discard(key)
++        if self.callables:
++            self.callables.pop(key, None)
+ 
+     @classmethod
+-    def _row_processor(cls, manager, fn, key):
++    def _instance_level_callable_processor(cls, manager, fn, key):
+         impl = manager[key].impl
+         if impl.collection:
+             def _set_callable(state, dict_, row):
++                if 'callables' not in state.__dict__:
++                    state.callables = {}
+                 old = dict_.pop(key, None)
+                 if old is not None:
+                     impl._invalidate_collection(old)
+                 state.callables[key] = fn
+         else:
+             def _set_callable(state, dict_, row):
++                if 'callables' not in state.__dict__:
++                    state.callables = {}
+                 state.callables[key] = fn
+         return _set_callable
+ 
+     def _expire(self, dict_, modified_set):
+         self.expired = True
++
+         if self.modified:
+             modified_set.discard(self)
++            self.committed_state.clear()
++            self.modified = False
+ 
+-        self.modified = False
+         self._strong_obj = None
+ 
+-        self.committed_state.clear()
++        if '_pending_mutations' in self.__dict__:
++            del self.__dict__['_pending_mutations']
++
++        if 'parents' in self.__dict__:
++            del self.__dict__['parents']
+ 
+-        InstanceState._pending_mutations._reset(self)
++        self.expired_attributes.update(
++            [impl.key for impl in self.manager._scalar_loader_impls
++             if impl.expire_missing or impl.key in dict_]
++        )
+ 
+-        # clear out 'parents' collection.  not
+-        # entirely clear how we can best determine
+-        # which to remove, or not.
+-        InstanceState.parents._reset(self)
++        if self.callables:
++            for k in self.expired_attributes.intersection(self.callables):
++                del self.callables[k]
+ 
+-        for key in self.manager:
+-            impl = self.manager[key].impl
+-            if impl.accepts_scalar_loader and \
+-                    (impl.expire_missing or key in dict_):
+-                self.callables[key] = self
+-            old = dict_.pop(key, None)
+-            if impl.collection and old is not None:
+-                impl._invalidate_collection(old)
++        for k in self.manager._collection_impl_keys.intersection(dict_):
++            collection = dict_.pop(k)
++            collection._sa_adapter.invalidated = True
++
++        for key in self.manager._all_key_set.intersection(dict_):
++            del dict_[key]
+ 
+         self.manager.dispatch.expire(self, None)
+ 
+     def _expire_attributes(self, dict_, attribute_names):
+         pending = self.__dict__.get('_pending_mutations', None)
+ 
++        callables = self.callables
++
+         for key in attribute_names:
+             impl = self.manager[key].impl
+             if impl.accepts_scalar_loader:
+-                self.callables[key] = self
++                self.expired_attributes.add(key)
++                if callables and key in callables:
++                    del callables[key]
+             old = dict_.pop(key, None)
+             if impl.collection and old is not None:
+                 impl._invalidate_collection(old)
+@@ -402,7 +464,7 @@ class InstanceState(interfaces.InspectionAttr):
+ 
+         self.manager.dispatch.expire(self, attribute_names)
+ 
+-    def __call__(self, state, passive):
++    def _load_expired(self, state, passive):
+         """__call__ allows the InstanceState to act as a deferred
+         callable for loading expired attributes, which is also
+         serializable (picklable).
+@@ -421,8 +483,7 @@ class InstanceState(interfaces.InspectionAttr):
+         # instance state didn't have an identity,
+         # the attributes still might be in the callables
+         # dict.  ensure they are removed.
+-        for k in toload.intersection(self.callables):
+-            del self.callables[k]
++        self.expired_attributes.clear()
+ 
+         return ATTR_WAS_SET
+ 
+@@ -457,18 +518,6 @@ class InstanceState(interfaces.InspectionAttr):
+             if self.manager[attr].impl.accepts_scalar_loader
+         )
+ 
+-    @property
+-    def expired_attributes(self):
+-        """Return the set of keys which are 'expired' to be loaded by
+-           the manager's deferred scalar loader, assuming no pending
+-           changes.
+-
+-           see also the ``unmodified`` collection which is intersected
+-           against this set when a refresh operation occurs.
+-
+-        """
+-        return set([k for k, v in self.callables.items() if v is self])
+-
+     def _instance_dict(self):
+         return None
+ 
+@@ -491,6 +540,7 @@ class InstanceState(interfaces.InspectionAttr):
+ 
+         if (self.session_id and self._strong_obj is None) \
+                 or not self.modified:
++            self.modified = True
+             instance_dict = self._instance_dict()
+             if instance_dict:
+                 instance_dict._modified.add(self)
+@@ -511,7 +561,6 @@ class InstanceState(interfaces.InspectionAttr):
+                         self.manager[attr.key],
+                         base.state_class_str(self)
+                     ))
+-            self.modified = True
+ 
+     def _commit(self, dict_, keys):
+         """Commit attributes.
+@@ -528,10 +577,18 @@ class InstanceState(interfaces.InspectionAttr):
+ 
+         self.expired = False
+ 
+-        for key in set(self.callables).\
++        self.expired_attributes.difference_update(
++            set(keys).intersection(dict_))
++
++        # the per-keys commit removes object-level callables,
++        # while that of commit_all does not.  it's not clear
++        # if this behavior has a clear rationale, however tests do
++        # ensure this is what it does.
++        if self.callables:
++            for key in set(self.callables).\
+                 intersection(keys).\
+-                intersection(dict_):
+-            del self.callables[key]
++                    intersection(dict_):
++                    del self.callables[key]
+ 
+     def _commit_all(self, dict_, instance_dict=None):
+         """commit all attributes unconditionally.
+@@ -542,7 +599,8 @@ class InstanceState(interfaces.InspectionAttr):
+          - all attributes are marked as "committed"
+          - the "strong dirty reference" is removed
+          - the "modified" flag is set to False
+-         - any "expired" markers/callables for attributes loaded are removed.
++         - any "expired" markers for scalar attributes loaded are removed.
++         - lazy load callables for objects / collections *stay*
+ 
+         Attributes marked as "expired" can potentially remain
+         "expired" after this step if a value was not populated in state.dict.
+@@ -562,10 +620,7 @@ class InstanceState(interfaces.InspectionAttr):
+             if '_pending_mutations' in state_dict:
+                 del state_dict['_pending_mutations']
+ 
+-            callables = state.callables
+-            for key in list(callables):
+-                if key in dict_ and callables[key] is state:
+-                    del callables[key]
++            state.expired_attributes.difference_update(dict_)
+ 
+             if instance_dict and state.modified:
+                 instance_dict._modified.discard(state)
+diff --git a/lib/sqlalchemy/orm/strategies.py b/lib/sqlalchemy/orm/strategies.py
+index 8a4c8e731..0444c63ae 100644
+--- a/lib/sqlalchemy/orm/strategies.py
++++ b/lib/sqlalchemy/orm/strategies.py
+@@ -206,9 +206,10 @@ class DeferredColumnLoader(LoaderStrategy):
+                     adapter, populators)
+ 
+         elif not self.is_class_level:
+-            set_deferred_for_local_state = InstanceState._row_processor(
+-                mapper.class_manager,
+-                LoadDeferredColumns(self.key), self.key)
++            set_deferred_for_local_state = \
++                InstanceState._instance_level_callable_processor(
++                    mapper.class_manager,
++                    LoadDeferredColumns(self.key), self.key)
+             populators["new"].append((self.key, set_deferred_for_local_state))
+         else:
+             populators["expire"].append((self.key, False))
+@@ -639,7 +640,7 @@ class LazyLoader(AbstractRelationshipLoader):
+             # "lazyload" option on a "no load"
+             # attribute - "eager" attributes always have a
+             # class-level lazyloader installed.
+-            set_lazy_callable = InstanceState._row_processor(
++            set_lazy_callable = InstanceState._instance_level_callable_processor(
+                 mapper.class_manager,
+                 LoadLazyAttribute(key), key)
+ 
+diff --git a/test/orm/test_attributes.py b/test/orm/test_attributes.py
+index 9c1f7a985..b22fff1a9 100644
+--- a/test/orm/test_attributes.py
++++ b/test/orm/test_attributes.py
+@@ -18,9 +18,9 @@ MyTest = None
+ MyTest2 = None
+ 
+ 
+-
+ def _set_callable(state, dict_, key, callable_):
+-    fn = InstanceState._row_processor(state.manager, callable_, key)
++    fn = InstanceState._instance_level_callable_processor(
++        state.manager, callable_, key)
+     fn(state, dict_, None)
+ 
+ 
+@@ -1818,7 +1818,7 @@ class HistoryTest(fixtures.TestBase):
+         # populators.expire.append((self.key, True))
+         # does in loading.py
+         state.dict.pop('someattr', None)
+-        state.callables['someattr'] = state
++        state.expired_attributes.add('someattr')
+ 
+         def scalar_loader(state, toload):
+             state.dict['someattr'] = 'one'
+diff --git a/test/orm/test_expire.py b/test/orm/test_expire.py
+index 150a1cb27..63341abec 100644
+--- a/test/orm/test_expire.py
++++ b/test/orm/test_expire.py
+@@ -885,7 +885,6 @@ class ExpireTest(_fixtures.FixtureTest):
+ 
+         users, User = self.tables.users, self.classes.User
+ 
+-
+         mapper(User, users)
+ 
+         sess = create_session()
+@@ -894,32 +893,30 @@ class ExpireTest(_fixtures.FixtureTest):
+         # callable
+         u1 = sess.query(User).options(defer(User.name)).first()
+         assert isinstance(
+-                    attributes.instance_state(u1).callables['name'],
+-                    strategies.LoadDeferredColumns
+-                )
++            attributes.instance_state(u1).callables['name'],
++            strategies.LoadDeferredColumns
++        )
+ 
+         # expire the attr, it gets the InstanceState callable
+         sess.expire(u1, ['name'])
+-        assert isinstance(
+-                    attributes.instance_state(u1).callables['name'],
+-                    state.InstanceState
+-                )
++        assert 'name' in attributes.instance_state(u1).expired_attributes
++        assert 'name' not in attributes.instance_state(u1).callables
+ 
+         # load it, callable is gone
+         u1.name
++        assert 'name' not in attributes.instance_state(u1).expired_attributes
+         assert 'name' not in attributes.instance_state(u1).callables
+ 
+         # same for expire all
+         sess.expunge_all()
+         u1 = sess.query(User).options(defer(User.name)).first()
+         sess.expire(u1)
+-        assert isinstance(
+-                    attributes.instance_state(u1).callables['name'],
+-                    state.InstanceState
+-                )
++        assert 'name' in attributes.instance_state(u1).expired_attributes
++        assert 'name' not in attributes.instance_state(u1).callables
+ 
+         # load over it.  everything normal.
+         sess.query(User).first()
++        assert 'name' not in attributes.instance_state(u1).expired_attributes
+         assert 'name' not in attributes.instance_state(u1).callables
+ 
+         sess.expunge_all()
+@@ -927,15 +924,15 @@ class ExpireTest(_fixtures.FixtureTest):
+         # for non present, still expires the same way
+         del u1.name
+         sess.expire(u1)
+-        assert 'name' in attributes.instance_state(u1).callables
++        assert 'name' in attributes.instance_state(u1).expired_attributes
++        assert 'name' not in attributes.instance_state(u1).callables
+ 
+     def test_state_deferred_to_col(self):
+         """Behavioral test to verify the current activity of loader callables."""
+ 
+         users, User = self.tables.users, self.classes.User
+ 
+-
+-        mapper(User, users, properties={'name':deferred(users.c.name)})
++        mapper(User, users, properties={'name': deferred(users.c.name)})
+ 
+         sess = create_session()
+         u1 = sess.query(User).options(undefer(User.name)).first()
+@@ -944,13 +941,12 @@ class ExpireTest(_fixtures.FixtureTest):
+         # mass expire, the attribute was loaded,
+         # the attribute gets the callable
+         sess.expire(u1)
+-        assert isinstance(
+-                    attributes.instance_state(u1).callables['name'],
+-                    state.InstanceState
+-                )
++        assert 'name' in attributes.instance_state(u1).expired_attributes
++        assert 'name' not in attributes.instance_state(u1).callables
+ 
+-        # load it, callable is gone
++        # load it
+         u1.name
++        assert 'name' not in attributes.instance_state(u1).expired_attributes
+         assert 'name' not in attributes.instance_state(u1).callables
+ 
+         # mass expire, attribute was loaded but then deleted,
+@@ -960,60 +956,63 @@ class ExpireTest(_fixtures.FixtureTest):
+         u1 = sess.query(User).options(undefer(User.name)).first()
+         del u1.name
+         sess.expire(u1)
++        assert 'name' not in attributes.instance_state(u1).expired_attributes
+         assert 'name' not in attributes.instance_state(u1).callables
+ 
+         # single attribute expire, the attribute gets the callable
+         sess.expunge_all()
+         u1 = sess.query(User).options(undefer(User.name)).first()
+         sess.expire(u1, ['name'])
+-        assert isinstance(
+-                    attributes.instance_state(u1).callables['name'],
+-                    state.InstanceState
+-                )
++        assert 'name' in attributes.instance_state(u1).expired_attributes
++        assert 'name' not in attributes.instance_state(u1).callables
+ 
+     def test_state_noload_to_lazy(self):
+         """Behavioral test to verify the current activity of loader callables."""
+ 
+-        users, Address, addresses, User = (self.tables.users,
+-                                self.classes.Address,
+-                                self.tables.addresses,
+-                                self.classes.User)
+-
++        users, Address, addresses, User = (
++            self.tables.users,
++            self.classes.Address,
++            self.tables.addresses,
++            self.classes.User)
+ 
+-        mapper(User, users, properties={'addresses':relationship(Address, lazy='noload')})
++        mapper(
++            User, users,
++            properties={'addresses': relationship(Address, lazy='noload')})
+         mapper(Address, addresses)
+ 
+         sess = create_session()
+         u1 = sess.query(User).options(lazyload(User.addresses)).first()
+         assert isinstance(
+-                    attributes.instance_state(u1).callables['addresses'],
+-                    strategies.LoadLazyAttribute
+-                )
++            attributes.instance_state(u1).callables['addresses'],
++            strategies.LoadLazyAttribute
++        )
+         # expire, it stays
+         sess.expire(u1)
++        assert 'addresses' not in attributes.instance_state(u1).expired_attributes
+         assert isinstance(
+-                    attributes.instance_state(u1).callables['addresses'],
+-                    strategies.LoadLazyAttribute
+-                )
++            attributes.instance_state(u1).callables['addresses'],
++            strategies.LoadLazyAttribute
++        )
+ 
+         # load over it.  callable goes away.
+         sess.query(User).first()
++        assert 'addresses' not in attributes.instance_state(u1).expired_attributes
+         assert 'addresses' not in attributes.instance_state(u1).callables
+ 
+         sess.expunge_all()
+         u1 = sess.query(User).options(lazyload(User.addresses)).first()
+         sess.expire(u1, ['addresses'])
++        assert 'addresses' not in attributes.instance_state(u1).expired_attributes
+         assert isinstance(
+-                    attributes.instance_state(u1).callables['addresses'],
+-                    strategies.LoadLazyAttribute
+-                )
++            attributes.instance_state(u1).callables['addresses'],
++            strategies.LoadLazyAttribute
++        )
+ 
+         # load the attr, goes away
+         u1.addresses
++        assert 'addresses' not in attributes.instance_state(u1).expired_attributes
+         assert 'addresses' not in attributes.instance_state(u1).callables
+ 
+-
+-
+ class PolymorphicExpireTest(fixtures.MappedTest):
+     run_inserts = 'once'
+     run_deletes = None
+diff --git a/test/orm/test_pickled.py b/test/orm/test_pickled.py
+index 35f1b19d1..db2a27c77 100644
+--- a/test/orm/test_pickled.py
++++ b/test/orm/test_pickled.py
+@@ -11,6 +11,8 @@ from sqlalchemy.orm import mapper, relationship, create_session, \
+                             clear_mappers, exc as orm_exc,\
+                             configure_mappers, Session, lazyload_all,\
+                             lazyload, aliased
++from sqlalchemy.orm import state as sa_state
++from sqlalchemy.orm import instrumentation
+ from sqlalchemy.orm.collections import attribute_mapped_collection, \
+     column_mapped_collection
+ from sqlalchemy.testing import fixtures
+@@ -241,6 +243,35 @@ class PickleTest(fixtures.MappedTest):
+             u2 = loads(dumps(u1))
+             eq_(u1, u2)
+ 
++    def test_09_pickle(self):
++        users = self.tables.users
++        mapper(User, users)
++        sess = Session()
++        sess.add(User(id=1, name='ed'))
++        sess.commit()
++        sess.close()
++
++        inst = User(id=1, name='ed')
++        del inst._sa_instance_state
++
++        state = sa_state.InstanceState.__new__(sa_state.InstanceState)
++        state_09 = {
++            'class_': User,
++            'modified': False,
++            'committed_state': {},
++            'instance': inst,
++            'callables': {'name': state, 'id': state},
++            'key': (User, (1,)),
++            'expired': True}
++        manager = instrumentation._SerializeManager.__new__(
++            instrumentation._SerializeManager)
++        manager.class_ = User
++        state_09['manager'] = manager
++        state.__setstate__(state_09)
++
++        sess = Session()
++        sess.add(inst)
++        eq_(inst.name, 'ed')
+ 
+     @testing.requires.non_broken_pickle
+     def test_options_with_descriptors(self):
+diff --git a/test/profiles.txt b/test/profiles.txt
+index 6e55b647d..6dafe4da1 100644
+--- a/test/profiles.txt
++++ b/test/profiles.txt
+@@ -110,6 +110,8 @@ test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.3_sqlite_
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.3_sqlite_pysqlite_nocextensions 4266
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.4_postgresql_psycopg2_cextensions 4266
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.4_postgresql_psycopg2_nocextensions 4266
++test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.4_sqlite_pysqlite_cextensions 4263
++test.aaa_profiling.test_orm.AttributeOverheadTest.test_attribute_set 3.4_sqlite_pysqlite_nocextensions 4267
+ 
+ # TEST: test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove
+ 
+@@ -125,36 +127,42 @@ test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove 3.3_sqlite_pysqlite_nocextensions 6428
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove 3.4_postgresql_psycopg2_cextensions 6428
+ test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove 3.4_postgresql_psycopg2_nocextensions 6428
++test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove 3.4_sqlite_pysqlite_cextensions 6428
++test.aaa_profiling.test_orm.AttributeOverheadTest.test_collection_append_remove 3.4_sqlite_pysqlite_nocextensions 6630
+ 
+ # TEST: test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline
+ 
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_mysql_mysqldb_cextensions 19132
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_mysql_mysqldb_nocextensions 28149
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_postgresql_psycopg2_cextensions 31132
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_mysql_mysqldb_cextensions 16236
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_mysql_mysqldb_nocextensions 25253
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_postgresql_psycopg2_cextensions 28219
+ test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_postgresql_psycopg2_nocextensions 40149
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_sqlite_pysqlite_cextensions 19280
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_sqlite_pysqlite_nocextensions 28347
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_postgresql_psycopg2_cextensions 20163
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_postgresql_psycopg2_nocextensions 29138
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_sqlite_pysqlite_cextensions 20352
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_sqlite_pysqlite_nocextensions 29355
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_postgresql_psycopg2_cextensions 20135
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_postgresql_psycopg2_nocextensions 29138
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_sqlite_pysqlite_cextensions 16386
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 2.7_sqlite_pysqlite_nocextensions 25403
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_postgresql_psycopg2_cextensions 17219
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_postgresql_psycopg2_nocextensions 26222
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_sqlite_pysqlite_cextensions 17408
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.3_sqlite_pysqlite_nocextensions 26411
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_postgresql_psycopg2_cextensions 17219
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_postgresql_psycopg2_nocextensions 26222
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_sqlite_pysqlite_cextensions 17408
++test.aaa_profiling.test_orm.DeferOptionsTest.test_baseline 3.4_sqlite_pysqlite_nocextensions 26411
+ 
+ # TEST: test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols
+ 
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_mysql_mysqldb_cextensions 27080
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_mysql_mysqldb_nocextensions 30085
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_postgresql_psycopg2_cextensions 27049
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_postgresql_psycopg2_nocextensions 30054
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_sqlite_pysqlite_cextensions 27144
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_sqlite_pysqlite_nocextensions 28183
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_postgresql_psycopg2_cextensions 26097
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_postgresql_psycopg2_nocextensions 29068
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_sqlite_pysqlite_cextensions 26208
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_sqlite_pysqlite_nocextensions 31179
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_postgresql_psycopg2_cextensions 26065
+-test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_postgresql_psycopg2_nocextensions 29068
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_mysql_mysqldb_cextensions 22227
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_mysql_mysqldb_nocextensions 25232
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_postgresql_psycopg2_cextensions 22198
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_postgresql_psycopg2_nocextensions 25203
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_sqlite_pysqlite_cextensions 24293
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 2.7_sqlite_pysqlite_nocextensions 25298
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_postgresql_psycopg2_cextensions 23212
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_postgresql_psycopg2_nocextensions 26215
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_sqlite_pysqlite_cextensions 23323
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.3_sqlite_pysqlite_nocextensions 26326
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_postgresql_psycopg2_cextensions 23212
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_postgresql_psycopg2_nocextensions 26215
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_sqlite_pysqlite_cextensions 23323
++test.aaa_profiling.test_orm.DeferOptionsTest.test_defer_many_cols 3.4_sqlite_pysqlite_nocextensions 28326
+ 
+ # TEST: test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity
+ 
+@@ -170,6 +178,8 @@ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity 3.3_sqlite_pysqlite_nocextensions 18988
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity 3.4_postgresql_psycopg2_cextensions 18988
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity 3.4_postgresql_psycopg2_nocextensions 18988
++test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity 3.4_sqlite_pysqlite_cextensions 18988
++test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_identity 3.4_sqlite_pysqlite_nocextensions 18988
+ 
+ # TEST: test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity
+ 
+@@ -185,6 +195,8 @@ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity 3.3_sqlite_pysqlite_nocextensions 171364
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity 3.4_postgresql_psycopg2_cextensions 123602
+ test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity 3.4_postgresql_psycopg2_nocextensions 125352
++test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity 3.4_sqlite_pysqlite_cextensions 170351
++test.aaa_profiling.test_orm.LoadManyToOneFromIdentityTest.test_many_to_one_load_no_identity 3.4_sqlite_pysqlite_nocextensions 174099
+ 
+ # TEST: test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks
+ 
+@@ -200,6 +212,8 @@ test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.
+ test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.3_sqlite_pysqlite_nocextensions 23271
+ test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.4_postgresql_psycopg2_cextensions 19228
+ test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.4_postgresql_psycopg2_nocextensions 19480
++test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.4_sqlite_pysqlite_cextensions 22354
++test.aaa_profiling.test_orm.MergeBackrefsTest.test_merge_pending_with_all_pks 3.4_sqlite_pysqlite_nocextensions 22597
+ 
+ # TEST: test.aaa_profiling.test_orm.MergeTest.test_merge_load
+ 
+@@ -215,6 +229,8 @@ test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.3_sqlite_pysqlite_cexten
+ test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.3_sqlite_pysqlite_nocextensions 1671
+ test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.4_postgresql_psycopg2_cextensions 1340
+ test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.4_postgresql_psycopg2_nocextensions 1355
++test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.4_sqlite_pysqlite_cextensions 1641
++test.aaa_profiling.test_orm.MergeTest.test_merge_load 3.4_sqlite_pysqlite_nocextensions 1658
+ 
+ # TEST: test.aaa_profiling.test_orm.MergeTest.test_merge_no_load
+ 
+@@ -230,6 +246,25 @@ test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.3_sqlite_pysqlite_cex
+ test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.3_sqlite_pysqlite_nocextensions 94,19
+ test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.4_postgresql_psycopg2_cextensions 94,19
+ test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.4_postgresql_psycopg2_nocextensions 94,19
++test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.4_sqlite_pysqlite_cextensions 96,20
++test.aaa_profiling.test_orm.MergeTest.test_merge_no_load 3.4_sqlite_pysqlite_nocextensions 96,20
++
++# TEST: test.aaa_profiling.test_orm.SessionTest.test_expire_lots
++
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_mysql_mysqldb_cextensions 1138
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_mysql_mysqldb_nocextensions 1142
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_postgresql_psycopg2_cextensions 1160
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_postgresql_psycopg2_nocextensions 1144
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_sqlite_pysqlite_cextensions 1135
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 2.7_sqlite_pysqlite_nocextensions 1152
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.3_postgresql_psycopg2_cextensions 1257
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.3_postgresql_psycopg2_nocextensions 1255
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.3_sqlite_pysqlite_cextensions 1250
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.3_sqlite_pysqlite_nocextensions 1253
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.4_postgresql_psycopg2_cextensions 1260
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.4_postgresql_psycopg2_nocextensions 1257
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.4_sqlite_pysqlite_cextensions 1249
++test.aaa_profiling.test_orm.SessionTest.test_expire_lots 3.4_sqlite_pysqlite_nocextensions 1231
+ 
+ # TEST: test.aaa_profiling.test_orm.SessionTest.test_expire_lots
+ 
+@@ -256,11 +291,14 @@ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 2.7_postgresql_psy
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 2.7_postgresql_psycopg2_nocextensions 91
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 2.7_sqlite_pysqlite_cextensions 91
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 2.7_sqlite_pysqlite_nocextensions 91
++test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.3_postgresql_psycopg2_cextensions 82
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.3_postgresql_psycopg2_nocextensions 78
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.3_sqlite_pysqlite_cextensions 78
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.3_sqlite_pysqlite_nocextensions 78
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.4_postgresql_psycopg2_cextensions 78
+ test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.4_postgresql_psycopg2_nocextensions 78
++test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.4_sqlite_pysqlite_cextensions 82
++test.aaa_profiling.test_pool.QueuePoolTest.test_first_connect 3.4_sqlite_pysqlite_nocextensions 82
+ 
+ # TEST: test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect
+ 
+@@ -270,11 +308,14 @@ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 2.7_postgresql_ps
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 2.7_postgresql_psycopg2_nocextensions 31
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 2.7_sqlite_pysqlite_cextensions 31
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 2.7_sqlite_pysqlite_nocextensions 31
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.3_postgresql_psycopg2_cextensions 24
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.3_postgresql_psycopg2_nocextensions 24
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.3_sqlite_pysqlite_cextensions 24
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.3_sqlite_pysqlite_nocextensions 24
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.4_postgresql_psycopg2_cextensions 24
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.4_postgresql_psycopg2_nocextensions 24
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.4_sqlite_pysqlite_cextensions 24
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_connect 3.4_sqlite_pysqlite_nocextensions 24
+ 
+ # TEST: test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect
+ 
+@@ -284,11 +325,14 @@ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 2.7_po
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 2.7_postgresql_psycopg2_nocextensions 8
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 2.7_sqlite_pysqlite_cextensions 8
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 2.7_sqlite_pysqlite_nocextensions 8
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.3_postgresql_psycopg2_cextensions 9
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.3_postgresql_psycopg2_nocextensions 9
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.3_sqlite_pysqlite_cextensions 9
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.3_sqlite_pysqlite_nocextensions 9
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.4_postgresql_psycopg2_cextensions 9
+ test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.4_postgresql_psycopg2_nocextensions 9
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.4_sqlite_pysqlite_cextensions 9
++test.aaa_profiling.test_pool.QueuePoolTest.test_second_samethread_connect 3.4_sqlite_pysqlite_nocextensions 9
+ 
+ # TEST: test.aaa_profiling.test_resultset.ExecutionTest.test_minimal_connection_execute
+ 

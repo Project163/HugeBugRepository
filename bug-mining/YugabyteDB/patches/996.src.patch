@@ -1,0 +1,576 @@
+diff --git a/src/yb/common/transaction.cc b/src/yb/common/transaction.cc
+index 14989b6391..ee725b609c 100644
+--- a/src/yb/common/transaction.cc
++++ b/src/yb/common/transaction.cc
+@@ -40,9 +40,10 @@ TransactionStatusResult::TransactionStatusResult(TransactionStatus status_, Hybr
+     : TransactionStatusResult(status_, status_time_, SubtxnSet()) {}
+ 
+ TransactionStatusResult::TransactionStatusResult(
+-    TransactionStatus status_, HybridTime status_time_,
+-    SubtxnSet aborted_subtxn_set_)
+-    : status(status_), status_time(status_time_), aborted_subtxn_set(aborted_subtxn_set_) {
++    TransactionStatus status_, HybridTime status_time_, SubtxnSet aborted_subtxn_set_,
++    Status expected_deadlock_status_) : status(status_), status_time(status_time_),
++        aborted_subtxn_set(aborted_subtxn_set_),
++        expected_deadlock_status(expected_deadlock_status_) {
+   DCHECK(status == TransactionStatus::ABORTED || status_time.is_valid())
+       << "Status: " << status << ", status_time: " << status_time;
+ }
+diff --git a/src/yb/common/transaction.h b/src/yb/common/transaction.h
+index 3f5d18a4be..0ba8bb3690 100644
+--- a/src/yb/common/transaction.h
++++ b/src/yb/common/transaction.h
+@@ -121,13 +121,17 @@ struct TransactionStatusResult {
+   // Populating status_tablet field is optional, except when we report transaction promotion.
+   TabletId status_tablet;
+ 
++  // Status containing the deadlock info if the transaction was aborted due to a deadlock.
++  // Defaults to Status::OK() in all other cases.
++  Status expected_deadlock_status = Status::OK();
++
+   TransactionStatusResult() {}
+ 
+   TransactionStatusResult(TransactionStatus status_, HybridTime status_time_);
+ 
+   TransactionStatusResult(
+       TransactionStatus status_, HybridTime status_time_,
+-      SubtxnSet aborted_subtxn_set_);
++      SubtxnSet aborted_subtxn_set_, Status expected_deadlock_status_ = Status::OK());
+ 
+   TransactionStatusResult(
+       TransactionStatus status_, HybridTime status_time_, SubtxnSet aborted_subtxn_set_,
+diff --git a/src/yb/docdb/deadlock_detector.cc b/src/yb/docdb/deadlock_detector.cc
+index f34ba6474c..7260e2c9c4 100644
+--- a/src/yb/docdb/deadlock_detector.cc
++++ b/src/yb/docdb/deadlock_detector.cc
+@@ -19,6 +19,7 @@
+ 
+ #include "yb/client/transaction_rpc.h"
+ 
++#include "yb/common/pgsql_error.h"
+ #include "yb/common/transaction.h"
+ #include "yb/common/wire_protocol.h"
+ 
+@@ -41,6 +42,7 @@
+ #include "yb/util/strongly_typed_uuid.h"
+ #include "yb/util/tsan_util.h"
+ #include "yb/util/unique_lock.h"
++#include "yb/util/yb_pg_errcodes.h"
+ 
+ using namespace std::placeholders;
+ using namespace std::literals;
+@@ -53,6 +55,12 @@ DEFINE_UNKNOWN_int32(
+ TAG_FLAG(clear_active_probes_older_than_seconds, hidden);
+ TAG_FLAG(clear_active_probes_older_than_seconds, advanced);
+ 
++DEFINE_RUNTIME_int32(
++    clear_deadlocked_txns_info_older_than_heartbeats, 10,
++    "Minimum number of transaction heartbeat periods for which a deadlocked transaction's info is "
++    "retained, after it has been reported to be aborted. This ensures the memory used to track "
++    "info of deadlocked transactions does not grow unbounded.");
++
+ METRIC_DEFINE_coarse_histogram(
+     tablet, deadlock_size, "Deadlock size", yb::MetricUnit::kTransactions,
+     "The number of transactions involved in detected deadlocks");
+@@ -67,6 +75,8 @@ DEFINE_test_flag(int32, sleep_amidst_iterating_blockers_ms, 0,
+     "Time for which the thread sleeps in each iteration while looping over the computed wait-for "
+     "probes and sending information to the waiters.");
+ 
++DECLARE_uint64(transaction_heartbeat_usec);
++
+ namespace yb {
+ namespace tablet {
+ 
+@@ -358,6 +368,22 @@ using LocalProbeProcessorPtr = std::shared_ptr<LocalProbeProcessor>;
+ 
+ } // namespace
+ 
++std::string ConstructDeadlockedMessage(const TransactionId& waiter,
++                                 const tserver::ProbeTransactionDeadlockResponsePB& resp) {
++  std::stringstream ss;
++  ss << Format("Transaction $0 aborted due to a deadlock.\n$0", waiter.ToString());
++  for (auto i = 1 ; i < resp.deadlocked_txn_ids_size() ; i++) {
++    auto id_or_status = FullyDecodeTransactionId(resp.deadlocked_txn_ids(i));
++    if (!id_or_status.ok()) {
++      ss << Format(" -> [Error decoding txn id: $0]", id_or_status.status());
++    } else {
++      ss << Format(" -> $0", *id_or_status);
++    }
++  }
++  ss << Format(" -> $0\n", waiter.ToString());
++  return ss.str();
++}
++
+ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetector::Impl> {
+  public:
+   explicit Impl(
+@@ -562,6 +588,20 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
+       // TODO(wait-queues): Trigger probes only for waiters which which have
+       // wait_start_time > Now() - N seconds
+       probes_to_send = GetProbesToSend(waiters_);
++
++      // Clear the info of old deadlocked transactions.
++      auto interval = FLAGS_clear_deadlocked_txns_info_older_than_heartbeats *
++          FLAGS_transaction_heartbeat_usec * 1us;
++      auto expired_cutoff_time = CoarseMonoClock::Now() - interval;
++      for (auto it = recently_deadlocked_txns_info_.begin();
++           it != recently_deadlocked_txns_info_.end();) {
++        const auto& deadlock_time = it->second.second;
++        if (deadlock_time < expired_cutoff_time) {
++          it = recently_deadlocked_txns_info_.erase(it);
++        } else {
++          it++;
++        }
++      }
+     }
+ 
+     for (auto& processor : probes_to_send) {
+@@ -581,6 +621,16 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
+     }
+   }
+ 
++  Status GetTransactionDeadlockStatus(const TransactionId& txn_id) {
++    SharedLock<decltype(mutex_)> l(mutex_);
++    auto it = recently_deadlocked_txns_info_.find(txn_id);
++    if (it == recently_deadlocked_txns_info_.end()) {
++      return Status::OK();
++    }
++    return STATUS_EC_FORMAT(
++        Expired, PgsqlError(YBPgErrorCode::YB_PG_T_R_DEADLOCK_DETECTED), it->second.first);
++  }
++
+  private:
+   template <class T>
+   std::vector<LocalProbeProcessorPtr> GetProbesToSend(const T& waiters) {
+@@ -630,9 +680,14 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
+             LOG(ERROR) << "Failed to decode transaction id in detected deadlock!";
+           } else {
+             const auto& waiter = *waiter_or_status;
++            {
++              UniqueLock<decltype(detector->mutex_)> l(detector->mutex_);
++              auto deadlock_info = std::make_pair(ConstructDeadlockedMessage(waiter, resp),
++                                                  CoarseMonoClock::Now());
++              detector->recently_deadlocked_txns_info_.emplace(waiter, deadlock_info);
++            }
+             detector->controller_->Abort(
+-                waiter,
+-                std::bind(&DeadlockDetector::Impl::TxnAbortCallback, detector, _1, waiter));
++                waiter, std::bind(&DeadlockDetector::Impl::TxnAbortCallback, detector, _1, waiter));
+           }
+         }
+       });
+@@ -770,7 +825,7 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
+ 
+   void TxnAbortCallback(Result<TransactionStatusResult> res, const TransactionId txn_id) {
+     if (res.ok()) {
+-      if (res->status == TransactionStatus::ABORTED && res->status_time.is_valid()) {
++      if (res->status == TransactionStatus::ABORTED) {
+         LOG_WITH_FUNC(INFO) << "Aborting deadlocked transaction " << txn_id << " succeeded.";
+         return;
+       }
+@@ -812,6 +867,9 @@ class DeadlockDetector::Impl : public std::enable_shared_from_this<DeadlockDetec
+   Waiters waiters_ GUARDED_BY(mutex_);
+ 
+   std::atomic<uint32_t> seq_no_ = 0;
++
++  std::unordered_map<TransactionId, std::pair<std::string, CoarseTimePoint>, TransactionIdHash>
++      recently_deadlocked_txns_info_ GUARDED_BY(mutex_);
+ };
+ 
+ DeadlockDetector::DeadlockDetector(
+@@ -841,6 +899,10 @@ void DeadlockDetector::TriggerProbes() {
+   return impl_->TriggerProbes();
+ }
+ 
++Status DeadlockDetector::GetTransactionDeadlockStatus(const TransactionId& txn_id) {
++  return impl_->GetTransactionDeadlockStatus(txn_id);
++}
++
+ void DeadlockDetector::Shutdown() {
+   return impl_->Shutdown();
+ }
+diff --git a/src/yb/docdb/deadlock_detector.h b/src/yb/docdb/deadlock_detector.h
+index da0ad9c3df..3350effa59 100644
+--- a/src/yb/docdb/deadlock_detector.h
++++ b/src/yb/docdb/deadlock_detector.h
+@@ -189,6 +189,10 @@ class DeadlockDetector {
+ 
+   void Shutdown();
+ 
++  // Returns the deadlock status if the given transaction could have been involved in a deadlock.
++  // Returns Status::OK() in all other cases.
++  Status GetTransactionDeadlockStatus(const TransactionId& txn_id);
++
+  private:
+   class Impl;
+   std::shared_ptr<Impl> impl_;
+diff --git a/src/yb/docdb/wait_queue.cc b/src/yb/docdb/wait_queue.cc
+index 502f9a9cc1..538d40775e 100644
+--- a/src/yb/docdb/wait_queue.cc
++++ b/src/yb/docdb/wait_queue.cc
+@@ -149,7 +149,7 @@ auto GetMaxSingleShardWaitDuration() {
+   return FLAGS_force_single_shard_waiter_retry_ms * 1ms;
+ }
+ 
+-YB_DEFINE_ENUM(ResolutionStatus, (kPending)(kCommitted)(kAborted)(kPromoted));
++YB_DEFINE_ENUM(ResolutionStatus, (kPending)(kCommitted)(kAborted)(kPromoted)(kDeadlocked));
+ 
+ class BlockerData;
+ using BlockerDataPtr = std::shared_ptr<BlockerData>;
+@@ -179,7 +179,9 @@ Result<ResolutionStatus> UnwrapResult(const Result<TransactionStatusResult>& res
+     case COMMITTED:
+       return ResolutionStatus::kCommitted;
+     case ABORTED:
+-      return ResolutionStatus::kAborted;
++      return res->expected_deadlock_status.ok()
++          ? ResolutionStatus::kAborted
++          : ResolutionStatus::kDeadlocked;
+     case PENDING:
+       return ResolutionStatus::kPending;
+     case PROMOTED:
+@@ -1312,10 +1314,13 @@ class WaitQueue::Impl {
+     }
+     if (resp.status(0) == ABORTED) {
+       VLOG_WITH_PREFIX(1) << "Waiter status aborted " << waiter_id;
+-      waiter->InvokeCallback(
+-          // We return InternalError so that TabletInvoker does not retry.
+-          STATUS_EC_FORMAT(InternalError, TransactionError(TransactionErrorCode::kConflict),
+-                           "Transaction $0 was aborted while waiting for locks", waiter_id));
++      auto s = resp.deadlock_reason(0).code() == AppStatusPB::OK
++          ? STATUS_EC_FORMAT(
++                // Return InternalError so that TabletInvoker does not retry.
++                InternalError, TransactionError(TransactionErrorCode::kConflict),
++                "Transaction $0 was aborted while waiting for locks", waiter_id)
++          : StatusFromPB(resp.deadlock_reason(0));
++      waiter->InvokeCallback(s);
+       return;
+     }
+     LOG(DFATAL) << "Waiting transaction " << waiter_id
+@@ -1337,6 +1342,9 @@ class WaitQueue::Impl {
+             InternalError, TransactionError(TransactionErrorCode::kConflict),
+             "Transaction was aborted while waiting for locks $0", waiter->id),
+           waiter);
++    } else if (*status == ResolutionStatus::kDeadlocked) {
++      DCHECK(!res->expected_deadlock_status.ok());
++      InvokeWaiterCallback(res->expected_deadlock_status, waiter);
+     }
+     // Need not handle waiter promotion case here as this code path is executed only as a callback
+     // from WaitQueue::Impl::Poll function, where we periodically request waiter transaction state.
+diff --git a/src/yb/tablet/running_transaction.cc b/src/yb/tablet/running_transaction.cc
+index 26de12ffd6..5a30459225 100644
+--- a/src/yb/tablet/running_transaction.cc
++++ b/src/yb/tablet/running_transaction.cc
+@@ -17,6 +17,7 @@
+ 
+ #include "yb/common/hybrid_time.h"
+ #include "yb/common/pgsql_error.h"
++#include "yb/common/wire_protocol.h"
+ 
+ #include "yb/tablet/transaction_participant_context.h"
+ 
+@@ -123,9 +124,11 @@ void RunningTransaction::RequestStatusAt(const StatusRequest& request,
+           transaction_status == TransactionStatus::PENDING) {
+         local_commit_aborted_subtxn_set = last_known_aborted_subtxn_set_;
+       }
++      auto last_known_deadlock_status = last_known_deadlock_status_;
+       lock->unlock();
+       request.callback(TransactionStatusResult{
+-          *transaction_status, last_known_status_hybrid_time, local_commit_aborted_subtxn_set});
++          *transaction_status, last_known_status_hybrid_time, local_commit_aborted_subtxn_set,
++          last_known_deadlock_status});
+       return;
+     }
+   }
+@@ -152,7 +155,7 @@ bool RunningTransaction::WasAborted() const {
+ 
+ Status RunningTransaction::CheckAborted() const {
+   if (WasAborted()) {
+-    return MakeAbortedStatus(id());
++    return last_known_deadlock_status_.ok() ? MakeAbortedStatus(id()) : last_known_deadlock_status_;
+   }
+   return Status::OK();
+ }
+@@ -278,7 +281,8 @@ void RunningTransaction::StatusReceived(
+ 
+ bool RunningTransaction::UpdateStatus(
+     TransactionStatus transaction_status, HybridTime time_of_status,
+-    HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set) {
++    HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
++    const Status& expected_deadlock_status) {
+   if (!local_commit_time_ && transaction_status != TransactionStatus::ABORTED) {
+     // If we've already committed locally, then last_known_aborted_subtxn_set_ is already set
+     // properly. Otherwise, we should update it here.
+@@ -303,6 +307,8 @@ bool RunningTransaction::UpdateStatus(
+     context_.NotifyAbortedTransactionDecrement(id());
+   }
+   last_known_status_ = transaction_status;
++  DCHECK(expected_deadlock_status.ok() || transaction_status == TransactionStatus::ABORTED);
++  last_known_deadlock_status_ = expected_deadlock_status;
+ 
+   return transaction_status == TransactionStatus::ABORTED;
+ }
+@@ -323,6 +329,7 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+   decltype(status_waiters_) status_waiters;
+   HybridTime time_of_status = HybridTime::kMin;
+   TransactionStatus transaction_status = TransactionStatus::PENDING;
++  Status expected_deadlock_status = Status::OK();
+   SubtxnSet aborted_subtxn_set;
+   const bool ok = status.ok();
+   int64_t new_request_id = -1;
+@@ -339,11 +346,11 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+     }
+ 
+     if (response.status_hybrid_time().size() != 1 ||
+-        response.status().size() != 1 ||
++        response.status().size() != 1 || response.deadlock_reason().size() != 1 ||
+         (response.aborted_subtxn_set().size() != 0 && response.aborted_subtxn_set().size() != 1)) {
+       LOG_WITH_PREFIX(DFATAL)
+-          << "Wrong number of status, status hybrid time, or aborted subtxn set entries, "
+-          << "exactly one entry expected: "
++          << "Wrong number of status, status hybrid time, deadlock_reason, or aborted subtxn "
++          << "set entries, exactly one entry expected: "
+           << response.ShortDebugString();
+     } else if (PREDICT_FALSE(response.aborted_subtxn_set().empty())) {
+       YB_LOG_EVERY_N(WARNING, 1)
+@@ -356,6 +363,10 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+         time_of_status = HybridTime(response.status_hybrid_time()[0]);
+         transaction_status = response.status(0);
+         aborted_subtxn_set = aborted_subtxn_set_or_status.get();
++        if (response.deadlock_reason(0).code() != AppStatusPB::OK) {
++          // response contains a deadlock specific error.
++          expected_deadlock_status = StatusFromPB(response.deadlock_reason(0));
++        }
+       } else {
+         LOG_WITH_PREFIX(DFATAL)
+             << "Could not deserialize SubtxnSet: "
+@@ -370,7 +381,8 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+     auto coordinator_safe_time = response.coordinator_safe_time().size() == 1
+         ? HybridTime::FromPB(response.coordinator_safe_time(0)) : HybridTime();
+     auto did_abort_txn = UpdateStatus(
+-        transaction_status, time_of_status, coordinator_safe_time, aborted_subtxn_set);
++        transaction_status, time_of_status, coordinator_safe_time, aborted_subtxn_set,
++        expected_deadlock_status);
+     if (did_abort_txn) {
+       context_.NotifyAbortedTransactionIncrement(id());
+       context_.EnqueueRemoveUnlocked(id(), RemoveReason::kStatusReceived, &min_running_notifier);
+@@ -410,7 +422,9 @@ void RunningTransaction::DoStatusReceived(const Status& status,
+   if (new_request_id >= 0) {
+     SendStatusRequest(new_request_id, shared_self);
+   }
+-  NotifyWaiters(serial_no, time_of_status, transaction_status, aborted_subtxn_set, status_waiters);
++  NotifyWaiters(
++      serial_no, time_of_status, transaction_status, aborted_subtxn_set, status_waiters,
++      expected_deadlock_status);
+ }
+ 
+ std::vector<StatusRequest> RunningTransaction::ExtractFinishedStatusWaitersUnlocked(
+@@ -441,7 +455,8 @@ std::vector<StatusRequest> RunningTransaction::ExtractFinishedStatusWaitersUnloc
+ void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_status,
+                                        TransactionStatus transaction_status,
+                                        const SubtxnSet& aborted_subtxn_set,
+-                                       const std::vector<StatusRequest>& status_waiters) {
++                                       const std::vector<StatusRequest>& status_waiters,
++                                       const Status& expected_deadlock_status) {
+   for (const auto& waiter : status_waiters) {
+     auto status_for_waiter = GetStatusAt(
+         waiter.global_limit_ht, time_of_status, transaction_status, external_transaction());
+@@ -452,6 +467,7 @@ void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_sta
+           result.status == TransactionStatus::PENDING) {
+         result.aborted_subtxn_set = aborted_subtxn_set;
+       }
++      result.expected_deadlock_status = expected_deadlock_status;
+       waiter.callback(std::move(result));
+     } else if (time_of_status >= waiter.read_ht) {
+       // It means that between read_ht and global_limit_ht transaction was pending.
+@@ -461,7 +477,8 @@ void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_sta
+           << "Notify waiter with request id greater than id of status request: "
+           << waiter.serial_no << " vs " << serial_no;
+       waiter.callback(TransactionStatusResult{
+-          TransactionStatus::PENDING, time_of_status, aborted_subtxn_set});
++          TransactionStatus::PENDING, time_of_status, aborted_subtxn_set,
++          expected_deadlock_status});
+     } else {
+       waiter.callback(STATUS(TryAgain,
+           Format("Cannot determine transaction status with read_ht $0, and global_limit_ht $1, "
+@@ -507,7 +524,8 @@ void RunningTransaction::AbortReceived(const Status& status,
+     if (result.ok() && result->status_time != HybridTime::kMax) {
+       auto coordinator_safe_time = HybridTime::FromPB(response.coordinator_safe_time());
+       if (UpdateStatus(
+-          result->status, result->status_time, coordinator_safe_time, result->aborted_subtxn_set)) {
++          result->status, result->status_time, coordinator_safe_time, result->aborted_subtxn_set,
++          result->expected_deadlock_status)) {
+         context_.NotifyAbortedTransactionIncrement(id());
+         context_.EnqueueRemoveUnlocked(id(), RemoveReason::kAbortReceived, &min_running_notifier);
+       }
+diff --git a/src/yb/tablet/running_transaction.h b/src/yb/tablet/running_transaction.h
+index 55b8abfe0b..8809e5e3b7 100644
+--- a/src/yb/tablet/running_transaction.h
++++ b/src/yb/tablet/running_transaction.h
+@@ -57,7 +57,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+ 
+   MUST_USE_RESULT bool UpdateStatus(
+       TransactionStatus transaction_status, HybridTime time_of_status,
+-      HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set);
++      HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
++      const Status& expected_deadlock_status);
+ 
+   void UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode);
+ 
+@@ -161,7 +162,8 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+   void NotifyWaiters(int64_t serial_no, HybridTime time_of_status,
+                      TransactionStatus transaction_status,
+                      const SubtxnSet& aborted_subtxn_set,
+-                     const std::vector<StatusRequest>& status_waiters);
++                     const std::vector<StatusRequest>& status_waiters,
++                     const Status& expected_deadlock_status);
+ 
+   static Result<TransactionStatusResult> MakeAbortResult(
+       const Status& status,
+@@ -181,6 +183,9 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+   TransactionStatus last_known_status_ = TransactionStatus::CREATED;
+   HybridTime last_known_status_hybrid_time_ = HybridTime::kMin;
+   SubtxnSet last_known_aborted_subtxn_set_;
++  // Status containing the deadlock info if the transaction was aborted due to a deadlock.
++  // Defaults to Status::OK() in all other cases.
++  Status last_known_deadlock_status_ = Status::OK();
+   std::vector<StatusRequest> status_waiters_;
+   rpc::Rpcs::Handle get_status_handle_;
+   rpc::Rpcs::Handle abort_handle_;
+diff --git a/src/yb/tablet/transaction_coordinator.cc b/src/yb/tablet/transaction_coordinator.cc
+index 4d7af12bd7..1d0f2238d0 100644
+--- a/src/yb/tablet/transaction_coordinator.cc
++++ b/src/yb/tablet/transaction_coordinator.cc
+@@ -1161,14 +1161,18 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+                    tserver::GetTransactionStatusResponsePB* response) {
+     AtomicFlagSleepMs(&FLAGS_TEST_inject_txn_get_status_delay_ms);
+     auto leader_term = context_.LeaderTerm();
++    std::vector<TransactionId> decoded_txn_ids;
++    decoded_txn_ids.reserve(transaction_ids.size());
++    for (auto i = 0 ; i < transaction_ids.size() ; i++) {
++      decoded_txn_ids.emplace_back(VERIFY_RESULT(FullyDecodeTransactionId(transaction_ids[i])));
++    }
++
+     PostponedLeaderActions postponed_leader_actions;
+     {
+       std::unique_lock<std::mutex> lock(managed_mutex_);
+       HybridTime leader_safe_time;
+       postponed_leader_actions_.leader_term = leader_term;
+-      for (const auto& transaction_id : transaction_ids) {
+-        auto id = VERIFY_RESULT(FullyDecodeTransactionId(transaction_id));
+-
++      for (const auto& id : decoded_txn_ids) {
+         auto it = managed_transactions_.find(id);
+         std::vector<ExpectedTabletBatches> expected_tablet_batches;
+         bool known_txn = it != managed_transactions_.end();
+@@ -1208,6 +1212,24 @@ class TransactionCoordinator::Impl : public TransactionStateContext,
+       postponed_leader_actions.Swap(&postponed_leader_actions_);
+     }
+ 
++    RSTATUS_DCHECK_EQ(
++        response->status().size(), decoded_txn_ids.size(), IllegalState,
++        Format("Expected to see $0 (vs $1) statuses in GetTransactionStatusResponsePB",
++               decoded_txn_ids.size(), response->status().size()));
++    // GetTransactionDeadlockStatus should be called outside the scope of managed_mutex_.
++    // Else we risk a deadlock since the detector acquires the locks in the order:
++    // detector's mutex -> coordinator's managed_mutex_, during execution of TriggerProbes().
++    for (auto i = 0 ; i < response->status().size() ; i++) {
++      // Deadlock detector stores info of transactions that might have been aborted due to a
++      // deadlock even before the coordinator cancels them. So it could happen that the detector
++      // reports a deadlock specific error for a transaction that the coordinator is/was unable
++      // to abort. Hence we query the detector for statuses of txns in ABORTED state alone.
++      Status s = response->status(i) == TransactionStatus::ABORTED
++          ? deadlock_detector_.GetTransactionDeadlockStatus(decoded_txn_ids[i])
++          : Status::OK();
++      StatusToPB(s, response->add_deadlock_reason());
++    }
++
+     ExecutePostponedLeaderActions(&postponed_leader_actions);
+     if (GetAtomicFlag(&FLAGS_TEST_inject_random_delay_on_txn_status_response_ms)) {
+       if (response->status().size() > 0 && response->status(0) == TransactionStatus::PENDING) {
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index 19faceeb73..9218c66302 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -1634,7 +1634,8 @@ class TransactionParticipant::Impl
+         continue;
+       }
+       if ((**it).UpdateStatus(
+-          info.status, info.status_ht, info.coordinator_safe_time, info.aborted_subtxn_set)) {
++          info.status, info.status_ht, info.coordinator_safe_time, info.aborted_subtxn_set,
++          info.expected_deadlock_status)) {
+         NotifyAbortedTransactionIncrement(info.transaction_id);
+         EnqueueRemoveUnlocked(
+             info.transaction_id, RemoveReason::kStatusReceived, &min_running_notifier);
+diff --git a/src/yb/tablet/transaction_status_resolver.cc b/src/yb/tablet/transaction_status_resolver.cc
+index cb3f855afc..0e20619629 100644
+--- a/src/yb/tablet/transaction_status_resolver.cc
++++ b/src/yb/tablet/transaction_status_resolver.cc
+@@ -259,6 +259,10 @@ class TransactionStatusResolver::Impl {
+       auto& status_info = status_infos_[i];
+       status_info.transaction_id = queue.front();
+       status_info.status = response.status(i);
++      if (response.deadlock_reason(i).code() != AppStatusPB::OK) {
++        // response contains a deadlock specific error.
++        status_info.expected_deadlock_status = StatusFromPB(response.deadlock_reason(i));
++      }
+ 
+       if (PREDICT_FALSE(response.aborted_subtxn_set().empty())) {
+         YB_LOG_EVERY_N(WARNING, 1)
+diff --git a/src/yb/tablet/transaction_status_resolver.h b/src/yb/tablet/transaction_status_resolver.h
+index 8e5b6620b2..91b5fe17c2 100644
+--- a/src/yb/tablet/transaction_status_resolver.h
++++ b/src/yb/tablet/transaction_status_resolver.h
+@@ -33,6 +33,9 @@ struct TransactionStatusInfo {
+   SubtxnSet aborted_subtxn_set;
+   HybridTime status_ht;
+   HybridTime coordinator_safe_time;
++  // Status containing the deadlock info if the transaction was aborted due to a deadlock.
++  // Defaults to Status::OK() in all other cases.
++  Status expected_deadlock_status = Status::OK();
+ 
+   std::string ToString() const {
+     return YB_STRUCT_TO_STRING(transaction_id, status, status_ht, coordinator_safe_time);
+diff --git a/src/yb/tserver/tserver_service.proto b/src/yb/tserver/tserver_service.proto
+index 1feb3c596e..03b5fe7003 100644
+--- a/src/yb/tserver/tserver_service.proto
++++ b/src/yb/tserver/tserver_service.proto
+@@ -38,6 +38,7 @@ option java_package = "org.yb.tserver";
+ import "yb/common/common.proto";
+ import "yb/common/common_types.proto";
+ import "yb/common/transaction.proto";
++import "yb/common/wire_protocol.proto";
+ import "yb/tablet/tablet_types.proto";
+ import "yb/tablet/operations.proto";
+ import "yb/tserver/tserver.proto";
+@@ -228,6 +229,31 @@ message GetTransactionStatusResponsePB {
+   repeated fixed64 coordinator_safe_time = 6;
+ 
+   repeated SubtxnSetPB aborted_subtxn_set = 7;
++
++  // Status containing deadlock info if the transaction was aborted due to deadlock. Else, it is
++  // set to Status::OK().
++  repeated AppStatusPB deadlock_reason = 8;
++}
++
++message GetOldTransactionsRequestPB {
++  optional bytes tablet_id = 1;
++  optional uint32 min_txn_age_ms = 2;
++  optional uint32 max_num_txns = 3;
++  optional fixed64 propagated_hybrid_time = 4;
++}
++
++message GetOldTransactionsResponsePB {
++  // Error message, if any.
++  optional TabletServerErrorPB error = 1;
++
++  message OldTransactionMetadataPB {
++    optional bytes transaction_id = 1;
++    repeated bytes tablets = 2;
++    optional SubtxnSetPB aborted_subtxn_set = 3;
++  }
++  repeated OldTransactionMetadataPB txn = 2;
++
++  optional fixed64 propagated_hybrid_time = 3;
+ }
+ 
+ message GetOldTransactionsRequestPB {

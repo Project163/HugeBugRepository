@@ -1,0 +1,121 @@
+diff --git a/src/yb/client/ql-transaction-test.cc b/src/yb/client/ql-transaction-test.cc
+index d24eccc3c7..8c419e3ca0 100644
+--- a/src/yb/client/ql-transaction-test.cc
++++ b/src/yb/client/ql-transaction-test.cc
+@@ -62,6 +62,7 @@ DECLARE_bool(flush_rocksdb_on_shutdown);
+ DECLARE_bool(transaction_disable_proactive_cleanup_in_tests);
+ DECLARE_uint64(aborted_intent_cleanup_ms);
+ DECLARE_int32(intents_flush_max_delay_ms);
++DECLARE_int32(remote_bootstrap_max_chunk_size);
+ 
+ namespace yb {
+ namespace client {
+@@ -1423,6 +1424,7 @@ class RemoteBootstrapTest : public QLTransactionTest {
+  protected:
+   void SetUp() override {
+     FLAGS_log_segment_size_bytes = 128;
++    FLAGS_remote_bootstrap_max_chunk_size = 1_KB;
+     QLTransactionTest::SetUp();
+   }
+ };
+diff --git a/src/yb/rpc/reactor.cc b/src/yb/rpc/reactor.cc
+index e172d13725..91877f9963 100644
+--- a/src/yb/rpc/reactor.cc
++++ b/src/yb/rpc/reactor.cc
+@@ -527,9 +527,10 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
+   }
+ 
+   auto context = messenger_->connection_context_factory_->Create();
++  auto& allocator = context->Allocator();
+   auto stream = VERIFY_RESULT(CreateStream(
+       messenger_->stream_factories_, conn_id.protocol(), conn_id.remote(), std::move(*sock),
+-      &context->Allocator(), context->BufferLimit()));
++      &allocator, context->BufferLimit() + allocator.block_size()));
+ 
+   // Register the new connection in our map.
+   auto connection = std::make_shared<Connection>(
+diff --git a/src/yb/tserver/remote_bootstrap_client.cc b/src/yb/tserver/remote_bootstrap_client.cc
+index d5eabfbd76..44a68775f2 100644
+--- a/src/yb/tserver/remote_bootstrap_client.cc
++++ b/src/yb/tserver/remote_bootstrap_client.cc
+@@ -763,6 +763,7 @@ Status RemoteBootstrapClient::DownloadFile(const DataIdPB& data_id,
+       return proxy_->FetchData(req, &resp, &controller);
+     }, [&resp]() { return resp.ByteSize(); });
+     RETURN_NOT_OK_UNWIND_PREPEND(status, controller, "Unable to fetch data from remote");
++    DCHECK_LE(resp.chunk().data().size(), max_length);
+ 
+     // Sanity-check for corruption.
+     RETURN_NOT_OK_PREPEND(VerifyData(offset, resp.chunk()),
+diff --git a/src/yb/tserver/remote_bootstrap_rocksdb_session-test.cc b/src/yb/tserver/remote_bootstrap_rocksdb_session-test.cc
+index 971d15d50b..359a09a3d0 100644
+--- a/src/yb/tserver/remote_bootstrap_rocksdb_session-test.cc
++++ b/src/yb/tserver/remote_bootstrap_rocksdb_session-test.cc
+@@ -34,7 +34,7 @@ TEST_F(RemoteBootstrapRocksDBTest, TestCheckpointDirectory) {
+   {
+     scoped_refptr<YB_EDITION_NS_PREFIX RemoteBootstrapSession>
+         temp_session(new YB_EDITION_NS_PREFIX RemoteBootstrapSession(
+-            tablet_peer_, "TestTempSession", "FakeUUID", fs_manager()));
++            tablet_peer_, "TestTempSession", "FakeUUID", fs_manager(), nullptr /* nsessions */));
+     CHECK_OK(temp_session->Init());
+     checkpoint_dir = temp_session->checkpoint_dir_;
+     ASSERT_FALSE(checkpoint_dir.empty());
+diff --git a/src/yb/tserver/remote_bootstrap_service.cc b/src/yb/tserver/remote_bootstrap_service.cc
+index e39cc8f1e7..7a6ccf8709 100644
+--- a/src/yb/tserver/remote_bootstrap_service.cc
++++ b/src/yb/tserver/remote_bootstrap_service.cc
+@@ -162,7 +162,7 @@ void RemoteBootstrapServiceImpl::BeginRemoteBootstrapSession(
+                 << " from peer " << requestor_uuid << " at " << context.requestor_string()
+                 << ": session id = " << session_id;
+       session.reset(new RemoteBootstrapSessionClass(tablet_peer, session_id,
+-                                                    requestor_uuid, fs_manager_));
++                                                    requestor_uuid, fs_manager_, &nsessions_));
+       RPC_RETURN_NOT_OK(session->Init(),
+                         RemoteBootstrapErrorPB::UNKNOWN_ERROR,
+                         Substitute("Error initializing remote bootstrap session for tablet $0",
+@@ -266,6 +266,8 @@ Status RemoteBootstrapServiceImpl::GetDataFilePiece(
+       *error_code = RemoteBootstrapErrorPB::INVALID_REMOTE_BOOTSTRAP_REQUEST;
+       return STATUS_SUBSTITUTE(InvalidArgument, "Invalid request type $0", data_id.type());
+   }
++  DCHECK(client_maxlen == 0 || data->size() <= client_maxlen)
++      << "client_maxlen: " << client_maxlen << ", data->size(): " << data->size();
+ 
+   return Status::OK();
+ }
+@@ -291,8 +293,9 @@ void RemoteBootstrapServiceImpl::FetchData(const FetchDataRequestPB* req,
+ 
+   uint64_t offset = req->offset();
+   VLOG(3) << " rate limiter max len: "  << session->rate_limiter().GetMaxSizeForNextTransmission();
+-  int64_t client_maxlen = std::min(static_cast<uint64_t>(req->max_length()),
+-                                   session->rate_limiter().GetMaxSizeForNextTransmission());
++  auto rate_limit = session->rate_limiter().GetMaxSizeForNextTransmission();
++  int64_t client_maxlen = rate_limit == 0
++      ? req->max_length() : std::min(static_cast<uint64_t>(req->max_length()), rate_limit);
+   const DataIdPB& data_id = req->data_id();
+   RemoteBootstrapErrorPB::Code error_code = RemoteBootstrapErrorPB::UNKNOWN_ERROR;
+   RPC_RETURN_NOT_OK(ValidateFetchRequestDataId(data_id, &error_code, session),
+diff --git a/src/yb/tserver/remote_bootstrap_session-test.h b/src/yb/tserver/remote_bootstrap_session-test.h
+index c9bc4bb045..ef31285ce3 100644
+--- a/src/yb/tserver/remote_bootstrap_session-test.h
++++ b/src/yb/tserver/remote_bootstrap_session-test.h
+@@ -200,7 +200,7 @@ class RemoteBootstrapTest : public YBTabletTest {
+ 
+   virtual void InitSession() {
+     session_.reset(new YB_EDITION_NS_PREFIX RemoteBootstrapSession(
+-        tablet_peer_, "TestSession", "FakeUUID", fs_manager()));
++        tablet_peer_, "TestSession", "FakeUUID", fs_manager(), nullptr /* nsessions */));
+     ASSERT_OK(session_->Init());
+   }
+ 
+diff --git a/src/yb/tserver/remote_bootstrap_session.h b/src/yb/tserver/remote_bootstrap_session.h
+index bba23963f2..b23b830bec 100644
+--- a/src/yb/tserver/remote_bootstrap_session.h
++++ b/src/yb/tserver/remote_bootstrap_session.h
+@@ -104,7 +104,7 @@ class RemoteBootstrapSession : public RefCountedThreadSafe<RemoteBootstrapSessio
+  public:
+   RemoteBootstrapSession(const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+                          std::string session_id, std::string requestor_uuid,
+-                         FsManager* fs_manager, const std::atomic<int>* nsessions = nullptr);
++                         FsManager* fs_manager, const std::atomic<int>* nsessions);
+ 
+   // Initialize the session, including anchoring files (TODO) and fetching the
+   // tablet superblock and list of WAL segments.

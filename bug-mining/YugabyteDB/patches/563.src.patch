@@ -1,0 +1,317 @@
+diff --git a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgRegressLargeTable.java b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgRegressLargeTable.java
+index 7c2bd35694..f740fb504e 100644
+--- a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgRegressLargeTable.java
++++ b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgRegressLargeTable.java
+@@ -49,9 +49,6 @@ public class TestPgRegressLargeTable extends BasePgSQLTest {
+   protected Map<String, String> getTServerFlags() {
+     Map<String, String> flags = super.getTServerFlags();
+     flags.put("ysql_pg_conf", TURN_OFF_COPY_FROM_BATCH_TRANSACTION);
+-    // TODO(#10163) -- Remove this to ensure the test is against the default value #10163 is
+-    // resolved.
+-    flags.put("txn_max_apply_batch_records", "100000");
+     return flags;
+   }
+ 
+diff --git a/src/yb/docdb/docdb.cc b/src/yb/docdb/docdb.cc
+index dd8a384306..35afc15dc4 100644
+--- a/src/yb/docdb/docdb.cc
++++ b/src/yb/docdb/docdb.cc
+@@ -83,8 +83,7 @@ DEFINE_bool(enable_transaction_sealing, false,
+             "Whether transaction sealing is enabled.");
+ DEFINE_test_flag(bool, fail_on_replicated_batch_idx_set_in_txn_record, false,
+                  "Fail when a set of replicated batch indexes is found in txn record.");
+-// TODO(#10163) -- Revert this flag to it's previous value once #10163 is resolved.
+-DEFINE_int32(txn_max_apply_batch_records, std::numeric_limits<int32>::max(),
++DEFINE_int32(txn_max_apply_batch_records, 100000,
+              "Max number of apply records allowed in single RocksDB batch. "
+              "When a transaction's data in one tablet does not fit into specified number of "
+              "records, it will be applied using multiple RocksDB write batches.");
+diff --git a/src/yb/docdb/docdb_compaction_filter.cc b/src/yb/docdb/docdb_compaction_filter.cc
+index e056323e6b..a5e8b37686 100644
+--- a/src/yb/docdb/docdb_compaction_filter.cc
++++ b/src/yb/docdb/docdb_compaction_filter.cc
+@@ -84,11 +84,11 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
+     filter_usage_logged_ = true;
+   }
+ 
+-  // Remove regular keys which are not related to this RocksDB anymore (due to split of the tablet).
+-  if (!IsWithinBounds(key_bounds_, key)) {
+-    // Given the addition of logic in the compaction iterator which looks at DropKeysLessThan()
+-    // and DropKeysGreaterOrEqual(), we expect the compaction iterator to never pass this component
+-    // a key in that range. If this invariant is violated, we LOG(DFATAL)
++  if (!IsWithinBounds(key_bounds_, key) &&
++      DecodeValueType(key) != ValueType::kTransactionApplyState) {
++    // If we reach this point, then we're processing a record which should have been excluded by
++    // proper use of GetLiveRanges(). We include this as a sanity check, but we should never get
++    // here.
+     LOG(DFATAL) << "Unexpectedly filtered out-of-bounds key during compaction: "
+         << SubDocKey::DebugSliceToString(key)
+         << " with bounds: " << key_bounds_->ToString();
+@@ -337,12 +337,20 @@ const char* DocDBCompactionFilter::Name() const {
+   return "DocDBCompactionFilter";
+ }
+ 
+-Slice DocDBCompactionFilter::DropKeysLessThan() const {
+-  return key_bounds_ ? key_bounds_->lower.AsSlice() : Slice();
+-}
+-
+-Slice DocDBCompactionFilter::DropKeysGreaterOrEqual() const {
+-  return key_bounds_ ? key_bounds_->upper.AsSlice() : Slice();
++std::vector<std::pair<Slice, Slice>> DocDBCompactionFilter::GetLiveRanges() const {
++  static constexpr char kApplyStateEndChar = ValueTypeAsChar::kTransactionApplyState + 1;
++  if (!key_bounds_ || (key_bounds_->lower.empty() && key_bounds_->upper.empty())) {
++    return {};
++  }
++  auto end_apply_state_region = Slice(&kApplyStateEndChar, 1);
++  auto first_range = std::make_pair(Slice(), end_apply_state_region);
++  auto second_range = std::make_pair(
++    key_bounds_->lower.AsSlice().Less(end_apply_state_region)
++        ? end_apply_state_region
++        : key_bounds_->lower.AsSlice(),
++    key_bounds_->upper.AsSlice());
++
++  return {first_range, second_range};
+ }
+ 
+ // ------------------------------------------------------------------------------------------------
+diff --git a/src/yb/docdb/docdb_compaction_filter.h b/src/yb/docdb/docdb_compaction_filter.h
+index fb65e73332..2d51dedb5b 100644
+--- a/src/yb/docdb/docdb_compaction_filter.h
++++ b/src/yb/docdb/docdb_compaction_filter.h
+@@ -86,10 +86,14 @@ class DocDBCompactionFilter : public rocksdb::CompactionFilter {
+   // ConsensusFrontier, so that it can be persisted in RocksDB metadata and recovered on bootstrap.
+   rocksdb::UserFrontierPtr GetLargestUserFrontier() const override;
+ 
+-  // Returns known post-split boundaries of the tablet's key space, if applicable, and boost::none
+-  // otherwise.
+-  Slice DropKeysLessThan() const override;
+-  Slice DropKeysGreaterOrEqual() const override;
++  // Returns an empty list when key_ranges_ is not set, denoting that the whole key range of the
++  // tablet should be considered live.
++  //
++  // When key_ranges_ is set, returns two live ranges:
++  // (1) A range covering any ApplyTransactionState records which may have been written
++  // (2) A range covering all valid keys in key_ranges_, i.e. all user data this tablet is
++  //     responsible for.
++  std::vector<std::pair<Slice, Slice>> GetLiveRanges() const override;
+ 
+  private:
+   // Assigns prev_subdoc_key_ from memory addressed by data. The length of key is taken from
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index ba9b8f3c48..623685a4c0 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -112,6 +112,8 @@ DECLARE_double(TEST_fail_tablet_split_probability);
+ DECLARE_bool(TEST_skip_post_split_compaction);
+ DECLARE_int32(TEST_nodes_per_cloud);
+ DECLARE_int32(replication_factor);
++DECLARE_int32(txn_max_apply_batch_records);
++DECLARE_int32(TEST_pause_and_skip_apply_intents_task_loop_ms);
+ 
+ namespace yb {
+ class TabletSplitITestWithIsolationLevel : public TabletSplitITest,
+@@ -773,6 +775,27 @@ TEST_F(TabletSplitITest, DifferentYBTableInstances) {
+   ASSERT_EQ(rows_count, kNumRows);
+ }
+ 
++TEST_F(TabletSplitITest, SplitSingleTabletLongTransactions) {
++  constexpr auto kNumRows = 1000;
++  constexpr auto kNumApplyLargeTxnBatches = 10;
++  FLAGS_txn_max_apply_batch_records = kNumRows / kNumApplyLargeTxnBatches;
++  FLAGS_TEST_pause_and_skip_apply_intents_task_loop_ms = 1;
++
++  // Write enough rows to trigger the large transaction apply path with kNumApplyLargeTxnBatches
++  // batches. Wait for post split compaction and validate data before returning.
++  ASSERT_OK(CreateSingleTabletAndSplit(kNumRows));
++
++  // At this point, post split compaction has happened, and no apply intent task iterations have
++  // run. If post-split compaction has improperly handled ApplyTransactionState present in
++  // regulardb, e.g. by deleting it, then upon restart, one or both of the new child subtablets will
++  // lose all unapplied data.
++  ASSERT_OK(cluster_->RestartSync());
++
++  // If we did not lose any large transaction apply data during post-split compaction, then we
++  // should have all rows present in the database.
++  EXPECT_OK(CheckRowsCount(kNumRows));
++}
++
+ class TabletSplitYedisTableTest : public integration_tests::RedisTableTestBase {
+  protected:
+   int num_tablets() override { return 1; }
+@@ -808,6 +831,7 @@ class AutomaticTabletSplitITest : public TabletSplitITest {
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = true;
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_split_tablet_candidate_processing) = false;
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_validate_all_tablet_candidates) = false;
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_outstanding_tablet_split_limit) = 5;
+   }
+ 
+  protected:
+@@ -910,8 +934,6 @@ TEST_F(AutomaticTabletSplitITest, TabletSplitHasClusterReplicationInfo) {
+   // Disable manual compations from flushes
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_file_num_compaction_trigger) = -1;
+   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_nodes_per_cloud) = 1;
+-  // Allow 5 outstanding tablet splits.
+-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_outstanding_tablet_split_limit) = 5;
+ 
+   std::vector<string> clouds = {"cloud1_split", "cloud2_split", "cloud3_split", "cloud4_split"};
+   std::vector<string> regions = {"rack1_split", "rack2_split", "rack3_split", "rack4_split"};
+diff --git a/src/yb/rocksdb/compaction_filter.h b/src/yb/rocksdb/compaction_filter.h
+index e983b9976b..f913fb5861 100644
+--- a/src/yb/rocksdb/compaction_filter.h
++++ b/src/yb/rocksdb/compaction_filter.h
+@@ -149,12 +149,10 @@ class CompactionFilter {
+   // The name will be printed to LOG file on start up for diagnosis.
+   virtual const char* Name() const = 0;
+ 
+-  // These methods specify any known lower or upper bounds on the tablet's active keyspace. By
+-  // overriding these methods, a compaction filter implementation is instructing the compaction job
+-  // that it can assume these bounds to be accurate for the sake of optimizing I/O during
+-  // compaction.
+-  virtual Slice DropKeysLessThan() const { return Slice(); }
+-  virtual Slice DropKeysGreaterOrEqual() const { return Slice(); }
++  // Returns a list of the ranges which should be considered "live" on this tablet. Returns an empty
++  // list if the whole key range of the tablet should be considered live. Returned ranges are
++  // represented as pairs of Slices denoting the beginning and end of the range in user space.
++  virtual std::vector<std::pair<Slice, Slice>> GetLiveRanges() const { return {}; }
+ };
+ 
+ // Each compaction will create a new CompactionFilter allowing the
+diff --git a/src/yb/rocksdb/db/compaction_iterator.cc b/src/yb/rocksdb/db/compaction_iterator.cc
+index 79daa96e57..2e3177ee4c 100644
+--- a/src/yb/rocksdb/db/compaction_iterator.cc
++++ b/src/yb/rocksdb/db/compaction_iterator.cc
+@@ -67,6 +67,20 @@ CompactionIterator::CompactionIterator(
+   } else {
+     ignore_snapshots_ = false;
+   }
++
++  if (compaction_filter_) {
++    auto ranges = compaction_filter_->GetLiveRanges();
++    while (!ranges.empty()) {
++      auto range = ranges.back();
++      ranges.pop_back();
++      DCHECK(range.first.Less(range.second));
++      if (!live_key_ranges_stack_.empty()) {
++        DCHECK(live_key_ranges_stack_.back().first.GreaterOrEqual(range.second));
++      }
++      auto user_key_pair = std::make_pair(range.first, range.second);
++      live_key_ranges_stack_.push_back(user_key_pair);
++    }
++  }
+ }
+ 
+ void CompactionIterator::ResetRecordCounts() {
+@@ -76,16 +90,6 @@ void CompactionIterator::ResetRecordCounts() {
+ }
+ 
+ void CompactionIterator::SeekToFirst() {
+-  if (compaction_filter_) {
+-    auto drop_keys_before = compaction_filter_->DropKeysLessThan();
+-
+-    if (!drop_keys_before.empty()) {
+-      IterKey start_iter;
+-      start_iter.SetInternalKey(drop_keys_before, kMaxSequenceNumber, kValueTypeForSeek);
+-      input_->Seek(start_iter.GetKey());
+-    }
+-  }
+-
+   NextFromInput();
+   PrepareOutput();
+ }
+@@ -160,12 +164,31 @@ void CompactionIterator::NextFromInput() {
+       break;
+     }
+ 
+-    if (compaction_filter_) {
+-      auto drop_keys_greater_or_equal = compaction_filter_->DropKeysGreaterOrEqual();
+-      if (!drop_keys_greater_or_equal.empty() &&
+-          cmp_->Compare(drop_keys_greater_or_equal, key_) <= 0) {
+-        valid_ = false;
+-        return;
++    {
++      auto updated_live_range = false;
++      while (!live_key_ranges_stack_.empty() &&
++             !live_key_ranges_stack_.back().second.empty() &&
++             live_key_ranges_stack_.back().second.Less(ikey_.user_key)) {
++        // As long as the active range is before the compaction iterator's current progress, pop to
++        // the next active range.
++        live_key_ranges_stack_.pop_back();
++        updated_live_range = true;
++      }
++      if (updated_live_range) {
++        if (live_key_ranges_stack_.empty()) {
++          // If we've iterated past the last active range, we're done.
++          valid_ = false;
++          return;
++        }
++
++        auto next_range_start = live_key_ranges_stack_.back().first;
++        if (ikey_.user_key.Less(next_range_start)) {
++          // If the next active range starts after the current key, then seek to it and continue.
++          IterKey iter_key;
++          iter_key.SetInternalKey(next_range_start, kMaxSequenceNumber, kValueTypeForSeek);
++          input_->Seek(iter_key.GetKey());
++          continue;
++        }
+       }
+     }
+ 
+diff --git a/src/yb/rocksdb/db/compaction_iterator.h b/src/yb/rocksdb/db/compaction_iterator.h
+index 2115735eb1..576e71dfd9 100644
+--- a/src/yb/rocksdb/db/compaction_iterator.h
++++ b/src/yb/rocksdb/db/compaction_iterator.h
+@@ -161,6 +161,11 @@ class CompactionIterator {
+   // is in or beyond the last file checked during the previous call
+   std::vector<size_t> level_ptrs_;
+   CompactionIteratorStats iter_stats_;
++
++  // Stores the disjoint live ranges of this tablet in user keyspace. Ranges at the back are
++  // lexicographically first. Ranges are popped off the back of the stack as our iteration passes
++  // them.
++  std::vector<std::pair<Slice, Slice>> live_key_ranges_stack_;
+ };
+ }  // namespace rocksdb
+ 
+diff --git a/src/yb/tablet/apply_intents_task.cc b/src/yb/tablet/apply_intents_task.cc
+index 8868af65a8..eca4020e0f 100644
+--- a/src/yb/tablet/apply_intents_task.cc
++++ b/src/yb/tablet/apply_intents_task.cc
+@@ -15,9 +15,12 @@
+ 
+ #include "yb/docdb/docdb.h"
+ 
++#include "yb/gutil/dynamic_annotations.h"
+ #include "yb/tablet/running_transaction.h"
+ 
++#include "yb/util/flag_tags.h"
+ #include "yb/util/logging.h"
++#include "yb/util/monotime.h"
+ #include "yb/util/status_log.h"
+ 
+ using namespace std::literals;
+@@ -26,6 +29,10 @@ DEFINE_int64(apply_intents_task_injected_delay_ms, 0,
+              "Inject such delay before applying intents for large transactions. "
+              "Could be used to throttle the apply speed.");
+ 
++DEFINE_test_flag(int32, pause_and_skip_apply_intents_task_loop_ms, 0,
++                 "If set to a value greater than zero, each loop of the apply intents task will "
++                 "sleep for the specified duration and continue without doing apply work.");
++
+ namespace yb {
+ namespace tablet {
+ 
+@@ -56,6 +63,14 @@ void ApplyIntentsTask::Run() {
+       VLOG_WITH_PREFIX(1) << "Abort because of shutdown";
+       break;
+     }
++
++    const auto pause_and_skip_ms = ANNOTATE_UNPROTECTED_READ(
++        FLAGS_TEST_pause_and_skip_apply_intents_task_loop_ms);
++    if (PREDICT_FALSE(pause_and_skip_ms > 0)) {
++      SleepFor(pause_and_skip_ms * 1ms);
++      continue;
++    }
++
+     auto result = applier_.ApplyIntents(apply_data_);
+     if (!result.ok()) {
+       LOG_WITH_PREFIX(DFATAL)

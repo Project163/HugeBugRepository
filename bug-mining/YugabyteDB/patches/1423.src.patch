@@ -1,0 +1,599 @@
+diff --git a/src/yb/docdb/docdb.proto b/src/yb/docdb/docdb.proto
+index 7bb3c4f734..5f356a0060 100644
+--- a/src/yb/docdb/docdb.proto
++++ b/src/yb/docdb/docdb.proto
+@@ -51,6 +51,11 @@ message LockPairPB {
+   optional bool is_lock = 3; // lock or unlock.
+ }
+ 
++message XClusterUsedSchemaVersionPB {
++  optional uint32 colocation_id = 1;
++  repeated uint32 schema_versions = 2;
++}
++
+ // A set of key/value pairs to be written into RocksDB.
+ message KeyValueWriteBatchPB {
+   repeated KeyValuePairPB write_pairs = 1;
+@@ -102,6 +107,9 @@ message KeyValueWriteBatchPB {
+ 
+   // Used to detect deadlocks between fast path transactions and transactional DDLs.
+   optional TransactionMetadataPB object_locking_txn_meta = 18;
++
++  // Used to keep track of packing schema versions used in a xCluster write batch.
++  repeated XClusterUsedSchemaVersionPB xcluster_used_schema_versions = 19;
+ }
+ 
+ message PerDbFilterPB {
+diff --git a/src/yb/dockv/schema_packing.cc b/src/yb/dockv/schema_packing.cc
+index 5825fe459c..0a291a73c8 100644
+--- a/src/yb/dockv/schema_packing.cc
++++ b/src/yb/dockv/schema_packing.cc
+@@ -963,6 +963,10 @@ bool SchemaPackingStorage::HasVersionBelow(SchemaVersion version) const {
+   return false;
+ }
+ 
++bool SchemaPackingStorage::HasVersion(SchemaVersion version) const {
++  return version_to_schema_packing_.contains(version);
++}
++
+ std::string SchemaPackingStorage::VersionsToString() const {
+   std::vector<SchemaVersion> versions;
+   versions.reserve(version_to_schema_packing_.size());
+diff --git a/src/yb/dockv/schema_packing.h b/src/yb/dockv/schema_packing.h
+index 39a52424eb..58fb3b095e 100644
+--- a/src/yb/dockv/schema_packing.h
++++ b/src/yb/dockv/schema_packing.h
+@@ -207,6 +207,8 @@ class SchemaPackingStorage {
+ 
+   bool HasVersionBelow(SchemaVersion version) const;
+ 
++  bool HasVersion(SchemaVersion version) const;
++
+   TableType table_type() const {
+     return table_type_;
+   }
+diff --git a/src/yb/integration-tests/xcluster/xcluster_ddl_replication-test.cc b/src/yb/integration-tests/xcluster/xcluster_ddl_replication-test.cc
+index 73bbe7d031..e2742ebc4d 100644
+--- a/src/yb/integration-tests/xcluster/xcluster_ddl_replication-test.cc
++++ b/src/yb/integration-tests/xcluster/xcluster_ddl_replication-test.cc
+@@ -40,7 +40,20 @@
+ #include "yb/util/sync_point.h"
+ #include "yb/util/tsan_util.h"
+ 
++DECLARE_int32(cdc_state_checkpoint_update_interval_ms);
++DECLARE_bool(enable_pg_cron);
++DECLARE_int32(timestamp_history_retention_interval_sec);
++DECLARE_int32(xcluster_ddl_queue_max_retries_per_ddl);
++DECLARE_uint32(xcluster_consistent_wal_safe_time_frequency_ms);
++DECLARE_uint32(xcluster_max_old_schema_versions);
++DECLARE_string(ysql_cron_database_name);
++DECLARE_bool(ysql_enable_packed_row);
++DECLARE_uint32(ysql_oid_cache_prefetch_size);
++DECLARE_string(ysql_pg_conf_csv);
++DECLARE_int32(ysql_sequence_cache_minval);
++
+ DECLARE_bool(TEST_force_get_checkpoint_from_cdc_state);
++DECLARE_string(TEST_skip_async_insert_packed_schema_for_tablet_id);
+ DECLARE_bool(TEST_skip_oid_advance_on_restore);
+ DECLARE_bool(TEST_xcluster_ddl_queue_handler_fail_at_end);
+ DECLARE_bool(TEST_xcluster_ddl_queue_handler_fail_at_start);
+@@ -793,6 +806,61 @@ TEST_F(XClusterDDLReplicationTest, DDLsWithinTransaction) {
+   InsertRowsIntoProducerTableAndVerifyConsumer(producer_table->name());
+ }
+ 
++TEST_F(XClusterDDLReplicationTest, FailAsyncInsertPackedSchema) {
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
++  ASSERT_OK(SetUpClustersAndReplication());
++
++  ASSERT_OK(producer_conn_->Execute(
++      "CREATE TABLE test_table_1 (key int PRIMARY KEY) SPLIT INTO 2 TABLETS;"));
++
++  ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
++
++  // Get the target tablet ids.
++  auto target_table = ASSERT_RESULT(
++      GetYsqlTable(&consumer_cluster_, namespace_name, /*schema_name*/ "", "test_table_1"));
++  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> target_tablet_locations;
++  ASSERT_OK(consumer_cluster_.client_->GetTabletsFromTableId(
++      target_table.table_id(), 0, &target_tablet_locations));
++  ASSERT_EQ(target_tablet_locations.size(), 2);
++  std::vector<TabletId> target_tablet_ids{
++      target_tablet_locations[0].tablet_id(), target_tablet_locations[1].tablet_id()};
++
++  // Fail InsertPackedSchemaForXClusterTarget requests for the first tablet. This will cause the
++  // first tablet to miss schema versions that the second tablet has.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_async_insert_packed_schema_for_tablet_id) =
++      target_tablet_ids[0];
++
++  // Run many ALTER TABLEs to cause many InsertPackedSchemaForXClusterTarget requests.
++  ASSERT_OK(producer_conn_->Execute("ALTER TABLE test_table_1 ADD COLUMN a int;"));
++  ASSERT_OK(producer_conn_->Execute(
++      "INSERT INTO test_table_1 SELECT i, i FROM generate_series(0, 10) as i"));
++
++  // Small delay.
++  SleepFor(3s);
++
++  // Allow the first tablet to make progress now.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_async_insert_packed_schema_for_tablet_id) = "";
++
++  // Perform some leader stepdowns on the target. This will cause new heartbeats to be sent to the
++  // master, which will notice the incorrect schema versions and force an update.
++  for (const auto& tablet_id : target_tablet_ids) {
++    ASSERT_OK(
++        WaitUntilTabletHasLeader(consumer_cluster(), tablet_id, CoarseMonoClock::Now() + kTimeout));
++    const auto leader_peer = ASSERT_RESULT(GetLeaderPeerForTablet(consumer_cluster(), tablet_id));
++    ASSERT_OK(StepDown(leader_peer, /*new_leader_uuid=*/"", ForceStepDown::kTrue));
++  }
++  // After the stepdown, the first tablet should try to rerun InsertPackedSchemaForXClusterTarget.
++
++  // Ensure that we don't get a FATAL.
++  ASSERT_NOK(WaitForSafeTimeToAdvanceToNow());
++  LOG(INFO) << "SELECT result: "
++            << ASSERT_RESULT(consumer_conn_->FetchAllAsString("SELECT * FROM test_table_1"));
++
++  // TODO(#28326): replace this with VerifyWrittenRecords.
++  // ASSERT_OK(WaitForSafeTimeToAdvanceToNow());
++  // ASSERT_OK(VerifyWrittenRecords({"test_table_1"}));
++}
++
+ TEST_F(XClusterDDLReplicationTest, PauseTargetOnRepeatedFailures) {
+   ASSERT_OK(SetUpClustersAndReplication());
+ 
+diff --git a/src/yb/master/async_rpc_tasks.cc b/src/yb/master/async_rpc_tasks.cc
+index 0d796a1c4a..c649c879c1 100644
+--- a/src/yb/master/async_rpc_tasks.cc
++++ b/src/yb/master/async_rpc_tasks.cc
+@@ -37,6 +37,9 @@ DEFINE_test_flag(bool, stuck_add_tablet_to_table_task_enabled, false, "descripti
+ DEFINE_test_flag(bool, fail_async_delete_replica_task, false,
+                  "When set, transition all delete replica tasks to a failed state.");
+ 
++DEFINE_test_flag(string, skip_async_insert_packed_schema_for_tablet_id, "",
++    "Tablet ID to skip AsyncInsertPackedSchemaForXClusterTarget requests for.");
++
+ DECLARE_int32(tablet_creation_timeout_ms);
+ DECLARE_int32(TEST_slowdown_alter_table_rpcs_ms);
+ 
+@@ -666,6 +669,19 @@ void AsyncInsertPackedSchemaForXClusterTarget::HandleInsertPackedSchema(
+   req.mutable_schema()->CopyFrom(packed_schema_);
+ }
+ 
++bool AsyncInsertPackedSchemaForXClusterTarget::SendRequest(int attempt) {
++  if (PREDICT_FALSE(!FLAGS_TEST_skip_async_insert_packed_schema_for_tablet_id.empty())) {
++    if (tablet_id() == FLAGS_TEST_skip_async_insert_packed_schema_for_tablet_id) {
++      LOG_WITH_PREFIX(INFO) << "Skipping AsyncInsertPackedSchemaForXClusterTarget for tablet "
++                            << tablet_id()
++                            << " due to FLAGS_TEST_skip_async_insert_packed_schema_for_tablet_id";
++      TransitionToCompleteState();
++      return true;
++    }
++  }
++  return AsyncAlterTable::SendRequest(attempt);
++}
++
+ // ============================================================================
+ //  Class AsyncTruncate.
+ // ============================================================================
+diff --git a/src/yb/master/async_rpc_tasks.h b/src/yb/master/async_rpc_tasks.h
+index 707868a613..2a4e0089d9 100644
+--- a/src/yb/master/async_rpc_tasks.h
++++ b/src/yb/master/async_rpc_tasks.h
+@@ -278,9 +278,10 @@ class AsyncAlterTable : public AsyncTabletLeaderTask {
+   uint32_t schema_version_;
+   tserver::ChangeMetadataResponsePB resp_;
+ 
++  bool SendRequest(int attempt) override;
++
+  private:
+   void HandleResponse(int attempt) override;
+-  bool SendRequest(int attempt) override;
+   virtual void HandleInsertPackedSchema(tablet::ChangeMetadataRequestPB& req) { return; }
+ 
+   TransactionId transaction_id_ = TransactionId::Nil();
+@@ -324,6 +325,8 @@ class AsyncInsertPackedSchemaForXClusterTarget : public AsyncAlterTable {
+  protected:
+   void HandleInsertPackedSchema(tablet::ChangeMetadataRequestPB& req) override;
+ 
++  bool SendRequest(int attempt) override;
++
+  private:
+   SchemaPB packed_schema_;
+ };
+diff --git a/src/yb/tablet/write_query.cc b/src/yb/tablet/write_query.cc
+index 1cc6822947..1110e4145e 100644
+--- a/src/yb/tablet/write_query.cc
++++ b/src/yb/tablet/write_query.cc
+@@ -29,6 +29,7 @@
+ #include "yb/docdb/conflict_resolution.h"
+ #include "yb/docdb/consensus_frontier.h"
+ #include "yb/docdb/cql_operation.h"
++#include "yb/docdb/doc_read_context.h"
+ #include "yb/docdb/doc_write_batch.h"
+ #include "yb/docdb/docdb_statistics.h"
+ #include "yb/docdb/pgsql_operation.h"
+@@ -457,7 +458,7 @@ Result<bool> WriteQuery::PrepareExecute() {
+     }
+ 
+     if (client_request_->has_write_batch() && client_request_->has_external_hybrid_time()) {
+-      return false;
++      return ExternalWritePrepareExecute();
+     }
+   } else {
+     const auto* request = operation().request();
+@@ -647,6 +648,37 @@ Result<bool> WriteQuery::PgsqlPrepareLock() {
+   return client_request_->pgsql_lock_batch().begin()->is_lock();
+ }
+ 
++Result<bool> WriteQuery::ExternalWritePrepareExecute() {
++  auto& write_batch = client_request_->write_batch();
++  if (write_batch.xcluster_used_schema_versions().empty()) {
++    return false;
++  }
++
++  auto tablet = VERIFY_RESULT(tablet_safe());
++  auto& metadata = *tablet->metadata();
++  // Verify that the schema versions used in the write batch are present in the tablet metadata.
++  for (const auto& used_schema_version : write_batch.xcluster_used_schema_versions()) {
++    auto table_info_res = metadata.GetTableInfo(used_schema_version.colocation_id());
++    if (!table_info_res.ok()) {
++      if (used_schema_version.colocation_id() != kColocationIdNotSet) {
++        // This is expected for colocated tables that are not yet created on the target.
++        continue;
++      }
++      return table_info_res.status();
++    }
++    const auto table_info = *table_info_res;
++    const auto& schema_packing_storage = table_info->doc_read_context->schema_packing_storage;
++    for (const auto& schema_version : used_schema_version.schema_versions()) {
++      SCHECK(
++          schema_packing_storage.HasVersion(schema_version), IllegalState,
++          Format(
++              "Schema version $0 not found in schema packing storage: $1", schema_version,
++              schema_packing_storage.VersionsToString()));
++    }
++  }
++  return false;
++}
++
+ void WriteQuery::Execute(std::unique_ptr<WriteQuery> query) {
+   auto* query_ptr = query.get();
+   query_ptr->self_ = std::move(query);
+diff --git a/src/yb/tablet/write_query.h b/src/yb/tablet/write_query.h
+index 037b09a4b9..5a814c703e 100644
+--- a/src/yb/tablet/write_query.h
++++ b/src/yb/tablet/write_query.h
+@@ -165,6 +165,7 @@ class WriteQuery {
+   Result<bool> CqlPrepareExecute();
+   Result<bool> PgsqlPrepareExecute();
+   Result<bool> PgsqlPrepareLock();
++  Result<bool> ExternalWritePrepareExecute();
+ 
+   void SimpleExecuteDone(const Status& status);
+   void RedisExecuteDone(const Status& status);
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index b89ea04139..ede0b7182c 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1055,6 +1055,14 @@ void TabletServiceAdminImpl::AlterSchema(const tablet::ChangeMetadataRequestPB*
+       return;
+     }
+ 
++    // If the request is to insert a packed schema, respond as succeeded.
++    // TODO(#28326): Need to validate that we do have the intermediate schema instead of just
++    // returning success.
++    if (req->insert_packed_schema()) {
++      context.RespondSuccess();
++      return;
++    }
++
+     schema_version = tablet.peer->tablet_metadata()->schema_version(
+         req->has_alter_table_id() ? req->alter_table_id() : "");
+     if (schema_version == req->schema_version()) {
+diff --git a/src/yb/tserver/xcluster_output_client.cc b/src/yb/tserver/xcluster_output_client.cc
+index dc5b5c8e5f..b89d0f5f80 100644
+--- a/src/yb/tserver/xcluster_output_client.cc
++++ b/src/yb/tserver/xcluster_output_client.cc
+@@ -101,6 +101,18 @@ using namespace std::placeholders;
+ namespace yb {
+ namespace tserver {
+ 
++namespace {
++Result<ColocationId> DecodeColocationId(const cdc::CDCRecordPB& record) {
++  if (record.changes().empty()) {
++    return kColocationIdNotSet;
++  }
++  auto decoder = dockv::DocKeyDecoder(record.changes(0).key());
++  ColocationId colocation_id = kColocationIdNotSet;
++  VERIFY_RESULT(decoder.DecodeColocationId(&colocation_id));
++  return colocation_id;
++}
++}  // namespace
++
+ XClusterOutputClient::XClusterOutputClient(
+     XClusterPoller* xcluster_poller, const xcluster::ConsumerTabletInfo& consumer_tablet_info,
+     const xcluster::ProducerTabletInfo& producer_tablet_info, client::YBClient& local_client,
+@@ -385,16 +397,13 @@ bool XClusterOutputClient::IsSequencesDataTablet() {
+ }
+ 
+ Result<cdc::XClusterSchemaVersionMap> XClusterOutputClient::GetSchemaVersionMap(
+-    const cdc::CDCRecordPB& record) {
++    const cdc::CDCRecordPB& record, ColocationId colocation_id) {
+   cdc::XClusterSchemaVersionMap* cached_schema_versions = nullptr;
+-  auto& kv_pair = record.changes(0);
+-  auto decoder = dockv::DocKeyDecoder(kv_pair.key());
+-  ColocationId colocationId = kColocationIdNotSet;
+-  if (VERIFY_RESULT(decoder.DecodeColocationId(&colocationId))) {
+-    // Can't find the table, so we most likely need an update
+-    // to the consumer registry, so return an error and fail the apply.
+-    cached_schema_versions = FindOrNull(colocated_schema_version_map_, colocationId);
+-    SCHECK(cached_schema_versions, NotFound, Format("ColocationId $0 not found.", colocationId));
++  if (colocation_id != kColocationIdNotSet) {
++    cached_schema_versions = FindOrNull(colocated_schema_version_map_, colocation_id);
++    // If we can't find the table, then we most likely need an update to the consumer registry,
++    // so return an error and fail the apply.
++    SCHECK_FORMAT(cached_schema_versions, NotFound, "ColocationId $0 not found.", colocation_id);
+   } else {
+     cached_schema_versions = &schema_versions_;
+   }
+@@ -402,7 +411,7 @@ Result<cdc::XClusterSchemaVersionMap> XClusterOutputClient::GetSchemaVersionMap(
+   if (PREDICT_FALSE(VLOG_IS_ON(3))) {
+     for (const auto& [producer_schema_version, consumer_schema_version] : *cached_schema_versions) {
+       VLOG_WITH_PREFIX(3) << Format(
+-          "ColocationId:$0 Producer Schema Version:$1, Consumer Schema Version:$2", colocationId,
++          "ColocationId:$0 Producer Schema Version:$1, Consumer Schema Version:$2", colocation_id,
+           producer_schema_version, consumer_schema_version);
+     }
+   }
+@@ -420,15 +429,19 @@ Status XClusterOutputClient::ProcessRecord(
+     SCHECK(!IsOffline(), Aborted, "$0$1", LogPrefix(), "xCluster output client went offline");
+ 
+     cdc::XClusterSchemaVersionMap schema_versions_map;
++    auto colocation_id = VERIFY_RESULT(DecodeColocationId(record));
+     if (PREDICT_TRUE(FLAGS_xcluster_enable_packed_rows_support) &&
+         !record.changes().empty() &&
+         (record.operation() == cdc::CDCRecordPB::WRITE ||
+          record.operation() == cdc::CDCRecordPB::DELETE)) {
+-        schema_versions_map = VERIFY_RESULT(GetSchemaVersionMap(record));
++      schema_versions_map = VERIFY_RESULT(GetSchemaVersionMap(record, colocation_id));
+     }
+ 
+     auto status = write_strategy_->ProcessRecord(
+-        ProcessRecordInfo{.tablet_id = tablet_id, .schema_versions_map = schema_versions_map},
++        ProcessRecordInfo{
++            .tablet_id = tablet_id,
++            .schema_versions_map = schema_versions_map,
++            .colocation_id = colocation_id},
+         record);
+     if (!status.ok()) {
+       error_status_ = status;
+@@ -797,7 +810,8 @@ void XClusterOutputClient::HandleNewSchemaPacking(
+                .InsertPackedSchemaForXClusterTarget(
+                    consumer_tablet_info_.table_id, req.schema(), resp.latest_schema_version(),
+                    colocation_id_opt);
+-
++  // TODO(#28326): We could pass the producer schema version here to check if a matching schema
++  // version already exists.
+   if (s.ok()) {
+     VLOG_WITH_PREFIX(2) << "Inserted schema for automatic DDL replication: "
+                         << req.schema().ShortDebugString();
+diff --git a/src/yb/tserver/xcluster_output_client.h b/src/yb/tserver/xcluster_output_client.h
+index 09e85409a5..a44c260a26 100644
+--- a/src/yb/tserver/xcluster_output_client.h
++++ b/src/yb/tserver/xcluster_output_client.h
+@@ -96,8 +96,8 @@ class XClusterOutputClient : public XClusterAsyncExecutor {
+   Result<bool> ProcessChangeMetadataOp(const cdc::CDCRecordPB& record);
+ 
+   // Gets the producer/consumer schema mapping for the record.
+-  Result<cdc::XClusterSchemaVersionMap> GetSchemaVersionMap(const cdc::CDCRecordPB& record)
+-      REQUIRES(lock_);
++  Result<cdc::XClusterSchemaVersionMap> GetSchemaVersionMap(
++      const cdc::CDCRecordPB& record, ColocationId colocation_id) REQUIRES(lock_);
+ 
+   // Processes the Record and sends the CDCWrite for it.
+   Status ProcessRecord(const std::vector<std::string>& tablet_ids, const cdc::CDCRecordPB& record)
+diff --git a/src/yb/tserver/xcluster_write_implementations.cc b/src/yb/tserver/xcluster_write_implementations.cc
+index 665dc1205e..4dec5dd301 100644
+--- a/src/yb/tserver/xcluster_write_implementations.cc
++++ b/src/yb/tserver/xcluster_write_implementations.cc
+@@ -10,7 +10,7 @@
+ // or implied.  See the License for the specific language governing permissions and limitations
+ // under the License.
+ 
+-#include <deque>
++#include <unordered_set>
+ 
+ #include "yb/client/client_fwd.h"
+ 
+@@ -63,10 +63,9 @@ namespace tserver {
+ 
+ // Updates the packed row encoded in the value with the local schema version
+ // without decoding the value. In case of a non-packed row, return as is.
+-Status UpdatePackedRow(const Slice& key,
+-    const Slice& value,
+-    const cdc::XClusterSchemaVersionMap& schema_versions_map,
+-    ValueBuffer *out) {
++Status UpdatePackedRow(
++    const Slice& key, const Slice& value, const cdc::XClusterSchemaVersionMap& schema_versions_map,
++    std::optional<SchemaVersion>& new_schema_version, ValueBuffer* out) {
+   CHECK(out != nullptr);
+   VLOG(3) << Format("Original kv with producer schema version $0=$1",
+       key.ToDebugHexString(), value.ToDebugHexString());
+@@ -85,11 +84,13 @@ Status UpdatePackedRow(const Slice& key,
+     return Status::OK();
+   }
+ 
+-  auto mapper = [&schema_versions_map](SchemaVersion version) -> Result<SchemaVersion> {
++  auto mapper = [&schema_versions_map,
++                 &new_schema_version](SchemaVersion version) -> Result<SchemaVersion> {
+     auto it = schema_versions_map.find(version);
+     if (it == schema_versions_map.end()) {
+       return STATUS_FORMAT(NotFound, "Schema version mapping for $0 not found", version);
+     }
++    new_schema_version = it->second;
+     return it->second;
+   };
+   auto status = ReplaceSchemaVersionInPackedValue(value_slice, control_fields, mapper, out);
+@@ -103,21 +104,22 @@ Status UpdatePackedRow(const Slice& key,
+ }
+ 
+ Status CombineExternalIntents(
+-    const tablet::TransactionStatePB& transaction_state,
+-    SubTransactionId subtransaction_id,
++    const tablet::TransactionStatePB& transaction_state, SubTransactionId subtransaction_id,
+     const google::protobuf::RepeatedPtrField<cdc::KeyValuePairPB>& pairs,
+-    docdb::KeyValuePairPB* out,
++    docdb::KeyValuePairPB* out, std::unordered_set<SchemaVersion>& used_packed_schema_versions,
+     const cdc::XClusterSchemaVersionMap& schema_versions_map) {
+   class Provider : public docdb::ExternalIntentsProvider {
+    public:
+     Provider(
+         const Uuid& involved_tablet,
+         const google::protobuf::RepeatedPtrField<cdc::KeyValuePairPB>* pairs,
+-        const cdc::XClusterSchemaVersionMap& schema_versions_map,
+-        docdb::KeyValuePairPB* out)
+-        : involved_tablet_(involved_tablet), pairs_(*pairs),
+-          schema_versions_map(schema_versions_map), out_(out) {
+-    }
++        const cdc::XClusterSchemaVersionMap& schema_versions_map, docdb::KeyValuePairPB* out,
++        std::unordered_set<SchemaVersion>& used_packed_schema_versions)
++        : involved_tablet_(involved_tablet),
++          pairs_(*pairs),
++          schema_versions_map_(schema_versions_map),
++          used_packed_schema_versions_(used_packed_schema_versions),
++          out_(out) {}
+ 
+     void SetKey(const Slice& slice) override {
+       out_->set_key(slice.cdata(), slice.size());
+@@ -143,19 +145,26 @@ Status CombineExternalIntents(
+ 
+       Slice key(input.key());
+       Slice value(input.value().binary_value());
+-      status = UpdatePackedRow(key, value, schema_versions_map, &updated_value);
++      std::optional<SchemaVersion> new_schema_version;
++      status =
++          UpdatePackedRow(key, value, schema_versions_map_, new_schema_version, &updated_value);
+       if (!status.ok()) {
+         LOG(WARNING) << "Could not update packed row with consumer schema version";
+         return std::nullopt;
+       }
+ 
++      if (new_schema_version) {
++        used_packed_schema_versions_.insert(*new_schema_version);
++      }
++
+       return std::pair(key, updated_value.AsSlice());
+     }
+ 
+    private:
+     Uuid involved_tablet_;
+     const google::protobuf::RepeatedPtrField<cdc::KeyValuePairPB>& pairs_;
+-    const cdc::XClusterSchemaVersionMap& schema_versions_map;
++    const cdc::XClusterSchemaVersionMap& schema_versions_map_;
++    std::unordered_set<SchemaVersion>& used_packed_schema_versions_;
+     docdb::KeyValuePairPB* out_;
+     int next_idx_ = 0;
+     ValueBuffer updated_value;
+@@ -166,14 +175,14 @@ Status CombineExternalIntents(
+   SCHECK_EQ(transaction_state.tablets().size(), 1, InvalidArgument, "Wrong tablets number");
+   auto source_tablet = VERIFY_RESULT(Uuid::FromHexString(transaction_state.tablets()[0]));
+ 
+-  Provider provider(source_tablet, &pairs, schema_versions_map, out);
++  Provider provider(source_tablet, &pairs, schema_versions_map, out, used_packed_schema_versions);
+   docdb::CombineExternalIntents(txn_id, subtransaction_id, &provider);
+   return provider.GetOutcome();
+ }
+ 
+ Status AddRecord(
+-    const ProcessRecordInfo& process_record_info,
+-    const cdc::CDCRecordPB& record,
++    const ProcessRecordInfo& process_record_info, const cdc::CDCRecordPB& record,
++    std::unordered_set<SchemaVersion>& used_packed_schema_versions,
+     docdb::KeyValueWriteBatchPB* write_batch) {
+   if (record.operation() == cdc::CDCRecordPB::APPLY) {
+     auto* apply_txn = write_batch->mutable_apply_external_transactions()->Add();
+@@ -211,8 +220,7 @@ Status AddRecord(
+     return CombineExternalIntents(
+         record.transaction_state(),
+         record.has_subtransaction_id() ? record.subtransaction_id() : kMinSubTransactionId,
+-        record.changes(),
+-        write_pair,
++        record.changes(), write_pair, used_packed_schema_versions,
+         process_record_info.schema_versions_map);
+   }
+ 
+@@ -224,8 +232,9 @@ Status AddRecord(
+     Slice key(kv_pair.key());
+     Slice value(kv_pair.value().binary_value());
+     ValueBuffer updated_value;
+-    RETURN_NOT_OK(
+-        UpdatePackedRow(key, value, process_record_info.schema_versions_map, &updated_value));
++    std::optional<SchemaVersion> new_schema_version;
++    RETURN_NOT_OK(UpdatePackedRow(
++        key, value, process_record_info.schema_versions_map, new_schema_version, &updated_value));
+ 
+     const Slice& updated_value_slice = updated_value.AsSlice();
+     write_pair->set_value(updated_value_slice.cdata(), updated_value_slice.size());
+@@ -236,6 +245,10 @@ Status AddRecord(
+     } else {
+       write_pair->set_external_hybrid_time(record.time());
+     }
++
++    if (new_schema_version) {
++      used_packed_schema_versions.insert(*new_schema_version);
++    }
+   }
+ 
+   return Status::OK();
+@@ -264,7 +277,9 @@ class XClusterWriteImplementation : public XClusterWriteInterface {
+       write_batch = it->second->mutable_write_batch();
+     }
+ 
+-    return AddRecord(process_record_info, record, write_batch);
++    return AddRecord(
++        process_record_info, record,
++        used_packed_schema_versions_[process_record_info.colocation_id], write_batch);
+   }
+ 
+   std::unique_ptr<WriteRequestPB> FetchNextRequest() override {
+@@ -273,6 +288,17 @@ class XClusterWriteImplementation : public XClusterWriteInterface {
+     }
+     auto next_req = std::move(records_.begin()->second);
+     records_.erase(next_req->tablet_id());
++
++    for (const auto& [colocation_id, used_packed_schema_versions] : used_packed_schema_versions_) {
++      if (used_packed_schema_versions.empty()) {
++        continue;
++      }
++      auto used_schema_versions =
++          next_req->mutable_write_batch()->add_xcluster_used_schema_versions();
++      used_schema_versions->set_colocation_id(colocation_id);
++      used_schema_versions->mutable_schema_versions()->Assign(
++          used_packed_schema_versions.begin(), used_packed_schema_versions.end());
++    }
+     return next_req;
+   }
+ 
+@@ -280,6 +306,10 @@ class XClusterWriteImplementation : public XClusterWriteInterface {
+   // Contains key value pairs to apply to regular and intents db. The key of this map is the
+   // tablet to send to.
+   std::unordered_map<TabletId, std::unique_ptr<WriteRequestPB>> records_;
++
++  // Keep track of the packed schema versions used.
++  // kColocationIdNotSet is used for non-colocated tables.
++  std::unordered_map<ColocationId, std::unordered_set<SchemaVersion>> used_packed_schema_versions_;
+ };
+ 
+ void ResetWriteInterface(std::unique_ptr<XClusterWriteInterface>* write_strategy) {
+diff --git a/src/yb/tserver/xcluster_write_interface.h b/src/yb/tserver/xcluster_write_interface.h
+index d99590552e..bd5ebe9c18 100644
+--- a/src/yb/tserver/xcluster_write_interface.h
++++ b/src/yb/tserver/xcluster_write_interface.h
+@@ -32,6 +32,9 @@ struct ProcessRecordInfo {
+ 
+   // Map of producer-consumer schema versions for the record.
+   const cdc::XClusterSchemaVersionMap schema_versions_map;
++
++  // Colocation id for the record, kColocationIdNotSet if not set.
++  ColocationId colocation_id;
+ };
+ 
+ class XClusterWriteInterface {

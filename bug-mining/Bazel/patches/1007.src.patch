@@ -1,0 +1,259 @@
+diff --git a/src/main/java/com/google/devtools/build/lib/skyframe/ActionMetadataHandler.java b/src/main/java/com/google/devtools/build/lib/skyframe/ActionMetadataHandler.java
+index 82ab03aac3..a4ecab69b6 100644
+--- a/src/main/java/com/google/devtools/build/lib/skyframe/ActionMetadataHandler.java
++++ b/src/main/java/com/google/devtools/build/lib/skyframe/ActionMetadataHandler.java
+@@ -340,7 +340,10 @@ final class ActionMetadataHandler implements InputMetadataProvider, OutputMetada
+             throw new IOException(errorMessage, e);
+           }
+ 
+-          tree.putChild(child, metadata);
++          // visitTree() uses multiple threads and putChild() is not thread-safe
++          synchronized (tree) {
++            tree.putChild(child, metadata);
++          }
+         });
+ 
+     if (archivedTreeArtifactsEnabled) {
+diff --git a/src/main/java/com/google/devtools/build/lib/skyframe/BUILD b/src/main/java/com/google/devtools/build/lib/skyframe/BUILD
+index d815d15406..c635f15477 100644
+--- a/src/main/java/com/google/devtools/build/lib/skyframe/BUILD
++++ b/src/main/java/com/google/devtools/build/lib/skyframe/BUILD
+@@ -2893,6 +2893,7 @@ java_library(
+         "//src/main/java/com/google/devtools/build/lib/actions:artifacts",
+         "//src/main/java/com/google/devtools/build/lib/actions:file_metadata",
+         "//src/main/java/com/google/devtools/build/lib/actions:has_digest",
++        "//src/main/java/com/google/devtools/build/lib/concurrent",
+         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec",
+         "//src/main/java/com/google/devtools/build/lib/skyframe/serialization/autocodec:serialization-constant",
+         "//src/main/java/com/google/devtools/build/lib/util",
+diff --git a/src/main/java/com/google/devtools/build/lib/skyframe/FilesystemValueChecker.java b/src/main/java/com/google/devtools/build/lib/skyframe/FilesystemValueChecker.java
+index 3c763d80b8..8a0a9df6e1 100644
+--- a/src/main/java/com/google/devtools/build/lib/skyframe/FilesystemValueChecker.java
++++ b/src/main/java/com/google/devtools/build/lib/skyframe/FilesystemValueChecker.java
+@@ -448,7 +448,8 @@ public class FilesystemValueChecker {
+ 
+     // This could be improved by short-circuiting as soon as we see a child that is not present in
+     // the TreeArtifactValue, but it doesn't seem to be a major source of overhead.
+-    Set<PathFragment> currentChildren = new HashSet<>();
++    // visitTree() is called from multiple threads in parallel so this need to be a hash set
++    Set<PathFragment> currentChildren = Sets.newConcurrentHashSet();
+     try {
+       TreeArtifactValue.visitTree(
+           path,
+diff --git a/src/main/java/com/google/devtools/build/lib/skyframe/TreeArtifactValue.java b/src/main/java/com/google/devtools/build/lib/skyframe/TreeArtifactValue.java
+index 484394f749..7dd56592d8 100644
+--- a/src/main/java/com/google/devtools/build/lib/skyframe/TreeArtifactValue.java
++++ b/src/main/java/com/google/devtools/build/lib/skyframe/TreeArtifactValue.java
+@@ -35,10 +35,15 @@ import com.google.devtools.build.lib.actions.FileContentsProxy;
+ import com.google.devtools.build.lib.actions.FileStateType;
+ import com.google.devtools.build.lib.actions.HasDigest;
+ import com.google.devtools.build.lib.actions.cache.MetadataDigestUtils;
++import com.google.devtools.build.lib.concurrent.AbstractQueueVisitor;
++import com.google.devtools.build.lib.concurrent.ErrorClassifier;
++import com.google.devtools.build.lib.concurrent.NamedForkJoinPool;
++import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
+ import com.google.devtools.build.lib.skyframe.serialization.autocodec.AutoCodec;
+ import com.google.devtools.build.lib.skyframe.serialization.autocodec.SerializationConstant;
+ import com.google.devtools.build.lib.util.Fingerprint;
+ import com.google.devtools.build.lib.vfs.Dirent;
++import com.google.devtools.build.lib.vfs.IORuntimeException;
+ import com.google.devtools.build.lib.vfs.Path;
+ import com.google.devtools.build.lib.vfs.PathFragment;
+ import com.google.devtools.build.lib.vfs.Symlinks;
+@@ -51,6 +56,7 @@ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
++import java.util.concurrent.ForkJoinPool;
+ import javax.annotation.Nullable;
+ 
+ /**
+@@ -58,7 +64,9 @@ import javax.annotation.Nullable;
+  * {@link TreeFileArtifact}s.
+  */
+ public class TreeArtifactValue implements HasDigest, SkyValue {
+-
++  private static final ForkJoinPool VISITOR_POOL =
++      NamedForkJoinPool.newNamedPool(
++          "tree-artifact-visitor", Runtime.getRuntime().availableProcessors());
+   /**
+    * Comparator based on exec path which works on {@link ActionInput} as opposed to {@link
+    * com.google.devtools.build.lib.actions.Artifact}. This way, we can use an {@link ActionInput} to
+@@ -486,10 +494,71 @@ public class TreeArtifactValue implements HasDigest, SkyValue {
+      *
+      * <p>If the implementation throws {@link IOException}, traversal is immediately halted and the
+      * exception is propagated.
++     *
++     * <p>This method can be called from multiple threads in parallel during a single call of {@link
++     * TreeArtifactVisitor#visitTree(Path, TreeArtifactVisitor)}.
+      */
++    @ThreadSafe
+     void visit(PathFragment parentRelativePath, Dirent.Type type) throws IOException;
+   }
+ 
++  /** An {@link AbstractQueueVisitor} that visits every file in the tree artifact. */
++  static class Visitor extends AbstractQueueVisitor {
++    private final Path parentDir;
++    private final TreeArtifactVisitor visitor;
++
++    Visitor(Path parentDir, TreeArtifactVisitor visitor) {
++      super(
++          VISITOR_POOL,
++          /* shutdownOnCompletion= */ false,
++          /* failFastOnException= */ true,
++          ErrorClassifier.DEFAULT);
++      this.parentDir = checkNotNull(parentDir);
++      this.visitor = checkNotNull(visitor);
++    }
++
++    void run() throws IOException, InterruptedException {
++      execute(() -> visitTree(PathFragment.EMPTY_FRAGMENT));
++      try {
++        awaitQuiescence(true);
++      } catch (IORuntimeException e) {
++        throw e.getCauseIOException();
++      }
++    }
++
++    // IOExceptions are wrapped in IORuntimeException so that it can be propagated to the main
++    // thread
++    private void visitTree(PathFragment subdir) {
++      try {
++        for (Dirent dirent : parentDir.getRelative(subdir).readdir(Symlinks.NOFOLLOW)) {
++          PathFragment parentRelativePath = subdir.getChild(dirent.getName());
++          Dirent.Type type = dirent.getType();
++
++          if (type == Dirent.Type.UNKNOWN) {
++            throw new IOException(
++                "Could not determine type of file for "
++                    + parentRelativePath
++                    + " under "
++                    + parentDir);
++          }
++
++          if (type == Dirent.Type.SYMLINK) {
++            checkSymlink(subdir, parentDir.getRelative(parentRelativePath));
++          }
++
++          visitor.visit(parentRelativePath, type);
++
++          if (type == Dirent.Type.DIRECTORY) {
++            execute(() -> visitTree(parentRelativePath));
++          }
++        }
++      } catch (IOException e) {
++        // We can't throw checked exceptions here since AQV expects Runnables
++        throw new IORuntimeException(e);
++      }
++    }
++  }
++
+   /**
+    * Recursively visits all descendants under a directory.
+    *
+@@ -501,35 +570,16 @@ public class TreeArtifactValue implements HasDigest, SkyValue {
+    * symlink that traverses outside of the tree artifact and any entry of {@link
+    * Dirent.Type#UNKNOWN}, such as a named pipe.
+    *
++   * <p>The visitor will be called on multiple threads in parallel. Accordingly, it must be
++   * thread-safe.
++   *
+    * @throws IOException if there is any problem reading or validating outputs under the given tree
+    *     artifact directory, or if {@link TreeArtifactVisitor#visit} throws {@link IOException}
+    */
+-  public static void visitTree(Path parentDir, TreeArtifactVisitor visitor)
++  public static void visitTree(Path parentDir, TreeArtifactVisitor treeArtifactVisitor)
+       throws IOException, InterruptedException {
+-    visitTree(parentDir, PathFragment.EMPTY_FRAGMENT, checkNotNull(visitor));
+-  }
+-
+-  private static void visitTree(Path parentDir, PathFragment subdir, TreeArtifactVisitor visitor)
+-      throws IOException {
+-    for (Dirent dirent : parentDir.getRelative(subdir).readdir(Symlinks.NOFOLLOW)) {
+-      PathFragment parentRelativePath = subdir.getChild(dirent.getName());
+-      Dirent.Type type = dirent.getType();
+-
+-      if (type == Dirent.Type.UNKNOWN) {
+-        throw new IOException(
+-            "Could not determine type of file for " + parentRelativePath + " under " + parentDir);
+-      }
+-
+-      if (type == Dirent.Type.SYMLINK) {
+-        checkSymlink(subdir, parentDir.getRelative(parentRelativePath));
+-      }
+-
+-      visitor.visit(parentRelativePath, type);
+-
+-      if (type == Dirent.Type.DIRECTORY) {
+-        visitTree(parentDir, parentRelativePath, visitor);
+-      }
+-    }
++    Visitor visitor = new Visitor(parentDir, treeArtifactVisitor);
++    visitor.run();
+   }
+ 
+   private static void checkSymlink(PathFragment subDir, Path path) throws IOException {
+diff --git a/src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java b/src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java
+index 62602a31c7..e09c0f28a2 100644
+--- a/src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java
++++ b/src/test/java/com/google/devtools/build/lib/actions/ActionCacheCheckerTest.java
+@@ -1393,7 +1393,9 @@ public class ActionCacheCheckerTest {
+                   Artifact.TreeFileArtifact.createTreeOutput(output, parentRelativePath);
+               FileArtifactValue metadata =
+                   FileArtifactValue.createForTesting(treeDir.getRelative(parentRelativePath));
+-              tree.putChild(child, metadata);
++              synchronized (tree) {
++                tree.putChild(child, metadata);
++              }
+             });
+       }
+ 
+diff --git a/src/test/java/com/google/devtools/build/lib/skyframe/TreeArtifactValueTest.java b/src/test/java/com/google/devtools/build/lib/skyframe/TreeArtifactValueTest.java
+index 9ef88e9394..d855ed3efa 100644
+--- a/src/test/java/com/google/devtools/build/lib/skyframe/TreeArtifactValueTest.java
++++ b/src/test/java/com/google/devtools/build/lib/skyframe/TreeArtifactValueTest.java
+@@ -373,7 +373,13 @@ public final class TreeArtifactValueTest {
+     scratch.resolve("tree/a/b/dangling_link").createSymbolicLink(PathFragment.create("?"));
+     List<Pair<PathFragment, Dirent.Type>> children = new ArrayList<>();
+ 
+-    TreeArtifactValue.visitTree(treeDir, (child, type) -> children.add(Pair.of(child, type)));
++    TreeArtifactValue.visitTree(
++        treeDir,
++        (child, type) -> {
++          synchronized (children) {
++            children.add(Pair.of(child, type));
++          }
++        });
+ 
+     assertThat(children)
+         .containsExactly(
+@@ -435,7 +441,13 @@ public final class TreeArtifactValueTest {
+     scratch.resolve("tree/a/up_link").createSymbolicLink(PathFragment.create("../file"));
+     List<Pair<PathFragment, Dirent.Type>> children = new ArrayList<>();
+ 
+-    TreeArtifactValue.visitTree(treeDir, (child, type) -> children.add(Pair.of(child, type)));
++    TreeArtifactValue.visitTree(
++        treeDir,
++        (child, type) -> {
++          synchronized (children) {
++            children.add(Pair.of(child, type));
++          }
++        });
+ 
+     assertThat(children)
+         .containsExactly(
+@@ -450,7 +462,13 @@ public final class TreeArtifactValueTest {
+     scratch.resolve("tree/absolute_link").createSymbolicLink(PathFragment.create("/tmp"));
+     List<Pair<PathFragment, Dirent.Type>> children = new ArrayList<>();
+ 
+-    TreeArtifactValue.visitTree(treeDir, (child, type) -> children.add(Pair.of(child, type)));
++    TreeArtifactValue.visitTree(
++        treeDir,
++        (child, type) -> {
++          synchronized (children) {
++            children.add(Pair.of(child, type));
++          }
++        });
+ 
+     assertThat(children)
+         .containsExactly(Pair.of(PathFragment.create("absolute_link"), Dirent.Type.SYMLINK));

@@ -1,0 +1,180 @@
+diff --git a/src/yb/tablet/operations/operation_driver.cc b/src/yb/tablet/operations/operation_driver.cc
+index 3ebae058d5..e2c6bd0fc5 100644
+--- a/src/yb/tablet/operations/operation_driver.cc
++++ b/src/yb/tablet/operations/operation_driver.cc
+@@ -256,42 +256,15 @@ Status OperationDriver::PrepareAndStart() {
+     // We can only do this after we've called Start()
+     prepare_state_ = PREPARED;
+ 
+-    // On the replica (non-leader) side, the replication state might have been REPLICATING during
+-    // our previous acquisition of this lock, but it might have changed to REPLICATED in the
+-    // meantime. That would mean ReplicationFinished got called, but ReplicationFinished would not
+-    // trigger Apply unless the operation is PREPARED, so we are responsible for doing that.
+-    // If we fail to capture the new replication state here, the operation will never be applied.
+-    repl_state_copy = replication_state_;
++    if (replication_state_ == NOT_REPLICATING) {
++      replication_state_ = REPLICATING;
++    }
+   }
+ 
+-  switch (repl_state_copy) {
+-    case NOT_REPLICATING:
+-    {
+-      {
+-        std::lock_guard<simple_spinlock> lock(lock_);
+-        replication_state_ = REPLICATING;
+-      }
++  return Status::OK();
++}
+ 
+-      // After the batching changes from 07/2017, It is the caller's responsibility to call
+-      // Consensus::Replicate. See Preparer for details.
+-      return Status::OK();
+-    }
+-    case REPLICATING:
+-    {
+-      // Already replicating - nothing to trigger
+-      return Status::OK();
+-    }
+-    case REPLICATION_FAILED:
+-      DCHECK(!operation_status_.ok());
+-      FALLTHROUGH_INTENDED;
+-    case REPLICATED:
+-    {
+-      // We can move on to apply.  Note that ApplyOperation() will handle the error status in the
+-      // REPLICATION_FAILED case.
+-      return ApplyOperation(yb::OpId::kUnknownTerm, nullptr /* applied_op_ids */);
+-    }
+-  }
+-  FATAL_INVALID_ENUM_VALUE(ReplicationState, repl_state_copy);
++OperationDriver::~OperationDriver() {
+ }
+ 
+ void OperationDriver::ReplicationFailed(const Status& replication_status) {
+@@ -373,11 +346,30 @@ void OperationDriver::ReplicationFinished(
+   // Note that if we set the state to REPLICATION_FAILED above, ApplyOperation() will actually abort
+   // the operation, i.e. ApplyTask() will never be called and the operation will never be applied to
+   // the tablet.
+-  if (prepare_state_copy == PREPARED) {
+-    // We likely need to do cleanup if this fails so for now just
+-    // CHECK_OK
+-    CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
++  if (prepare_state_copy != PrepareState::PREPARED) {
++    LOG(DFATAL) << "Replicating an operation that has not been prepared: " << AsString(this);
++
++    LOG(ERROR) << "Attempting to wait for the operation to be prepared";
++
++    // This case should never happen, but if it happens we are trying to survive.
++    for (;;) {
++      std::this_thread::sleep_for(1ms);
++      PrepareState prepare_state;
++      {
++        std::lock_guard<simple_spinlock> lock(lock_);
++        prepare_state = prepare_state_;
++        if (prepare_state == PrepareState::PREPARED) {
++          break;
++        }
++      }
++      YB_LOG_EVERY_N_SECS(WARNING, 1)
++          << "Waiting for the operation to be prepared, current state: " << prepare_state;
++    }
+   }
++
++  // We likely need to do cleanup if this fails so for now just
++  // CHECK_OK
++  CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
+ }
+ 
+ void OperationDriver::Abort(const Status& status) {
+diff --git a/src/yb/tablet/operations/operation_driver.h b/src/yb/tablet/operations/operation_driver.h
+index 9d2fc69984..1cd094d06d 100644
+--- a/src/yb/tablet/operations/operation_driver.h
++++ b/src/yb/tablet/operations/operation_driver.h
+@@ -231,7 +231,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+     PREPARED
+   };
+ 
+-  ~OperationDriver() override {}
++  ~OperationDriver();
+ 
+   // Starts operation, returns false is we should NOT continue processing the operation.
+   bool StartOperation();
+diff --git a/src/yb/tablet/preparer.cc b/src/yb/tablet/preparer.cc
+index 0fa570e040..9fcffb750c 100644
+--- a/src/yb/tablet/preparer.cc
++++ b/src/yb/tablet/preparer.cc
+@@ -31,6 +31,7 @@
+ DEFINE_int32(max_group_replicate_batch_size, 16,
+              "Maximum number of operations to submit to consensus for replication in a batch.");
+ 
++using namespace std::literals;
+ using std::vector;
+ 
+ namespace yb {
+@@ -139,8 +140,19 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
+     return STATUS(IllegalState, "Tablet is shutting down");
+   }
+ 
+-  active_tasks_.fetch_add(1, std::memory_order_release);
+-  queue_.Push(operation_driver);
++  if (!operation_driver->is_leader_side()) {
++    while (active_tasks_.load(std::memory_order_acquire) != 0) {
++      YB_LOG_EVERY_N_SECS(WARNING, 1)
++          << "Waiting for active tasks to become zero: "
++          << active_tasks_.load(std::memory_order_acquire);
++      // It should be very rare case, so could do busy wait.
++      std::this_thread::sleep_for(1ms);
++    }
++    operation_driver->PrepareAndStartTask();
++  } else {
++    active_tasks_.fetch_add(1, std::memory_order_release);
++    queue_.Push(operation_driver);
++  }
+ 
+   auto expected = false;
+   if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+@@ -213,29 +225,24 @@ bool ShouldApplySeparately(OperationType operation_type) {
+ void PreparerImpl::ProcessItem(OperationDriver* item) {
+   CHECK_NOTNULL(item);
+ 
+-  if (item->is_leader_side()) {
+-    auto operation_type = item->operation_type();
++  LOG_IF(DFATAL, !item->is_leader_side()) << "Processing follower-side item";
+ 
+-    const bool apply_separately = ShouldApplySeparately(operation_type);
+-    const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
++  auto operation_type = item->operation_type();
+ 
+-    // Don't add more than the max number of operations to a batch, and also don't add
+-    // operations bound to different terms, so as not to fail unrelated operations
+-    // unnecessarily in case of a bound term mismatch.
+-    if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
+-        (!leader_side_batch_.empty() &&
+-            bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
+-      ProcessAndClearLeaderSideBatch();
+-    }
+-    leader_side_batch_.push_back(item);
+-    if (apply_separately) {
+-      ProcessAndClearLeaderSideBatch();
+-    }
+-  } else {
+-    // We found a non-leader-side operation. We need to process the accumulated batch of
+-    // leader-side operations first, and then process this other operation.
++  const bool apply_separately = ShouldApplySeparately(operation_type);
++  const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
++
++  // Don't add more than the max number of operations to a batch, and also don't add
++  // operations bound to different terms, so as not to fail unrelated operations
++  // unnecessarily in case of a bound term mismatch.
++  if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
++      (!leader_side_batch_.empty() &&
++          bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
++    ProcessAndClearLeaderSideBatch();
++  }
++  leader_side_batch_.push_back(item);
++  if (apply_separately) {
+     ProcessAndClearLeaderSideBatch();
+-    item->PrepareAndStartTask();
+   }
+ }
+ 

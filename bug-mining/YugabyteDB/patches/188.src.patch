@@ -1,0 +1,397 @@
+diff --git a/src/yb/docdb/conflict_resolution.cc b/src/yb/docdb/conflict_resolution.cc
+index 73fe5420a7..ebc92a4353 100644
+--- a/src/yb/docdb/conflict_resolution.cc
++++ b/src/yb/docdb/conflict_resolution.cc
+@@ -182,6 +182,18 @@ class ConflictResolver {
+     return Status::OK();
+   }
+ 
++  void EnsureIntentIteratorCreated() {
++    if (!intent_iter_) {
++      intent_iter_ = CreateRocksDBIterator(
++          doc_db_.intents,
++          BloomFilterMode::DONT_USE_BLOOM_FILTER,
++          boost::none /* user_key_for_filter */,
++          rocksdb::kDefaultQueryId,
++          nullptr /* file_filter */,
++          &intent_key_upperbound_);
++    }
++  }
++
+  private:
+   CHECKED_STATUS ResolveConflicts() {
+     if (!conflicts_.empty()) {
+@@ -196,18 +208,6 @@ class ConflictResolver {
+     return Status::OK();
+   }
+ 
+-  void EnsureIntentIteratorCreated() {
+-    if (!intent_iter_) {
+-      intent_iter_ = CreateRocksDBIterator(
+-          doc_db_.intents,
+-          BloomFilterMode::DONT_USE_BLOOM_FILTER,
+-          boost::none /* user_key_for_filter */,
+-          rocksdb::kDefaultQueryId,
+-          nullptr /* file_filter */,
+-          &intent_key_upperbound_);
+-    }
+-  }
+-
+   CHECKED_STATUS DoResolveConflicts() {
+     for (;;) {
+       RETURN_NOT_OK(CheckLocalCommits());
+@@ -437,11 +437,21 @@ class TransactionConflictResolverContext : public ConflictResolverContext {
+     auto intent_type_set = strength == IntentStrength::kWeak
+         ? StrongToWeak(strong_intent_types) : strong_intent_types;
+ 
++    VLOG(4) << "Resolve conflicts: " << transaction_id_
++            << ", key: " << SubDocKey::DebugSliceToString(intent_key_prefix->data())
++            << ", strength: " << strength << ", read time: " << read_time_;
++
+     // read_time is HybridTime::kMax in case of serializable isolation or when read time not yet
+     // picked for snapshot isolation.
+     // I.e. if it the first operation in the transaction.
+     if (strength == IntentStrength::kStrong && read_time_ != HybridTime::kMax) {
+-      Slice key_slice(intent_key_prefix->data());
++      Slice key_slice = intent_key_prefix->AsSlice();
++
++      // Iterator on intents DB should be created before iterator on regular DB.
++      // This is to prevent the case when we create an iterator on the regular DB where a
++      // provisional record has not yet been applied, and then create an iterator the intents
++      // DB where the provisional record has already been removed.
++      resolver->EnsureIntentIteratorCreated();
+ 
+       // TODO(dtxn) reuse iterator
+       auto value_iter = CreateRocksDBIterator(
+@@ -451,15 +461,23 @@ class TransactionConflictResolverContext : public ConflictResolverContext {
+           rocksdb::kDefaultQueryId);
+ 
+       value_iter->Seek(key_slice);
+-      if (value_iter->Valid() && value_iter->key().starts_with(key_slice)) {
++      KeyBytes buffer;
++      while (value_iter->Valid() && value_iter->key().starts_with(key_slice)) {
+         auto existing_key = value_iter->key();
+-        DocHybridTime doc_ht;
+-        RETURN_NOT_OK(doc_ht.DecodeFromEnd(existing_key));
++        auto doc_ht = VERIFY_RESULT(DocHybridTime::DecodeFromEnd(&existing_key));
++        VLOG(4) << "Check value overwrite: " << transaction_id_
++                << ", key: " << SubDocKey::DebugSliceToString(intent_key_prefix->data())
++                << ", read time: " << read_time_
++                << ", found key: " << SubDocKey::DebugSliceToString(value_iter->key());
+         if (doc_ht.hybrid_time() >= read_time_) {
+           conflicts_metric_->Increment();
+           return STATUS_FORMAT(TryAgain, "Value write after transaction start: $0 >= $1",
+                                doc_ht.hybrid_time(), read_time_);
+         }
++        buffer.Reset(existing_key);
++        // Already have ValueType::kHybridTime at the end
++        buffer.AppendHybridTime(DocHybridTime::kMin);
++        ROCKSDB_SEEK(value_iter.get(), buffer.AsSlice());
+       }
+     }
+ 
+diff --git a/src/yb/docdb/docdb.cc b/src/yb/docdb/docdb.cc
+index bd9aee1beb..bfb4d9d67e 100644
+--- a/src/yb/docdb/docdb.cc
++++ b/src/yb/docdb/docdb.cc
+@@ -1339,6 +1339,18 @@ CHECKED_STATUS IntentToWriteRequest(
+         intent.doc_ht,
+         intent_value,
+     }};
++
++    // Useful when debugging transaction failure.
++#if defined(DUMP_APPLY)
++    auto int_value = BigEndian::Load64(intent_value.data() + 1);
++    SubDocKey sub_doc_key;
++    CHECK_OK(sub_doc_key.FullyDecodeFrom(intent.doc_path, HybridTimeRequired::kFalse));
++    auto txn_id = FullyDecodeTransactionId(transaction_id_slice);
++    LOG(INFO) << "Apply: " << sub_doc_key.doc_key().hashed_group().front() << " = " << int_value
++              << ", time: " << commit_ht << ", txn: " << txn_id
++              << ", raw: " << intent_iter->key().ToDebugHexString();
++#endif
++
+     regular_batch->Put(key_parts, value_parts);
+     ++*write_id;
+   }
+diff --git a/src/yb/docdb/pgsql_operation.cc b/src/yb/docdb/pgsql_operation.cc
+index 56860b318c..5ba25a4933 100644
+--- a/src/yb/docdb/pgsql_operation.cc
++++ b/src/yb/docdb/pgsql_operation.cc
+@@ -314,9 +314,6 @@ Status PgsqlWriteOperation::PopulateResultSet(const QLTableRow::SharedPtr& table
+ 
+ Status PgsqlWriteOperation::GetDocPaths(
+     GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const {
+-  if (encoded_doc_key_) {
+-    paths->push_back(encoded_doc_key_);
+-  }
+   // When this write operation requires a read, it requires a read snapshot so paths will be locked
+   // in snapshot isolation for consistency. Otherwise, pure writes will happen in serializable
+   // isolation so that they will serialize but do not conflict with one another.
+@@ -325,6 +322,34 @@ Status PgsqlWriteOperation::GetDocPaths(
+   // snapshot isolation level.
+   *level = RequireReadSnapshot() ? IsolationLevel::SNAPSHOT_ISOLATION
+                                  : IsolationLevel::SERIALIZABLE_ISOLATION;
++
++  if (mode == GetDocPathsMode::kIntents) {
++    const google::protobuf::RepeatedPtrField<PgsqlColumnValuePB>* column_values = nullptr;
++    if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_INSERT) {
++      column_values = &request_.column_values();
++    } else if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_UPDATE) {
++      column_values = &request_.column_new_values();
++    }
++    if (column_values != nullptr && !column_values->empty()) {
++      KeyBytes buffer;
++      for (const auto& column_value : *column_values) {
++        ColumnId column_id(column_value.column_id());
++        Slice doc_key = encoded_doc_key_.as_slice();
++        buffer.Clear();
++        buffer.AppendValueType(ValueType::kColumnId);
++        buffer.AppendColumnId(column_id);
++        RefCntBuffer path(doc_key.size() + buffer.size());
++        memcpy(path.data(), doc_key.data(), doc_key.size());
++        memcpy(path.data() + doc_key.size(), buffer.data().c_str(), buffer.size());
++        paths->push_back(RefCntPrefix(path));
++      }
++      return Status::OK();
++    }
++  }
++  if (encoded_doc_key_) {
++    paths->push_back(encoded_doc_key_);
++  }
++
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/yql/pgwrapper/libpq_utils.cc b/src/yb/yql/pgwrapper/libpq_utils.cc
+index e7ac7c849d..4dfe346084 100644
+--- a/src/yb/yql/pgwrapper/libpq_utils.cc
++++ b/src/yb/yql/pgwrapper/libpq_utils.cc
+@@ -46,14 +46,39 @@ Result<PGResultPtr> Fetch(PGconn* conn, const std::string& command) {
+   return std::move(res);
+ }
+ 
+-Result<int32_t> GetInt32(PGresult* result, int row, int column) {
+-  int32_t res;
++Result<PGResultPtr> FetchMatrix(PGconn* conn, const std::string& command, int rows, int columns) {
++  auto res = VERIFY_RESULT(Fetch(conn, command));
++
++  auto fetched_columns = PQnfields(res.get());
++  if (fetched_columns != columns) {
++    return STATUS_FORMAT(
++        RuntimeError, "Fetched $0 columns, while $1 expected", fetched_columns, columns);
++  }
++
++  auto fetched_rows = PQntuples(res.get());
++  if (fetched_rows != rows) {
++    return STATUS_FORMAT(
++        RuntimeError, "Fetched $0 rows, while $1 expected", fetched_rows, rows);
++  }
++
++  return res;
++}
++
++Result<char*> GetValueWithLength(PGresult* result, int row, int column, size_t size) {
+   auto len = PQgetlength(result, row, column);
+-  if (len != sizeof(res)) {
++  if (len != size) {
+     return STATUS_FORMAT(Corruption, "Bad column length: $0, expected: $1, row: $2, column: $3",
+-                         len, sizeof(res), row, column);
++                         len, size, row, column);
+   }
+-  return BigEndian::Load32(PQgetvalue(result, row, column));
++  return PQgetvalue(result, row, column);
++}
++
++Result<int32_t> GetInt32(PGresult* result, int row, int column) {
++  return BigEndian::Load32(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int32_t))));
++}
++
++Result<int64_t> GetInt64(PGresult* result, int row, int column) {
++  return BigEndian::Load64(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int64_t))));
+ }
+ 
+ Result<std::string> GetString(PGresult* result, int row, int column) {
+diff --git a/src/yb/yql/pgwrapper/libpq_utils.h b/src/yb/yql/pgwrapper/libpq_utils.h
+index 0b8387c5d4..cc3f84ce6b 100644
+--- a/src/yb/yql/pgwrapper/libpq_utils.h
++++ b/src/yb/yql/pgwrapper/libpq_utils.h
+@@ -38,10 +38,39 @@ CHECKED_STATUS Execute(PGconn* conn, const std::string& command);
+ 
+ Result<PGResultPtr> Fetch(PGconn* conn, const std::string& command);
+ 
++// Fetches data matrix of specified size. I.e. exact number of rows and columns are expected.
++Result<PGResultPtr> FetchMatrix(PGconn* conn, const std::string& command, int rows, int columns);
++
+ Result<int32_t> GetInt32(PGresult* result, int row, int column);
+ 
++Result<int64_t> GetInt64(PGresult* result, int row, int column);
++
+ Result<std::string> GetString(PGresult* result, int row, int column);
+ 
++Result<int32_t> GetValueImpl(PGresult* result, int row, int column, int32_t*) {
++  return GetInt32(result, row, column);
++}
++
++Result<int64_t> GetValueImpl(PGresult* result, int row, int column, int64_t*) {
++  return GetInt64(result, row, column);
++}
++
++Result<std::string> GetValueImpl(PGresult* result, int row, int column, std::string*) {
++  return GetString(result, row, column);
++}
++
++template<class T>
++Result<T> GetValue(PGresult* result, int row, int column) {
++  // static_cast<T*>(nullptr) is a trick to use function overload from template.
++  return GetValueImpl(result, row, column, static_cast<T*>(nullptr));
++}
++
++template <class T>
++Result<T> FetchValue(PGconn* conn, const std::string& command) {
++  auto res = VERIFY_RESULT(FetchMatrix(conn, command, 1, 1));
++  return GetValue<T>(res.get(), 0, 0);
++}
++
+ } // namespace pgwrapper
+ } // namespace yb
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_libpq-test.cc b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+index 2bc0fb1661..8a0d228797 100644
+--- a/src/yb/yql/pgwrapper/pg_libpq-test.cc
++++ b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+@@ -35,7 +35,6 @@ class PgLibPqTest : public PgWrapperTestBase {
+     }
+     return result;
+   }
+-
+ };
+ 
+ TEST_F(PgLibPqTest, YB_DISABLE_TEST_IN_TSAN(Simple)) {
+@@ -335,5 +334,127 @@ TEST_F(PgLibPqTest, YB_DISABLE_TEST_IN_TSAN(ConcurrentIndexInsert)) {
+   std::this_thread::sleep_for(30s);
+ }
+ 
++bool TransactionalFailure(const Status& status) {
++  auto message = status.ToString();
++  return message.find("Restart read required at") != std::string::npos ||
++         message.find("Transaction expired") != std::string::npos ||
++         message.find("Conflicts with committed transaction") != std::string::npos ||
++         message.find("Value write after transaction start") != std::string::npos ||
++         message.find("Conflicts with higher priority transaction") != std::string::npos;
++}
++
++Result<int64_t> ReadSumBalance(PGconn* conn, int accounts, std::atomic<int>* counter) {
++  RETURN_NOT_OK(Execute(conn, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
++  BOOST_SCOPE_EXIT(conn) {
++    EXPECT_OK(Execute(conn, "ROLLBACK"));
++  } BOOST_SCOPE_EXIT_END;
++
++  RETURN_NOT_OK(Execute(conn, Format("INSERT INTO fake (id) VALUES ($0)", ++*counter)));
++  int64_t sum = 0;
++  for (int i = 1; i <= accounts; ++i) {
++    sum += VERIFY_RESULT(FetchValue<int64_t>(
++        conn, Format("SELECT balance FROM account_$0 WHERE id = $0", i)));
++  }
++  return sum;
++}
++
++TEST_F(PgLibPqTest, YB_DISABLE_TEST_IN_TSAN(MultiBankAccount)) {
++  constexpr int kAccounts = RegularBuildVsSanitizers(30, 10);
++  constexpr int kThreads = RegularBuildVsSanitizers(20, 5);
++  constexpr int64_t kInitialBalance = 100;
++  PGConnPtr conn;
++  ASSERT_OK(WaitFor([this, &conn] {
++    auto res = Connect();
++    if (!res.ok()) {
++      return false;
++    }
++    conn = std::move(*res);
++    return true;
++  }, 5s, "Initial connect"));
++
++  for (int i = 1; i <= kAccounts; ++i) {
++    ASSERT_OK(Execute(
++        conn.get(),
++        Format("CREATE TABLE account_$0 (id int, balance bigint, PRIMARY KEY(id))", i)));
++    ASSERT_OK(Execute(
++        conn.get(),
++        Format("INSERT INTO account_$0 (id, balance) VALUES ($0, $1)", i, kInitialBalance)));
++  }
++
++  ASSERT_OK(Execute(conn.get(), "CREATE TABLE fake (id int, PRIMARY KEY(id))"));
++
++  std::atomic<int> writes(0);
++  std::atomic<int> reads(0);
++
++  // TODO(dtxn) Remove it.
++  // Currently using fake insert to force transaction start before actual statements.
++  std::atomic<int> counter(100000);
++  TestThreadHolder thread_holder;
++  for (int i = 1; i <= kThreads; ++i) {
++    thread_holder.AddThreadFunctor(
++        [this, &counter, &writes, &stop_flag = thread_holder.stop_flag()]() {
++      auto conn = ASSERT_RESULT(Connect());
++      while (!stop_flag.load(std::memory_order_acquire)) {
++        int from = RandomUniformInt(1, kAccounts);
++        int to = RandomUniformInt(1, kAccounts - 1);
++        if (to >= from) {
++          ++to;
++        }
++        int64_t amount = RandomUniformInt(1, 10);
++        ASSERT_OK(Execute(conn.get(), "START TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
++        ASSERT_OK(Execute(conn.get(), Format("INSERT INTO fake (id) VALUES ($0)", ++counter)));
++        auto status = Execute(conn.get(), Format(
++              "UPDATE account_$0 SET balance = balance - $1 WHERE id = $0", from, amount));
++        if (status.ok()) {
++          status = Execute(conn.get(), Format(
++              "UPDATE account_$0 SET balance = balance + $1 WHERE id = $0", to, amount));
++        }
++        if (status.ok()) {
++          status = Execute(conn.get(), "COMMIT;");
++        } else {
++          ASSERT_OK(Execute(conn.get(), "ROLLBACK;"));
++        }
++        if (!status.ok()) {
++          ASSERT_TRUE(TransactionalFailure(status)) << status;
++        } else {
++          LOG(INFO) << "Updated: " << from << " => " << to << " by " << amount;
++          ++writes;
++        }
++      }
++    });
++  }
++
++  thread_holder.AddThreadFunctor(
++      [this, &counter, &reads, &stop_flag = thread_holder.stop_flag()]() {
++    auto conn = ASSERT_RESULT(Connect());
++    while (!stop_flag.load(std::memory_order_acquire)) {
++      auto sum = ReadSumBalance(conn.get(), kAccounts, &counter);
++      if (!sum.ok()) {
++        ASSERT_TRUE(TransactionalFailure(sum.status())) << sum.status();
++      } else {
++        ASSERT_EQ(*sum, kAccounts * kInitialBalance);
++        ++reads;
++      }
++    }
++  });
++
++  thread_holder.WaitAndStop(60s);
++
++  ASSERT_GE(writes.load(), 50);
++  ASSERT_GE(reads.load(), 2);
++
++  ASSERT_OK(WaitFor([&conn, &counter]() -> Result<bool> {
++    auto sum = ReadSumBalance(conn.get(), kAccounts, &counter);
++    if (!sum.ok()) {
++      if (!TransactionalFailure(sum.status())) {
++        return sum.status();
++      }
++      return false;
++    }
++    EXPECT_EQ(*sum, kAccounts * kInitialBalance);
++    return true;
++  }, 5s, "Final read"));
++}
++
+ } // namespace pgwrapper
+ } // namespace yb

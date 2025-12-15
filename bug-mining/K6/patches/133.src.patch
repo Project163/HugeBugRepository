@@ -1,0 +1,1041 @@
+diff --git a/internal/js/bundle.go b/internal/js/bundle.go
+index 89df5b379..13b80ca6f 100644
+--- a/internal/js/bundle.go
++++ b/internal/js/bundle.go
+@@ -20,6 +20,7 @@ import (
+ 	"go.k6.io/k6/internal/event"
+ 	"go.k6.io/k6/internal/js/compiler"
+ 	"go.k6.io/k6/internal/js/eventloop"
++	"go.k6.io/k6/internal/js/tc55/timers"
+ 	"go.k6.io/k6/internal/loader"
+ 	"go.k6.io/k6/js/common"
+ 	"go.k6.io/k6/js/modules"
+@@ -312,7 +313,11 @@ func (b *Bundle) instantiate(vuImpl *moduleVUImpl, vuID uint64) (*BundleInstance
+ 
+ 	modSys := modules.NewModuleSystem(b.ModuleResolver, vuImpl)
+ 	b.setInitGlobals(rt, vuImpl, modSys)
+-	modules.ExportGloballyModule(rt, modSys, "k6/timers")
++
++	err = timers.SetupGlobally(vuImpl)
++	if err != nil {
++		return nil, err
++	}
+ 	vuImpl.initEnv = initenv
+ 	defer func() {
+ 		vuImpl.initEnv = nil
+diff --git a/internal/js/modules/k6/timers/timers.go b/internal/js/modules/k6/timers/timers.go
+index a96fe1185..ac8064e1d 100644
+--- a/internal/js/modules/k6/timers/timers.go
++++ b/internal/js/modules/k6/timers/timers.go
+@@ -1,15 +1,7 @@
+-// Package timers is implementing setInterval setTimeout and co.
++// Package timers exposes setInterval setTimeout and co. as a module
+ package timers
+ 
+ import (
+-	"fmt"
+-	"time"
+-
+-	"github.com/mstoykov/k6-taskqueue-lib/taskqueue"
+-	"github.com/sirupsen/logrus"
+-
+-	"github.com/grafana/sobek"
+-	"go.k6.io/k6/js/common"
+ 	"go.k6.io/k6/js/modules"
+ )
+ 
+@@ -20,19 +12,6 @@ type RootModule struct{}
+ // Timers represents an instance of the timers module.
+ type Timers struct {
+ 	vu modules.VU
+-
+-	timerIDCounter uint64
+-
+-	timers map[uint64]time.Time
+-	// Maybe in the future if this moves to core it will be expanded to have multiple queues
+-	queue *timerQueue
+-
+-	// this used predominantly to get around very unlikely race conditions as we are adding stuff to the event loop
+-	// from outside of it on multitple timers. And it is easier to just use this then redo half the work it does
+-	// to make that safe
+-	taskQueue *taskqueue.TaskQueue
+-	// used to synchronize around context closing
+-	taskQueueCh chan struct{}
+ }
+ 
+ var (
+@@ -40,11 +19,6 @@ var (
+ 	_ modules.Instance = &Timers{}
+ )
+ 
+-const (
+-	setTimeoutName  = "setTimeout"
+-	setIntervalName = "setInterval"
+-)
+-
+ // New returns a pointer to a new RootModule instance.
+ func New() *RootModule {
+ 	return &RootModule{}
+@@ -54,9 +28,7 @@ func New() *RootModule {
+ // a new instance for each VU.
+ func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
+ 	return &Timers{
+-		vu:     vu,
+-		timers: make(map[uint64]time.Time),
+-		queue:  new(timerQueue),
++		vu: vu,
+ 	}
+ }
+ 
+@@ -64,291 +36,10 @@ func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
+ func (e *Timers) Exports() modules.Exports {
+ 	return modules.Exports{
+ 		Named: map[string]interface{}{
+-			// TODO the usage of `ToValue` here is so that Sobek doesn't do it automatically later
+-			// which will effectively create new instance each time it is accessed.
+-			"setTimeout":    e.vu.Runtime().ToValue(e.setTimeout),
+-			"clearTimeout":  e.vu.Runtime().ToValue(e.clearTimeout),
+-			"setInterval":   e.vu.Runtime().ToValue(e.setInterval),
+-			"clearInterval": e.vu.Runtime().ToValue(e.clearInterval),
++			"setTimeout":    e.vu.Runtime().GlobalObject().Get("setTimeout"),
++			"clearTimeout":  e.vu.Runtime().GlobalObject().Get("clearTimeout"),
++			"setInterval":   e.vu.Runtime().GlobalObject().Get("setInterval"),
++			"clearInterval": e.vu.Runtime().GlobalObject().Get("clearInterval"),
+ 		},
+ 	}
+ }
+-
+-func (e *Timers) nextID() uint64 {
+-	e.timerIDCounter++
+-	return e.timerIDCounter
+-}
+-
+-func (e *Timers) call(callback sobek.Callable, args []sobek.Value) error {
+-	// TODO: investigate, not sure GlobalObject() is always the correct value for `this`?
+-	_, err := callback(e.vu.Runtime().GlobalObject(), args...)
+-	return err
+-}
+-
+-func (e *Timers) setTimeout(callback sobek.Callable, delay float64, args ...sobek.Value) uint64 {
+-	id := e.nextID()
+-	e.timerInitialization(callback, delay, args, false, id)
+-	return id
+-}
+-
+-func (e *Timers) clearTimeout(id uint64) {
+-	_, exists := e.timers[id]
+-	if !exists {
+-		return
+-	}
+-	delete(e.timers, id)
+-
+-	e.queue.remove(id)
+-	e.freeEventLoopIfPossible()
+-}
+-
+-func (e *Timers) freeEventLoopIfPossible() {
+-	if e.queue.length() == 0 && e.taskQueue != nil {
+-		e.closeTaskQueue()
+-	}
+-}
+-
+-func (e *Timers) setInterval(callback sobek.Callable, delay float64, args ...sobek.Value) uint64 {
+-	id := e.nextID()
+-	e.timerInitialization(callback, delay, args, true, id)
+-	return id
+-}
+-
+-func (e *Timers) clearInterval(id uint64) {
+-	e.clearTimeout(id)
+-}
+-
+-// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps
+-// NOTE: previousId from the specification is always send and it is basically id
+-func (e *Timers) timerInitialization(
+-	callback sobek.Callable, timeout float64, args []sobek.Value, repeat bool, id uint64,
+-) {
+-	// skip all the nesting stuff as we do not care about them
+-	if timeout < 0 {
+-		timeout = 0
+-	}
+-
+-	name := setTimeoutName
+-	if repeat {
+-		name = setIntervalName
+-	}
+-
+-	if callback == nil {
+-		common.Throw(e.vu.Runtime(), fmt.Errorf("%s's callback isn't a callable function", name))
+-	}
+-
+-	task := func() error {
+-		// Specification 8.1: If id does not exist in global's map of active timers, then abort these steps.
+-		if _, exist := e.timers[id]; !exist {
+-			return nil
+-		}
+-
+-		err := e.call(callback, args)
+-
+-		if _, exist := e.timers[id]; !exist { // 8.4
+-			return err
+-		}
+-
+-		if repeat {
+-			e.timerInitialization(callback, timeout, args, repeat, id)
+-		} else {
+-			delete(e.timers, id)
+-		}
+-
+-		return err
+-	}
+-
+-	e.runAfterTimeout(&timer{
+-		id:          id,
+-		task:        task,
+-		nextTrigger: time.Now().Add(time.Duration(timeout * float64(time.Millisecond))),
+-		name:        name,
+-	})
+-}
+-
+-// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#run-steps-after-a-timeout
+-// Notes: this just takes timers as makes the implementation way easier and we do not currently need
+-// most of the functionality provided
+-func (e *Timers) runAfterTimeout(t *timer) {
+-	e.timers[t.id] = t.nextTrigger
+-
+-	// as we have only one orderingId we have one queue
+-	index := e.queue.add(t)
+-
+-	if index != 0 {
+-		return // not a timer at the very beginning
+-	}
+-
+-	e.setupTaskTimeout()
+-}
+-
+-func (e *Timers) runFirstTask() error {
+-	t := e.queue.pop()
+-	if t == nil {
+-		return nil // everything was cleared
+-	}
+-
+-	err := t.task()
+-
+-	if e.queue.length() > 0 {
+-		e.setupTaskTimeout()
+-	} else {
+-		e.freeEventLoopIfPossible()
+-	}
+-
+-	return err
+-}
+-
+-func (e *Timers) setupTaskTimeout() {
+-	e.queue.stopTimer()
+-	delay := -time.Since(e.timers[e.queue.first().id])
+-	if e.taskQueue == nil {
+-		e.taskQueue = taskqueue.New(e.vu.RegisterCallback)
+-		e.setupTaskQueueCloserOnIterationEnd()
+-	}
+-	q := e.taskQueue
+-	e.queue.head = time.AfterFunc(delay, func() {
+-		q.Queue(e.runFirstTask)
+-	})
+-}
+-
+-func (e *Timers) closeTaskQueue() {
+-	// this only runs on the event loop
+-	if e.taskQueueCh == nil {
+-		return
+-	}
+-	ch := e.taskQueueCh
+-	// so that we do not execute it twice
+-	e.taskQueueCh = nil
+-
+-	select {
+-	case ch <- struct{}{}:
+-		// wait for this to happen so we don't need to hit the event loop again
+-		// instead this just closes the queue
+-		<-ch
+-	case <-e.vu.Context().Done(): // still shortcircuit if the context is done as we might block otherwise
+-	}
+-}
+-
+-// logger is helper to get a logger either from the state or the initenv
+-func (e *Timers) logger() logrus.FieldLogger {
+-	if state := e.vu.State(); state != nil {
+-		return state.Logger
+-	}
+-	return e.vu.InitEnv().Logger
+-}
+-
+-func (e *Timers) setupTaskQueueCloserOnIterationEnd() {
+-	ctx := e.vu.Context()
+-	q := e.taskQueue
+-	ch := make(chan struct{})
+-	e.taskQueueCh = ch
+-	go func() {
+-		select { // wait for one of the two
+-		case <-ctx.Done():
+-			// lets report timers won't be executed and clean the fields for the next execution
+-			// we need to do this on the event loop as we don't want to have a race
+-			q.Queue(func() error {
+-				logger := e.logger()
+-				for _, timer := range e.queue.queue {
+-					logger.Warnf("%s %d was stopped because the VU iteration was interrupted",
+-						timer.name, timer.id)
+-				}
+-
+-				// TODO: use `clear` when we only support go 1.21 and above
+-				e.timers = make(map[uint64]time.Time)
+-				e.queue.stopTimer()
+-				e.queue = new(timerQueue)
+-				e.taskQueue = nil
+-				return nil
+-			})
+-			q.Close()
+-		case <-ch:
+-			e.timers = make(map[uint64]time.Time)
+-			e.queue.stopTimer()
+-			e.queue = new(timerQueue)
+-			e.taskQueue = nil
+-			q.Close()
+-			close(ch)
+-		}
+-	}()
+-}
+-
+-// this is just a small struct to keep the internals of a timer
+-type timer struct {
+-	id          uint64
+-	nextTrigger time.Time
+-	task        func() error
+-	name        string
+-}
+-
+-// this is just a list of timers that should be ordered once after the other
+-// this mostly just has methods to work on the slice
+-type timerQueue struct {
+-	queue []*timer
+-	head  *time.Timer
+-}
+-
+-func (tq *timerQueue) add(t *timer) int {
+-	var i int
+-	// don't use range as we want to index to go over one if it needs to go to the end
+-	for ; i < len(tq.queue); i++ {
+-		if tq.queue[i].nextTrigger.After(t.nextTrigger) {
+-			break
+-		}
+-	}
+-
+-	tq.queue = append(tq.queue, nil)
+-	copy(tq.queue[i+1:], tq.queue[i:])
+-	tq.queue[i] = t
+-	return i
+-}
+-
+-func (tq *timerQueue) stopTimer() {
+-	if tq.head != nil && tq.head.Stop() { // we have a timer and we stopped it before it was over.
+-		select {
+-		case <-tq.head.C:
+-		default:
+-		}
+-	}
+-}
+-
+-func (tq *timerQueue) remove(id uint64) {
+-	i := tq.findIndex(id)
+-	if i == -1 {
+-		return
+-	}
+-
+-	tq.queue = append(tq.queue[:i], tq.queue[i+1:]...)
+-}
+-
+-func (tq *timerQueue) findIndex(id uint64) int {
+-	for i, timer := range tq.queue {
+-		if id == timer.id {
+-			return i
+-		}
+-	}
+-	return -1
+-}
+-
+-func (tq *timerQueue) pop() *timer {
+-	length := len(tq.queue)
+-	if length == 0 {
+-		return nil
+-	}
+-	t := tq.queue[0]
+-	copy(tq.queue, tq.queue[1:])
+-	tq.queue = tq.queue[:length-1]
+-	return t
+-}
+-
+-func (tq *timerQueue) length() int {
+-	return len(tq.queue)
+-}
+-
+-func (tq *timerQueue) first() *timer {
+-	if tq.length() == 0 {
+-		return nil
+-	}
+-	return tq.queue[0]
+-}
+diff --git a/internal/js/modules/k6/timers/timers_test.go b/internal/js/modules/k6/timers/timers_test.go
+index 98c3b1148..589732c31 100644
+--- a/internal/js/modules/k6/timers/timers_test.go
++++ b/internal/js/modules/k6/timers/timers_test.go
+@@ -13,7 +13,7 @@ import (
+ func newRuntime(t testing.TB) *modulestest.Runtime {
+ 	t.Helper()
+ 	runtime := modulestest.NewRuntime(t)
+-	err := runtime.SetupModuleSystem(map[string]any{"k6/x/timers": timers.New()}, nil, nil)
++	err := runtime.SetupModuleSystem(map[string]any{"k6/timers": timers.New()}, nil, nil)
+ 	require.NoError(t, err)
+ 	return runtime
+ }
+@@ -27,7 +27,7 @@ func TestSetTimeout(t *testing.T) {
+ 	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
+ 
+ 	_, err := runtime.RunOnEventLoop(`
+-		let timers = require("k6/x/timers");
++		let timers = require("k6/timers");
+ 		timers.setTimeout(()=> {
+ 			print("in setTimeout")
+ 		})
+@@ -42,7 +42,7 @@ func TestSetUndefinedFunction(t *testing.T) {
+ 
+ 	runtime := newRuntime(t)
+ 	_, err := runtime.RunOnEventLoop(`
+-		let timers = require("k6/x/timers");
++		let timers = require("k6/timers");
+ 		timers.setTimeout(undefined)
+ 	`)
+ 	require.Error(t, err, "setTimeout's callback isn't a callable function")
+@@ -58,7 +58,7 @@ func TestSetInterval(t *testing.T) {
+ 	require.NoError(t, rt.Set("sleep10", func() { time.Sleep(10 * time.Millisecond) }))
+ 
+ 	_, err := runtime.RunOnEventLoop(`
+-		let timers = require("k6/x/timers");
++		let timers = require("k6/timers");
+ 		var i = 0;
+ 		let s = timers.setInterval(()=> {
+ 			sleep10();
+@@ -86,7 +86,7 @@ func TestSetTimeoutOrder(t *testing.T) {
+ 	var log []string
+ 	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
+ 
+-	_, err := rt.RunString(`globalThis.setTimeout = require("k6/x/timers").setTimeout;`)
++	_, err := rt.RunString(`globalThis.setTimeout = require("k6/timers").setTimeout;`)
+ 	require.NoError(t, err)
+ 
+ 	for i := 0; i < 100; i++ {
+@@ -114,10 +114,10 @@ func TestSetIntervalOrder(t *testing.T) {
+ 	var log []string
+ 	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
+ 
+-	_, err := rt.RunString(`globalThis.setInterval = require("k6/x/timers").setInterval;`)
++	_, err := rt.RunString(`globalThis.setInterval = require("k6/timers").setInterval;`)
+ 	require.NoError(t, err)
+ 
+-	_, err = rt.RunString(`globalThis.clearInterval = require("k6/x/timers").clearInterval;`)
++	_, err = rt.RunString(`globalThis.clearInterval = require("k6/timers").clearInterval;`)
+ 	require.NoError(t, err)
+ 
+ 	for i := 0; i < 100; i++ {
+@@ -167,7 +167,7 @@ func TestSetTimeoutContextCancel(t *testing.T) {
+ 		}
+ 	}))
+ 
+-	_, err := rt.RunString(`globalThis.setTimeout = require("k6/x/timers").setTimeout;`)
++	_, err := rt.RunString(`globalThis.setTimeout = require("k6/timers").setTimeout;`)
+ 	require.NoError(t, err)
+ 
+ 	for i := 0; i < 2000; i++ {
+diff --git a/internal/js/tc55/timers/timers.go b/internal/js/tc55/timers/timers.go
+new file mode 100644
+index 000000000..950de4503
+--- /dev/null
++++ b/internal/js/tc55/timers/timers.go
+@@ -0,0 +1,346 @@
++// Package timers is implementing setInterval setTimeout and co.
++package timers
++
++import (
++	"fmt"
++	"time"
++
++	"github.com/mstoykov/k6-taskqueue-lib/taskqueue"
++	"github.com/sirupsen/logrus"
++
++	"github.com/grafana/sobek"
++	"go.k6.io/k6/js/common"
++	"go.k6.io/k6/js/modules"
++)
++
++type timers struct {
++	vu modules.VU
++
++	timerIDCounter uint64
++
++	timers map[uint64]time.Time
++	// Maybe in the future if this moves to core it will be expanded to have multiple queues
++	queue *timerQueue
++
++	// this used predominantly to get around very unlikely race conditions as we are adding stuff to the event loop
++	// from outside of it on multitple timers. And it is easier to just use this then redo half the work it does
++	// to make that safe
++	taskQueue *taskqueue.TaskQueue
++	// used to synchronize around context closing
++	taskQueueCh chan struct{}
++}
++
++const (
++	setTimeoutName  = "setTimeout"
++	setIntervalName = "setInterval"
++)
++
++// SetupGlobally setups implementatins of setTimeout, clearTimeout, setInterval and clearInterval
++// to be accessible globally by setting them on globalThis.
++func SetupGlobally(vu modules.VU) error {
++	return newTimers(vu).setupGlobally()
++}
++
++func newTimers(vu modules.VU) *timers {
++	return &timers{
++		vu:     vu,
++		timers: make(map[uint64]time.Time),
++		queue:  new(timerQueue),
++	}
++}
++
++func (e *timers) setupGlobally() error {
++	mapping := map[string]any{
++		"setTimeout":    e.setTimeout,
++		"clearTimeout":  e.clearTimeout,
++		"setInterval":   e.setInterval,
++		"clearInterval": e.clearInterval,
++	}
++	rt := e.vu.Runtime()
++	for k, v := range mapping {
++		err := rt.Set(k, v)
++		if err != nil {
++			return fmt.Errorf("error setting up %q globally: %w", k, err)
++		}
++	}
++	return nil
++}
++
++func (e *timers) nextID() uint64 {
++	e.timerIDCounter++
++	return e.timerIDCounter
++}
++
++func (e *timers) call(callback sobek.Callable, args []sobek.Value) error {
++	// TODO: investigate, not sure GlobalObject() is always the correct value for `this`?
++	_, err := callback(e.vu.Runtime().GlobalObject(), args...)
++	return err
++}
++
++func (e *timers) setTimeout(callback sobek.Callable, delay float64, args ...sobek.Value) uint64 {
++	id := e.nextID()
++	e.timerInitialization(callback, delay, args, false, id)
++	return id
++}
++
++func (e *timers) clearTimeout(id uint64) {
++	_, exists := e.timers[id]
++	if !exists {
++		return
++	}
++	delete(e.timers, id)
++
++	e.queue.remove(id)
++	e.freeEventLoopIfPossible()
++}
++
++func (e *timers) freeEventLoopIfPossible() {
++	if e.queue.length() == 0 && e.taskQueue != nil {
++		e.closeTaskQueue()
++	}
++}
++
++func (e *timers) setInterval(callback sobek.Callable, delay float64, args ...sobek.Value) uint64 {
++	id := e.nextID()
++	e.timerInitialization(callback, delay, args, true, id)
++	return id
++}
++
++func (e *timers) clearInterval(id uint64) {
++	e.clearTimeout(id)
++}
++
++// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps
++// NOTE: previousId from the specification is always send and it is basically id
++func (e *timers) timerInitialization(
++	callback sobek.Callable, timeout float64, args []sobek.Value, repeat bool, id uint64,
++) {
++	// skip all the nesting stuff as we do not care about them
++	if timeout < 0 {
++		timeout = 0
++	}
++
++	name := setTimeoutName
++	if repeat {
++		name = setIntervalName
++	}
++
++	if callback == nil {
++		common.Throw(e.vu.Runtime(), fmt.Errorf("%s's callback isn't a callable function", name))
++	}
++
++	task := func() error {
++		// Specification 8.1: If id does not exist in global's map of active timers, then abort these steps.
++		if _, exist := e.timers[id]; !exist {
++			return nil
++		}
++
++		err := e.call(callback, args)
++
++		if _, exist := e.timers[id]; !exist { // 8.4
++			return err
++		}
++
++		if repeat {
++			e.timerInitialization(callback, timeout, args, repeat, id)
++		} else {
++			delete(e.timers, id)
++		}
++
++		return err
++	}
++
++	e.runAfterTimeout(&timer{
++		id:          id,
++		task:        task,
++		nextTrigger: time.Now().Add(time.Duration(timeout * float64(time.Millisecond))),
++		name:        name,
++	})
++}
++
++// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#run-steps-after-a-timeout
++// Notes: this just takes timers as makes the implementation way easier and we do not currently need
++// most of the functionality provided
++func (e *timers) runAfterTimeout(t *timer) {
++	e.timers[t.id] = t.nextTrigger
++
++	// as we have only one orderingId we have one queue
++	index := e.queue.add(t)
++
++	if index != 0 {
++		return // not a timer at the very beginning
++	}
++
++	e.setupTaskTimeout()
++}
++
++func (e *timers) runFirstTask() error {
++	t := e.queue.pop()
++	if t == nil {
++		return nil // everything was cleared
++	}
++
++	err := t.task()
++
++	if e.queue.length() > 0 {
++		e.setupTaskTimeout()
++	} else {
++		e.freeEventLoopIfPossible()
++	}
++
++	return err
++}
++
++func (e *timers) setupTaskTimeout() {
++	e.queue.stopTimer()
++	delay := -time.Since(e.timers[e.queue.first().id])
++	if e.taskQueue == nil {
++		e.taskQueue = taskqueue.New(e.vu.RegisterCallback)
++		e.setupTaskQueueCloserOnIterationEnd()
++	}
++	q := e.taskQueue
++	e.queue.head = time.AfterFunc(delay, func() {
++		q.Queue(e.runFirstTask)
++	})
++}
++
++func (e *timers) closeTaskQueue() {
++	// this only runs on the event loop
++	if e.taskQueueCh == nil {
++		return
++	}
++	ch := e.taskQueueCh
++	// so that we do not execute it twice
++	e.taskQueueCh = nil
++
++	select {
++	case ch <- struct{}{}:
++		// wait for this to happen so we don't need to hit the event loop again
++		// instead this just closes the queue
++		<-ch
++	case <-e.vu.Context().Done(): // still shortcircuit if the context is done as we might block otherwise
++	}
++}
++
++// logger is helper to get a logger either from the state or the initenv
++func (e *timers) logger() logrus.FieldLogger {
++	if state := e.vu.State(); state != nil {
++		return state.Logger
++	}
++	return e.vu.InitEnv().Logger
++}
++
++func (e *timers) setupTaskQueueCloserOnIterationEnd() {
++	ctx := e.vu.Context()
++	q := e.taskQueue
++	ch := make(chan struct{})
++	e.taskQueueCh = ch
++	go func() {
++		select { // wait for one of the two
++		case <-ctx.Done():
++			// lets report timers won't be executed and clean the fields for the next execution
++			// we need to do this on the event loop as we don't want to have a race
++			q.Queue(func() error {
++				logger := e.logger()
++				for _, timer := range e.queue.queue {
++					logger.Warnf("%s %d was stopped because the VU iteration was interrupted",
++						timer.name, timer.id)
++				}
++
++				// TODO: use `clear` when we only support go 1.21 and above
++				e.timers = make(map[uint64]time.Time)
++				e.queue.stopTimer()
++				e.queue = new(timerQueue)
++				e.taskQueue = nil
++				return nil
++			})
++			q.Close()
++		case <-ch:
++			e.timers = make(map[uint64]time.Time)
++			e.queue.stopTimer()
++			e.queue = new(timerQueue)
++			e.taskQueue = nil
++			q.Close()
++			close(ch)
++		}
++	}()
++}
++
++// this is just a small struct to keep the internals of a timer
++type timer struct {
++	id          uint64
++	nextTrigger time.Time
++	task        func() error
++	name        string
++}
++
++// this is just a list of timers that should be ordered once after the other
++// this mostly just has methods to work on the slice
++type timerQueue struct {
++	queue []*timer
++	head  *time.Timer
++}
++
++func (tq *timerQueue) add(t *timer) int {
++	var i int
++	// don't use range as we want to index to go over one if it needs to go to the end
++	for ; i < len(tq.queue); i++ {
++		if tq.queue[i].nextTrigger.After(t.nextTrigger) {
++			break
++		}
++	}
++
++	tq.queue = append(tq.queue, nil)
++	copy(tq.queue[i+1:], tq.queue[i:])
++	tq.queue[i] = t
++	return i
++}
++
++func (tq *timerQueue) stopTimer() {
++	if tq.head != nil && tq.head.Stop() { // we have a timer and we stopped it before it was over.
++		select {
++		case <-tq.head.C:
++		default:
++		}
++	}
++}
++
++func (tq *timerQueue) remove(id uint64) {
++	i := tq.findIndex(id)
++	if i == -1 {
++		return
++	}
++
++	tq.queue = append(tq.queue[:i], tq.queue[i+1:]...)
++}
++
++func (tq *timerQueue) findIndex(id uint64) int {
++	for i, timer := range tq.queue {
++		if id == timer.id {
++			return i
++		}
++	}
++	return -1
++}
++
++func (tq *timerQueue) pop() *timer {
++	length := len(tq.queue)
++	if length == 0 {
++		return nil
++	}
++	t := tq.queue[0]
++	copy(tq.queue, tq.queue[1:])
++	tq.queue = tq.queue[:length-1]
++	return t
++}
++
++func (tq *timerQueue) length() int {
++	return len(tq.queue)
++}
++
++func (tq *timerQueue) first() *timer {
++	if tq.length() == 0 {
++		return nil
++	}
++	return tq.queue[0]
++}
+diff --git a/internal/js/tc55/timers/timers_test.go b/internal/js/tc55/timers/timers_test.go
+new file mode 100644
+index 000000000..adc763248
+--- /dev/null
++++ b/internal/js/tc55/timers/timers_test.go
+@@ -0,0 +1,185 @@
++package timers_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"go.k6.io/k6/js/modulestest"
++)
++
++func newRuntime(t testing.TB) *modulestest.Runtime {
++	t.Helper()
++	runtime := modulestest.NewRuntime(t)
++
++	return runtime
++}
++
++func TestSetTimeout(t *testing.T) {
++	t.Parallel()
++
++	runtime := newRuntime(t)
++	rt := runtime.VU.Runtime()
++	var log []string
++	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
++
++	_, err := runtime.RunOnEventLoop(`
++		setTimeout(()=> {
++			print("in setTimeout")
++		})
++		print("outside setTimeout")
++	`)
++	require.NoError(t, err)
++	require.Equal(t, []string{"outside setTimeout", "in setTimeout"}, log)
++}
++
++func TestSetUndefinedFunction(t *testing.T) {
++	t.Parallel()
++
++	runtime := newRuntime(t)
++	_, err := runtime.RunOnEventLoop(`
++		setTimeout(undefined)
++	`)
++	require.Error(t, err, "setTimeout's callback isn't a callable function")
++}
++
++func TestSetInterval(t *testing.T) {
++	t.Parallel()
++	runtime := newRuntime(t)
++
++	rt := runtime.VU.Runtime()
++	var log []string
++	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
++	require.NoError(t, rt.Set("sleep10", func() { time.Sleep(10 * time.Millisecond) }))
++
++	_, err := runtime.RunOnEventLoop(`
++		var i = 0;
++		let s = setInterval(()=> {
++			sleep10();
++			if (i>1) {
++			  print("in setInterval");
++			  clearInterval(s);
++			}
++			i++;
++		}, 1);
++		print("outside setInterval")
++	`)
++	require.NoError(t, err)
++	require.Equal(t, len(log), 2)
++	require.Equal(t, "outside setInterval", log[0])
++	for i, l := range log[1:] {
++		require.Equal(t, "in setInterval", l, i)
++	}
++}
++
++func TestSetTimeoutOrder(t *testing.T) {
++	t.Parallel()
++	runtime := newRuntime(t)
++
++	rt := runtime.VU.Runtime()
++	var log []string
++	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
++
++	for i := 0; i < 100; i++ {
++		_, err := runtime.RunOnEventLoop(`
++			setTimeout((_) => print("one"), 1);
++			setTimeout((_) => print("two"), 1);
++			setTimeout((_) => print("three"), 1);
++			setTimeout((_) => print("last"), 10);
++			setTimeout((_) => print("four"), 1);
++			setTimeout((_) => print("five"), 1);
++			setTimeout((_) => print("six"), 1);
++			print("outside setTimeout");
++		`)
++		require.NoError(t, err)
++		require.Equal(t, []string{"outside setTimeout", "one", "two", "three", "four", "five", "six", "last"}, log, i)
++		log = log[:0]
++	}
++}
++
++func TestSetIntervalOrder(t *testing.T) {
++	t.Parallel()
++	runtime := newRuntime(t)
++
++	rt := runtime.VU.Runtime()
++	var log []string
++	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
++
++	for i := 0; i < 100; i++ {
++		_, err := runtime.RunOnEventLoop(`
++			var one = setInterval((_) => print("one"), 1);
++			var two = setInterval((_) => print("two"), 1);
++			var last = setInterval((_) => {
++				print("last")
++				clearInterval(one);
++				clearInterval(two);
++				clearInterval(three);
++				clearInterval(last);
++			}, 4);
++			var three = setInterval((_) => print("three"), 1);
++			print("outside");
++		`)
++		require.NoError(t, err)
++		require.GreaterOrEqual(t, len(log), 5)
++		require.Equal(t, log[0], "outside")
++		for i := 1; i < len(log)-1; i += 3 {
++			switch len(log) - i {
++			case 2:
++				require.Equal(t, log[i:i+1], []string{"one"})
++			case 3:
++				require.Equal(t, log[i:i+2], []string{"one", "two"})
++			default:
++				require.Equal(t, log[i:i+3], []string{"one", "two", "three"})
++			}
++		}
++		require.Equal(t, log[len(log)-1], "last")
++		log = log[:0]
++	}
++}
++
++func TestSetTimeoutContextCancel(t *testing.T) {
++	t.Parallel()
++	runtime := newRuntime(t)
++
++	rt := runtime.VU.Runtime()
++	var log []string
++	interruptChannel := make(chan struct{})
++	require.NoError(t, rt.Set("print", func(s string) { log = append(log, s) }))
++	require.NoError(t, rt.Set("interrupt", func() {
++		select {
++		case interruptChannel <- struct{}{}:
++		default:
++		}
++	}))
++
++	for i := 0; i < 2000; i++ {
++		ctx, cancel := context.WithCancel(context.Background())
++		runtime.CancelContext = cancel
++		runtime.VU.CtxField = ctx //nolint:fatcontext
++		runtime.VU.RuntimeField.ClearInterrupt()
++		const interruptMsg = "definitely an interrupt"
++		go func() {
++			<-interruptChannel
++			time.Sleep(time.Millisecond)
++			runtime.CancelContext()
++			runtime.VU.RuntimeField.Interrupt(interruptMsg)
++		}()
++		_, err := runtime.RunOnEventLoop(`
++			(async () => {
++				let poll = async (resolve, reject) => {
++					await (async () => 5);
++					setTimeout(poll, 1, resolve, reject);
++					interrupt();
++				}
++				setTimeout(async () => {
++					await new Promise(poll)
++				}, 0)
++			})()
++		`)
++		if err != nil {
++			require.ErrorContains(t, err, interruptMsg)
++		}
++		require.Empty(t, log)
++	}
++}
+diff --git a/js/modulestest/runtime.go b/js/modulestest/runtime.go
+index da714d947..c973eba39 100644
+--- a/js/modulestest/runtime.go
++++ b/js/modulestest/runtime.go
+@@ -7,9 +7,10 @@ import (
+ 	"testing"
+ 
+ 	"github.com/grafana/sobek"
++	"github.com/stretchr/testify/require"
+ 	"go.k6.io/k6/internal/js/compiler"
+ 	"go.k6.io/k6/internal/js/eventloop"
+-	"go.k6.io/k6/internal/js/modules/k6/timers"
++	"go.k6.io/k6/internal/js/tc55/timers"
+ 	"go.k6.io/k6/internal/lib/testutils"
+ 	"go.k6.io/k6/internal/usage"
+ 	"go.k6.io/k6/js/common"
+@@ -54,6 +55,7 @@ func NewRuntime(t testing.TB) *Runtime {
+ 		CancelContext:  cancel,
+ 		BuiltinMetrics: metrics.RegisterBuiltinMetrics(vu.InitEnvField.Registry),
+ 	}
++	require.NoError(t, timers.SetupGlobally(vu))
+ 	// let's cancel again in case it has changed
+ 	t.Cleanup(func() { result.CancelContext() })
+ 	return result
+@@ -72,10 +74,6 @@ func (r *Runtime) SetupModuleSystem(goModules map[string]any, loader modules.Fil
+ 		goModules = make(map[string]any)
+ 	}
+ 
+-	if _, ok := goModules["k6/timers"]; !ok {
+-		goModules["k6/timers"] = timers.New()
+-	}
+-
+ 	r.mr = modules.NewModuleResolver(
+ 		goModules, loader, c, r.VU.InitEnvField.CWD, r.VU.InitEnvField.Usage, r.VU.InitEnvField.Logger)
+ 	return r.innerSetupModuleSystem()
+@@ -117,6 +115,5 @@ func (r *Runtime) RunOnEventLoop(code string) (value sobek.Value, err error) {
+ 
+ func (r *Runtime) innerSetupModuleSystem() error {
+ 	ms := modules.NewModuleSystem(r.mr, r.VU)
+-	modules.ExportGloballyModule(r.VU.RuntimeField, ms, "k6/timers")
+ 	return r.VU.RuntimeField.Set("require", ms.Require)
+ }

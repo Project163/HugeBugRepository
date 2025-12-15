@@ -1,0 +1,558 @@
+diff --git a/src/yb/client/ql-transaction-test.cc b/src/yb/client/ql-transaction-test.cc
+index 8cbf559396..d5423f651d 100644
+--- a/src/yb/client/ql-transaction-test.cc
++++ b/src/yb/client/ql-transaction-test.cc
+@@ -299,6 +299,30 @@ class QLTransactionTest : public KeyValueTableTest {
+     ASSERT_EQ(false, has_bad);
+   }
+ 
++  bool CheckAllTabletsRunning() {
++    bool result = true;
++    size_t count = 0;
++    for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
++      auto peers = cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers();
++      if (i == 0) {
++        count = peers.size();
++      } else if (count != peers.size()) {
++        LOG(WARNING) << "Different number of tablets in tservers: "
++                     << count << " vs " << peers.size() << " at " << i;
++        result = false;
++      }
++      for (const auto& peer : peers) {
++        auto status = peer->CheckRunning();
++        if (!status.ok()) {
++          LOG(WARNING) << Format("T $0 P $1 is not running: $2", peer->tablet_id(),
++                                 peer->permanent_uuid(), status);
++          result = false;
++        }
++      }
++    }
++    return result;
++  }
++
+   // We write data with first transaction then try to read it another one.
+   // If commit is true, then first transaction is committed and second should be restarted.
+   // Otherwise second transaction would see pending intents from first one and should not restart.
+@@ -1433,6 +1457,14 @@ class RemoteBootstrapTest : public QLTransactionTest {
+ };
+ 
+ // Check that we do correct remote bootstrap for intents db.
++// Workflow is the following:
++// Shutdown TServer with index 0.
++// Write some data to two remaining servers.
++// Flush data and clean logs.
++// Restart cluster.
++// Verify that all tablets at all tservers are up and running.
++// Verify that all tservers have same amount of running tablets.
++// During test tear down cluster verifier will check that all servers have same data.
+ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
+   constexpr size_t kNumWrites = 10;
+   constexpr size_t kTransactionalWrites = 8;
+@@ -1470,7 +1502,7 @@ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
+   ASSERT_OK(cluster_->CleanTabletLogs());
+ 
+   // Wait logs cleanup.
+-  std::this_thread::sleep_for(5s);
++  std::this_thread::sleep_for(5s * kTimeMultiplier);
+ 
+   // Shutdown to reset cached logs.
+   for (int i = 1; i != cluster_->num_tablet_servers(); ++i) {
+@@ -1481,6 +1513,9 @@ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
+   for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
+     ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
+   }
++
++  ASSERT_OK(WaitFor([this] { return CheckAllTabletsRunning(); }, 30s * kTimeMultiplier,
++                    "All tablets running"));
+ }
+ 
+ TEST_F(QLTransactionTest, FlushIntents) {
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 63151f1953..8743cbc468 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -361,7 +361,7 @@ Status RaftConsensus::Start(const ConsensusBootstrapInfo& info) {
+     }
+     EnableFailureDetector(initial_delta);
+ 
+-    RETURN_NOT_OK(BecomeReplicaUnlocked());
++    RETURN_NOT_OK(BecomeReplicaUnlocked(std::string()));
+   }
+ 
+   RETURN_NOT_OK(ExecuteHook(POST_START));
+@@ -661,9 +661,7 @@ Status RaftConsensus::StepDown(const LeaderStepDownRequestPB* req, LeaderStepDow
+     }
+   }
+ 
+-  RETURN_NOT_OK(BecomeReplicaUnlocked());
+-
+-  WithholdElectionAfterStepDown(new_leader_uuid);
++  RETURN_NOT_OK(BecomeReplicaUnlocked(new_leader_uuid));
+ 
+   return Status::OK();
+ }
+@@ -699,9 +697,15 @@ void RaftConsensus::WithholdElectionAfterStepDown(const std::string& protege_uui
+   DCHECK(state_->IsLocked());
+   protege_leader_uuid_ = protege_uuid;
+   auto timeout = MonoDelta::FromMilliseconds(
+-      FLAGS_after_stepdown_delay_election_multiplier *
+       FLAGS_leader_failure_max_missed_heartbeat_periods *
+       FLAGS_raft_heartbeat_interval_ms);
++  if (!protege_uuid.empty()) {
++    // Actually we have 2 kinds of step downs.
++    // 1) We step down in favor of some protege.
++    // 2) We step down because term was advanced or just started.
++    // In second case we should not withhold election for a long period of time.
++    timeout *= FLAGS_after_stepdown_delay_election_multiplier;
++  }
+   auto deadline = MonoTime::Now() + timeout;
+   withhold_election_start_until_.store(deadline.ToUint64(), std::memory_order_release);
+   election_lost_by_protege_at_ = MonoTime();
+@@ -807,12 +811,13 @@ Status RaftConsensus::BecomeLeaderUnlocked() {
+   return Status::OK();
+ }
+ 
+-Status RaftConsensus::BecomeReplicaUnlocked() {
+-  LOG_WITH_PREFIX_UNLOCKED(INFO) << "Becoming Follower/Learner. State: "
+-                                 << state_->ToStringUnlocked();
++Status RaftConsensus::BecomeReplicaUnlocked(const std::string& new_leader_uuid) {
++  LOG_WITH_PREFIX_UNLOCKED(INFO)
++      << "Becoming Follower/Learner. State: " << state_->ToStringUnlocked()
++      << ", new leader: " << new_leader_uuid;
+ 
+   if (state_->GetActiveRoleUnlocked() == RaftPeerPB::LEADER) {
+-    WithholdElectionAfterStepDown(std::string());
++    WithholdElectionAfterStepDown(new_leader_uuid);
+   }
+ 
+   state_->ClearLeaderUnlocked();
+@@ -2811,7 +2816,7 @@ Status RaftConsensus::HandleTermAdvanceUnlocked(ConsensusTerm new_term) {
+                                    << state_->GetCurrentTermUnlocked()
+                                    << " since new term is " << new_term;
+ 
+-    RETURN_NOT_OK(BecomeReplicaUnlocked());
++    RETURN_NOT_OK(BecomeReplicaUnlocked(std::string()));
+   }
+ 
+   LOG_WITH_PREFIX_UNLOCKED(INFO) << "Advancing to term " << new_term;
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index 74c45291f1..3f41dd26a1 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -318,7 +318,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+   // Makes the peer become a replica, i.e. a FOLLOWER or a LEARNER.
+   //
+   // The ReplicaState must be locked for configuration change before calling.
+-  CHECKED_STATUS BecomeReplicaUnlocked();
++  CHECKED_STATUS BecomeReplicaUnlocked(const std::string& new_leader_uuid);
+ 
+   // Updates the state in a replica by storing the received operations in the log
+   // and triggering the required operations. This method won't return until all
+diff --git a/src/yb/master/sys_catalog.cc b/src/yb/master/sys_catalog.cc
+index 8773222d2e..27f4f96417 100644
+--- a/src/yb/master/sys_catalog.cc
++++ b/src/yb/master/sys_catalog.cc
+@@ -469,7 +469,7 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::TabletMetadata>&
+   shared_ptr<TabletClass> tablet;
+   scoped_refptr<Log> log;
+   consensus::ConsensusBootstrapInfo consensus_info;
+-  tablet_peer()->SetBootstrapping();
++  RETURN_NOT_OK(tablet_peer()->SetBootstrapping());
+   tablet::TabletOptions tablet_options;
+   tablet::BootstrapTabletData data = { metadata,
+                                        std::shared_future<client::YBClientPtr>(),
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index beee138ebb..3be0239c94 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -629,6 +629,16 @@ Status Tablet::CreateCheckpoint(const std::string& dir) {
+   std::lock_guard<std::mutex> lock(create_checkpoint_lock_);
+ 
+   Status status;
++  if (!regular_db_) {
++    LOG_WITH_PREFIX(INFO) << "Skipped creating checkpoint in " << dir;
++    return STATUS(NotSupported,
++                  "Tablet does not have a RocksDB (could be a transaction status tablet)");
++  }
++
++  auto parent_dir = DirName(dir);
++  RETURN_NOT_OK_PREPEND(metadata()->fs_manager()->CreateDirIfMissing(parent_dir),
++                        Format("Unable to create checkpoints directory $0", parent_dir));
++
+   // Order does not matter because we flush both DBs and does not have parallel writes.
+   if (intents_db_) {
+     status = rocksdb::checkpoint::CreateCheckpoint(intents_db_.get(), temp_intents_dir);
+diff --git a/src/yb/tablet/tablet_peer-test.cc b/src/yb/tablet/tablet_peer-test.cc
+index 7721c4d8cd..9eec85a9ff 100644
+--- a/src/yb/tablet/tablet_peer-test.cc
++++ b/src/yb/tablet/tablet_peer-test.cc
+@@ -160,7 +160,7 @@ class TabletPeerTest : public YBTabletTest,
+                         tablet()->metadata()->schema_version(), metric_entity_.get(),
+                         append_pool_.get(), &log));
+ 
+-    tablet_peer_->SetBootstrapping();
++    ASSERT_OK(tablet_peer_->SetBootstrapping());
+     ASSERT_OK(tablet_peer_->InitTabletPeer(tablet(),
+                                            std::shared_future<client::YBClientPtr>(),
+                                            clock(),
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index 6dcb5db09c..924130be22 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -146,9 +146,7 @@ TabletPeer::~TabletPeer() {
+   std::lock_guard<simple_spinlock> lock(lock_);
+   // We should either have called Shutdown(), or we should have never called
+   // Init().
+-  CHECK(!tablet_)
+-      << "TabletPeer not fully shut down. State: "
+-      << TabletStatePB_Name(state_);
++  LOG_IF_WITH_PREFIX(DFATAL, tablet_) << "TabletPeer not fully shut down.";
+ }
+ 
+ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
+@@ -167,7 +165,11 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
+ 
+   {
+     std::lock_guard<simple_spinlock> lock(lock_);
+-    CHECK_EQ(TabletStatePB::BOOTSTRAPPING, state_);
++    auto state = state_.load(std::memory_order_acquire);
++    if (state != TabletStatePB::BOOTSTRAPPING) {
++      return STATUS_FORMAT(
++          IllegalState, "Invalid tablet state for init: $0", TabletStatePB_Name(state));
++    }
+     tablet_ = tablet;
+     client_future_ = client_future;
+     clock_ = clock;
+@@ -318,6 +320,7 @@ bool TabletPeer::StartShutdown() {
+       }
+       if (state_.compare_exchange_strong(
+           state, TabletStatePB::QUIESCING, std::memory_order_acq_rel)) {
++        LOG_WITH_PREFIX(INFO) << "Started shutdown from state: " << TabletStatePB_Name(state);
+         break;
+       }
+     }
+@@ -368,7 +371,9 @@ void TabletPeer::CompleteShutdown() {
+     consensus_.reset();
+     prepare_thread_.reset();
+     tablet_.reset();
+-    DCHECK_EQ(state_.load(std::memory_order_acquire), TabletStatePB::QUIESCING);
++    auto state = state_.load(std::memory_order_acquire);
++    LOG_IF_WITH_PREFIX(DFATAL, state != TabletStatePB::QUIESCING) <<
++        "Bad state when completing shutdown: " << TabletStatePB_Name(state);
+     state_.store(TabletStatePB::SHUTDOWN, std::memory_order_release);
+   }
+ }
+@@ -894,5 +899,32 @@ TableType TabletPeer::table_type() {
+   return tablet()->table_type();
+ }
+ 
++void TabletPeer::SetFailed(const Status& error) {
++  DCHECK(error_.get(std::memory_order_acquire) == nullptr);
++  error_ = MakeAtomicUniquePtr<Status>(error);
++  auto state = state_.load(std::memory_order_acquire);
++  while (state != TabletStatePB::FAILED && state != TabletStatePB::QUIESCING &&
++         state != TabletStatePB::SHUTDOWN) {
++    if (state_.compare_exchange_weak(state, TabletStatePB::FAILED, std::memory_order_acq_rel)) {
++      LOG_WITH_PREFIX(INFO) << "Changed state from " << TabletStatePB_Name(state) << " to FAILED";
++      break;
++    }
++  }
++}
++
++Status TabletPeer::UpdateState(TabletStatePB expected, TabletStatePB new_state,
++                               const std::string& error_message) {
++  TabletStatePB old = expected;
++  if (!state_.compare_exchange_strong(old, new_state, std::memory_order_acq_rel)) {
++    return STATUS_FORMAT(
++        InvalidArgument, "$0 Expected state: $1, got: $2",
++        error_message, TabletStatePB_Name(expected), TabletStatePB_Name(old));
++  }
++
++  LOG_WITH_PREFIX(INFO) << "Changed state from " << TabletStatePB_Name(old) << " to "
++                        << TabletStatePB_Name(new_state);
++  return Status::OK();
++}
++
+ }  // namespace tablet
+ }  // namespace yb
+diff --git a/src/yb/tablet/tablet_peer.h b/src/yb/tablet/tablet_peer.h
+index f3039404ad..85057aa626 100644
+--- a/src/yb/tablet/tablet_peer.h
++++ b/src/yb/tablet/tablet_peer.h
+@@ -195,25 +195,16 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
+   }
+ 
+   // Sets the tablet to a BOOTSTRAPPING state, indicating it is starting up.
+-  void SetBootstrapping() {
+-    CHECK_OK(UpdateState(TabletStatePB::NOT_STARTED, TabletStatePB::BOOTSTRAPPING, ""));
++  CHECKED_STATUS SetBootstrapping() {
++    return UpdateState(TabletStatePB::NOT_STARTED, TabletStatePB::BOOTSTRAPPING, "");
+   }
+ 
+-  Status UpdateState(TabletStatePB expected, TabletStatePB new_state, string error_message) {
+-    TabletStatePB old = expected;
+-    return (state_.compare_exchange_strong(old, new_state, std::memory_order_acq_rel) ?
+-        Status::OK() : STATUS_FORMAT(
+-            InvalidArgument, "$0 Expected state:$1, got:$2",
+-            error_message, TabletStatePB_Name(expected), TabletStatePB_Name(old)));
+-  }
++  CHECKED_STATUS UpdateState(TabletStatePB expected, TabletStatePB new_state,
++                             const std::string& error_message);
+ 
+   // sets the tablet state to FAILED additionally setting the error to the provided
+   // one.
+-  void SetFailed(const Status& error) {
+-    DCHECK(error_.get(std::memory_order_acquire) == nullptr);
+-    error_ = MakeAtomicUniquePtr<Status>(error);
+-    state_.store(TabletStatePB::FAILED, std::memory_order_release);
+-  }
++  void SetFailed(const Status& error);
+ 
+   // Returns the error that occurred, when state is FAILED.
+   CHECKED_STATUS error() const {
+diff --git a/src/yb/tserver/remote_bootstrap_session-test.h b/src/yb/tserver/remote_bootstrap_session-test.h
+index ef31285ce3..200adab723 100644
+--- a/src/yb/tserver/remote_bootstrap_session-test.h
++++ b/src/yb/tserver/remote_bootstrap_session-test.h
+@@ -152,7 +152,7 @@ class RemoteBootstrapTest : public YBTabletTest {
+     proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger);
+ 
+     log_anchor_registry_.reset(new LogAnchorRegistry());
+-    tablet_peer_->SetBootstrapping();
++    ASSERT_OK(tablet_peer_->SetBootstrapping());
+     ASSERT_OK(tablet_peer_->InitTabletPeer(tablet(),
+                                           std::shared_future<client::YBClientPtr>(),
+                                           clock(),
+diff --git a/src/yb/tserver/remote_bootstrap_session.cc b/src/yb/tserver/remote_bootstrap_session.cc
+index ff2c09aaa6..136a98f053 100644
+--- a/src/yb/tserver/remote_bootstrap_session.cc
++++ b/src/yb/tserver/remote_bootstrap_session.cc
+@@ -245,8 +245,6 @@ Status RemoteBootstrapSession::Init() {
+ 
+   MonoTime now = MonoTime::Now();
+   auto checkpoints_dir = JoinPathSegments(tablet_superblock_.rocksdb_dir(), "checkpoints");
+-  RETURN_NOT_OK_PREPEND(metadata->fs_manager()->CreateDirIfMissing(checkpoints_dir),
+-                        Substitute("Unable to create checkpoints directory $0", checkpoints_dir));
+ 
+   auto session_checkpoint_dir = std::to_string(last_logged_opid.index) + "_" + now.ToString();
+   checkpoint_dir_ = JoinPathSegments(checkpoints_dir, session_checkpoint_dir);
+@@ -254,8 +252,12 @@ Status RemoteBootstrapSession::Init() {
+   // Clear any previous rocksdb files in the superblock. Each session should create a new list
+   // based the checkpoint directory files.
+   tablet_superblock_.clear_rocksdb_files();
+-  RETURN_NOT_OK(tablet->CreateCheckpoint(checkpoint_dir_));
+-  *tablet_superblock_.mutable_rocksdb_files() = VERIFY_RESULT(ListFiles(checkpoint_dir_));
++  auto status = tablet->CreateCheckpoint(checkpoint_dir_);
++  if (status.ok()) {
++    *tablet_superblock_.mutable_rocksdb_files() = VERIFY_RESULT(ListFiles(checkpoint_dir_));
++  } else if (!status.IsNotSupported()) {
++    RETURN_NOT_OK(status);
++  }
+ 
+   RETURN_NOT_OK(InitSnapshotFiles());
+ 
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index 1d1b6ef2d7..f24ec7a76d 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -445,7 +445,7 @@ Status TSTabletManager::Init() {
+       CHECK_OK(StartTabletStateTransitionUnlocked(meta->tablet_id(), "opening tablet", &deleter));
+     }
+ 
+-    TabletPeerPtr tablet_peer = CreateAndRegisterTabletPeer(meta, NEW_PEER);
++    TabletPeerPtr tablet_peer = VERIFY_RESULT(CreateAndRegisterTabletPeer(meta, NEW_PEER));
+     RETURN_NOT_OK(open_tablet_pool_->SubmitFunc(
+         std::bind(&TSTabletManager::OpenTablet, this, meta, deleter)));
+   }
+@@ -554,7 +554,7 @@ Status TSTabletManager::CreateNewTablet(
+   RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(fs_manager_, tablet_id, fs_manager_->uuid(),
+                                                   config, consensus::kMinimumTerm, &cmeta),
+                         "Unable to create new ConsensusMeta for tablet " + tablet_id);
+-  TabletPeerPtr new_peer = CreateAndRegisterTabletPeer(meta, NEW_PEER);
++  TabletPeerPtr new_peer = VERIFY_RESULT(CreateAndRegisterTabletPeer(meta, NEW_PEER));
+ 
+   // We can run this synchronously since there is nothing to bootstrap.
+   RETURN_NOT_OK(
+@@ -649,12 +649,21 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+   scoped_refptr<TransitionInProgressDeleter> deleter;
+   {
+     std::lock_guard<RWMutex> lock(lock_);
++    if (ClosingUnlocked()) {
++      auto result = STATUS_FORMAT(
++          IllegalState, "StartRemoteBootstrap in wrong state: $0",
++          TSTabletManagerStatePB_Name(state_));
++      LOG(WARNING) << result;
++      return result;
++    }
++
+     if (LookupTabletUnlocked(tablet_id, &old_tablet_peer)) {
+       meta = old_tablet_peer->tablet_metadata();
+       replacing_tablet = true;
+     }
+-    RETURN_NOT_OK(StartTabletStateTransitionUnlocked(tablet_id,
+-        Substitute("remote bootstrapping tablet from peer $0", bootstrap_peer_uuid), &deleter));
++    RETURN_NOT_OK(StartTabletStateTransitionUnlocked(
++        tablet_id, Substitute("remote bootstrapping tablet from peer $0", bootstrap_peer_uuid),
++        &deleter));
+   }
+ 
+   if (replacing_tablet) {
+@@ -691,7 +700,7 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+ 
+   // Registering a non-initialized TabletPeer offers visibility through the Web UI.
+   RegisterTabletPeerMode mode = replacing_tablet ? REPLACEMENT_PEER : NEW_PEER;
+-  TabletPeerPtr tablet_peer = CreateAndRegisterTabletPeer(meta, mode);
++  TabletPeerPtr tablet_peer = VERIFY_RESULT(CreateAndRegisterTabletPeer(meta, mode));
+ 
+   // Download all of the remote files.
+   TOMBSTONE_NOT_OK(rb_client->FetchAll(tablet_peer->status_listener()),
+@@ -749,7 +758,7 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+ }
+ 
+ // Create and register a new TabletPeer, given tablet metadata.
+-TabletPeerPtr TSTabletManager::CreateAndRegisterTabletPeer(
++Result<TabletPeerPtr> TSTabletManager::CreateAndRegisterTabletPeer(
+     const scoped_refptr<TabletMetadata>& meta, RegisterTabletPeerMode mode) {
+   TabletPeerPtr tablet_peer(
+       new TabletPeerClass(meta,
+@@ -757,7 +766,7 @@ TabletPeerPtr TSTabletManager::CreateAndRegisterTabletPeer(
+                           Bind(&TSTabletManager::ApplyChange,
+                                Unretained(this),
+                                meta->tablet_id())));
+-  RegisterTablet(meta->tablet_id(), tablet_peer, mode);
++  RETURN_NOT_OK(RegisterTablet(meta->tablet_id(), tablet_peer, mode));
+   return tablet_peer;
+ }
+ 
+@@ -922,7 +931,12 @@ void TSTabletManager::OpenTablet(const scoped_refptr<TabletMetadata>& meta,
+   LOG_TIMING_PREFIX(INFO, kLogPrefix, "bootstrapping tablet") {
+     // TODO: handle crash mid-creation of tablet? do we ever end up with a
+     // partially created tablet here?
+-    tablet_peer->SetBootstrapping();
++    auto s = tablet_peer->SetBootstrapping();
++    if (!s.ok()) {
++      LOG(ERROR) << kLogPrefix << "Tablet failed to set bootstrapping: " << s;
++      tablet_peer->SetFailed(s);
++      return;
++    }
+     tablet::BootstrapTabletData data = {
+         meta,
+         async_client_init_->get_client_future(),
+@@ -1063,20 +1077,39 @@ std::string TSTabletManager::LogPrefix() const {
+   return "P " + fs_manager_->uuid() + ": ";
+ }
+ 
+-void TSTabletManager::RegisterTablet(const std::string& tablet_id,
+-                                     const TabletPeerPtr& tablet_peer,
+-                                     RegisterTabletPeerMode mode) {
++bool TSTabletManager::ClosingUnlocked() const {
++  return state_ == MANAGER_QUIESCING || state_ == MANAGER_SHUTDOWN;
++}
++
++Status TSTabletManager::RegisterTablet(const std::string& tablet_id,
++                                       const TabletPeerPtr& tablet_peer,
++                                       RegisterTabletPeerMode mode) {
+   std::lock_guard<RWMutex> lock(lock_);
++  if (ClosingUnlocked()) {
++    auto result = STATUS_FORMAT(
++        IllegalState, "Unable to register tablet peer: $0: closing", tablet_id);
++    LOG(WARNING) << result;
++    return result;
++  }
++
+   // If we are replacing a tablet peer, we delete the existing one first.
+   if (mode == REPLACEMENT_PEER && tablet_map_.erase(tablet_id) != 1) {
+-    LOG(FATAL) << "Unable to remove previous tablet peer " << tablet_id << ": not registered!";
++    auto result = STATUS_FORMAT(
++        NotFound, "Unable to remove previous tablet peer $0: not registered", tablet_id);
++    LOG(WARNING) << result;
++    return result;
+   }
+   if (!InsertIfNotPresent(&tablet_map_, tablet_id, tablet_peer)) {
++    auto result = STATUS_FORMAT(
++        AlreadyPresent, "Unable to register tablet peer $0: already registered", tablet_id);
+     scoped_refptr<TabletMetadata> meta = tablet_peer->tablet_metadata();
+-    LOG(FATAL) << "Unable to register tablet peer " << tablet_id << ": already registered!";
++    LOG(WARNING) << result;
++    return result;
+   }
+ 
+   LOG(INFO) << "Registered tablet " << tablet_id;
++
++  return Status::OK();
+ }
+ 
+ bool TSTabletManager::LookupTablet(const string& tablet_id,
+@@ -1343,7 +1376,7 @@ Status TSTabletManager::HandleNonReadyTabletOnStartup(const scoped_refptr<Tablet
+   // allows us to permanently delete replica tombstones when a table gets
+   // deleted.
+   if (data_state == TABLET_DATA_TOMBSTONED) {
+-    CreateAndRegisterTabletPeer(meta, NEW_PEER);
++    RETURN_NOT_OK(CreateAndRegisterTabletPeer(meta, NEW_PEER));
+   }
+ 
+   return Status::OK();
+diff --git a/src/yb/tserver/ts_tablet_manager.h b/src/yb/tserver/ts_tablet_manager.h
+index 88804d5691..95330e4906 100644
+--- a/src/yb/tserver/ts_tablet_manager.h
++++ b/src/yb/tserver/ts_tablet_manager.h
+@@ -351,15 +351,15 @@ class TSTabletManager : public tserver::TabletPeerLookupIf {
+   // registered, a FATAL message is logged, causing a process crash.
+   // Calls to this method are expected to be externally synchronized, typically
+   // using the transition_in_progress_ map.
+-  void RegisterTablet(const std::string& tablet_id,
+-                      const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
+-                      RegisterTabletPeerMode mode);
++  CHECKED_STATUS RegisterTablet(const std::string& tablet_id,
++                                const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
++                                RegisterTabletPeerMode mode);
+ 
+   // Create and register a new TabletPeer, given tablet metadata.
+   // Calls RegisterTablet() with the given 'mode' parameter after constructing
+   // the TablerPeer object. See RegisterTablet() for details about the
+   // semantics of 'mode' and the locking requirements.
+-  std::shared_ptr<tablet::TabletPeer> CreateAndRegisterTabletPeer(
++  Result<std::shared_ptr<tablet::TabletPeer>> CreateAndRegisterTabletPeer(
+       const scoped_refptr<tablet::TabletMetadata>& meta,
+       RegisterTabletPeerMode mode);
+ 
+@@ -386,6 +386,8 @@ class TSTabletManager : public tserver::TabletPeerLookupIf {
+     return state_;
+   }
+ 
++  bool ClosingUnlocked() const;
++
+   // Initializes the RaftPeerPB for the local peer.
+   // Guaranteed to include both uuid and last_seen_addr fields.
+   // Crashes with an invariant check if the RPC server is not currently in a
+diff --git a/src/yb/util/monotime.cc b/src/yb/util/monotime.cc
+index a2e94dfd53..6afc52be30 100644
+--- a/src/yb/util/monotime.cc
++++ b/src/yb/util/monotime.cc
+@@ -174,6 +174,14 @@ MonoDelta& MonoDelta::operator-=(const MonoDelta& rhs) {
+   return *this;
+ }
+ 
++MonoDelta& MonoDelta::operator*=(int64_t mul) {
++  DCHECK(Initialized());
++  DCHECK_EQ(nano_delta_ * mul / mul, nano_delta_); // Check for overflow
++  DCHECK(nano_delta_ * mul != kUninitialized);
++  nano_delta_ *= mul;
++  return *this;
++}
++
+ void MonoDelta::ToTimeVal(struct timeval *tv) const {
+   DCHECK(Initialized());
+   tv->tv_sec = nano_delta_ / MonoTime::kNanosecondsPerSecond;
+diff --git a/src/yb/util/monotime.h b/src/yb/util/monotime.h
+index 87166a292b..461bcbf6f1 100644
+--- a/src/yb/util/monotime.h
++++ b/src/yb/util/monotime.h
+@@ -88,6 +88,7 @@ class MonoDelta {
+ 
+   MonoDelta& operator+=(const MonoDelta& rhs);
+   MonoDelta& operator-=(const MonoDelta& rhs);
++  MonoDelta& operator*=(int64_t mul);
+ 
+   // Update struct timeval to current value of delta, with microsecond accuracy.
+   // Note that if MonoDelta::IsPositive() returns true, the struct timeval

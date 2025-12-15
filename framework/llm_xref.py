@@ -43,28 +43,28 @@ Your task is to analyze a Git Commit Message and identify which IDs from a *spec
 
 Key Rules:
 1.  You will be given a JSON input containing "relevant_ids" and a "commit_message".
-2.  Your response MUST be a valid JSON array (list).
-3.  The array MUST contain *only* the IDs from "relevant_ids" that the commit message explicitly "Fixes", "Closes", or "Resolves".
-4.  If *no* IDs are explicitly fixed, you MUST return an empty array: `[]`.
+2.  Your response MUST be a valid JSON object with a single key "fixed_ids".
+3.  The value of "fixed_ids" MUST be a list containing *only* the IDs from "relevant_ids" that the commit message explicitly "Fixes", "Closes", or "Resolves".
+4.  If *no* IDs are explicitly fixed, return an empty list: `{"fixed_ids": []}`.
 5.  Do not include IDs that are only "Related" (e.g., "See #123").
 
 Example 1 (User Input):
 {
   "relevant_ids": ["8714", "8699"],
-  "commit_message": "Refactor ActiveFilter's predicate name translation (#8714)\nRefactor ActiveFilter' predicate name translation\nSimplify `ActiveFilter#predicate_name` by leveraging\n`Ransack::Translate.predicate`, removing redundant implementation logic.\nClose #8699"
+  "commit_message": "Refactor ActiveFilter (#8714)\nClose #8699"
 }
 
 Example 1 (Your Response):
-["8699"]
+{"fixed_ids": ["8699"]}
 
 Example 2 (User Input):
 {
   "relevant_ids": ["8700", "8699"],
-  "commit_message": "Start refactoring components related to #8700.\nThis is part of the work for #8699."
+  "commit_message": "Work on #8699 related to #8700"
 }
 
 Example 2 (Your Response):
-[]
+{"fixed_ids": []}
 
 Example 3 (User Input):
 {
@@ -73,7 +73,7 @@ Example 3 (User Input):
 }
 
 Example 3 (Your Response):
-["9001", "9002"]
+{"fixed_ids": ["9001", "9002"]}
 """
 
 # LLM call function
@@ -104,15 +104,31 @@ def get_fixed_bug_ids(commit_message, relevant_bug_ids_list):
         )
         
         response_text = completion.choices[0].message.content.strip()
-        
+
+        print(f"[DEBUG] LLM Response Text:\n{response_text}", file=sys.stderr)
+        parsed_data = json.loads(response_text)
+                
         # Parse the JSON list returned by LLM
         # Expected: ["8699"] or []
-        fixed_ids_list = json.loads(response_text)
         
-        # Validate that the returned value is a list
-        if not isinstance(fixed_ids_list, list):
-            print(f"LLM returned a non-list type: {response_text}", file=sys.stderr)
-            return [] # Failure, return empty
+        if isinstance(parsed_data, list):
+            fixed_ids_list = parsed_data
+        elif isinstance(parsed_data, dict):
+            target_keys = ["fixed_ids", "fix_ids", "fixed", "fix"]
+            
+            for key in target_keys:
+                if key in parsed_data and isinstance(parsed_data[key], list):
+                    fixed_ids_list = parsed_data[key]
+                    break
+            
+            if not fixed_ids_list:
+                for val in parsed_data.values():
+                    if isinstance(val, list):
+                        fixed_ids_list = val
+                        break
+        else:
+            print(f"LLM returned unexpected type: {type(parsed_data)}", file=sys.stderr)
+            return []
 
         # Validate that all IDs in the list are indeed a subset of the original IDs
         validated_list = [

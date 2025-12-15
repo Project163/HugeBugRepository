@@ -1,0 +1,1296 @@
+diff --git a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgUpdate.java b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgUpdate.java
+index c29df32914..ff92702ef5 100644
+--- a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgUpdate.java
++++ b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgUpdate.java
+@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
+ import org.yb.util.YBTestRunnerNonTsanOnly;
+ 
+ import static java.lang.Math.toIntExact;
++import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+@@ -28,6 +29,8 @@ import java.util.Collections;
+ import java.util.List;
+ 
+ import static org.yb.AssertionWrappers.assertEquals;
++import static org.yb.AssertionWrappers.assertTrue;
++import static org.yb.AssertionWrappers.fail;
+ 
+ @RunWith(value=YBTestRunnerNonTsanOnly.class)
+ public class TestPgUpdate extends BasePgSQLTest {
+@@ -223,4 +226,61 @@ public class TestPgUpdate extends BasePgSQLTest {
+       assertEquals(expectedRows, getSortedRowList(returning));
+     }
+   }
++
++  @Test
++  public void testConcurrentUpdate() throws Exception {
++
++    connection.createStatement().execute("create table test_concurrent_update (k int primary key," +
++                                         " v1 int, v2 int, v3 int, v4 int)");
++    connection.createStatement().execute("insert into test_concurrent_update values"+
++                                         " (0, 0, 0, 0, 0)");
++
++    final List<Throwable> errors = new ArrayList<Throwable>();
++
++    // Test concurrent update to individual columns from 1 to 100. They should not block one
++    // another.
++    List<Thread> threads = new ArrayList<Thread>();
++    for (int i = 1; i <= 4; i++) {
++      final int index = i;
++      Thread thread = new Thread(() -> {
++          try {
++            PreparedStatement updateStmt = connection.prepareStatement(
++                String.format("update test_concurrent_update set v%d = ? where k = 0", index));
++            PreparedStatement selectStmt = connection.prepareStatement(
++                String.format("select v%d from test_concurrent_update where k = 0", index));
++
++            for (int j = 1; j <= 100; j++) {
++              // Update column.
++              updateStmt.setInt(1, j);
++              updateStmt.execute();
++
++              // Verify update.
++              ResultSet rs = selectStmt.executeQuery();
++              assertNextRow(rs, j);
++            }
++
++          } catch (Throwable e) {
++            synchronized (errors) {
++              errors.add(e);
++            }
++          }
++      });
++      thread.start();
++      threads.add(thread);
++    }
++
++    for (Thread thread : threads) {
++      thread.join();
++    }
++
++    // Verify final result of all columns.
++    assertOneRow("select v1, v2, v3, v4 from test_concurrent_update where k = 0",
++                 100, 100, 100, 100);
++
++    // Log the actual errors that occurred.
++    for (Throwable e : errors) {
++      LOG.error("Errors occurred", e);
++    }
++    assertTrue(errors.isEmpty());
++  }
+ }
+diff --git a/src/postgres/src/backend/executor/nodeModifyTable.c b/src/postgres/src/backend/executor/nodeModifyTable.c
+index 8b2ec3198f..9cc56605bd 100644
+--- a/src/postgres/src/backend/executor/nodeModifyTable.c
++++ b/src/postgres/src/backend/executor/nodeModifyTable.c
+@@ -73,6 +73,7 @@
+ #include "access/sysattr.h"
+ #include "catalog/pg_database.h"
+ #include "executor/ybcModifyTable.h"
++#include "parser/parsetree.h"
+ #include "pg_yb_utils.h"
+ #include "optimizer/ybcplan.h"
+ 
+@@ -1132,7 +1133,12 @@ ExecUpdate(ModifyTableState *mtstate,
+ 		if (resultRelationDesc->rd_att->constr)
+ 			ExecConstraints(resultRelInfo, slot, estate);
+ 
+-		bool row_found = YBCExecuteUpdate(resultRelationDesc, planSlot, tuple, estate, mtstate);
++
++		RangeTblEntry *rte = rt_fetch(resultRelInfo->ri_RangeTableIndex,
++									  estate->es_range_table);
++
++		bool row_found = YBCExecuteUpdate(resultRelationDesc, planSlot, tuple, estate, mtstate, rte->updatedCols);
++
+ 		if (!row_found)
+ 		{
+ 			/*
+@@ -2463,7 +2469,6 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
+ 	mtstate->mt_plans = (PlanState **) palloc0(sizeof(PlanState *) * nplans);
+ 	mtstate->resultRelInfo = estate->es_result_relations + node->resultRelIndex;
+ 	mtstate->yb_mt_is_single_row_update_or_delete = YBCIsSingleRowUpdateOrDelete(node);
+-	mtstate->yb_mt_update_attrs = node->ybUpdateAttrs;
+ 
+ 	/* If modifying a partitioned table, initialize the root table info */
+ 	if (node->rootResultRelIndex >= 0)
+diff --git a/src/postgres/src/backend/executor/ybcModifyTable.c b/src/postgres/src/backend/executor/ybcModifyTable.c
+index 6fee631b30..2e5d0b1472 100644
+--- a/src/postgres/src/backend/executor/ybcModifyTable.c
++++ b/src/postgres/src/backend/executor/ybcModifyTable.c
+@@ -682,14 +682,14 @@ bool YBCExecuteUpdate(Relation rel,
+ 					  TupleTableSlot *slot,
+ 					  HeapTuple tuple,
+ 					  EState *estate,
+-					  ModifyTableState *mtstate)
++					  ModifyTableState *mtstate,
++					  Bitmapset *updatedCols)
+ {
+ 	TupleDesc      tupleDesc      = slot->tts_tupleDescriptor;
+ 	Oid            dboid          = YBCGetDatabaseOid(rel);
+ 	Oid            relid          = RelationGetRelid(rel);
+ 	YBCPgStatement update_stmt    = NULL;
+ 	bool           isSingleRow    = mtstate->yb_mt_is_single_row_update_or_delete;
+-	Bitmapset     *update_attrs   = mtstate->yb_mt_update_attrs;
+ 	Datum          ybctid         = 0;
+ 
+ 	/* Create update statement. */
+@@ -731,23 +731,27 @@ bool YBCExecuteUpdate(Relation rel,
+ 	                                      YBTupleIdAttributeNumber,
+ 	                                      ybctid_expr), update_stmt);
+ 
+-	/* Assign new values to columns for updating the current row. */
++	/* Assign new values to the updated columns for the current row. */
+ 	tupleDesc = RelationGetDescr(rel);
++	bool whole_row = bms_is_member(InvalidAttrNumber, updatedCols);
+ 	for (int idx = 0; idx < tupleDesc->natts; idx++)
+ 	{
+ 		AttrNumber attnum = TupleDescAttr(tupleDesc, idx)->attnum;
+-
++		bool has_default = TupleDescAttr(tupleDesc, idx)->atthasdef;
+ 		/* Skip virtual (system) and dropped columns */
+ 		if (!IsRealYBColumn(rel, attnum))
+ 			continue;
+ 
+-		if (update_attrs && !bms_is_member(attnum, update_attrs))
++		/* Skip unmodified columns */
++		int bms_idx = attnum - YBGetFirstLowInvalidAttributeNumber(rel);
++		if (!whole_row && !bms_is_member(bms_idx, updatedCols) && !has_default)
+ 			continue;
+ 
+ 		bool is_null = false;
+ 		Datum d = heap_getattr(tuple, attnum, tupleDesc, &is_null);
+ 		YBCPgExpr ybc_expr = YBCNewConstant(update_stmt, TupleDescAttr(tupleDesc, idx)->atttypid,
+ 		                                    d, is_null);
++
+ 		HandleYBStmtStatus(YBCPgDmlAssignColumn(update_stmt, attnum, ybc_expr), update_stmt);
+ 	}
+ 
+@@ -840,7 +844,7 @@ void YBCUpdateSysCatalogTuple(Relation rel, HeapTuple oldtuple, HeapTuple tuple)
+ 	/* Bind the ybctid to the statement. */
+ 	YBCBindTupleId(update_stmt, tuple->t_ybctid);
+ 
+-	/* Assign new values to columns for updating the current row. */
++	/* Assign values to the non-primary-key columns to update the current row. */
+ 	for (int idx = 0; idx < natts; idx++)
+ 	{
+ 		AttrNumber attnum = TupleDescAttr(tupleDesc, idx)->attnum;
+diff --git a/src/postgres/src/backend/nodes/copyfuncs.c b/src/postgres/src/backend/nodes/copyfuncs.c
+index 924db8d44b..2f481d7e1d 100644
+--- a/src/postgres/src/backend/nodes/copyfuncs.c
++++ b/src/postgres/src/backend/nodes/copyfuncs.c
+@@ -222,7 +222,6 @@ _copyModifyTable(const ModifyTable *from)
+ 	COPY_NODE_FIELD(onConflictWhere);
+ 	COPY_SCALAR_FIELD(exclRelRTI);
+ 	COPY_NODE_FIELD(exclRelTlist);
+-	COPY_BITMAPSET_FIELD(ybUpdateAttrs);
+ 
+ 	return newnode;
+ }
+diff --git a/src/postgres/src/backend/nodes/outfuncs.c b/src/postgres/src/backend/nodes/outfuncs.c
+index 391d738973..b33e6757b3 100644
+--- a/src/postgres/src/backend/nodes/outfuncs.c
++++ b/src/postgres/src/backend/nodes/outfuncs.c
+@@ -395,7 +395,6 @@ _outModifyTable(StringInfo str, const ModifyTable *node)
+ 	WRITE_NODE_FIELD(onConflictWhere);
+ 	WRITE_UINT_FIELD(exclRelRTI);
+ 	WRITE_NODE_FIELD(exclRelTlist);
+-	WRITE_BITMAPSET_FIELD(ybUpdateAttrs);
+ }
+ 
+ static void
+diff --git a/src/postgres/src/backend/optimizer/plan/createplan.c b/src/postgres/src/backend/optimizer/plan/createplan.c
+index f43e70a992..deaaf946a3 100644
+--- a/src/postgres/src/backend/optimizer/plan/createplan.c
++++ b/src/postgres/src/backend/optimizer/plan/createplan.c
+@@ -42,7 +42,9 @@
+ #include "parser/parse_clause.h"
+ #include "parser/parsetree.h"
+ #include "partitioning/partprune.h"
++#include "utils/selfuncs.h"
+ #include "utils/lsyscache.h"
++#include "utils/rel.h"
+ 
+ #include "pg_yb_utils.h"
+ #include "optimizer/ybcplan.h"
+@@ -112,7 +114,7 @@ static RecursiveUnion *create_recursiveunion_plan(PlannerInfo *root, RecursiveUn
+ static LockRows *create_lockrows_plan(PlannerInfo *root, LockRowsPath *best_path,
+ 					 int flags);
+ static bool yb_single_row_update_or_delete_path(PlannerInfo *root, ModifyTablePath *path,
+-												List **tlist, Bitmapset **update_attrs);
++												List **tlist);
+ static ModifyTable *create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path);
+ static Limit *create_limit_plan(PlannerInfo *root, LimitPath *best_path,
+ 				  int flags);
+@@ -286,8 +288,7 @@ static ModifyTable *make_modifytable(PlannerInfo *root,
+ 				 bool partColsUpdated,
+ 				 List *resultRelations, List *subplans, List *subroots,
+ 				 List *withCheckOptionLists, List *returningLists,
+-				 List *rowMarks, OnConflictExpr *onconflict, int epqParam,
+-				 Bitmapset *yb_update_attrs);
++				 List *rowMarks, OnConflictExpr *onconflict, int epqParam);
+ static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
+ 						 GatherMergePath *best_path);
+ 
+@@ -2382,8 +2383,7 @@ create_lockrows_plan(PlannerInfo *root, LockRowsPath *best_path,
+ static bool
+ yb_single_row_update_or_delete_path(PlannerInfo *root,
+ 									ModifyTablePath *path,
+-									List **tlist,
+-									Bitmapset **update_attrs)
++									List **tlist)
+ {
+ 	RelOptInfo *relInfo;
+ 	Oid relid;
+@@ -2400,7 +2400,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
+ 	int attr_num;
+ 
+ 	*tlist = NIL;
+-	*update_attrs = NULL;
++	Bitmapset *update_attrs = NULL;
+ 
+ 	/* Verify YB is enabled. */
+ 	if (!IsYugaByteEnabled())
+@@ -2500,15 +2500,25 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
+ 			tle = lfirst_node(TargetEntry, values);
+ 
+ 			/* Ignore unspecified columns. */
+-			if (IsA(tle->expr, Var) && castNode(Var, tle->expr)->vartypmod == -1)
+-				continue;
++			if (IsA(tle->expr, Var)) {
++				Var *var = castNode(Var, tle->expr);
++				/*
++				 * Column set to itself (unset) or ybctid pseudo-column
++				 * (added for YB scan in rewrite handler).
++				 */
++				if (var->varattno == tle->resno ||
++				    (var->varattno == YBTupleIdAttributeNumber &&
++				        var->varcollid == InvalidOid)) {
++					continue;
++				}
++			}
+ 
+ 			/* Verify expression is supported. */
+ 			if (!YBCIsSupportedSingleRowModifyWriteExpr(tle->expr))
+ 				return false;
+ 
+ 			subpath_tlist = lappend(subpath_tlist, tle);
+-			*update_attrs = bms_add_member(*update_attrs, tle->resno);
++			update_attrs = bms_add_member(update_attrs, tle->resno);
+ 		}
+ 	}
+ 
+@@ -2525,7 +2535,39 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
+ 			return false;
+ 	}
+ 
+-	/* Add WHERE clauses from index scan quals to list, verify they are supported write exprs. */
++	/* Check that all WHERE clause conditions use equality operator. */
++	List	   *qinfos;
++	ListCell   *lc;
++	qinfos = deconstruct_indexquals(index_path);
++	foreach(lc, qinfos)
++	{
++		IndexQualInfo *qinfo = (IndexQualInfo *) lfirst(lc);
++		RestrictInfo *rinfo = qinfo->rinfo;
++		Expr	   *clause = rinfo->clause;
++		Oid			clause_op;
++		int			op_strategy;
++
++		if (!IsA(clause, OpExpr))
++			return false;
++
++		clause_op = qinfo->clause_op;
++		if (!OidIsValid(clause_op))
++			return false;
++
++		op_strategy = get_op_opfamily_strategy(clause_op, index_path->indexinfo->opfamily[qinfo->indexcol]);
++		Assert(op_strategy != 0);  /* not a member of opfamily?? */
++		/* Only pushdown equal operators. */
++		if (op_strategy != BTEqualStrategyNumber) {
++			return false;
++		}
++	}
++
++	/*
++	 * Add WHERE clauses from index scan quals to list, verify they are supported write exprs.
++	 * i.e. after fix_indexqual_references:
++	 * - LHS must be a (key) column
++	 * - RHS must be a "stable" expression (evaluate to constant)
++	 */
+ 	foreach(values, fix_indexqual_references(subroot, index_path))
+ 	{
+ 		Expr *clause;
+@@ -2580,7 +2622,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
+ 			TargetEntry *tle;
+ 
+ 			tle = lfirst_node(TargetEntry, values);
+-			if (!bms_is_member(tle->resorigcol, *update_attrs) &&
++			if (!bms_is_member(tle->resorigcol, update_attrs) &&
+ 				!bms_is_member(tle->resorigcol, primary_key_attrs))
+ 				return false;
+ 		}
+@@ -2659,8 +2701,6 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
+ 	ListCell   *subpaths,
+ 			   *subroots;
+ 	List       *tlist = NIL;
+-	Bitmapset  *yb_update_attrs_param = NULL;
+-	Bitmapset  *yb_update_attrs = NULL;
+ 
+ 	/*
+ 	 * If we are a single row UPDATE/DELETE in a YB relation, add Result subplan
+@@ -2668,13 +2708,12 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
+ 	 * running outside of a transaction and thus cannot rely on the results from a
+ 	 * seperately executed operation.
+ 	 */
+-	if (yb_single_row_update_or_delete_path(root, best_path, &tlist, &yb_update_attrs_param))
++	if (yb_single_row_update_or_delete_path(root, best_path, &tlist))
+ 	{
+ 		Plan *subplan = (Plan *) make_result(tlist, NULL, NULL);
+ 		copy_generic_path_info(subplan, linitial(best_path->subpaths));
+ 
+ 		subplans = lappend(subplans, subplan);
+-		yb_update_attrs = yb_update_attrs_param;
+ 	}
+ 	else
+ 	{
+@@ -2719,8 +2758,7 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
+ 							best_path->returningLists,
+ 							best_path->rowMarks,
+ 							best_path->onconflict,
+-							best_path->epqParam,
+-							yb_update_attrs);
++							best_path->epqParam);
+ 
+ 	copy_generic_path_info(&plan->plan, &best_path->path);
+ 
+@@ -6654,8 +6692,7 @@ make_modifytable(PlannerInfo *root,
+ 				 bool partColsUpdated,
+ 				 List *resultRelations, List *subplans, List *subroots,
+ 				 List *withCheckOptionLists, List *returningLists,
+-				 List *rowMarks, OnConflictExpr *onconflict, int epqParam,
+-				 Bitmapset *yb_update_attrs)
++				 List *rowMarks, OnConflictExpr *onconflict, int epqParam)
+ {
+ 	ModifyTable *node = makeNode(ModifyTable);
+ 	List	   *fdw_private_list;
+@@ -6786,9 +6823,6 @@ make_modifytable(PlannerInfo *root,
+ 	}
+ 	node->fdwPrivLists = fdw_private_list;
+ 	node->fdwDirectModifyPlans = direct_modify_plans;
+-
+-	node->ybUpdateAttrs = yb_update_attrs;
+-
+ 	return node;
+ }
+ 
+diff --git a/src/postgres/src/backend/optimizer/util/ybcplan.c b/src/postgres/src/backend/optimizer/util/ybcplan.c
+index 3cc5a2a6fc..63eea60e5f 100644
+--- a/src/postgres/src/backend/optimizer/util/ybcplan.c
++++ b/src/postgres/src/backend/optimizer/util/ybcplan.c
+@@ -23,18 +23,24 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/htup_details.h"
++#include "catalog/pg_proc.h"
+ #include "nodes/nodes.h"
+ #include "nodes/plannodes.h"
+ #include "nodes/print.h"
+ #include "nodes/relation.h"
+ #include "utils/rel.h"
++#include "utils/syscache.h"
+ 
+ #include "yb/yql/pggate/ybc_pggate.h"
+ #include "pg_yb_utils.h"
+ 
+ /*
+- * Theoretically, any expression without side-effects.
+- * Currently restrict this to only constants or bind markers.
++ * Theoretically, any expression that evaluates to a constant before YB
++ * execution.
++ * Currently restrict this to a subset of expressions.
++ * Note: As enhance pushdown support in DocDB (e.g. expr evaluation) this
++ * can be expanded.
+  */
+ bool YBCIsSupportedSingleRowModifyWriteExpr(Expr *expr)
+ {
+@@ -44,6 +50,7 @@ bool YBCIsSupportedSingleRowModifyWriteExpr(Expr *expr)
+ 			return true;
+ 		case T_Param:
+ 		{
++			/* Bind variables. */
+ 			Param *param = (Param *) expr;
+ 			return param->paramkind == PARAM_EXTERN;
+ 		}
+@@ -56,6 +63,49 @@ bool YBCIsSupportedSingleRowModifyWriteExpr(Expr *expr)
+ 			RelabelType *rt = (RelabelType *) expr;
+ 			return YBCIsSupportedSingleRowModifyWriteExpr(rt->arg);
+ 		}
++		case T_FuncExpr:
++		case T_OpExpr:
++		{
++			List         *args = NULL;
++			ListCell     *lc = NULL;
++			Oid          funcid = InvalidOid;
++			HeapTuple    tuple = NULL;
++
++			/* Get the function info. */
++			if (IsA(expr, FuncExpr))
++			{
++				args = ((FuncExpr *) expr)->args;
++				funcid = ((FuncExpr *) expr)->funcid;
++			}
++			else if (IsA(expr, OpExpr))
++			{
++				args = ((OpExpr *) expr)->args;
++				funcid = ((OpExpr *) expr)->opfuncid;
++			}
++
++			/*
++			 * Only allow immutable functions as they cannot modify the
++			 * database or do lookups.
++			 */
++			tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
++			if (!HeapTupleIsValid(tuple))
++				elog(ERROR, "cache lookup failed for function %u", funcid);
++			char provolatile = ((Form_pg_proc) GETSTRUCT(tuple))->provolatile;
++			ReleaseSysCache(tuple);
++			if (provolatile != PROVOLATILE_IMMUTABLE)
++			{
++				return false;
++			}
++
++			/* Checking all arguments are valid (stable). */
++			foreach (lc, args) {
++				Expr* expr = (Expr *) lfirst(lc);
++				if (!YBCIsSupportedSingleRowModifyWriteExpr(expr)) {
++				    return false;
++				}
++			}
++			return true;
++		}
+ 		default:
+ 			break;
+ 	}
+@@ -81,6 +131,7 @@ bool YBCIsSupportedSingleRowModifyWriteExpr(Expr *expr)
+  */
+ static bool ModifyTableIsSingleRowWrite(ModifyTable *modifyTable)
+ {
++
+ 	/* Support INSERT, UPDATE, and DELETE. */
+ 	if (modifyTable->operation != CMD_INSERT &&
+ 		modifyTable->operation != CMD_UPDATE &&
+diff --git a/src/postgres/src/backend/rewrite/rewriteHandler.c b/src/postgres/src/backend/rewrite/rewriteHandler.c
+index aeeb8faf4c..0d95cfc62b 100644
+--- a/src/postgres/src/backend/rewrite/rewriteHandler.c
++++ b/src/postgres/src/backend/rewrite/rewriteHandler.c
+@@ -82,8 +82,11 @@ static List *matchLocks(CmdType event, RuleLock *rulelocks,
+ 		   int varno, Query *parsetree, bool *hasUpdate);
+ static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
+ static bool view_has_instead_trigger(Relation view, CmdType event);
+-static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
+ 
++static Bitmapset *adjust_view_column_set(Bitmapset *cols,
++                                         List *targetlist,
++                                         Relation view_rel,
++                                         Oid base_relid);
+ 
+ /*
+  * AcquireRewriteLocks -
+@@ -2669,13 +2672,14 @@ relation_is_updatable(Oid reloid,
+ 			rtr = (RangeTblRef *) linitial(viewquery->jointree->fromlist);
+ 			base_rte = rt_fetch(rtr->rtindex, viewquery->rtable);
+ 			Assert(base_rte->rtekind == RTE_RELATION);
+-
+ 			if (base_rte->relkind != RELKIND_RELATION &&
+ 				base_rte->relkind != RELKIND_PARTITIONED_TABLE)
+ 			{
+ 				baseoid = base_rte->relid;
+ 				include_cols = adjust_view_column_set(updatable_cols,
+-													  viewquery->targetList);
++				                                      viewquery->targetList,
++				                                      rel,
++				                                      base_rte->relid);
+ 				auto_events &= relation_is_updatable(baseoid,
+ 													 include_triggers,
+ 													 include_cols);
+@@ -2699,16 +2703,21 @@ relation_is_updatable(Oid reloid,
+  * relation (as per the checks above in view_query_is_auto_updatable).
+  */
+ static Bitmapset *
+-adjust_view_column_set(Bitmapset *cols, List *targetlist)
++adjust_view_column_set(Bitmapset *cols,
++                       List *targetlist,
++                       Relation view_rel,
++                       Oid base_relid)
+ {
+ 	Bitmapset  *result = NULL;
+ 	int			col;
++	AttrNumber view_lowattrno = YBGetFirstLowInvalidAttributeNumber(view_rel);
++	AttrNumber base_lowattrno = YBGetFirstLowInvalidAttributeNumberFromOid(base_relid);
+ 
+ 	col = -1;
+ 	while ((col = bms_next_member(cols, col)) >= 0)
+ 	{
+ 		/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
+-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
++		AttrNumber	attno = col + view_lowattrno;
+ 
+ 		if (attno == InvalidAttrNumber)
+ 		{
+@@ -2730,7 +2739,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
+ 					continue;
+ 				var = castNode(Var, tle->expr);
+ 				result = bms_add_member(result,
+-										var->varattno - FirstLowInvalidHeapAttributeNumber);
++				                        var->varattno - base_lowattrno);
+ 			}
+ 		}
+ 		else
+@@ -2747,7 +2756,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
+ 				Var		   *var = (Var *) tle->expr;
+ 
+ 				result = bms_add_member(result,
+-										var->varattno - FirstLowInvalidHeapAttributeNumber);
++				                        var->varattno - base_lowattrno);
+ 			}
+ 			else
+ 				elog(ERROR, "attribute number %d not found in view targetlist",
+@@ -3021,10 +3030,14 @@ rewriteTargetView(Query *parsetree, Relation view)
+ 		   bms_is_empty(new_rte->updatedCols));
+ 
+ 	new_rte->insertedCols = adjust_view_column_set(view_rte->insertedCols,
+-												   view_targetlist);
++	                                               view_targetlist,
++	                                               view,
++	                                               new_rte->relid);
+ 
+ 	new_rte->updatedCols = adjust_view_column_set(view_rte->updatedCols,
+-												  view_targetlist);
++	                                              view_targetlist,
++	                                              view,
++	                                              new_rte->relid);
+ 
+ 	/*
+ 	 * Move any security barrier quals from the view RTE onto the new target
+diff --git a/src/postgres/src/backend/tcop/postgres.c b/src/postgres/src/backend/tcop/postgres.c
+index 20595aec8c..c2a380b89b 100644
+--- a/src/postgres/src/backend/tcop/postgres.c
++++ b/src/postgres/src/backend/tcop/postgres.c
+@@ -4657,7 +4657,6 @@ PostgresMain(int argc, char *argv[],
+ 
+ 				query_string = pq_getmsgstring(&input_message);
+ 				pq_getmsgend(&input_message);
+-
+ 				MemoryContext oldcontext = CurrentMemoryContext;
+ 
+ 				PG_TRY();
+diff --git a/src/postgres/src/include/executor/ybcModifyTable.h b/src/postgres/src/include/executor/ybcModifyTable.h
+index 513e499e39..8d279d7b3e 100644
+--- a/src/postgres/src/include/executor/ybcModifyTable.h
++++ b/src/postgres/src/include/executor/ybcModifyTable.h
+@@ -90,7 +90,8 @@ extern bool YBCExecuteUpdate(Relation rel,
+ 							 TupleTableSlot *slot,
+ 							 HeapTuple tuple,
+ 							 EState *estate,
+-							 ModifyTableState *mtstate);
++							 ModifyTableState *mtstate,
++							 Bitmapset *updatedCols);
+ 
+ //------------------------------------------------------------------------------
+ // System tables modify-table API.
+diff --git a/src/postgres/src/include/nodes/execnodes.h b/src/postgres/src/include/nodes/execnodes.h
+index 75f9bc5903..c8bf21bdeb 100644
+--- a/src/postgres/src/include/nodes/execnodes.h
++++ b/src/postgres/src/include/nodes/execnodes.h
+@@ -1085,7 +1085,6 @@ typedef struct ModifyTableState
+ 
+ 	/* YB specific attributes. */
+ 	bool yb_mt_is_single_row_update_or_delete;
+-	Bitmapset *yb_mt_update_attrs;
+ } ModifyTableState;
+ 
+ /* ----------------
+diff --git a/src/postgres/src/include/nodes/plannodes.h b/src/postgres/src/include/nodes/plannodes.h
+index 5798411ba7..249aa6520a 100644
+--- a/src/postgres/src/include/nodes/plannodes.h
++++ b/src/postgres/src/include/nodes/plannodes.h
+@@ -239,7 +239,6 @@ typedef struct ModifyTable
+ 	Node	   *onConflictWhere;	/* WHERE for ON CONFLICT UPDATE */
+ 	Index		exclRelRTI;		/* RTI of the EXCLUDED pseudo relation */
+ 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
+-	Bitmapset  *ybUpdateAttrs;  /* attr nums of columns for single row UPDATE write */
+ } ModifyTable;
+ 
+ struct PartitionPruneInfo;		/* forward reference to struct below */
+diff --git a/src/postgres/src/test/regress/expected/yb_dml_single_row.out b/src/postgres/src/test/regress/expected/yb_dml_single_row.out
+index c1fdcf4942..ff5af8aef8 100644
+--- a/src/postgres/src/test/regress/expected/yb_dml_single_row.out
++++ b/src/postgres/src/test/regress/expected/yb_dml_single_row.out
+@@ -125,6 +125,20 @@ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k IN (1);
+    ->  Result  (cost=0.00..4.11 rows=1 width=44)
+ (2 rows)
+ 
++EXPLAIN UPDATE single_row SET v1 = 3 + 2 WHERE k = 1;
++                       QUERY PLAN
++---------------------------------------------------------
++ Update on single_row  (cost=0.00..4.11 rows=1 width=44)
++   ->  Result  (cost=0.00..4.11 rows=1 width=44)
++(2 rows)
++
++EXPLAIN UPDATE single_row SET v1 = power(2, 3 - 1) WHERE k = 1;
++                       QUERY PLAN
++---------------------------------------------------------
++ Update on single_row  (cost=0.00..4.11 rows=1 width=44)
++   ->  Result  (cost=0.00..4.11 rows=1 width=44)
++(2 rows)
++
+ -- Below statements should all NOT USE single-row.
+ EXPLAIN UPDATE single_row SET v1 = 1;
+                                 QUERY PLAN
+@@ -190,6 +204,22 @@ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k IN (1, 2);
+          Filter: (k = ANY ('{1,2}'::integer[]))
+ (3 rows)
+ 
++EXPLAIN UPDATE single_row SET v1 = v1 + 3 WHERE k = 1;
++                                       QUERY PLAN
++-----------------------------------------------------------------------------------------
++ Update on single_row  (cost=0.00..4.12 rows=1 width=44)
++   ->  Index Scan using single_row_pkey on single_row  (cost=0.00..4.12 rows=1 width=44)
++         Index Cond: (k = 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row SET v1 = power(2, 3 - k) WHERE k = 1;
++                                       QUERY PLAN
++-----------------------------------------------------------------------------------------
++ Update on single_row  (cost=0.00..4.12 rows=1 width=44)
++   ->  Index Scan using single_row_pkey on single_row  (cost=0.00..4.12 rows=1 width=44)
++         Index Cond: (k = 1)
++(3 rows)
++
+ --
+ -- Test single-row UPDATE/DELETE execution.
+ --
+@@ -454,7 +484,7 @@ DROP TRIGGER single_row_update_trigger ON single_row;
+ --
+ -- Test table with composite primary key.
+ --
+-CREATE TABLE single_row_comp_key (v int, k1 int, k2 int, PRIMARY KEY (k1, k2));
++CREATE TABLE single_row_comp_key (v int, k1 int, k2 int, PRIMARY KEY (k1 HASH, k2 ASC));
+ -- Below statements should all USE single-row.
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1;
+                             QUERY PLAN
+@@ -511,6 +541,23 @@ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1 RETURNING v;
+          Index Cond: ((k1 = 1) AND (k2 = 1))
+ (3 rows)
+ 
++EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 < 1;
++                                                QUERY PLAN
++-----------------------------------------------------------------------------------------------------------
++ Delete on single_row_comp_key  (cost=0.00..4.12 rows=1 width=32)
++   ->  Index Scan using single_row_comp_key_pkey on single_row_comp_key  (cost=0.00..4.12 rows=1 width=32)
++         Index Cond: ((k1 = 1) AND (k2 < 1))
++(3 rows)
++
++EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 != 1;
++                                                 QUERY PLAN
++------------------------------------------------------------------------------------------------------------
++ Delete on single_row_comp_key  (cost=0.00..5.06 rows=10 width=32)
++   ->  Index Scan using single_row_comp_key_pkey on single_row_comp_key  (cost=0.00..5.06 rows=10 width=32)
++         Index Cond: (k1 = 1)
++         Filter: (k2 <> 1)
++(4 rows)
++
+ -- Below statements should all USE single-row.
+ EXPLAIN UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1;
+                             QUERY PLAN
+@@ -533,6 +580,20 @@ EXPLAIN UPDATE single_row_comp_key SET v = 1 + 2 WHERE k1 = 1 and k2 = 1;
+    ->  Result  (cost=0.00..4.12 rows=1 width=44)
+ (2 rows)
+ 
++EXPLAIN UPDATE single_row SET v1 = 3 - 2 WHERE k = 1;
++                       QUERY PLAN
++---------------------------------------------------------
++ Update on single_row  (cost=0.00..4.11 rows=1 width=44)
++   ->  Result  (cost=0.00..4.11 rows=1 width=44)
++(2 rows)
++
++EXPLAIN UPDATE single_row SET v1 = ceil(3 - 2.5) WHERE k = 1;
++                       QUERY PLAN
++---------------------------------------------------------
++ Update on single_row  (cost=0.00..4.11 rows=1 width=44)
++   ->  Result  (cost=0.00..4.11 rows=1 width=44)
++(2 rows)
++
+ -- Below statements should all NOT USE single-row.
+ EXPLAIN UPDATE single_row_comp_key SET v = 1;
+                                     QUERY PLAN
+@@ -558,6 +619,24 @@ EXPLAIN UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1 and v = 1;
+          Filter: (v = 1)
+ (4 rows)
+ 
++EXPLAIN UPDATE single_row SET v1 = 3 - v1 WHERE k = 1;
++                                       QUERY PLAN
++-----------------------------------------------------------------------------------------
++ Update on single_row  (cost=0.00..4.12 rows=1 width=44)
++   ->  Index Scan using single_row_pkey on single_row  (cost=0.00..4.12 rows=1 width=44)
++         Index Cond: (k = 1)
++(3 rows)
++
++-- Random is not a stable function so it should NOT USE single-row.
++-- TODO However it technically does not read/write data so later on it could be allowed.
++EXPLAIN UPDATE single_row SET v1 = ceil(random()) WHERE k = 1;
++                                       QUERY PLAN
++-----------------------------------------------------------------------------------------
++ Update on single_row  (cost=0.00..4.12 rows=1 width=44)
++   ->  Index Scan using single_row_pkey on single_row  (cost=0.00..4.12 rows=1 width=44)
++         Index Cond: (k = 1)
++(3 rows)
++
+ -- Test execution.
+ INSERT INTO single_row_comp_key VALUES (1, 2, 3);
+ UPDATE single_row_comp_key SET v = 2 WHERE k1 = 2 and k2 = 3;
+@@ -815,3 +894,249 @@ EXPLAIN UPDATE single_row_no_primary_key SET b = 1 WHERE b = 1;
+    ->  Foreign Scan on single_row_no_primary_key  (cost=0.00..102.50 rows=1000 width=40)
+          Filter: (b = 1)
+ (3 rows)
++
++--
++-- Test table with range primary key (ASC).
++--
++CREATE TABLE single_row_range_asc_primary_key (k int, v int, primary key (k ASC));
++-- Below statements should all USE single-row.
++EXPLAIN DELETE FROM single_row_range_asc_primary_key WHERE k = 1;
++                                  QUERY PLAN
++-------------------------------------------------------------------------------
++ Delete on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=32)
++   ->  Result  (cost=0.00..4.11 rows=1 width=32)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k = 1;
++                                  QUERY PLAN
++-------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 + 2 WHERE k = 1;
++                                  QUERY PLAN
++-------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++                                  QUERY PLAN
++-------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++-- Below statements should all NOT USE single-row.
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k > 1;
++                                                             QUERY PLAN
++-------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Index Scan using single_row_range_asc_primary_key_pkey on single_row_range_asc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++         Index Cond: (k > 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k != 1;
++                                           QUERY PLAN
++------------------------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..102.50 rows=1000 width=40)
++   ->  Foreign Scan on single_row_range_asc_primary_key  (cost=0.00..102.50 rows=1000 width=40)
++         Filter: (k <> 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 1;
++                                                             QUERY PLAN
++-------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++   ->  Index Scan using single_row_range_asc_primary_key_pkey on single_row_range_asc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++         Index Cond: (k = 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = abs(5 - k) WHERE k = 1;
++                                                             QUERY PLAN
++-------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_asc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++   ->  Index Scan using single_row_range_asc_primary_key_pkey on single_row_range_asc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++         Index Cond: (k = 1)
++(3 rows)
++
++-- Test execution
++INSERT INTO single_row_range_asc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
++UPDATE single_row_range_asc_primary_key SET v = 10 WHERE k = 1;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 1 | 10
++ 2 |  2
++ 3 |  3
++ 4 |  4
++(4 rows)
++
++UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 2;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 1 | 10
++ 2 |  3
++ 3 |  3
++ 4 |  4
++(4 rows)
++
++UPDATE single_row_range_asc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 1 | 10
++ 2 |  3
++ 3 | -3
++ 4 |  4
++(4 rows)
++
++UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 1 | 10
++ 2 |  3
++ 3 | -3
++ 4 |  7
++(4 rows)
++
++DELETE FROM single_row_range_asc_primary_key WHERE k < 3;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 3 | -3
++ 4 |  7
++(2 rows)
++
++DELETE FROM single_row_range_asc_primary_key WHERE k = 4;
++SELECT * FROM single_row_range_asc_primary_key;
++ k | v
++---+----
++ 3 | -3
++(1 row)
++
++--
++-- Test table with range primary key (DESC)
++--
++CREATE TABLE single_row_range_desc_primary_key (k int, v int, primary key (k DESC));
++-- Below statements should all USE single-row.
++EXPLAIN DELETE FROM single_row_range_desc_primary_key WHERE k = 1;
++                                   QUERY PLAN
++--------------------------------------------------------------------------------
++ Delete on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=32)
++   ->  Result  (cost=0.00..4.11 rows=1 width=32)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k = 1;
++                                   QUERY PLAN
++--------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 + 2 WHERE k = 1;
++                                   QUERY PLAN
++--------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++                                   QUERY PLAN
++--------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Result  (cost=0.00..4.11 rows=1 width=40)
++(2 rows)
++
++-- Below statements should all NOT USE single-row.
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k > 1;
++                                                              QUERY PLAN
++---------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++   ->  Index Scan using single_row_range_desc_primary_key_pkey on single_row_range_desc_primary_key  (cost=0.00..4.11 rows=1 width=40)
++         Index Cond: (k > 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k != 1;
++                                           QUERY PLAN
++-------------------------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..102.50 rows=1000 width=40)
++   ->  Foreign Scan on single_row_range_desc_primary_key  (cost=0.00..102.50 rows=1000 width=40)
++         Filter: (k <> 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 1;
++                                                              QUERY PLAN
++---------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++   ->  Index Scan using single_row_range_desc_primary_key_pkey on single_row_range_desc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++         Index Cond: (k = 1)
++(3 rows)
++
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = abs(5 - k) WHERE k = 1;
++                                                              QUERY PLAN
++---------------------------------------------------------------------------------------------------------------------------------------
++ Update on single_row_range_desc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++   ->  Index Scan using single_row_range_desc_primary_key_pkey on single_row_range_desc_primary_key  (cost=0.00..4.12 rows=1 width=40)
++         Index Cond: (k = 1)
++(3 rows)
++
++-- Test execution
++INSERT INTO single_row_range_desc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
++UPDATE single_row_range_desc_primary_key SET v = 10 WHERE k = 1;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 4 |  4
++ 3 |  3
++ 2 |  2
++ 1 | 10
++(4 rows)
++
++UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 2;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 4 |  4
++ 3 |  3
++ 2 |  3
++ 1 | 10
++(4 rows)
++
++UPDATE single_row_range_desc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 4 |  4
++ 3 | -3
++ 2 |  3
++ 1 | 10
++(4 rows)
++
++UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 4 |  7
++ 3 | -3
++ 2 |  3
++ 1 | 10
++(4 rows)
++
++DELETE FROM single_row_range_desc_primary_key WHERE k < 3;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 4 |  7
++ 3 | -3
++(2 rows)
++
++DELETE FROM single_row_range_desc_primary_key WHERE k = 4;
++SELECT * FROM single_row_range_desc_primary_key;
++ k | v
++---+----
++ 3 | -3
++(1 row)
+diff --git a/src/postgres/src/test/regress/sql/yb_dml_single_row.sql b/src/postgres/src/test/regress/sql/yb_dml_single_row.sql
+index 89ca770da4..6eefebd00b 100644
+--- a/src/postgres/src/test/regress/sql/yb_dml_single_row.sql
++++ b/src/postgres/src/test/regress/sql/yb_dml_single_row.sql
+@@ -25,6 +25,9 @@ EXPLAIN UPDATE single_row SET v1 = 1, v2 = 1 + 2 WHERE k = 1;
+ EXPLAIN UPDATE single_row SET v1 = 1, v2 = 2 WHERE k = 1 RETURNING k, v1, v2;
+ EXPLAIN UPDATE single_row SET v1 = 1, v2 = 2 WHERE k = 1 RETURNING *;
+ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k IN (1);
++EXPLAIN UPDATE single_row SET v1 = 3 + 2 WHERE k = 1;
++EXPLAIN UPDATE single_row SET v1 = power(2, 3 - 1) WHERE k = 1;
++
+ -- Below statements should all NOT USE single-row.
+ EXPLAIN UPDATE single_row SET v1 = 1;
+ EXPLAIN UPDATE single_row SET v1 = v1 + 1 WHERE k = 1;
+@@ -34,6 +37,8 @@ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k = 1 RETURNING *;
+ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k > 1;
+ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k != 1;
+ EXPLAIN UPDATE single_row SET v1 = 1 WHERE k IN (1, 2);
++EXPLAIN UPDATE single_row SET v1 = v1 + 3 WHERE k = 1;
++EXPLAIN UPDATE single_row SET v1 = power(2, 3 - k) WHERE k = 1;
+ 
+ --
+ -- Test single-row UPDATE/DELETE execution.
+@@ -159,26 +164,36 @@ DROP TRIGGER single_row_update_trigger ON single_row;
+ --
+ -- Test table with composite primary key.
+ --
+-CREATE TABLE single_row_comp_key (v int, k1 int, k2 int, PRIMARY KEY (k1, k2));
++CREATE TABLE single_row_comp_key (v int, k1 int, k2 int, PRIMARY KEY (k1 HASH, k2 ASC));
+ 
+ -- Below statements should all USE single-row.
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1;
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1 RETURNING k1, k2;
++
+ -- Below statements should all NOT USE single-row.
+ EXPLAIN DELETE FROM single_row_comp_key;
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1;
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k2 = 1;
+ EXPLAIN DELETE FROM single_row_comp_key WHERE v = 1 and k1 = 1 and k2 = 1;
+ EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1 RETURNING v;
++EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 < 1;
++EXPLAIN DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 != 1;
+ 
+ -- Below statements should all USE single-row.
+ EXPLAIN UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1;
+ EXPLAIN UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1 RETURNING k1, k2, v;
+ EXPLAIN UPDATE single_row_comp_key SET v = 1 + 2 WHERE k1 = 1 and k2 = 1;
++EXPLAIN UPDATE single_row SET v1 = 3 - 2 WHERE k = 1;
++EXPLAIN UPDATE single_row SET v1 = ceil(3 - 2.5) WHERE k = 1;
++
+ -- Below statements should all NOT USE single-row.
+ EXPLAIN UPDATE single_row_comp_key SET v = 1;
+ EXPLAIN UPDATE single_row_comp_key SET v = v + 1 WHERE k1 = 1 and k2 = 1;
+ EXPLAIN UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1 and v = 1;
++EXPLAIN UPDATE single_row SET v1 = 3 - v1 WHERE k = 1;
++-- Random is not a stable function so it should NOT USE single-row.
++-- TODO However it technically does not read/write data so later on it could be allowed.
++EXPLAIN UPDATE single_row SET v1 = ceil(random()) WHERE k = 1;
+ 
+ -- Test execution.
+ INSERT INTO single_row_comp_key VALUES (1, 2, 3);
+@@ -261,3 +276,69 @@ EXPLAIN DELETE FROM single_row_no_primary_key WHERE a = 1 and b = 1;
+ EXPLAIN UPDATE single_row_no_primary_key SET a = 1;
+ EXPLAIN UPDATE single_row_no_primary_key SET b = 1 WHERE a = 1;
+ EXPLAIN UPDATE single_row_no_primary_key SET b = 1 WHERE b = 1;
++
++--
++-- Test table with range primary key (ASC).
++--
++CREATE TABLE single_row_range_asc_primary_key (k int, v int, primary key (k ASC));
++
++-- Below statements should all USE single-row.
++EXPLAIN DELETE FROM single_row_range_asc_primary_key WHERE k = 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 + 2 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++
++-- Below statements should all NOT USE single-row.
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k > 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k != 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_asc_primary_key SET v = abs(5 - k) WHERE k = 1;
++
++-- Test execution
++INSERT INTO single_row_range_asc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
++
++UPDATE single_row_range_asc_primary_key SET v = 10 WHERE k = 1;
++SELECT * FROM single_row_range_asc_primary_key;
++UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 2;
++SELECT * FROM single_row_range_asc_primary_key;
++UPDATE single_row_range_asc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
++SELECT * FROM single_row_range_asc_primary_key;
++UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++SELECT * FROM single_row_range_asc_primary_key;
++DELETE FROM single_row_range_asc_primary_key WHERE k < 3;
++SELECT * FROM single_row_range_asc_primary_key;
++DELETE FROM single_row_range_asc_primary_key WHERE k = 4;
++SELECT * FROM single_row_range_asc_primary_key;
++
++--
++-- Test table with range primary key (DESC)
++--
++CREATE TABLE single_row_range_desc_primary_key (k int, v int, primary key (k DESC));
++
++-- Below statements should all USE single-row.
++EXPLAIN DELETE FROM single_row_range_desc_primary_key WHERE k = 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 + 2 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++
++-- Below statements should all NOT USE single-row.
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k > 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k != 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 1;
++EXPLAIN UPDATE single_row_range_desc_primary_key SET v = abs(5 - k) WHERE k = 1;
++
++-- Test execution
++INSERT INTO single_row_range_desc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
++
++UPDATE single_row_range_desc_primary_key SET v = 10 WHERE k = 1;
++SELECT * FROM single_row_range_desc_primary_key;
++UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 2;
++SELECT * FROM single_row_range_desc_primary_key;
++UPDATE single_row_range_desc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
++SELECT * FROM single_row_range_desc_primary_key;
++UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
++SELECT * FROM single_row_range_desc_primary_key;
++DELETE FROM single_row_range_desc_primary_key WHERE k < 3;
++SELECT * FROM single_row_range_desc_primary_key;
++DELETE FROM single_row_range_desc_primary_key WHERE k = 4;
++SELECT * FROM single_row_range_desc_primary_key;
+diff --git a/src/yb/docdb/pgsql_operation.cc b/src/yb/docdb/pgsql_operation.cc
+index 8d155fe691..fc1fd4a60f 100644
+--- a/src/yb/docdb/pgsql_operation.cc
++++ b/src/yb/docdb/pgsql_operation.cc
+@@ -121,27 +121,22 @@ Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data, IsUps
+     }
+   }
+ 
+-  const MonoDelta ttl = Value::kMaxTtl;
+-  const UserTimeMicros user_timestamp = Value::kInvalidUserTimestamp;
++  // Add the liveness column.
++  static const PrimitiveValue kLivenessColumnId =
++      PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn);
+ 
+-  // Add the appropriate liveness column.
+-  if (encoded_doc_key_) {
+-    const DocPath sub_path(encoded_doc_key_.as_slice(),
+-                           PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn));
+-    const auto value = Value(PrimitiveValue(), ttl, user_timestamp);
+-    RETURN_NOT_OK(data.doc_write_batch->SetPrimitive(
+-        sub_path, value, data.read_time, data.deadline, request_.stmt_id()));
+-  }
++  RETURN_NOT_OK(data.doc_write_batch->SetPrimitive(
++      DocPath(encoded_doc_key_.as_slice(), kLivenessColumnId),
++      Value(PrimitiveValue()),
++      data.read_time, data.deadline, request_.stmt_id()));
+ 
+   for (const auto& column_value : request_.column_values()) {
+     // Get the column.
+     if (!column_value.has_column_id()) {
+-      return STATUS_FORMAT(InvalidArgument, "column id missing: $0",
+-                           column_value.DebugString());
++      return STATUS(InternalError, "column id missing", column_value.DebugString());
+     }
+     const ColumnId column_id(column_value.column_id());
+-    auto column = schema_.column_by_id(column_id);
+-    RETURN_NOT_OK(column);
++    const ColumnSchema& column = VERIFY_RESULT(schema_.column_by_id(column_id));
+ 
+     // Check column-write operator.
+     CHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert)
+@@ -151,12 +146,12 @@ Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data, IsUps
+     QLValue expr_result;
+     RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, &expr_result));
+     const SubDocument sub_doc =
+-        SubDocument::FromQLValuePB(expr_result.value(), column->sorting_type());
++        SubDocument::FromQLValuePB(expr_result.value(), column.sorting_type());
+ 
+     // Inserting into specified column.
+     DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));
+     RETURN_NOT_OK(data.doc_write_batch->InsertSubDocument(
+-        sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id(), ttl, user_timestamp));
++        sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));
+   }
+ 
+   RETURN_NOT_OK(PopulateResultSet(table_row));
+@@ -181,12 +176,10 @@ Status PgsqlWriteOperation::ApplyUpdate(const DocOperationApplyData& data) {
+     for (const auto& column_value : request_.column_new_values()) {
+       // Get the column.
+       if (!column_value.has_column_id()) {
+-        return STATUS_FORMAT(InvalidArgument, "column id missing: $0",
+-                             column_value.DebugString());
++        return STATUS(InternalError, "column id missing", column_value.DebugString());
+       }
+       const ColumnId column_id(column_value.column_id());
+-      auto column = schema_.column_by_id(column_id);
+-      RETURN_NOT_OK(column);
++      const ColumnSchema& column = VERIFY_RESULT(schema_.column_by_id(column_id));
+ 
+       // Check column-write operator.
+       CHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert)
+@@ -196,19 +189,14 @@ Status PgsqlWriteOperation::ApplyUpdate(const DocOperationApplyData& data) {
+       QLValue expr_result;
+       RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, &expr_result));
+ 
+-      // Compare with existing value.
+-      QLValue old_value;
+-      RETURN_NOT_OK(EvalColumnRef(column_value.column_id(), table_row, &old_value));
+-
+       // Inserting into specified column.
+-      if (expr_result != old_value) {
+-        const SubDocument sub_doc =
+-          SubDocument::FromQLValuePB(expr_result.value(), column->sorting_type());
+-        DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));
+-        RETURN_NOT_OK(data.doc_write_batch->InsertSubDocument(
+-            sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));
+-        skipped = false;
+-      }
++      const SubDocument sub_doc =
++          SubDocument::FromQLValuePB(expr_result.value(), column.sorting_type());
++
++      DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));
++      RETURN_NOT_OK(data.doc_write_batch->InsertSubDocument(
++          sub_path, sub_doc, data.read_time, data.deadline, request_.stmt_id()));
++      skipped = false;
+     }
+   } else {
+     // This UPDATE is calling PGGATE directly without going thru PosgreSQL layer.
+@@ -227,12 +215,10 @@ Status PgsqlWriteOperation::ApplyUpdate(const DocOperationApplyData& data) {
+       for (const auto &column_value : request_.column_new_values()) {
+         // Get the column.
+         if (!column_value.has_column_id()) {
+-          return STATUS_FORMAT(InvalidArgument, "column id missing: $0",
+-                               column_value.DebugString());
++          return STATUS(InternalError, "column id missing", column_value.DebugString());
+         }
+         const ColumnId column_id(column_value.column_id());
+-        auto column = schema_.column_by_id(column_id);
+-        RETURN_NOT_OK(column);
++        const ColumnSchema& column = VERIFY_RESULT(schema_.column_by_id(column_id));
+ 
+         // Check column-write operator.
+         CHECK(GetTSWriteInstruction(column_value.expr()) == bfpg::TSOpcode::kScalarInsert)
+@@ -243,7 +229,7 @@ Status PgsqlWriteOperation::ApplyUpdate(const DocOperationApplyData& data) {
+         RETURN_NOT_OK(EvalExpr(column_value.expr(), table_row, &expr_result));
+ 
+         const SubDocument sub_doc =
+-            SubDocument::FromQLValuePB(expr_result.value(), column->sorting_type());
++            SubDocument::FromQLValuePB(expr_result.value(), column.sorting_type());
+ 
+         // Inserting into specified column.
+         DocPath sub_path(encoded_doc_key_.as_slice(), PrimitiveValue(column_id));
+@@ -334,8 +320,11 @@ Status PgsqlWriteOperation::PopulateResultSet(const QLTableRow::SharedPtr& table
+   return Status::OK();
+ }
+ 
+-Status PgsqlWriteOperation::GetDocPaths(
+-    GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const {
++Status PgsqlWriteOperation::GetDocPaths(GetDocPathsMode mode,
++                                        DocPathsToLock *paths,
++                                        IsolationLevel *level) const {
++  paths->push_back(encoded_doc_key_);
++
+   // When this write operation requires a read, it requires a read snapshot so paths will be locked
+   // in snapshot isolation for consistency. Otherwise, pure writes will happen in serializable
+   // isolation so that they will serialize but do not conflict with one another.
+@@ -353,6 +342,8 @@ Status PgsqlWriteOperation::GetDocPaths(
+     } else if (request_.stmt_type() == PgsqlWriteRequestPB::PGSQL_UPDATE) {
+       column_values = &request_.column_new_values();
+     }
++
++    column_values = &request_.column_values();
+     if (column_values != nullptr && !column_values->empty()) {
+       KeyBytes buffer;
+       for (const auto& column_value : *column_values) {
+diff --git a/src/yb/docdb/pgsql_operation.h b/src/yb/docdb/pgsql_operation.h
+index bf86c1955e..5f7acb076e 100644
+--- a/src/yb/docdb/pgsql_operation.h
++++ b/src/yb/docdb/pgsql_operation.h
+@@ -79,8 +79,9 @@ class PgsqlWriteOperation :
+   CHECKED_STATUS PopulateResultSet(const QLTableRow::SharedPtr& table_row);
+ 
+   // Reading path to operate on.
+-  CHECKED_STATUS GetDocPaths(
+-      GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const override;
++  CHECKED_STATUS GetDocPaths(GetDocPathsMode mode,
++                             DocPathsToLock *paths,
++                             IsolationLevel *level) const override;
+ 
+   //------------------------------------------------------------------------------------------------
+   // Context.

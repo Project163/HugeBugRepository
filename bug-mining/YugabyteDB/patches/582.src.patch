@@ -1,0 +1,1468 @@
+diff --git a/src/yb/consensus/log-test.cc b/src/yb/consensus/log-test.cc
+index 7cbb30009e..bb3d8dc786 100644
+--- a/src/yb/consensus/log-test.cc
++++ b/src/yb/consensus/log-test.cc
+@@ -162,8 +162,46 @@ class LogTest : public LogTestBase {
+     return Format("$0.copy-$1", tablet_wal_path_, copy_idx);
+   }
+ 
+-  Result<SegmentSequence> GetSegmentsFromLogCopyAndCheckLastOpIndex(
+-      size_t copy_idx, int64_t last_op_min_idx);
++  Result<std::unique_ptr<LogReader>> GetLogCopyReader(const size_t copy_idx) {
++    const auto log_copy_dir = GetLogCopyPath(copy_idx);
++    std::unique_ptr<LogReader> copied_log_reader;
++    RETURN_NOT_OK(LogReader::Open(
++        fs_manager_->env(), make_scoped_refptr<LogIndex>(log_copy_dir), "Log reader: ",
++        log_copy_dir, /* table_metric_entity = */ nullptr,
++        /* tablet_metric_entity = */ nullptr, &copied_log_reader));
++
++    return copied_log_reader;
++  }
++
++  Result<SegmentSequence> GetSegmentsAndCheckMaxOpIndex(
++      LogReader* log_reader, const int64_t copy_up_to_idx) {
++    SegmentSequence segments;
++    RETURN_NOT_OK(log_reader->GetSegmentsSnapshot(&segments));
++
++    SCHECK_GE(
++        segments.back()->footer().max_replicate_index(), copy_up_to_idx, InternalError,
++        "Max replicated operation index should be >= index of the operation to copy up to passed to"
++        " Log::CopyTo. It could be larger in case of overwriting not committed operations, for "
++        "example: 3.30, 3.31, 3.32, 4.30.");
++
++    return segments;
++  }
++
++  Result<SegmentSequence> GetSegmentsFromLogCopyAndCheckMaxOpIndex(
++      const size_t copy_idx, const int64_t copy_up_to_idx) {
++    auto log_copy_reader = VERIFY_RESULT(GetLogCopyReader(copy_idx));
++    return GetSegmentsAndCheckMaxOpIndex(log_copy_reader.get(), copy_up_to_idx);
++  }
++
++  struct Op {
++    OpId id;
++    bool committed;
++  };
++
++  Result<std::vector<Op>> GenerateOpsAndAppendToLog(
++      const int num_segments, const int num_batches_per_segment, const int num_entries_per_batch,
++      const double commit_probability, const int num_approx_term_changes,
++      const int num_approx_term_changes_with_index_rollback);
+ };
+ 
+ // If we write more than one entry in a batch, we should be able to
+@@ -1187,37 +1225,71 @@ TEST_F(LogTest, ConcurrentAllocateSegmentAndRollOver) {
+ }
+ 
+ Result<std::vector<OpId>> LogTest::AppendAndCopy(size_t num_batches, size_t num_entries_per_batch) {
+-  std::vector<OpId> last_op_id_before_copy;
+-  last_op_id_before_copy.reserve(num_batches);
++  std::vector<OpId> copied_up_to_op_id;
++  copied_up_to_op_id.reserve(num_batches);
+   for (size_t i = 0; i < num_batches; ++i) {
+     AppendReplicateBatchToLog(
+         num_entries_per_batch, i % 2 == 0 ? AppendSync::kFalse : AppendSync::kTrue);
+-    last_op_id_before_copy.push_back(log_->GetLatestEntryOpId());
++    copied_up_to_op_id.push_back(log_->GetLatestEntryOpId());
+     RETURN_NOT_OK(log_->CopyTo(GetLogCopyPath(i)));
+   }
+-  return last_op_id_before_copy;
++  return copied_up_to_op_id;
+ }
+ 
+-Result<SegmentSequence> LogTest::GetSegmentsFromLogCopyAndCheckLastOpIndex(
+-    const size_t copy_idx, const int64_t last_op_min_idx) {
+-  const auto log_copy_dir = GetLogCopyPath(copy_idx);
+-  std::unique_ptr<LogReader> copied_log_reader;
+-  RETURN_NOT_OK(LogReader::Open(
+-      fs_manager_->env(), make_scoped_refptr<LogIndex>(log_copy_dir), "Log reader: ",
+-      log_copy_dir, /* table_metric_entity = */ nullptr,
+-      /* tablet_metric_entity = */ nullptr, &copied_log_reader));
++namespace {
+ 
+-  SegmentSequence copied_segments;
+-  RETURN_NOT_OK(copied_log_reader->GetSegmentsSnapshot(&copied_segments));
++CHECKED_STATUS CheckEntryEq(const LogEntries& lhs, const LogEntries& rhs, const size_t entry_idx) {
++  SCHECK_EQ(
++      lhs[entry_idx]->DebugString(), rhs[entry_idx]->DebugString(), InternalError,
++      Format("entries[$0]", entry_idx));
++  return Status::OK();
++}
+ 
+-  SCHECK_GE(
+-      copied_segments.back()->footer().max_replicate_index(), last_op_min_idx, InternalError,
+-      "Last copied operation index should be >= index of last log operation added before calling "
+-      "Log::CopyTo.");
++CHECKED_STATUS CheckReadEntriesResultEq(
++    const ReadEntriesResult& lhs, const ReadEntriesResult& rhs) {
++  SCHECK_EQ(lhs.committed_op_id, rhs.committed_op_id, InternalError, "committed_op_id");
++  SCHECK_EQ(lhs.end_offset, rhs.end_offset, InternalError, "end_offset");
++  SCHECK_EQ(lhs.entry_metadata, rhs.entry_metadata, InternalError, "entry_metadata");
++  SCHECK_EQ(lhs.entries.size(), rhs.entries.size(), InternalError, "entries.size()");
++  for (size_t entry_idx = 0; entry_idx < lhs.entries.size(); ++entry_idx) {
++    RETURN_NOT_OK(CheckEntryEq(lhs.entries, rhs.entries, entry_idx));
++  }
++  return Status::OK();
++}
+ 
+-  return copied_segments;
++// Checks that lhs is a prefix of rhs.
++CHECKED_STATUS CheckReadEntriesResultIsCorrectPrefixOf(
++    const ReadEntriesResult& lhs, const ReadEntriesResult& rhs) {
++  SCHECK_LE(
++      lhs.committed_op_id, rhs.committed_op_id, InternalError,
++      "committed_op_id");
++  if (!lhs.entries.empty()) {
++    SCHECK_LE(
++        lhs.committed_op_id, OpId::FromPB(lhs.entries.back()->replicate().id()), InternalError,
++        "committed_op_id should be <= last op id");
++  }
++
++  const auto num_lhs_entries = lhs.entries.size();
++
++  SCHECK_LE(num_lhs_entries, rhs.entries.size(), InternalError, "entries.size()");
++  SCHECK_EQ(
++      lhs.entry_metadata.size(), num_lhs_entries, InternalError,
++      "entry_metadata.size()");
++  for (size_t entry_idx = 0; entry_idx < num_lhs_entries; ++entry_idx) {
++    SCHECK_EQ(
++        lhs.entry_metadata[entry_idx].entry_time, rhs.entry_metadata[entry_idx].entry_time,
++        InternalError, Format("entry_metadata[$0].entry_time", entry_idx));
++    SCHECK_EQ(
++        lhs.entry_metadata[entry_idx].active_segment_sequence_number,
++        rhs.entry_metadata[entry_idx].active_segment_sequence_number, InternalError,
++        Format("entry_metadata[$0].active_segment_sequence_number", entry_idx));
++    RETURN_NOT_OK(CheckEntryEq(lhs.entries, rhs.entries, entry_idx));
++  }
++  return Status::OK();
+ }
+ 
++} // namespace
++
+ // Verifies CopyTo works in parallel with rollovers triggered by concurrent
+ // log entries writes.
+ TEST_F(LogTest, CopyTo) {
+@@ -1229,14 +1301,14 @@ TEST_F(LogTest, CopyTo) {
+ 
+   BuildLog();
+ 
+-  auto last_op_id_before_copy = ASSERT_RESULT(AppendAndCopy(kNumBatches, kNumEntriesPerBatch));
++  auto copied_up_to_op_id = ASSERT_RESULT(AppendAndCopy(kNumBatches, kNumEntriesPerBatch));
+ 
+   SegmentSequence segments;
+   ASSERT_OK(log_->GetSegmentsSnapshot(&segments));
+ 
+   for (auto i = 0; i < kNumBatches; ++i) {
+     auto copied_segments = ASSERT_RESULT(
+-        GetSegmentsFromLogCopyAndCheckLastOpIndex(i, last_op_id_before_copy[i].index));
++        GetSegmentsFromLogCopyAndCheckMaxOpIndex(i, copied_up_to_op_id[i].index));
+     ASSERT_LE(copied_segments.size(), segments.size());
+ 
+     // Copied log segments should match log segments of the original log.
+@@ -1249,15 +1321,7 @@ TEST_F(LogTest, CopyTo) {
+       auto entries_copy_result = segment_copy->ReadEntries();
+       ASSERT_OK(entries_copy_result.status);
+ 
+-      ASSERT_EQ(entries_copy_result.committed_op_id, entries_result.committed_op_id);
+-      ASSERT_EQ(entries_copy_result.end_offset, entries_result.end_offset);
+-      ASSERT_EQ(entries_copy_result.entry_metadata, entries_result.entry_metadata);
+-      ASSERT_EQ(entries_copy_result.entries.size(), entries_result.entries.size());
+-      for (size_t entry_idx = 0; entry_idx < entries_copy_result.entries.size(); ++entry_idx) {
+-        ASSERT_EQ(
+-            entries_copy_result.entries[entry_idx]->DebugString(),
+-            entries_result.entries[entry_idx]->DebugString());
+-      }
++      ASSERT_OK(CheckReadEntriesResultEq(entries_copy_result, entries_result));
+     }
+   }
+ 
+@@ -1285,14 +1349,14 @@ TEST_F(LogTest, CopyToWithConcurrentGc) {
+     }
+   });
+ 
+-  auto last_op_id_before_copy_result = AppendAndCopy(kNumBatches, kNumEntriesPerBatch);
++  auto copied_up_to_op_id_result = AppendAndCopy(kNumBatches, kNumEntriesPerBatch);
+   stop_gc = true;
+   gc_thread.join();
+-  auto last_op_id_before_copy = ASSERT_RESULT(std::move(last_op_id_before_copy_result));
++  auto copied_up_to_op_id = ASSERT_RESULT(std::move(copied_up_to_op_id_result));
+ 
+   for (auto i = 0; i < kNumBatches; ++i) {
+     auto copied_segments = ASSERT_RESULT(
+-        GetSegmentsFromLogCopyAndCheckLastOpIndex(i, last_op_id_before_copy[i].index));
++        GetSegmentsFromLogCopyAndCheckMaxOpIndex(i, copied_up_to_op_id[i].index));
+ 
+     // Make sure copied log contains a sequence of entries without gaps in index.
+     int64_t last_index = -1;
+@@ -1314,5 +1378,196 @@ TEST_F(LogTest, CopyToWithConcurrentGc) {
+   ASSERT_OK(log_->Close());
+ }
+ 
++Result<std::vector<LogTest::Op>> LogTest::GenerateOpsAndAppendToLog(
++    const int num_segments, const int num_batches_per_segment, const int num_entries_per_batch,
++    const double commit_probability, const int num_approx_term_changes,
++    const int num_approx_term_changes_with_index_rollback) {
++  const auto num_entries = num_segments * num_batches_per_segment * num_entries_per_batch;
++
++  std::vector<Op> ops;
++  auto current_op_id = OpId(1, 1);
++  OpId last_committed_op_id;
++  for (auto seg_idx = 0; seg_idx < num_segments; ++seg_idx) {
++    for (auto batch_idx = 0; batch_idx < num_batches_per_segment; ++batch_idx) {
++      ReplicateMsgs replicates;
++      for (int i = 0; i < num_entries_per_batch; i++) {
++        replicates.emplace_back(std::make_shared<ReplicateMsg>());
++        auto& replicate = replicates.back();
++        current_op_id.ToPB(replicate->mutable_id());
++        replicate->set_op_type(NO_OP);
++        replicate->set_hybrid_time(clock_->Now().ToUint64());
++        ops.push_back({current_op_id, false});
++
++        if (RandomActWithProbability(commit_probability)) {
++          last_committed_op_id = current_op_id;
++          // Commit not yet committed ops from this term.
++          for (auto op = ops.end() - 1;
++               op >= ops.begin() && op->id.term == current_op_id.term && !op->committed;
++               op--) {
++            op->committed = true;
++          }
++        }
++        if (RandomActWithProbability(1.0 * num_approx_term_changes / num_entries)) {
++          ++current_op_id.term;
++          if (RandomActWithProbability(
++                  1.0 * num_approx_term_changes_with_index_rollback / num_approx_term_changes)) {
++            // Do not overwrite committed ops.
++            current_op_id.index = std::max<int64_t>(
++                std::max<int64_t>(
++                    current_op_id.index - RandomUniformInt<int64_t>(1, 10),
++                    last_committed_op_id.index),
++                1);
++          }
++        }
++        ++current_op_id.index;
++      }
++      Synchronizer s;
++      RETURN_NOT_OK(log_->AsyncAppendReplicates(
++          replicates, last_committed_op_id, restart_safe_coarse_mono_clock_.Now(),
++          s.AsStatusCallback()));
++      RETURN_NOT_OK(s.Wait());
++    }
++    RETURN_NOT_OK(log_->AllocateSegmentAndRollOver());
++  }
++  return ops;
++}
++
++namespace {
++
++CHECKED_STATUS CheckLogIndex(
++    LogReader* log_reader,
++    const std::map<int64_t, std::pair<OpId, LogEntryMetadata>>& op_id_with_entry_meta_by_idx) {
++  auto* copied_log_index = log_reader->TEST_GetLogIndex();
++  LogIndexEntry index_entry;
++  int64_t first_op_idx = -1;
++  int64_t last_op_idx = -1;
++  for (const auto& op_id_with_entry_meta : op_id_with_entry_meta_by_idx) {
++    const auto& op_id = op_id_with_entry_meta.second.first;
++    const auto& entry_meta = op_id_with_entry_meta.second.second;
++    RETURN_NOT_OK(copied_log_index->TEST_OpenChunkForIndex(op_id.index));
++    RETURN_NOT_OK_PREPEND(
++        copied_log_index->GetEntry(op_id.index, &index_entry), Format("op_id: $0", op_id));
++    SCHECK_EQ(
++        index_entry.op_id.index, op_id.index, InternalError, Format("index of op_id: $0", op_id));
++    SCHECK_GE(
++        index_entry.op_id.term, op_id.term, InternalError, Format("term of op_id: $0", op_id));
++    // Operation could be rewritten in higher term, then we don't expect offset and segment
++    // number to match, it will be checked once we get to ops with the same index from that
++    // higher term.
++    if (index_entry.op_id.term == op_id.term) {
++      SCHECK_EQ(
++          index_entry.segment_sequence_number, entry_meta.active_segment_sequence_number,
++          InternalError, Format("segment_sequence_number for op_id: $0", op_id));
++      SCHECK_EQ(
++          index_entry.offset_in_segment, entry_meta.offset, InternalError,
++          Format("offset_in_segment for op_id: $0", op_id));
++    }
++
++    if (first_op_idx < 0) {
++      first_op_idx = op_id.index;
++    }
++    last_op_idx = op_id.index;
++  }
++  SCHECK_GT(first_op_idx, 0, InternalError, "first_op_idx");
++  SCHECK_GT(last_op_idx, 0, InternalError, "last_op_idx");
++
++  if (first_op_idx > 1) {
++    // GetEntry is not supported for zero index, so only check for first_op_idx > 1.
++    const auto s = copied_log_index->GetEntry(first_op_idx - 1, &index_entry);
++    SCHECK(
++        s.IsNotFound(), InternalError,
++        Format("Expected NotFound error for getting op by index before the first one, but got: $0, "
++        "first_op_idx: $1, index_entry: $2", s, first_op_idx, index_entry));
++  }
++  return Status::OK();
++}
++
++} // namespace
++
++TEST_F(LogTest, CopyUpTo) {
++  constexpr auto kNumSegments = 5;
++  constexpr auto kNumBatchesPerSegment = 5;
++  constexpr auto kNumEntriesPerBatch = 5;
++  constexpr auto kNumApproxTermChanges = 10;
++  constexpr auto kNumApproxTermChangesWithIndexRollback = 3;
++  constexpr auto kCommitProbability = 0.1;
++
++  // We will rollover segments manually.
++  options_.segment_size_bytes = std::numeric_limits<size_t>::max();
++
++  BuildLog();
++
++  auto ops = ASSERT_RESULT(GenerateOpsAndAppendToLog(
++      kNumSegments, kNumBatchesPerSegment, kNumEntriesPerBatch, kCommitProbability,
++      kNumApproxTermChanges, kNumApproxTermChangesWithIndexRollback));
++
++  SegmentSequence segments;
++  ASSERT_OK(log_->GetSegmentsSnapshot(&segments));
++
++  constexpr auto kLogCopyIdx = 0;
++  const auto log_copy_path = GetLogCopyPath(kLogCopyIdx);
++  for (size_t copy_num_ops = 1; copy_num_ops <= ops.size(); ++copy_num_ops) {
++    const auto& op = ops[copy_num_ops - 1];
++    const auto& up_to_op_id = op.id;
++    ASSERT_OK(options_.env->DeleteRecursively(log_copy_path));
++    ASSERT_OK(log_->CopyTo(log_copy_path, up_to_op_id));
++
++    auto log_copy_reader = ASSERT_RESULT(GetLogCopyReader(kLogCopyIdx));
++    auto copied_segments = ASSERT_RESULT(
++        GetSegmentsAndCheckMaxOpIndex(log_copy_reader.get(), up_to_op_id.index));
++
++    // Copied log segments (except might be the last one that could be truncated) should match log
++    // segments of the original log.
++    size_t num_ops_copied = 0;
++    std::map<int64_t, std::pair<OpId, LogEntryMetadata>> op_id_with_entry_meta_by_idx;
++
++    for (size_t seg_idx = 0; seg_idx < copied_segments.size(); ++seg_idx) {
++      auto& segment = segments[seg_idx];
++      auto& segment_copy = copied_segments[seg_idx];
++
++      auto entries_result = segment->ReadEntries();
++      ASSERT_OK(entries_result.status);
++      if (!entries_result.entries.empty()) {
++        ASSERT_LE(
++            entries_result.committed_op_id,
++            OpId::FromPB(entries_result.entries.back()->replicate().id()));
++      }
++
++      auto entries_copy_result = segment_copy->ReadEntries();
++      ASSERT_OK(entries_copy_result.status);
++      const auto num_copied_segment_entries = entries_copy_result.entries.size();
++
++      if (seg_idx < copied_segments.size() - 1 || copy_num_ops == ops.size()) {
++        ASSERT_OK(CheckReadEntriesResultEq(entries_copy_result, entries_result));
++      } else {
++        // Last segment (truncated).
++        ASSERT_OK(CheckReadEntriesResultIsCorrectPrefixOf(entries_copy_result, entries_result));
++      }
++
++      for (size_t entry_idx = 0; entry_idx < num_copied_segment_entries; ++entry_idx) {
++        const auto& copied_entry = entries_copy_result.entries[entry_idx];
++        if (copied_entry->has_replicate()) {
++          const auto& op_id = OpId::FromPB(copied_entry->replicate().id());
++          op_id_with_entry_meta_by_idx[op_id.index] =
++              std::make_pair(op_id, entries_copy_result.entry_metadata[entry_idx]);
++        }
++      }
++      num_ops_copied += num_copied_segment_entries;
++    }
++
++    if (num_ops_copied > copy_num_ops) {
++      LOG(INFO) << "up_to_op_id: " << AsString(up_to_op_id) << ", copied ops tail:";
++      for (auto i = copy_num_ops - 1; i < num_ops_copied; ++i) {
++        LOG(INFO) << i << ": " << ops[i].id;
++      }
++    }
++    ASSERT_EQ(num_ops_copied, copy_num_ops);
++
++    ASSERT_OK(CheckLogIndex(log_copy_reader.get(), op_id_with_entry_meta_by_idx));
++  }
++
++  ASSERT_OK(log_->Close());
++}
++
+ } // namespace log
+ } // namespace yb
+diff --git a/src/yb/consensus/log.cc b/src/yb/consensus/log.cc
+index e22e8dace2..d0dd870396 100644
+--- a/src/yb/consensus/log.cc
++++ b/src/yb/consensus/log.cc
+@@ -315,7 +315,7 @@ class LogEntryBatch {
+   int64_t offset_;
+ 
+   // Segment sequence number for this entry batch.
+-  uint64_t active_segment_sequence_number_;
++  int64_t active_segment_sequence_number_;
+ 
+   enum LogEntryState {
+     kEntryInitialized,
+@@ -892,16 +892,10 @@ void Log::UpdateFooterForBatch(LogEntryBatch* batch) {
+   // over to a new segment, we set the first operation in the footer immediately.
+   // Update the index bounds for the current segment.
+   for (const LogEntryPB& entry_pb : batch->entry_batch_pb_.entry()) {
+-    int64_t index = entry_pb.replicate().id().index();
+-    if (!footer_builder_.has_min_replicate_index() ||
+-        index < footer_builder_.min_replicate_index()) {
+-      footer_builder_.set_min_replicate_index(index);
+-      min_replicate_index_.store(index, std::memory_order_release);
+-    }
+-    if (!footer_builder_.has_max_replicate_index() ||
+-        index > footer_builder_.max_replicate_index()) {
+-      footer_builder_.set_max_replicate_index(index);
+-    }
++    UpdateSegmentFooterIndexes(entry_pb.replicate(), &footer_builder_);
++  }
++  if (footer_builder_.has_min_replicate_index()) {
++    min_replicate_index_.store(footer_builder_.min_replicate_index(), std::memory_order_release);
+   }
+ }
+ 
+@@ -1324,7 +1318,108 @@ Status Log::FlushIndex() {
+   return log_index_->Flush();
+ }
+ 
+-Status Log::CopyTo(const std::string& dest_wal_dir) {
++Result<SegmentOpIdRelation> Log::GetSegmentOpIdRelation(
++    ReadableLogSegment* segment, const OpId& op_id) {
++  const auto& footer = segment->footer();
++  VLOG_WITH_PREFIX_AND_FUNC(2) << "footer.has_max_replicate_index(): "
++                               << footer.has_max_replicate_index()
++                               << " footer.max_replicate_index(): "
++                               << footer.max_replicate_index();
++
++  if (footer.has_max_replicate_index() && op_id.index > footer.max_replicate_index()) {
++    return SegmentOpIdRelation::kOpIdAfterSegment;
++  }
++
++  auto read_entries = segment->ReadEntries();
++  RETURN_NOT_OK(read_entries.status);
++
++  const auto has_replicate = [](const std::unique_ptr<LogEntryPB>& entry) {
++    return entry->has_replicate();
++  };
++  const auto first_replicate =
++      std::find_if(read_entries.entries.cbegin(), read_entries.entries.cend(), has_replicate);
++
++  if (first_replicate == read_entries.entries.cend()) {
++    return SegmentOpIdRelation::kEmptySegment;
++  }
++
++  const auto first_op_id = OpId::FromPB((*first_replicate)->replicate().id());
++  if (op_id < first_op_id) {
++    return SegmentOpIdRelation::kOpIdBeforeSegment;
++  }
++
++  // first_op_id <= up_to_op_id
++
++  const auto last_replicate = std::find_if(
++      read_entries.entries.crbegin(), read_entries.entries.crend(), has_replicate);
++  const auto last_op_id = OpId::FromPB((*last_replicate)->replicate().id());
++
++  if (op_id > last_op_id) {
++    return SegmentOpIdRelation::kOpIdAfterSegment;
++  }
++
++  if (op_id == last_op_id) {
++    return SegmentOpIdRelation::kOpIdIsLast;
++  }
++
++  // first_op_id <= up_to_op_id < last_op_id
++  return SegmentOpIdRelation::kOpIdIsInsideAndNotLast;
++}
++
++Result<bool> Log::CopySegmentUpTo(
++    ReadableLogSegment* segment, const std::string& dest_wal_dir, const OpId& up_to_op_id) {
++  SegmentOpIdRelation relation = up_to_op_id.valid() && !up_to_op_id.empty()
++                                     ? VERIFY_RESULT(GetSegmentOpIdRelation(segment, up_to_op_id))
++                                     : SegmentOpIdRelation::kOpIdAfterSegment;
++  auto* const env = options_.env;
++  const auto sequence_number = segment->header().sequence_number();
++  const auto file_name = FsManager::GetWalSegmentFileName(sequence_number);
++  const auto src_path = JoinPathSegments(wal_dir_, file_name);
++  SCHECK_EQ(src_path, segment->path(), InternalError, "Log segment path does not match");
++  const auto dest_path = JoinPathSegments(dest_wal_dir, file_name);
++
++  bool stop = false;
++  switch (relation) {
++    case SegmentOpIdRelation::kOpIdBeforeSegment:
++      // Stop copying segments.
++      return true;
++
++    case SegmentOpIdRelation::kOpIdIsLast:
++      // Stop after copying the current segment.
++      stop = true;
++      FALLTHROUGH_INTENDED;
++    case SegmentOpIdRelation::kEmptySegment:
++      FALLTHROUGH_INTENDED;
++    case SegmentOpIdRelation::kOpIdAfterSegment:
++      // Copy (hard-link) the whole segment.
++      RETURN_NOT_OK(env->LinkFile(src_path, dest_path));
++      VLOG_WITH_PREFIX(1) << Format("Hard linked $0 to $1", src_path, dest_path);
++      return stop;
++
++    case SegmentOpIdRelation::kOpIdIsInsideAndNotLast:
++      // Copy part of the segment up to up_to_op_id.
++      std::unique_ptr<WritableFile> dest_file;
++      auto opts = GetNewSegmentWritableFileOptions();
++      RETURN_NOT_OK(env->NewWritableFile(opts, dest_path, &dest_file));
++      std::shared_ptr<WritableFile> shared_dest_file(dest_file.release());
++
++      // Rebuild log index for this segment, it might be not necessary after
++      // https://github.com/yugabyte/yugabyte-db/issues/10960 is fixed.
++      auto copied_log_index = make_scoped_refptr(new LogIndex(dest_wal_dir));
++      RETURN_NOT_OK(
++          segment->CopyTo(up_to_op_id, dest_path, shared_dest_file, copied_log_index.get()));
++      RETURN_NOT_OK(copied_log_index->Flush());
++
++      VLOG_WITH_PREFIX(1) << Format(
++          "Copied $0 to $1, up to $2", src_path, dest_path, up_to_op_id);
++      return false;
++  }
++  FATAL_INVALID_ENUM_VALUE(SegmentOpIdRelation, relation);
++}
++
++Status Log::CopyTo(const std::string& dest_wal_dir, const OpId up_to_op_id) {
++  VLOG_WITH_PREFIX_AND_FUNC(1) << "dest_wal_dir: " << dest_wal_dir
++                               << " up_to_op_id: " << AsString(up_to_op_id);
+   // We mainly need log_copy_mutex_ to simplify managing of log_copy_min_index_.
+   std::lock_guard<decltype(log_copy_mutex_)> log_copy_lock(log_copy_mutex_);
+   auto se = ScopeExit([this]() {
+@@ -1376,38 +1471,17 @@ Status Log::CopyTo(const std::string& dest_wal_dir) {
+   RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(options_.env, dest_wal_dir),
+                         Format("Failed to create tablet WAL dir $0", dest_wal_dir));
+ 
+-  RETURN_NOT_OK(log_index->Flush());
+-
+-  auto* const env = options_.env;
++  const auto has_op_id_limit = up_to_op_id.valid() && !up_to_op_id.empty();
+ 
+-  {
+-    for (const auto& segment : segments) {
+-      const auto sequence_number = segment->header().sequence_number();
+-      const auto file_name = FsManager::GetWalSegmentFileName(sequence_number);
+-      const auto src_path = JoinPathSegments(wal_dir_, file_name);
+-      SCHECK_EQ(src_path, segment->path(), InternalError, "Log segment path does not match");
+-      const auto dest_path = JoinPathSegments(dest_wal_dir, file_name);
++  RETURN_NOT_OK(
++      log_index->CopyTo(options_.env, dest_wal_dir, has_op_id_limit ? up_to_op_id.index : -1));
+ 
+-      RETURN_NOT_OK(env->LinkFile(src_path, dest_path));
+-      VLOG_WITH_PREFIX(1) << Format("Hard linked $0 to $1", src_path, dest_path);
++  for (const auto& segment : segments) {
++    if (VERIFY_RESULT(CopySegmentUpTo(segment.get(), dest_wal_dir, up_to_op_id))) {
++      break;
+     }
+   }
+ 
+-  const auto files = VERIFY_RESULT(env->GetChildren(wal_dir_, ExcludeDots::kTrue));
+-
+-  for (const auto& file : files) {
+-    const auto src_path = JoinPathSegments(wal_dir_, file);
+-    const auto dest_path = JoinPathSegments(dest_wal_dir, file);
+-
+-    if (FsManager::IsWalSegmentFileName(file)) {
+-      // Already processed above.
+-    } else if (!boost::starts_with(file, kSegmentPlaceholderFilePrefix)) {
+-      RETURN_NOT_OK_PREPEND(
+-          CopyFile(env, src_path, dest_path),
+-          Format("Failed to copy file $0 to $1", src_path, dest_path));
+-      VLOG_WITH_PREFIX(1) << Format("Copied $0 to $1", src_path, dest_path);
+-    }
+-  }
+   return Status::OK();
+ }
+ 
+@@ -1415,14 +1489,19 @@ uint64_t Log::NextSegmentDesiredSize() {
+   return std::min(cur_max_segment_size_ * 2, max_segment_size_);
+ }
+ 
+-Status Log::PreAllocateNewSegment() {
+-  TRACE_EVENT1("log", "PreAllocateNewSegment", "file", next_segment_path_);
+-  CHECK_EQ(allocation_state(), SegmentAllocationState::kAllocationInProgress);
+-
++WritableFileOptions Log::GetNewSegmentWritableFileOptions() {
+   WritableFileOptions opts;
+   // We always want to sync on close: https://github.com/yugabyte/yugabyte-db/issues/3490
+   opts.sync_on_close = true;
+   opts.o_direct = durable_wal_write_;
++  return opts;
++}
++
++Status Log::PreAllocateNewSegment() {
++  TRACE_EVENT1("log", "PreAllocateNewSegment", "file", next_segment_path_);
++  CHECK_EQ(allocation_state(), SegmentAllocationState::kAllocationInProgress);
++
++  auto opts = GetNewSegmentWritableFileOptions();
+   RETURN_NOT_OK(CreatePlaceholderSegment(opts, &next_segment_path_, &next_segment_file_));
+ 
+   if (options_.preallocate_segments) {
+diff --git a/src/yb/consensus/log.h b/src/yb/consensus/log.h
+index 50382426a8..03e53565e7 100644
+--- a/src/yb/consensus/log.h
++++ b/src/yb/consensus/log.h
+@@ -88,6 +88,20 @@ YB_DEFINE_ENUM(
+     (kAllocationFinished)    // Next segment ready
+ );
+ 
++YB_DEFINE_ENUM(
++    SegmentOpIdRelation,
++    // Segment is empty
++    (kEmptySegment)
++    // OpId is before the segment
++    (kOpIdBeforeSegment)
++    // OpId is inside the segment, but not the last
++    (kOpIdIsInsideAndNotLast)
++    // OpId corresponds to the last operation in the segment
++    (kOpIdIsLast)
++    // OpId is after the segment
++    (kOpIdAfterSegment)
++);
++
+ // Log interface, inspired by Raft's (logcabin) Log. Provides durability to YugaByte as a normal
+ // Write Ahead Log and also plays the role of persistent storage for the consensus state machine.
+ //
+@@ -300,8 +314,22 @@ class Log : public RefCountedThreadSafe<Log> {
+   CHECKED_STATUS FlushIndex();
+ 
+   // Copies log to a new dir.
++  // If up_to_op_id is specified - only part of the log up to up_to_op_id is copied.
+   // Flushes necessary files and uses hard links where it is safe.
+-  CHECKED_STATUS CopyTo(const std::string& dest_wal_dir);
++  //
++  // Until https://github.com/yugabyte/yugabyte-db/issues/10960 is fixed, destination LogIndex
++  // might point to an operation that we've not copied, but it rewrites some operation that we've
++  // copied and there is no way to fix it without full rebuild of LogIndex.
++  // But that should be OK, because:
++  // 1) That can only happen for indexes of operations that are not yet committed, so only
++  //    for indexes > last_commited_op.index.
++  // 2) We use CopyTo for tablet splitting and pass up_to_op_id = split_op_id that is committed.
++  // 3) We only use LogIndex for ops on leader that are in log Raft log, so
++  //    a) Either this is committed operation copied from parent tablet and log index is correct
++  //       for it.
++  //    b) Or this is operation added by the leader, so log index is also correct for it, because
++  //       we updated it as we added this operation to the Raft log.
++  Status CopyTo(const std::string& dest_wal_dir, OpId up_to_op_id = OpId());
+ 
+   // Waits until all entries flushed, then reset last received op id to specified one.
+   CHECKED_STATUS ResetLastSyncedEntryOpId(const OpId& op_id);
+@@ -406,6 +434,17 @@ class Log : public RefCountedThreadSafe<Log> {
+ 
+   LogEntryBatch* ReserveMarker(LogEntryTypePB type);
+ 
++  // Returns WritableFileOptions for a new segment writable file.
++  WritableFileOptions GetNewSegmentWritableFileOptions();
++
++  // See SegmentOpIdRelation comments.
++  Result<SegmentOpIdRelation> GetSegmentOpIdRelation(
++      ReadableLogSegment* segment, const OpId& op_id);
++
++  // Returns whether operation with up_to_op_id itself has been copied.
++  Result<bool> CopySegmentUpTo(
++      ReadableLogSegment* segment, const std::string& dest_wal_dir, const OpId& up_to_op_id);
++
+   LogOptions options_;
+ 
+   // The dir path where the write-ahead log for this tablet is stored.
+diff --git a/src/yb/consensus/log_index.cc b/src/yb/consensus/log_index.cc
+index 4131595bca..c1af06aed4 100644
+--- a/src/yb/consensus/log_index.cc
++++ b/src/yb/consensus/log_index.cc
+@@ -52,6 +52,8 @@
+ 
+ #include "yb/gutil/map-util.h"
+ 
++#include "yb/util/env.h"
++#include "yb/util/file_util.h"
+ #include "yb/util/locks.h"
+ 
+ using std::string;
+@@ -192,8 +194,16 @@ LogIndex::LogIndex(std::string base_dir) : base_dir_(std::move(base_dir)) {}
+ LogIndex::~LogIndex() {
+ }
+ 
+-string LogIndex::GetChunkPath(int64_t chunk_idx) {
+-  return StringPrintf("%s/index.%09" PRId64, base_dir_.c_str(), chunk_idx);
++namespace {
++
++std::string GetChunkPath(const std::string& base_dir, const int64_t chunk_idx) {
++  return StringPrintf("%s/index.%09" PRId64, base_dir.c_str(), chunk_idx);
++}
++
++} // namespace
++
++std::string LogIndex::GetChunkPath(const int64_t chunk_idx) {
++  return log::GetChunkPath(base_dir_, chunk_idx);
+ }
+ 
+ Status LogIndex::OpenChunk(int64_t chunk_idx, scoped_refptr<IndexChunk>* chunk) {
+@@ -238,6 +248,11 @@ Status LogIndex::GetChunkForIndex(int64_t log_index, bool create,
+   return Status::OK();
+ }
+ 
++Status LogIndex::TEST_OpenChunkForIndex(const int64_t op_index) {
++  scoped_refptr<IndexChunk> chunk;
++  return GetChunkForIndex(op_index, /* create = */ true, &chunk);
++}
++
+ Status LogIndex::AddEntry(const LogIndexEntry& entry) {
+   scoped_refptr<IndexChunk> chunk;
+   RETURN_NOT_OK(GetChunkForIndex(entry.op_id.index,
+@@ -324,6 +339,34 @@ Status LogIndex::Flush() {
+   return Status::OK();
+ }
+ 
++Status LogIndex::CopyTo(Env* env, const std::string& dest_wal_dir, const int64_t up_to_index) {
++  const auto up_to_chunk_idx = up_to_index < 0 ? -1 : (up_to_index / kEntriesPerIndexChunk);
++
++  ChunkMap chunks_to_copy;
++
++  {
++    std::lock_guard<simple_spinlock> l(open_chunks_lock_);
++    for (auto& it : open_chunks_) {
++      if (up_to_chunk_idx < 0 || it.first <= up_to_chunk_idx) {
++        chunks_to_copy.emplace(it);
++      }
++    }
++  }
++
++  for (auto& chunk : chunks_to_copy) {
++    const auto chunk_idx = chunk.first;
++    RETURN_NOT_OK(chunk.second->Flush());
++    const auto src_path = GetChunkPath(chunk_idx);
++    const auto dest_path = log::GetChunkPath(dest_wal_dir, chunk_idx);
++    RETURN_NOT_OK_PREPEND(
++        CopyFile(env, src_path, dest_path),
++        Format("Failed to copy file $0 to $1", src_path, dest_path));
++    VLOG(1) << Format("Copied $0 to $1", src_path, dest_path);
++  }
++
++  return Status::OK();
++}
++
+ string LogIndexEntry::ToString() const {
+   return Substitute("op_id=$0.$1 segment_sequence_number=$2 offset=$3",
+                     op_id.term, op_id.index,
+diff --git a/src/yb/consensus/log_index.h b/src/yb/consensus/log_index.h
+index 98848a6a8d..b42c74f394 100644
+--- a/src/yb/consensus/log_index.h
++++ b/src/yb/consensus/log_index.h
+@@ -43,6 +43,9 @@
+ #include "yb/util/opid.h"
+ 
+ namespace yb {
++
++class Env;
++
+ namespace log {
+ 
+ // An entry in the index.
+@@ -91,6 +94,13 @@ class LogIndex : public RefCountedThreadSafe<LogIndex> {
+   // Flushes log index to disk.
+   CHECKED_STATUS Flush();
+ 
++  // Copies log index into dest_wal_dir up to specified op index.
++  CHECKED_STATUS CopyTo(Env* env, const std::string& dest_wal_dir, int64_t up_to_index = -1);
++
++  // TODO: shouldn't be necessary after https://github.com/yugabyte/yugabyte-db/issues/10960 is
++  // fixed.
++  Status TEST_OpenChunkForIndex(int64_t op_index);
++
+  private:
+   friend class RefCountedThreadSafe<LogIndex>;
+   ~LogIndex();
+diff --git a/src/yb/consensus/log_reader.h b/src/yb/consensus/log_reader.h
+index 63864601af..1ee5d10ac9 100644
+--- a/src/yb/consensus/log_reader.h
++++ b/src/yb/consensus/log_reader.h
+@@ -136,6 +136,8 @@ class LogReader {
+     return log_prefix_;
+   }
+ 
++  LogIndex* TEST_GetLogIndex() const { return log_index_.get(); }
++
+  private:
+   FRIEND_TEST(cdc::CDCServiceTestMaxRentionTime, TestLogRetentionByOpId_MaxRentionTime);
+   FRIEND_TEST(cdc::CDCServiceTestMinSpace, TestLogRetentionByOpId_MinSpace);
+diff --git a/src/yb/consensus/log_util.cc b/src/yb/consensus/log_util.cc
+index a053d8fc31..8da35d4c89 100644
+--- a/src/yb/consensus/log_util.cc
++++ b/src/yb/consensus/log_util.cc
+@@ -42,6 +42,7 @@
+ #include "yb/common/hybrid_time.h"
+ 
+ #include "yb/consensus/opid_util.h"
++#include "yb/consensus/log_index.h"
+ 
+ #include "yb/fs/fs_manager.h"
+ 
+@@ -255,16 +256,7 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
+   // Rebuild the min/max replicate index (by scanning)
+   for (const auto& entry : read_entries.entries) {
+     if (entry->has_replicate()) {
+-      int64_t index = entry->replicate().id().index();
+-      // TODO: common code with Log::UpdateFooterForBatch
+-      if (!footer_.has_min_replicate_index() ||
+-          index < footer_.min_replicate_index()) {
+-        footer_.set_min_replicate_index(index);
+-      }
+-      if (!footer_.has_max_replicate_index() ||
+-          index > footer_.max_replicate_index()) {
+-        footer_.set_max_replicate_index(index);
+-      }
++      UpdateSegmentFooterIndexes(entry->replicate(), &footer_);
+       latest_ht = std::max(latest_ht, entry->replicate().hybrid_time());
+     }
+   }
+@@ -284,6 +276,87 @@ Status ReadableLogSegment::RebuildFooterByScanning() {
+   return Status::OK();
+ }
+ 
++int64_t ReadableLogSegment::GetOffsetReadUpTo() {
++  const auto readable_to_offset = readable_to_offset_.Load();
++  VLOG(1) << "Reading segment entries from "
++          << path_ << ": offset=" << first_entry_offset() << " file_size="
++          << file_size() << " readable_to_offset=" << readable_to_offset;
++
++  // If we have a footer we only read up to it. If we don't we likely crashed
++  // and always read to the end.
++  return (footer_.IsInitialized() && !footer_was_rebuilt_)
++             ? file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength
++             : readable_to_offset;
++}
++
++Status ReadableLogSegment::CopyTo(
++    const OpId& up_to_op_id, const std::string& dest_path,
++    const std::shared_ptr<WritableFile>& dest_file, LogIndex* log_index_to_rebuild) {
++  auto dest_segment = std::make_unique<WritableLogSegment>(dest_path, dest_file);
++  RETURN_NOT_OK(dest_segment->WriteHeaderAndOpen(header()));
++  LogSegmentFooterPB footer;
++
++  const auto read_up_to = GetOffsetReadUpTo();
++  auto offset = first_entry_offset();
++
++  faststring read_buf;
++  faststring write_buf;
++  size_t num_entries = 0;
++  uint64_t latest_ht = 0;
++
++  const auto has_op_id_limit = up_to_op_id.valid() && !up_to_op_id.empty();
++  bool hit_limit = false;
++
++  LogIndexEntry index_entry;
++  index_entry.segment_sequence_number = header().sequence_number();
++  while (offset < read_up_to && !hit_limit) {
++    index_entry.offset_in_segment = offset;
++    LogEntryBatchPB current_batch;
++
++    if (offset + implicit_cast<ssize_t>(kEntryHeaderSize) < read_up_to) {
++      RETURN_NOT_OK(ReadEntryHeaderAndBatch(&offset, &read_buf, &current_batch));
++    } else {
++      return STATUS(Corruption, Format("Truncated log entry at offset $0", offset));
++    }
++
++    for (auto it = current_batch.entry().cbegin(); it != current_batch.entry().end(); ++it) {
++      if (!it->has_replicate()) {
++        continue;
++      }
++
++      index_entry.op_id = yb::OpId::FromPB(it->replicate().id());
++
++      if (has_op_id_limit) {
++        if (OpId::FromPB(current_batch.committed_op_id()) > up_to_op_id) {
++          up_to_op_id.ToPB(current_batch.mutable_committed_op_id());
++        }
++
++        const auto op_id = OpId::FromPB(it->replicate().id());
++        if (op_id > up_to_op_id) {
++          hit_limit = true;
++          current_batch.mutable_entry()->erase(it, current_batch.entry().cend());
++          break;
++        }
++      }
++      UpdateSegmentFooterIndexes(it->replicate(), &footer);
++      latest_ht = std::max(latest_ht, it->replicate().hybrid_time());
++      RETURN_NOT_OK(log_index_to_rebuild->AddEntry(index_entry));
++    }
++
++    write_buf.clear();
++    write_buf.reserve(current_batch.ByteSize());
++    pb_util::AppendToString(current_batch, &write_buf);
++    RETURN_NOT_OK(dest_segment->WriteEntryBatch(write_buf));
++
++    num_entries += current_batch.entry().size();
++  }
++  footer.set_num_entries(num_entries);
++  if (latest_ht > 0) {
++    footer_.set_close_timestamp_micros(HybridTime(latest_ht).GetPhysicalValueMicros());
++  }
++  return dest_segment->WriteFooterAndClose(footer);
++}
++
+ Status ReadableLogSegment::ReadFileSize() {
+   // Check the size of the file.
+   // Env uses uint here, even though we generally prefer signed ints to avoid
+@@ -479,21 +552,13 @@ ReadEntriesResult ReadableLogSegment::ReadEntries(int64_t max_entries_to_read) {
+   std::vector<int64_t> recent_offsets(4, -1);
+   int64_t batches_read = 0;
+ 
+-  int64_t offset = first_entry_offset();
+-  int64_t readable_to_offset = readable_to_offset_.Load();
+-  VLOG(1) << "Reading segment entries from "
+-          << path_ << ": offset=" << offset << " file_size="
+-          << file_size() << " readable_to_offset=" << readable_to_offset;
+-  faststring tmp_buf;
+-
+-  // If we have a footer we only read up to it. If we don't we likely crashed
+-  // and always read to the end.
+-  int64_t read_up_to = (footer_.IsInitialized() && !footer_was_rebuilt_) ?
+-      file_size() - footer_.ByteSize() - kLogSegmentFooterMagicAndFooterLength :
+-      readable_to_offset;
++  const auto read_up_to = GetOffsetReadUpTo();
+ 
++  int64_t offset = first_entry_offset();
+   result.end_offset = offset;
+ 
++  faststring tmp_buf;
++
+   int64_t num_entries_read = 0;
+   while (offset < read_up_to) {
+     const int64_t this_batch_offset = offset;
+@@ -980,5 +1045,17 @@ Status ModifyDurableWriteFlagIfNotODirect() {
+   return Status::OK();
+ }
+ 
++void UpdateSegmentFooterIndexes(
++    const consensus::ReplicateMsg& replicate, LogSegmentFooterPB* footer) {
++  const auto index = replicate.id().index();
++  if (!footer->has_min_replicate_index() || index < footer->min_replicate_index()) {
++    footer->set_min_replicate_index(index);
++  }
++  if (!footer->has_max_replicate_index() || index > footer->max_replicate_index()) {
++    footer->set_max_replicate_index(index);
++  }
++}
++
++
+ }  // namespace log
+ }  // namespace yb
+diff --git a/src/yb/consensus/log_util.h b/src/yb/consensus/log_util.h
+index e50d68c4e0..185b6d9994 100644
+--- a/src/yb/consensus/log_util.h
++++ b/src/yb/consensus/log_util.h
+@@ -117,7 +117,7 @@ struct LogOptions {
+ struct LogEntryMetadata {
+   RestartSafeCoarseTimePoint entry_time;
+   int64_t offset;
+-  uint64_t active_segment_sequence_number;
++  int64_t active_segment_sequence_number;
+ 
+   std::string ToString() const {
+     return YB_STRUCT_TO_STRING(entry_time, offset, active_segment_sequence_number);
+@@ -212,6 +212,11 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
+   // missing because we didn't have the time to write it out.
+   CHECKED_STATUS RebuildFooterByScanning();
+ 
++  // Copies log segment up to up_to_op_id into dest_file at dest_path and updates
++  // log_index_to_rebuild.
++  CHECKED_STATUS CopyTo(const OpId& up_to_op_id, const std::string& dest_path,
++      const std::shared_ptr<WritableFile>& dest_file, LogIndex* log_index_to_rebuild);
++
+   bool IsInitialized() const {
+     return is_initialized_;
+   }
+@@ -337,6 +342,8 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
+ 
+   void UpdateReadableToOffset(int64_t readable_to_offset);
+ 
++  int64_t GetOffsetReadUpTo();
++
+   const std::string path_;
+ 
+   // The size of the readable file.
+@@ -480,6 +487,9 @@ CHECKED_STATUS CheckRelevantPathsAreODirectWritable();
+ // Modify durable wal write flag depending on the value of FLAGS_require_durable_wal_write.
+ CHECKED_STATUS ModifyDurableWriteFlagIfNotODirect();
+ 
++void UpdateSegmentFooterIndexes(
++    const consensus::ReplicateMsg& replicate, LogSegmentFooterPB* footer);
++
+ }  // namespace log
+ }  // namespace yb
+ 
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 0447963645..34f9dd465f 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -3137,6 +3137,10 @@ RaftConfigPB RaftConsensus::CommittedConfig() const {
+   return state_->GetCommittedConfigUnlocked();
+ }
+ 
++RaftConfigPB RaftConsensus::CommittedConfigUnlocked() const {
++  return state_->GetCommittedConfigUnlocked();
++}
++
+ void RaftConsensus::DumpStatusHtml(std::ostream& out) const {
+   out << "<h1>Raft Consensus State</h1>" << std::endl;
+ 
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index b0e8a65235..6e02c600c4 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -203,6 +203,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+       LeaderLeaseStatus* leader_lease_status) const override;
+ 
+   RaftConfigPB CommittedConfig() const override;
++  RaftConfigPB CommittedConfigUnlocked() const;
+ 
+   void DumpStatusHtml(std::ostream& out) const override;
+ 
+diff --git a/src/yb/integration-tests/external_mini_cluster.cc b/src/yb/integration-tests/external_mini_cluster.cc
+index 749152e8e9..964294f96a 100644
+--- a/src/yb/integration-tests/external_mini_cluster.cc
++++ b/src/yb/integration-tests/external_mini_cluster.cc
+@@ -1683,7 +1683,7 @@ ExternalMaster* ExternalMiniCluster::GetLeaderMaster() {
+ Result<size_t> ExternalMiniCluster::GetTabletLeaderIndex(const std::string& tablet_id) {
+   for (size_t i = 0; i < num_tablet_servers(); ++i) {
+     auto tserver = tablet_server(i);
+-    if (tserver->IsProcessAlive()) {
++    if (tserver->IsProcessAlive() && !tserver->IsProcessPaused()) {
+       auto tablets = VERIFY_RESULT(GetTablets(tserver));
+       for (const auto& tablet : tablets) {
+         if (tablet.tablet_id() == tablet_id && tablet.is_leader()) {
+@@ -2180,13 +2180,17 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
+ Status ExternalDaemon::Pause() {
+   if (!process_) return Status::OK();
+   VLOG(1) << "Pausing " << ProcessNameAndPidStr();
+-  return process_->Kill(SIGSTOP);
++  RETURN_NOT_OK(process_->Kill(SIGSTOP));
++  is_paused_ = true;
++  return Status::OK();
+ }
+ 
+ Status ExternalDaemon::Resume() {
+   if (!process_) return Status::OK();
+   VLOG(1) << "Resuming " << ProcessNameAndPidStr();
+-  return process_->Kill(SIGCONT);
++  RETURN_NOT_OK(process_->Kill(SIGCONT));
++  is_paused_ = false;
++  return Status::OK();
+ }
+ 
+ Status ExternalDaemon::Kill(int signal) {
+@@ -2211,6 +2215,11 @@ bool ExternalDaemon::IsProcessAlive() const {
+   return s.IsTimedOut();
+ }
+ 
++bool ExternalDaemon::IsProcessPaused() const {
++  return is_paused_;
++}
++
++
+ pid_t ExternalDaemon::pid() const {
+   return process_->pid();
+ }
+diff --git a/src/yb/integration-tests/external_mini_cluster.h b/src/yb/integration-tests/external_mini_cluster.h
+index 50b1da094d..17103752e4 100644
+--- a/src/yb/integration-tests/external_mini_cluster.h
++++ b/src/yb/integration-tests/external_mini_cluster.h
+@@ -574,6 +574,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
+   // even if we didn't explicitly call Shutdown().
+   bool IsProcessAlive() const;
+ 
++  bool IsProcessPaused() const;
++
+   virtual void Shutdown();
+ 
+   std::vector<std::string> GetDataDirs() const { return data_dirs_; }
+@@ -657,6 +659,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
+   std::vector<std::string> extra_flags_;
+ 
+   std::unique_ptr<Subprocess> process_;
++  bool is_paused_ = false;
+ 
+   std::unique_ptr<server::ServerStatusPB> status_;
+ 
+diff --git a/src/yb/integration-tests/tablet-split-itest-base.cc b/src/yb/integration-tests/tablet-split-itest-base.cc
+index a058e357c3..cb1ab9dc3d 100644
+--- a/src/yb/integration-tests/tablet-split-itest-base.cc
++++ b/src/yb/integration-tests/tablet-split-itest-base.cc
+@@ -774,7 +774,7 @@ Result<std::set<TabletId>> TabletSplitExternalMiniClusterITest::GetTestTableTabl
+ Result<std::set<TabletId>> TabletSplitExternalMiniClusterITest::GetTestTableTabletIds() {
+   std::set<TabletId> tablet_ids;
+   for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
+-    if (cluster_->tablet_server(i)->IsShutdown()) {
++    if (cluster_->tablet_server(i)->IsShutdown() || cluster_->tablet_server(i)->IsProcessPaused()) {
+       continue;
+     }
+     auto res = VERIFY_RESULT(GetTestTableTabletIds(i));
+@@ -821,7 +821,7 @@ Result<vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>>
+ Status TabletSplitExternalMiniClusterITest::WaitForTabletsExcept(
+     size_t num_tablets, size_t tserver_idx, const TabletId& exclude_tablet) {
+   std::set<TabletId> tablets;
+-  auto status = WaitFor(
++  auto status = LoggedWaitFor(
+       [&]() -> Result<bool> {
+         tablets = VERIFY_RESULT(GetTestTableTabletIds(tserver_idx));
+         size_t count = 0;
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index b133e29188..7077f45f5c 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -50,6 +50,7 @@
+ #include "yb/master/master_admin.proxy.h"
+ #include "yb/master/master_admin.pb.h"
+ #include "yb/master/master_client.pb.h"
++#include "yb/master/master_cluster.proxy.h"
+ #include "yb/master/master_defaults.h"
+ #include "yb/master/master_error.h"
+ #include "yb/master/master_heartbeat.pb.h"
+@@ -2463,6 +2464,134 @@ TEST_P(TabletSplitSystemRecordsITest, GetSplitKey) {
+   ASSERT_OK(VerifySplitKeyError(tablet));
+ }
+ 
++TEST_F_EX(TabletSplitITest, SplitOpApplyAfterLeaderChange, TabletSplitExternalMiniClusterITest) {
++  constexpr auto kNumRows = kDefaultNumRows;
++
++  ASSERT_OK(cluster_->SetFlagOnMasters("enable_load_balancing", "false"));
++
++  auto ts_map = ASSERT_RESULT(itest::CreateTabletServerMap(
++      cluster_->GetLeaderMasterProxy<master::MasterClusterProxy>(), &cluster_->proxy_cache()));
++
++  CreateSingleTablet();
++  ASSERT_OK(WriteRowsAndFlush(kNumRows));
++  const auto source_tablet_id = ASSERT_RESULT(GetOnlyTestTabletId());
++  LOG(INFO) << "Source tablet ID: " << source_tablet_id;
++
++  // Select tserver to pause making sure it is not leader for source tablet (just for master to not
++  // wait for re-election and GetSplitKey timeout before proceeding with the split).
++  const auto paused_ts_idx =
++      (ASSERT_RESULT(cluster_->GetTabletLeaderIndex(source_tablet_id)) + 1) %
++      cluster_->num_tablet_servers();
++  auto* paused_ts = cluster_->tablet_server(paused_ts_idx);
++
++  // We want to avoid leader changes in child tablets for this test.
++  // Disabling leader failure detection for paused_ts now before pausing it.
++  // And will disable it for other tservers after child tablets are created and their leaders are
++  // elected.
++  ASSERT_OK(cluster_->SetFlag(paused_ts, "enable_leader_failure_detection", "false"));
++
++  const auto paused_ts_id = paused_ts->uuid();
++  LOG(INFO) << Format("Pausing ts-$0: $1", paused_ts_idx + 1, paused_ts_id);
++  ASSERT_OK(paused_ts->Pause());
++
++  ASSERT_OK(SplitTablet(source_tablet_id));
++  // Wait for split to compete on all non-paused replicas.
++  for (size_t ts_idx = 0; ts_idx < cluster_->num_tablet_servers(); ++ts_idx) {
++    if (ts_idx != paused_ts_idx) {
++      ASSERT_OK(WaitForTablets(3, ts_idx));
++    }
++  }
++
++  // Make sure all test tablets have leaders.
++  const auto tablet_ids = ASSERT_RESULT(GetTestTableTabletIds());
++  for (auto& tablet_id : tablet_ids) {
++    itest::TServerDetails* leader;
++    ASSERT_OK(FindTabletLeader(ts_map, tablet_id, kRpcTimeout, &leader));
++  }
++
++  // We want to avoid leader changes in child tablets for this test.
++  for (size_t ts_idx = 0; ts_idx < cluster_->num_tablet_servers(); ++ts_idx) {
++    if (ts_idx != paused_ts_idx) {
++      ASSERT_OK(cluster_->SetFlag(
++          cluster_->tablet_server(ts_idx), "enable_leader_failure_detection", "false"));
++    }
++  }
++
++  struct TabletLeaderInfo {
++    PeerId peer_id;
++    int64_t term;
++  };
++
++  auto get_leader_info = [&](const TabletId& tablet_id) -> Result<TabletLeaderInfo> {
++    const auto leader_idx = VERIFY_RESULT(cluster_->GetTabletLeaderIndex(tablet_id));
++    const auto leader_peer_id = cluster_->tablet_server(leader_idx)->uuid();
++    LOG(INFO) << "Tablet " << tablet_id << " leader: " << leader_peer_id << " idx: " << leader_idx;
++    consensus::ConsensusStatePB cstate;
++    RETURN_NOT_OK(itest::GetConsensusState(
++        ts_map[leader_peer_id].get(), tablet_id, consensus::CONSENSUS_CONFIG_ACTIVE, kRpcTimeout,
++        &cstate));
++    LOG(INFO) << "Tablet " << tablet_id << " cstate: " << cstate.DebugString();
++    return TabletLeaderInfo {
++        .peer_id = leader_peer_id,
++        .term = cstate.current_term(),
++    };
++  };
++
++  std::unordered_map<TabletId, TabletLeaderInfo> leader_info;
++  int64_t max_leader_term = 0;
++  for (auto& tablet_id : tablet_ids) {
++    auto info = ASSERT_RESULT(get_leader_info(tablet_id));
++    max_leader_term = std::max(max_leader_term, info.term);
++    leader_info[tablet_id] = info;
++  }
++  LOG(INFO) << "Max leader term: " << max_leader_term;
++
++  // Make source tablet to advance term to larger than max_leader_term, so resumed replica will
++  // apply split in later term than child leader replicas have.
++  while (leader_info[source_tablet_id].term <= max_leader_term) {
++    ASSERT_OK(itest::LeaderStepDown(
++        ts_map[leader_info[source_tablet_id].peer_id].get(), source_tablet_id, nullptr,
++        kRpcTimeout));
++
++    const auto source_leader_term = leader_info[source_tablet_id].term;
++    ASSERT_OK(LoggedWaitFor(
++        [&]() -> Result<bool> {
++          auto result = get_leader_info(source_tablet_id);
++          if (!result.ok()) {
++            return false;
++          }
++          leader_info[source_tablet_id] = *result;
++          return result->term > source_leader_term;
++        },
++        30s * kTimeMultiplier,
++        Format("Waiting for term >$0 on source tablet ...", source_leader_term)));
++  }
++
++  ASSERT_OK(paused_ts->Resume());
++  // To avoid term changes.
++  ASSERT_OK(cluster_->SetFlag(paused_ts, "enable_leader_failure_detection", "false"));
++
++  // Wait for all replicas to have only 2 child tablets (parent tablet will be deleted).
++  for (size_t ts_idx = 0; ts_idx < cluster_->num_tablet_servers(); ++ts_idx) {
++    ASSERT_OK(WaitForTablets(2, ts_idx));
++  }
++
++  ASSERT_OK(cluster_->WaitForTabletsRunning(paused_ts, 20s * kTimeMultiplier));
++
++  // Make sure resumed replicas are not ahead of leader.
++  const auto child_tablet_ids = ASSERT_RESULT(GetTestTableTabletIds());
++  for (auto& child_tablet_id : child_tablet_ids) {
++    consensus::ConsensusStatePB cstate;
++    ASSERT_OK(itest::GetConsensusState(
++        ts_map[paused_ts_id].get(), child_tablet_id, consensus::CONSENSUS_CONFIG_ACTIVE,
++        kRpcTimeout, &cstate));
++    LOG(INFO) << "Child tablet " << child_tablet_id
++              << " resumed replica cstate: " << cstate.DebugString();
++
++    ASSERT_LE(cstate.current_term(), leader_info[child_tablet_id].term);
++  }
++}
++
+ namespace {
+ 
+ PB_ENUM_FORMATTERS(IsolationLevel);
+diff --git a/src/yb/tablet/operations.proto b/src/yb/tablet/operations.proto
+index 43dc4f8468..a7406fa904 100644
+--- a/src/yb/tablet/operations.proto
++++ b/src/yb/tablet/operations.proto
+@@ -18,6 +18,7 @@ option java_package = "org.yb.tablet";
+ 
+ import "yb/common/common.proto";
+ import "yb/common/transaction.proto";
++import "yb/consensus/metadata.proto";
+ import "yb/docdb/docdb.proto";
+ import "yb/tablet/metadata.proto";
+ 
+@@ -123,4 +124,11 @@ message SplitTabletRequestPB {
+   required bytes split_partition_key = 6;
+ 
+   required bytes split_encoded_key = 7;
++
++  // TODO(tsplit): after we support backward-compatibility conversion for protobufs, switch
++  // SplitOperation class to use a new SplitOperationDataPB that contains both SplitTabletRequestPB
++  // and the following fields that are not part of SplitTablet RPC.
++
++  // Parent tablet leader UUID from SPLIT_OP term.
++  optional string split_parent_leader_uuid = 8;
+ }
+diff --git a/src/yb/tablet/operations/operation.h b/src/yb/tablet/operations/operation.h
+index 122d9d116b..74aa4b84f2 100644
+--- a/src/yb/tablet/operations/operation.h
++++ b/src/yb/tablet/operations/operation.h
+@@ -257,6 +257,11 @@ struct RequestTraits {
+ 
+ consensus::ReplicateMsgPtr CreateReplicateMsg(OperationType op_type);
+ 
++// Request here actually means serializable part of operation state.
++// When creating new XxxOperation class inherited from OperationBase, it is better to declare
++// separate protobuf XxxOperationDataPB wrapping original RPC request and use XxxOperationDataPB as
++// a Request. This way it will be easier to add into XxxOperationDataPB more fields that are not
++// part of RPC request, but should be stored in Raft log.
+ template <OperationType op_type, class Request, class Base = Operation>
+ class OperationBase : public Base {
+  public:
+diff --git a/src/yb/tablet/tablet_bootstrap.cc b/src/yb/tablet/tablet_bootstrap.cc
+index c876333028..0e0ee6e7d3 100644
+--- a/src/yb/tablet/tablet_bootstrap.cc
++++ b/src/yb/tablet/tablet_bootstrap.cc
+@@ -989,6 +989,7 @@ class TabletBootstrap {
+     }
+ 
+     SplitOperation operation(tablet_.get(), data_.tablet_init_data.tablet_splitter, split_request);
++    operation.set_op_id(OpId::FromPB(replicate_msg->id()));
+     operation.set_hybrid_time(HybridTime(replicate_msg->hybrid_time()));
+     return data_.tablet_init_data.tablet_splitter->ApplyTabletSplit(&operation, log_.get());
+ 
+diff --git a/src/yb/tserver/service_util.cc b/src/yb/tserver/service_util.cc
+index a9accc918d..af7abb1b53 100644
+--- a/src/yb/tserver/service_util.cc
++++ b/src/yb/tserver/service_util.cc
+@@ -249,7 +249,8 @@ Result<TabletPeerTablet> LookupTabletPeer(
+   // Check RUNNING state.
+   tablet::RaftGroupStatePB state = result.tablet_peer->state();
+   if (PREDICT_FALSE(state != tablet::RUNNING)) {
+-    Status s = STATUS(IllegalState, "Tablet not RUNNING", tablet::RaftGroupStateError(state))
++    Status s = STATUS(IllegalState,  Format("Tablet $0 not RUNNING", tablet_id),
++                      tablet::RaftGroupStateError(state))
+         .CloneAndAddErrorCode(TabletServerError(TabletServerErrorPB::TABLET_NOT_RUNNING));
+     return s;
+   }
+diff --git a/src/yb/tserver/tablet_server-test.cc b/src/yb/tserver/tablet_server-test.cc
+index ec0f52043b..eaf879dc06 100644
+--- a/src/yb/tserver/tablet_server-test.cc
++++ b/src/yb/tserver/tablet_server-test.cc
+@@ -578,7 +578,8 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
+   // We're expecting the write to fail.
+   ASSERT_OK(DCHECK_NOTNULL(proxy_.get())->Write(req, &resp, &controller));
+   ASSERT_EQ(TabletServerErrorPB::TABLET_NOT_RUNNING, resp.error().code());
+-  ASSERT_STR_CONTAINS(resp.error().status().message(), "Tablet not RUNNING: FAILED");
++  ASSERT_STR_CONTAINS(
++      resp.error().status().message(), Format("Tablet $0 not RUNNING: FAILED", kTabletId));
+ }
+ 
+ TEST_F(TabletServerTest, TestCreateTablet_TabletExists) {
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index b579b171cd..cbb91e584a 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1506,13 +1506,25 @@ void TabletServiceAdminImpl::SplitTablet(
+     }
+   }
+ 
+-  auto state = std::make_unique<tablet::SplitOperation>(
++  const auto consensus = leader_tablet_peer.peer->shared_consensus();
++  if (consensus == nullptr) {
++    SetupErrorAndRespond(
++        resp->mutable_error(),
++        STATUS_FORMAT(InvalidArgument, "Tablet $0 has no consensus", req->tablet_id()),
++        TabletServerErrorPB::TABLET_NOT_RUNNING, &context);
++    return;
++  }
++
++  auto operation = std::make_unique<tablet::SplitOperation>(
+       leader_tablet_peer.peer->tablet(), server_->tablet_manager(), req);
++  *operation->AllocateRequest() = *req;
++  operation->mutable_request()->set_split_parent_leader_uuid(
++      leader_tablet_peer.peer->permanent_uuid());
+ 
+-  state->set_completion_callback(
++  operation->set_completion_callback(
+       MakeRpcOperationCompletionCallback(std::move(context), resp, server_->Clock()));
+ 
+-  leader_tablet_peer.peer->Submit(std::move(state), leader_tablet_peer.leader_term);
++  leader_tablet_peer.peer->Submit(std::move(operation), leader_tablet_peer.leader_term);
+ }
+ 
+ void TabletServiceAdminImpl::UpgradeYsql(
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index a0488b4d1f..65153136dc 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -827,6 +827,10 @@ Status TSTabletManager::ApplyTabletSplit(tablet::SplitOperation* operation, log:
+     return STATUS_FORMAT(IllegalState, "Manager is not running: $0", state());
+   }
+ 
++  const auto& split_op_id = operation->op_id();
++  SCHECK_FORMAT(
++      split_op_id.valid() && !split_op_id.empty(), InvalidArgument,
++      "Incorrect ID for SPLIT_OP: $0", operation->ToString());
+   auto* tablet = CHECK_NOTNULL(operation->tablet());
+   const auto tablet_id = tablet->tablet_id();
+   const auto* request = operation->request();
+@@ -834,19 +838,20 @@ Status TSTabletManager::ApplyTabletSplit(tablet::SplitOperation* operation, log:
+       request->tablet_id(), tablet_id, IllegalState,
+       Format(
+           "Unexpected SPLIT_OP $0 designated for tablet $1 to be applied to tablet $2",
+-          operation->op_id(), request->tablet_id(), tablet_id));
++          split_op_id, request->tablet_id(), tablet_id));
+   SCHECK(
+       tablet_id != request->new_tablet1_id() && tablet_id != request->new_tablet2_id(),
+       IllegalState,
+       Format(
+           "One of SPLIT_OP $0 destination tablet IDs ($1, $2) is the same as source tablet ID $3",
+-          operation->op_id(), request->new_tablet1_id(), request->new_tablet2_id(), tablet_id));
++          split_op_id, request->new_tablet1_id(), request->new_tablet2_id(), tablet_id));
+ 
+   LOG_WITH_PREFIX(INFO) << "Tablet " << tablet_id << " split operation apply started";
+ 
++  auto tablet_peer = VERIFY_RESULT(LookupTablet(tablet_id));
++  auto* raft_consensus = tablet_peer->raft_consensus();
+   if (raft_log == nullptr) {
+-    auto tablet_peer = VERIFY_RESULT(LookupTablet(tablet_id));
+-    raft_log = tablet_peer->raft_consensus()->log().get();
++    raft_log = raft_consensus->log().get();
+   }
+ 
+   MAYBE_FAULT(FLAGS_TEST_fault_crash_in_split_before_log_flushed);
+@@ -889,28 +894,38 @@ Status TSTabletManager::ApplyTabletSplit(tablet::SplitOperation* operation, log:
+   });
+ 
+   std::unique_ptr<ConsensusMetadata> cmeta;
+-  RETURN_NOT_OK(ConsensusMetadata::Load(fs_manager_, tablet_id, fs_manager_->uuid(), &cmeta));
++  RETURN_NOT_OK(ConsensusMetadata::Create(
++      fs_manager_, tablet_id, fs_manager_->uuid(), raft_consensus->CommittedConfigUnlocked(),
++      split_op_id.term, &cmeta));
++  if (request->has_split_parent_leader_uuid()) {
++    cmeta->set_leader_uuid(request->split_parent_leader_uuid());
++    LOG_WITH_PREFIX(INFO) << "Using consensus state: "
++                          << cmeta
++                                 ->ToConsensusStatePB(
++                                     consensus::ConsensusConfigType::CONSENSUS_CONFIG_COMMITTED)
++                                 .ShortDebugString();
++  }
++  cmeta->set_split_parent_tablet_id(tablet_id);
+ 
+   for (auto& tcmeta : tcmetas) {
+     const auto& new_tablet_id = tcmeta.tablet_id;
+ 
+     // Copy raft group metadata.
+     tcmeta.raft_group_metadata = VERIFY_RESULT(tablet->CreateSubtablet(
+-        new_tablet_id, tcmeta.partition, tcmeta.key_bounds, operation->op_id(),
++        new_tablet_id, tcmeta.partition, tcmeta.key_bounds, split_op_id,
+         operation->hybrid_time()));
+     LOG_WITH_PREFIX(INFO) << "Created raft group metadata for table: " << table_id
+                           << " tablet: " << new_tablet_id;
+ 
+-    // Copy consensus metadata.
++    // Store consensus metadata.
+     // Here we reuse the same cmeta instance for both new tablets. This is safe, because:
+     // 1) Their consensus metadata only differ by tablet id.
+-    // 2) Flush() will save it into a new path corresponding to tablet id we set before flushing.
++    // 2) Flush() will save it into a new path corresponding to tablet ID we set before flushing.
+     cmeta->set_tablet_id(new_tablet_id);
+-    cmeta->set_split_parent_tablet_id(tablet_id);
+     RETURN_NOT_OK(cmeta->Flush());
+ 
+     const auto& dest_wal_dir = tcmeta.raft_group_metadata->wal_dir();
+-    RETURN_NOT_OK(raft_log->CopyTo(dest_wal_dir));
++    RETURN_NOT_OK(raft_log->CopyTo(dest_wal_dir, split_op_id));
+ 
+     MAYBE_FAULT(FLAGS_TEST_fault_crash_in_split_after_log_copied);
+ 
+@@ -918,7 +933,7 @@ Status TSTabletManager::ApplyTabletSplit(tablet::SplitOperation* operation, log:
+     RETURN_NOT_OK(tcmeta.raft_group_metadata->Flush());
+   }
+ 
+-  meta.SetSplitDone(operation->op_id(), request->new_tablet1_id(), request->new_tablet2_id());
++  meta.SetSplitDone(split_op_id, request->new_tablet1_id(), request->new_tablet2_id());
+   RETURN_NOT_OK(meta.Flush());
+ 
+   tablet->SplitDone();

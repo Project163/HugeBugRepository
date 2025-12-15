@@ -1,0 +1,1969 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index d7cde42e7..84f12dfae 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -95,6 +95,18 @@ jobs:
+         #   tox_extra_args: "-n 4 mypyc/test/test_run.py mypyc/test/test_external.py"
+         #   debug_build: true
+ 
++        - name: Parallel tests with py314-ubuntu, interpreted
++          python: '3.14'
++          os: ubuntu-24.04-arm
++          toxenv: py
++          tox_extra_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
++        - name: Parallel tests with py314-ubuntu, mypyc-compiled
++          python: '3.14'
++          os: ubuntu-24.04-arm
++          toxenv: py
++          tox_extra_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
++          test_mypyc: true
++
+         - name: Type check our own code (py310-ubuntu)
+           python: '3.10'
+           os: ubuntu-latest
+diff --git a/mypy/build.py b/mypy/build.py
+index 3b6428c15..d6d6a8ba9 100644
+--- a/mypy/build.py
++++ b/mypy/build.py
+@@ -13,18 +13,22 @@ The function build() is the main interface to this module.
+ 
+ from __future__ import annotations
+ 
++import base64
+ import collections
+ import contextlib
+ import gc
+ import json
+ import os
++import pickle
+ import platform
+ import re
+ import stat
++import subprocess
+ import sys
+ import time
+ import types
+ from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
++from heapq import heappop, heappush
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+@@ -39,12 +43,19 @@ from typing import (
+ from librt.internal import cache_version
+ 
+ import mypy.semanal_main
+-from mypy.cache import CACHE_VERSION, CacheMeta, ReadBuffer, WriteBuffer
++from mypy.cache import CACHE_VERSION, CacheMeta, ReadBuffer, WriteBuffer, write_json
+ from mypy.checker import TypeChecker
++from mypy.defaults import (
++    WORKER_CONNECTION_TIMEOUT,
++    WORKER_DONE_TIMEOUT,
++    WORKER_START_INTERVAL,
++    WORKER_START_TIMEOUT,
++)
+ from mypy.error_formatter import OUTPUT_CHOICES, ErrorFormatter
+ from mypy.errors import CompileError, ErrorInfo, Errors, report_internal_error
+ from mypy.graph_utils import prepare_sccs, strongly_connected_components, topsort
+ from mypy.indirection import TypeIndirectionVisitor
++from mypy.ipc import BadStatus, IPCClient, read_status, ready_to_read, receive, send
+ from mypy.messages import MessageBuilder
+ from mypy.nodes import Import, ImportAll, ImportBase, ImportFrom, MypyFile, SymbolTable
+ from mypy.partially_defined import PossiblyUndefinedVariableVisitor
+@@ -120,6 +131,10 @@ CORE_BUILTIN_MODULES: Final = {
+ # We are careful now, we can increase this in future if safe/useful.
+ MAX_GC_FREEZE_CYCLES = 1
+ 
++# We store status of initial GC freeze as a global variable to avoid memory
++# leaks in tests, where we keep creating new BuildManagers in the same process.
++initial_gc_freeze_done = False
++
+ Graph: _TypeAlias = dict[str, "State"]
+ 
+ 
+@@ -128,13 +143,18 @@ class SCC:
+ 
+     id_counter: ClassVar[int] = 0
+ 
+-    def __init__(self, ids: set[str]) -> None:
+-        self.id = SCC.id_counter
+-        SCC.id_counter += 1
++    def __init__(
++        self, ids: set[str], scc_id: int | None = None, deps: list[int] | None = None
++    ) -> None:
++        if scc_id is None:
++            self.id = SCC.id_counter
++            SCC.id_counter += 1
++        else:
++            self.id = scc_id
+         # Ids of modules in this cycle.
+         self.mod_ids = ids
+         # Direct dependencies, should be populated by the caller.
+-        self.deps: set[int] = set()
++        self.deps: set[int] = set(deps) if deps is not None else set()
+         # Direct dependencies that have not been processed yet.
+         # Should be populated by the caller. This set may change during graph
+         # processing, while the above stays constant.
+@@ -143,6 +163,9 @@ class SCC:
+         # make processing order more predictable. Dependents will be notified
+         # that they may be ready in the order in this list.
+         self.direct_dependents: list[int] = []
++        # Rough estimate of how much time processing this SCC will take, this
++        # is used for more efficient scheduling across multiple build workers.
++        self.size_hint: int = 0
+ 
+ 
+ # TODO: Get rid of BuildResult.  We might as well return a BuildManager.
+@@ -166,6 +189,57 @@ class BuildResult:
+         self.errors: list[str] = []  # Filled in by build if desired
+ 
+ 
++class WorkerClient:
++    """A simple class that represents a mypy build worker."""
++
++    conn: IPCClient
++
++    def __init__(self, status_file: str, options_data: str, env: Mapping[str, str]) -> None:
++        self.status_file = status_file
++        if os.path.isfile(status_file):
++            os.unlink(status_file)
++
++        command = [
++            sys.executable,
++            "-m",
++            "mypy.build_worker",
++            f"--status-file={status_file}",
++            f'--options-data="{options_data}"',
++        ]
++        # Return early without waiting, caller must call connect() before using the client.
++        self.proc = subprocess.Popen(command, env=env)
++
++    def connect(self) -> None:
++        end_time = time.time() + WORKER_START_TIMEOUT
++        while time.time() < end_time:
++            try:
++                data = read_status(self.status_file)
++            except BadStatus:
++                time.sleep(WORKER_START_INTERVAL)
++                continue
++            try:
++                pid, connection_name = data["pid"], data["connection_name"]
++                assert isinstance(pid, int) and isinstance(connection_name, str)
++                # Double-check this status file is created by us.
++                assert pid == self.proc.pid
++                self.conn = IPCClient(connection_name, WORKER_CONNECTION_TIMEOUT)
++                return
++            except Exception:
++                break
++        print("Failed to establish connection with worker")
++        sys.exit(2)
++
++    def close(self) -> None:
++        self.conn.close()
++        # Technically we don't need to wait, but otherwise we will get ResourceWarnings.
++        try:
++            self.proc.wait(timeout=1)
++        except subprocess.TimeoutExpired:
++            pass
++        if os.path.isfile(self.status_file):
++            os.unlink(self.status_file)
++
++
+ def build_error(msg: str) -> NoReturn:
+     raise CompileError([f"mypy: error: {msg}"])
+ 
+@@ -179,6 +253,7 @@ def build(
+     stdout: TextIO | None = None,
+     stderr: TextIO | None = None,
+     extra_plugins: Sequence[Plugin] | None = None,
++    worker_env: Mapping[str, str] | None = None,
+ ) -> BuildResult:
+     """Analyze a program.
+ 
+@@ -200,7 +275,7 @@ def build(
+         (takes precedence over other directories)
+       flush_errors: optional function to flush errors after a file is processed
+       fscache: optionally a file-system cacher
+-
++      worker_env: An environment to start parallel build workers (used for tests)
+     """
+     # If we were not given a flush_errors, we use one that will populate those
+     # fields for callers that want the traditional API.
+@@ -219,9 +294,32 @@ def build(
+     stderr = stderr or sys.stderr
+     extra_plugins = extra_plugins or []
+ 
++    workers = []
++    if options.num_workers > 0:
++        # TODO: switch to something more efficient than pickle (also in the daemon).
++        pickled_options = pickle.dumps(options.snapshot())
++        options_data = base64.b64encode(pickled_options).decode()
++        workers = [
++            WorkerClient(f".mypy_worker.{idx}.json", options_data, worker_env or os.environ)
++            for idx in range(options.num_workers)
++        ]
++        sources_data = sources_to_bytes(sources)
++        for worker in workers:
++            # Start loading graph in each worker as soon as it is up.
++            worker.connect()
++            worker.conn.write_bytes(sources_data)
++
+     try:
+-        result = _build(
+-            sources, options, alt_lib_path, flush_errors, fscache, stdout, stderr, extra_plugins
++        result = build_inner(
++            sources,
++            options,
++            alt_lib_path,
++            flush_errors,
++            fscache,
++            stdout,
++            stderr,
++            extra_plugins,
++            workers,
+         )
+         result.errors = messages
+         return result
+@@ -234,9 +332,17 @@ def build(
+         flush_errors(None, e.messages, serious)
+         e.messages = messages
+         raise
++    finally:
++        for worker in workers:
++            try:
++                send(worker.conn, {"final": True})
++            except OSError:
++                pass
++        for worker in workers:
++            worker.close()
+ 
+ 
+-def _build(
++def build_inner(
+     sources: list[BuildSource],
+     options: Options,
+     alt_lib_path: str | None,
+@@ -245,6 +351,7 @@ def _build(
+     stdout: TextIO,
+     stderr: TextIO,
+     extra_plugins: Sequence[Plugin],
++    workers: list[WorkerClient],
+ ) -> BuildResult:
+     if platform.python_implementation() == "CPython":
+         # Run gc less frequently, as otherwise we can spent a large fraction of
+@@ -294,6 +401,7 @@ def _build(
+         stdout=stdout,
+         stderr=stderr,
+     )
++    manager.workers = workers
+     if manager.verbosity() >= 2:
+         manager.trace(repr(options))
+ 
+@@ -596,6 +704,7 @@ class BuildManager:
+         stdout: TextIO,
+         stderr: TextIO,
+         error_formatter: ErrorFormatter | None = None,
++        parallel_worker: bool = False,
+     ) -> None:
+         self.stats: dict[str, Any] = {}  # Values are ints or floats
+         self.stdout = stdout
+@@ -669,7 +778,7 @@ class BuildManager:
+                 ]
+             )
+ 
+-        self.metastore = create_metastore(options)
++        self.metastore = create_metastore(options, parallel_worker)
+ 
+         # a mapping from source files to their corresponding shadow files
+         # for efficient lookup
+@@ -704,12 +813,21 @@ class BuildManager:
+         # Global topological order for SCCs. This exists to make order of processing
+         # SCCs more predictable.
+         self.top_order: list[int] = []
+-        # Stale SCCs that are queued for processing. Note that as of now we have just
+-        # one worker, that is the same process. In the future, we will support multiple
+-        # parallel worker processes.
+-        self.scc_queue: list[SCC] = []
++        # Stale SCCs that are queued for processing. Each tuple contains SCC size hint,
++        # SCC adding order (tie-breaker), and the SCC itself.
++        self.scc_queue: list[tuple[int, int, SCC]] = []
+         # SCCs that have been fully processed.
+         self.done_sccs: set[int] = set()
++        # Parallel build workers, list is empty for in-process type-checking.
++        self.workers: list[WorkerClient] = []
++        # We track which workers are currently free in the coordinator process.
++        # This is a tiny bit faster and conceptually simpler than check which ones
++        # are writeable each time we want to submit an SCC for processing.
++        self.free_workers: set[int] = set()
++        # A global adding order for SCC queue, see comment above.
++        self.queue_order: int = 0
++        # Is this an instance used by a parallel worker?
++        self.parallel_worker = parallel_worker
+ 
+     def dump_stats(self) -> None:
+         if self.options.dump_build_stats:
+@@ -910,21 +1028,64 @@ class BuildManager:
+         return self.stats
+ 
+     def submit(self, sccs: list[SCC]) -> None:
+-        """Submit a stale SCC for processing in current process."""
+-        self.scc_queue.extend(sccs)
+-
+-    def wait_for_done(self, graph: Graph) -> tuple[list[SCC], bool]:
+-        """Wait for a stale SCC processing (in process) to finish.
+-
+-        Return next processed SCC and whether we have more in the queue.
+-        This emulates the API we will have for parallel processing
+-        in multiple worker processes.
++        """Submit a stale SCC for processing in current process or parallel workers."""
++        if self.workers:
++            self.submit_to_workers(sccs)
++        else:
++            self.scc_queue.extend([(0, 0, scc) for scc in sccs])
++
++    def submit_to_workers(self, sccs: list[SCC] | None = None) -> None:
++        if sccs is not None:
++            for scc in sccs:
++                heappush(self.scc_queue, (-scc.size_hint, self.queue_order, scc))
++                self.queue_order += 1
++        while self.scc_queue and self.free_workers:
++            idx = self.free_workers.pop()
++            _, _, scc = heappop(self.scc_queue)
++            send(self.workers[idx].conn, {"scc_id": scc.id})
++
++    def wait_for_done(
++        self, graph: Graph
++    ) -> tuple[list[SCC], bool, dict[str, tuple[str, list[str]]]]:
++        """Wait for a stale SCC processing to finish.
++
++        Return a tuple three items:
++          * processed SCCs
++          * whether we have more in the queue
++          * new interface hash and list of errors for each module
++        The last item is only used for parallel processing.
+         """
++        if self.workers:
++            return self.wait_for_done_workers()
+         if not self.scc_queue:
+-            return [], False
+-        next_scc = self.scc_queue.pop(0)
++            return [], False, {}
++        _, _, next_scc = self.scc_queue.pop(0)
+         process_stale_scc(graph, next_scc, self)
+-        return [next_scc], bool(self.scc_queue)
++        return [next_scc], bool(self.scc_queue), {}
++
++    def wait_for_done_workers(self) -> tuple[list[SCC], bool, dict[str, tuple[str, list[str]]]]:
++        if not self.scc_queue and len(self.free_workers) == len(self.workers):
++            return [], False, {}
++
++        done_sccs = []
++        results = {}
++        for idx in ready_to_read([w.conn for w in self.workers], WORKER_DONE_TIMEOUT):
++            data = receive(self.workers[idx].conn)
++            self.free_workers.add(idx)
++            scc_id = data["scc_id"]
++            if "blocker" in data:
++                blocker = data["blocker"]
++                raise CompileError(
++                    blocker["messages"], blocker["use_stdout"], blocker["module_with_blocker"]
++                )
++            results.update({k: tuple(v) for k, v in data["result"].items()})
++            done_sccs.append(self.scc_by_id[scc_id])
++        self.submit_to_workers()  # advance after some workers are free.
++        return (
++            done_sccs,
++            bool(self.scc_queue) or len(self.free_workers) < len(self.workers),
++            results,
++        )
+ 
+ 
+ def deps_to_json(x: dict[str, set[str]]) -> bytes:
+@@ -1245,10 +1406,13 @@ def exclude_from_backups(target_dir: str) -> None:
+         pass
+ 
+ 
+-def create_metastore(options: Options) -> MetadataStore:
++def create_metastore(options: Options, parallel_worker: bool = False) -> MetadataStore:
+     """Create the appropriate metadata store."""
+     if options.sqlite_cache:
+-        mds: MetadataStore = SqliteMetadataStore(_cache_dir_prefix(options))
++        # We use this flag in both coordinator and workers to seep up commits,
++        # see mypy.metastore.connect_db() for details.
++        sync_off = options.num_workers > 0 or parallel_worker
++        mds: MetadataStore = SqliteMetadataStore(_cache_dir_prefix(options), sync_off=sync_off)
+     else:
+         mds = FilesystemMetadataStore(_cache_dir_prefix(options))
+     return mds
+@@ -1308,13 +1472,16 @@ def options_snapshot(id: str, manager: BuildManager) -> dict[str, object]:
+     return {"platform": platform_opt, "other_options": hash_digest(json_dumps(snapshot))}
+ 
+ 
+-def find_cache_meta(id: str, path: str, manager: BuildManager) -> CacheMeta | None:
++def find_cache_meta(
++    id: str, path: str, manager: BuildManager, skip_validation: bool = False
++) -> CacheMeta | None:
+     """Find cache data for a module.
+ 
+     Args:
+       id: module ID
+       path: module path
+       manager: the build manager (for pyversion, log/trace, and build options)
++      skip_validation: if True skip any validation steps (used for parallel checking)
+ 
+     Returns:
+       A CacheMeta instance if the cache data was found and appears
+@@ -1362,6 +1529,8 @@ def find_cache_meta(id: str, path: str, manager: BuildManager) -> CacheMeta | No
+     manager.add_stats(
+         load_meta_time=t2 - t0, load_meta_load_time=t1 - t0, load_meta_from_dict_time=t2 - t1
+     )
++    if skip_validation:
++        return m
+ 
+     # Ignore cache if generated by an older mypy version.
+     if m.version_id != manager.version_id and not manager.options.skip_version_check:
+@@ -1914,6 +2083,10 @@ class State:
+     # on a given source code line).
+     per_line_checking_time_ns: dict[int, int]
+ 
++    # Rough estimate of how much time it would take to process this file. Currently,
++    # we use file size as a proxy for complexity.
++    size_hint: int
++
+     def __init__(
+         self,
+         id: str | None,
+@@ -2016,6 +2189,7 @@ class State:
+                 if exist_added_packages(self.suppressed, manager, self.options):
+                     self.parse_file()  # This is safe because the cache is anyway stale.
+                     self.compute_dependencies()
++            self.size_hint = self.meta.size
+         else:
+             # When doing a fine-grained cache load, pretend we only
+             # know about modules that have cache information and defer
+@@ -2027,6 +2201,22 @@ class State:
+             # Parse the file (and then some) to get the dependencies.
+             self.parse_file(temporary=temporary)
+             self.compute_dependencies()
++            if self.manager.workers:
++                # We don't need parsed trees in coordinator process, we parse only to
++                # compute dependencies.
++                self.tree = None
++
++    def reload_meta(self) -> None:
++        """Force reload of cache meta.
++
++        This is used by parallel checking workers to update shared information
++        that may have changed after initial graph loading. Currently, this is only
++        the interface hash.
++        """
++        assert self.path is not None
++        self.meta = find_cache_meta(self.id, self.path, self.manager, skip_validation=True)
++        assert self.meta is not None
++        self.interface_hash = self.meta.interface_hash
+ 
+     def add_ancestors(self) -> None:
+         if self.path is not None:
+@@ -2102,17 +2292,20 @@ class State:
+         return self.manager.load_fine_grained_deps(self.id)
+ 
+     def load_tree(self, temporary: bool = False) -> None:
+-        assert (
+-            self.meta is not None
+-        ), "Internal error: this method must be called only for cached modules"
++        if self.manager.parallel_worker:
++            assert self.path is not None
++            _, data_file, _ = get_cache_names(self.id, self.path, self.manager.options)
++        else:
++            assert (
++                self.meta is not None
++            ), "Internal error: this method must be called only for cached modules"
++            data_file = self.meta.data_file
+ 
+         data: bytes | dict[str, Any] | None
+         if self.options.fixed_format_cache:
+-            data = _load_ff_file(self.meta.data_file, self.manager, "Could not load tree: ")
++            data = _load_ff_file(data_file, self.manager, "Could not load tree: ")
+         else:
+-            data = _load_json_file(
+-                self.meta.data_file, self.manager, "Load tree ", "Could not load tree: "
+-            )
++            data = _load_json_file(data_file, self.manager, "Load tree ", "Could not load tree: ")
+         if data is None:
+             return
+ 
+@@ -2196,6 +2389,7 @@ class State:
+                 self.source_hash = compute_hash(source)
+ 
+             self.parse_inline_configuration(source)
++            self.size_hint = len(source)
+             if not cached:
+                 self.tree = manager.parse_file(
+                     self.id,
+@@ -2434,6 +2628,7 @@ class State:
+             self.free_state()
+             if not manager.options.fine_grained_incremental and not manager.options.preserve_asts:
+                 free_tree(self.tree)
++                self.tree.defs.clear()
+         self.time_spent_us += time_spent_us(t0)
+ 
+     def free_state(self) -> None:
+@@ -2894,6 +3089,18 @@ def dispatch(sources: list[BuildSource], manager: BuildManager, stdout: TextIO)
+     log_configuration(manager, sources)
+ 
+     t0 = time.time()
++
++    # We disable GC while loading the graph as a performance optimization for
++    # cold-cache runs. The parsed ASTs are trees, and therefore should not have any
++    # reference cycles. This is an important optimization, since we create a lot of
++    # new objects while parsing files.
++    global initial_gc_freeze_done
++    if (
++        not manager.options.test_env
++        and platform.python_implementation() == "CPython"
++        and not initial_gc_freeze_done
++    ):
++        gc.disable()
+     graph = load_graph(sources, manager)
+ 
+     # This is a kind of unfortunate hack to work around some of fine-grained's
+@@ -2907,6 +3114,16 @@ def dispatch(sources: list[BuildSource], manager: BuildManager, stdout: TextIO)
+         manager.cache_enabled = False
+         graph = load_graph(sources, manager)
+ 
++    if (
++        not manager.options.test_env
++        and platform.python_implementation() == "CPython"
++        and not initial_gc_freeze_done
++    ):
++        gc.freeze()
++        gc.unfreeze()
++        gc.enable()
++        initial_gc_freeze_done = True
++
+     for id in graph:
+         manager.import_map[id] = set(graph[id].dependencies + graph[id].suppressed)
+ 
+@@ -3319,6 +3536,18 @@ def process_graph(graph: Graph, manager: BuildManager) -> None:
+     manager.scc_by_id = scc_by_id
+     manager.top_order = [scc.id for scc in sccs]
+ 
++    # Broadcast SCC structure to the parallel workers, since they don't compute it.
++    sccs_data = sccs_to_bytes(sccs)
++    for worker in manager.workers:
++        data = receive(worker.conn)
++        assert data["status"] == "ok"
++        worker.conn.write_bytes(sccs_data)
++    for worker in manager.workers:
++        data = receive(worker.conn)
++        assert data["status"] == "ok"
++
++    manager.free_workers = set(range(manager.options.num_workers))
++
+     # Prime the ready list with leaf SCCs (that have no dependencies).
+     ready = []
+     not_ready = []
+@@ -3332,6 +3561,9 @@ def process_graph(graph: Graph, manager: BuildManager) -> None:
+     while ready or not_ready or still_working:
+         stale, fresh = find_stale_sccs(ready, graph, manager)
+         if stale:
++            for scc in stale:
++                for id in scc.mod_ids:
++                    graph[id].mark_as_rechecked()
+             manager.submit(stale)
+             still_working = True
+         # We eagerly walk over fresh SCCs to reach as many stale SCCs as soon
+@@ -3341,7 +3573,17 @@ def process_graph(graph: Graph, manager: BuildManager) -> None:
+         if fresh:
+             done = fresh
+         else:
+-            done, still_working = manager.wait_for_done(graph)
++            done, still_working, results = manager.wait_for_done(graph)
++            # Expose the results of type-checking by workers. For in-process
++            # type-checking this is already done and results should be empty here.
++            if not manager.workers:
++                assert not results
++            for id, (interface_cache, errors) in results.items():
++                new_hash = bytes.fromhex(interface_cache)
++                if new_hash != graph[id].interface_hash:
++                    graph[id].mark_interface_stale()
++                    graph[id].interface_hash = new_hash
++                manager.flush_errors(manager.errors.simplify_path(graph[id].xpath), errors, False)
+         ready = []
+         for done_scc in done:
+             for dependent in done_scc.direct_dependents:
+@@ -3414,9 +3656,12 @@ def process_fresh_modules(graph: Graph, modules: list[str], manager: BuildManage
+     manager.add_stats(process_fresh_time=t2 - t0, load_tree_time=t1 - t0)
+ 
+ 
+-def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
++def process_stale_scc(
++    graph: Graph, ascc: SCC, manager: BuildManager
++) -> dict[str, tuple[str, list[str]]]:
+     """Process the modules in one SCC from source code."""
+     # First verify if all transitive dependencies are loaded in the current process.
++    t0 = time.time()
+     missing_sccs = set()
+     sccs_to_find = ascc.deps.copy()
+     while sccs_to_find:
+@@ -3432,6 +3677,14 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+         fresh_sccs_to_load = [
+             manager.scc_by_id[sid] for sid in manager.top_order if sid in missing_sccs
+         ]
++
++        if manager.parallel_worker:
++            # Update cache metas as well, cache data is loaded below
++            # in process_fresh_modules().
++            for prev_scc in fresh_sccs_to_load:
++                for mod_id in prev_scc.mod_ids:
++                    graph[mod_id].reload_meta()
++
+         manager.log(f"Processing {len(fresh_sccs_to_load)} fresh SCCs")
+         if (
+             not manager.options.test_env
+@@ -3445,7 +3698,8 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+             # generation with the freeze()/unfreeze() trick below. This is arguably
+             # a hack, but it gives huge performance wins for large third-party
+             # libraries, like torch.
+-            gc.collect()
++            if manager.gc_freeze_cycles > 0:
++                gc.collect()
+             gc.disable()
+         for prev_scc in fresh_sccs_to_load:
+             manager.done_sccs.add(prev_scc.id)
+@@ -3460,8 +3714,11 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+             gc.unfreeze()
+             gc.enable()
+ 
++    t1 = time.time()
+     # Process the SCC in stable order.
+     scc = order_ascc_ex(graph, ascc)
++
++    t2 = time.time()
+     stale = scc
+     for id in stale:
+         # We may already have parsed the module, or not.
+@@ -3475,6 +3732,7 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+         assert typing_mod, "The typing module was not parsed"
+     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
+ 
++    t3 = time.time()
+     # Track what modules aren't yet done, so we can finish them as soon
+     # as possible, saving memory.
+     unfinished_modules = set(stale)
+@@ -3497,6 +3755,7 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+         graph[id].generate_unused_ignore_notes()
+         graph[id].generate_ignore_without_code_notes()
+ 
++    t4 = time.time()
+     # Flush errors, and write cache in two phases: first data files, then meta files.
+     meta_tuples = {}
+     errors_by_id = {}
+@@ -3508,7 +3767,6 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+             manager.flush_errors(manager.errors.simplify_path(graph[id].xpath), errors, False)
+             errors_by_id[id] = errors
+         meta_tuples[id] = graph[id].write_cache()
+-        graph[id].mark_as_rechecked()
+     for id in stale:
+         meta_tuple = meta_tuples[id]
+         if meta_tuple is None:
+@@ -3518,6 +3776,17 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+         meta.error_lines = errors_by_id.get(id, [])
+         write_cache_meta(meta, manager, meta_file)
+     manager.done_sccs.add(ascc.id)
++    manager.add_stats(
++        load_missing_time=t1 - t0,
++        order_scc_time=t2 - t1,
++        semanal_time=t3 - t2,
++        type_check_time=t4 - t3,
++        flush_and_cache_time=time.time() - t4,
++    )
++    scc_result = {}
++    for id in scc:
++        scc_result[id] = graph[id].interface_hash.hex(), errors_by_id.get(id, [])
++    return scc_result
+ 
+ 
+ def prepare_sccs_full(
+@@ -3565,6 +3834,7 @@ def sorted_components(graph: Graph) -> list[SCC]:
+         #   and the result is [{c, d}, {a, b}].
+         sorted_ready = sorted(ready, key=lambda scc: -min(graph[id].order for id in scc.mod_ids))
+         for scc in sorted_ready:
++            scc.size_hint = sum(graph[mid].size_hint for mid in scc.mod_ids)
+             for dep in scc_dep_map[scc]:
+                 dep.direct_dependents.append(scc.id)
+         res.extend(sorted_ready)
+@@ -3648,3 +3918,17 @@ def write_undocumented_ref_info(
+ 
+     deps_json = get_undocumented_ref_info_json(state.tree, type_map)
+     metastore.write(ref_info_file, json_dumps(deps_json))
++
++
++def sources_to_bytes(sources: list[BuildSource]) -> bytes:
++    source_tuples = [(s.path, s.module, s.text, s.base_dir, s.followed) for s in sources]
++    buf = WriteBuffer()
++    write_json(buf, {"sources": source_tuples})
++    return buf.getvalue()
++
++
++def sccs_to_bytes(sccs: list[SCC]) -> bytes:
++    scc_tuples = [(list(scc.mod_ids), scc.id, list(scc.deps)) for scc in sccs]
++    buf = WriteBuffer()
++    write_json(buf, {"sccs": scc_tuples})
++    return buf.getvalue()
+diff --git a/mypy/build_worker/__init__.py b/mypy/build_worker/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/mypy/build_worker/__main__.py b/mypy/build_worker/__main__.py
+new file mode 100644
+index 000000000..2156f44e4
+--- /dev/null
++++ b/mypy/build_worker/__main__.py
+@@ -0,0 +1,6 @@
++from __future__ import annotations
++
++from mypy.build_worker.worker import console_entry
++
++if __name__ == "__main__":
++    console_entry()
+diff --git a/mypy/build_worker/worker.py b/mypy/build_worker/worker.py
+new file mode 100644
+index 000000000..3af34411b
+--- /dev/null
++++ b/mypy/build_worker/worker.py
+@@ -0,0 +1,196 @@
++"""
++Mypy parallel build worker.
++
++The protocol of communication with the coordinator is as following:
++* Read (pickled) build options from command line.
++* Populate status file with pid and socket address.
++* Receive build sources from coordinator.
++* Load graph using the sources, and send "ok" to coordinator.
++* Receive SCC structure from coordinator, and ack it with an "ok".
++* Receive an SCC id from coordinator, process it, and send back the results.
++* When prompted by coordinator (with a "final" message), cleanup and shutdown.
++"""
++
++from __future__ import annotations
++
++import argparse
++import base64
++import gc
++import json
++import os
++import pickle
++import platform
++import sys
++import time
++from typing import NamedTuple
++
++from mypy import util
++from mypy.build import SCC, BuildManager, load_graph, load_plugins, process_stale_scc
++from mypy.defaults import RECURSION_LIMIT, WORKER_CONNECTION_TIMEOUT
++from mypy.errors import CompileError, Errors, report_internal_error
++from mypy.fscache import FileSystemCache
++from mypy.ipc import IPCServer, receive, send
++from mypy.modulefinder import BuildSource, BuildSourceSet, compute_search_paths
++from mypy.options import Options
++from mypy.util import read_py_file
++from mypy.version import __version__
++
++parser = argparse.ArgumentParser(prog="mypy_worker", description="Mypy build worker")
++parser.add_argument("--status-file", help="status file to communicate worker details")
++parser.add_argument("--options-data", help="serialized mypy options")
++
++CONNECTION_NAME = "build_worker"
++
++
++class ServerContext(NamedTuple):
++    options: Options
++    disable_error_code: list[str]
++    enable_error_code: list[str]
++    errors: Errors
++    fscache: FileSystemCache
++
++
++def main(argv: list[str]) -> None:
++    # Set recursion limit and GC thresholds consistent with mypy/main.py
++    sys.setrecursionlimit(RECURSION_LIMIT)
++    if platform.python_implementation() == "CPython":
++        gc.set_threshold(200 * 1000, 30, 30)
++
++    args = parser.parse_args(argv)
++
++    # This mimics how daemon receives the options. Note we need to postpone
++    # processing error codes after plugins are loaded, because plugins can add
++    # custom error codes.
++    options_dict = pickle.loads(base64.b64decode(args.options_data))
++    options_obj = Options()
++    disable_error_code = options_dict.pop("disable_error_code", [])
++    enable_error_code = options_dict.pop("enable_error_code", [])
++    options = options_obj.apply_changes(options_dict)
++
++    status_file = args.status_file
++    server = IPCServer(CONNECTION_NAME, WORKER_CONNECTION_TIMEOUT)
++
++    with open(status_file, "w") as f:
++        json.dump({"pid": os.getpid(), "connection_name": server.connection_name}, f)
++        f.write("\n")
++
++    fscache = FileSystemCache()
++    cached_read = fscache.read
++    errors = Errors(options, read_source=lambda path: read_py_file(path, cached_read))
++
++    ctx = ServerContext(options, disable_error_code, enable_error_code, errors, fscache)
++    try:
++        with server:
++            serve(server, ctx)
++    except OSError:
++        pass
++    except Exception as exc:
++        report_internal_error(exc, errors.file, 0, errors, options)
++    finally:
++        server.cleanup()
++
++    if options.fast_exit:
++        # Exit fast if allowed, since coordinator is waiting on us.
++        util.hard_exit(0)
++
++
++def serve(server: IPCServer, ctx: ServerContext) -> None:
++    data = receive(server)
++    sources = [BuildSource(*st) for st in data["sources"]]
++    manager = setup_worker_manager(sources, ctx)
++    if manager is None:
++        return
++
++    # Mirror the GC freeze hack in the coordinator.
++    if platform.python_implementation() == "CPython":
++        gc.disable()
++    try:
++        graph = load_graph(sources, manager)
++    except CompileError:
++        # CompileError during loading will be reported by the coordinator.
++        return
++    if platform.python_implementation() == "CPython":
++        gc.freeze()
++        gc.unfreeze()
++        gc.enable()
++    for id in graph:
++        manager.import_map[id] = set(graph[id].dependencies + graph[id].suppressed)
++
++    # Notify worker we are done loading graph.
++    send(server, {"status": "ok"})
++    data = receive(server)
++    sccs = [SCC(set(mod_ids), scc_id, deps) for (mod_ids, scc_id, deps) in data["sccs"]]
++    manager.scc_by_id = {scc.id: scc for scc in sccs}
++    manager.top_order = [scc.id for scc in sccs]
++
++    # Notify coordinator we are ready to process SCCs.
++    send(server, {"status": "ok"})
++    while True:
++        data = receive(server)
++        if "final" in data:
++            manager.dump_stats()
++            break
++        scc_id = data["scc_id"]
++        scc = manager.scc_by_id[scc_id]
++        t0 = time.time()
++        try:
++            result = process_stale_scc(graph, scc, manager)
++            # We must commit after each SCC, otherwise we break --sqlite-cache.
++            manager.metastore.commit()
++        except CompileError as e:
++            blocker = {
++                "messages": e.messages,
++                "use_stdout": e.use_stdout,
++                "module_with_blocker": e.module_with_blocker,
++            }
++            send(server, {"scc_id": scc_id, "blocker": blocker})
++        else:
++            send(server, {"scc_id": scc_id, "result": result})
++        manager.add_stats(total_process_stale_time=time.time() - t0, stale_sccs_processed=1)
++
++
++def setup_worker_manager(sources: list[BuildSource], ctx: ServerContext) -> BuildManager | None:
++    data_dir = os.path.dirname(os.path.dirname(__file__))
++    # This is used for testing only now.
++    alt_lib_path = os.environ.get("MYPY_ALT_LIB_PATH")
++    search_paths = compute_search_paths(sources, ctx.options, data_dir, alt_lib_path)
++
++    source_set = BuildSourceSet(sources)
++    try:
++        plugin, snapshot = load_plugins(ctx.options, ctx.errors, sys.stdout, [])
++    except CompileError:
++        # CompileError while importing plugins will be reported by the coordinator.
++        return None
++
++    # Process the rest of the options when plugins are loaded.
++    options = ctx.options
++    options.disable_error_code = ctx.disable_error_code
++    options.enable_error_code = ctx.enable_error_code
++    options.process_error_codes(error_callback=lambda msg: None)
++
++    def flush_errors(filename: str | None, new_messages: list[str], is_serious: bool) -> None:
++        # We never flush errors in the worker, we send them back to coordinator.
++        pass
++
++    return BuildManager(
++        data_dir,
++        search_paths,
++        ignore_prefix=os.getcwd(),
++        source_set=source_set,
++        reports=None,
++        options=options,
++        version_id=__version__,
++        plugin=plugin,
++        plugins_snapshot=snapshot,
++        errors=ctx.errors,
++        error_formatter=None,
++        flush_errors=flush_errors,
++        fscache=ctx.fscache,
++        stdout=sys.stdout,
++        stderr=sys.stderr,
++        parallel_worker=True,
++    )
++
++
++def console_entry() -> None:
++    main(sys.argv[1:])
+diff --git a/mypy/cache.py b/mypy/cache.py
+index 18759b9e7..0d80c6d09 100644
+--- a/mypy/cache.py
++++ b/mypy/cache.py
+@@ -390,7 +390,14 @@ def write_str_opt_list(data: WriteBuffer, value: list[str | None]) -> None:
+         write_str_opt(data, item)
+ 
+ 
+-JsonValue: _TypeAlias = None | int | str | bool | list["JsonValue"] | dict[str, "JsonValue"]
++Value: _TypeAlias = None | int | str | bool
++JsonValue: _TypeAlias = Value | list["JsonValue"] | dict[str, "JsonValue"]
++
++# Currently tuples are used by mypyc plugin. They will be normalized to
++# JSON lists after a roundtrip.
++JsonValueEx: _TypeAlias = (
++    Value | list["JsonValueEx"] | dict[str, "JsonValueEx"] | tuple["JsonValueEx", ...]
++)
+ 
+ 
+ def read_json_value(data: ReadBuffer) -> JsonValue:
+@@ -414,9 +421,7 @@ def read_json_value(data: ReadBuffer) -> JsonValue:
+     assert False, f"Invalid JSON tag: {tag}"
+ 
+ 
+-# Currently tuples are used by mypyc plugin. They will be normalized to
+-# JSON lists after a roundtrip.
+-def write_json_value(data: WriteBuffer, value: JsonValue | tuple[JsonValue, ...]) -> None:
++def write_json_value(data: WriteBuffer, value: JsonValueEx) -> None:
+     if value is None:
+         write_tag(data, LITERAL_NONE)
+     elif isinstance(value, bool):
+diff --git a/mypy/defaults.py b/mypy/defaults.py
+index eca6f714f..a39a577d0 100644
+--- a/mypy/defaults.py
++++ b/mypy/defaults.py
+@@ -42,3 +42,10 @@ REPORTER_NAMES: Final = [
+ # Threshold after which we sometimes filter out most errors to avoid very
+ # verbose output. The default is to show all errors.
+ MANY_ERRORS_THRESHOLD: Final = -1
++
++RECURSION_LIMIT: Final = 2**14
++
++WORKER_START_INTERVAL: Final = 0.01
++WORKER_START_TIMEOUT: Final = 3
++WORKER_CONNECTION_TIMEOUT: Final = 10
++WORKER_DONE_TIMEOUT: Final = 600
+diff --git a/mypy/dmypy/client.py b/mypy/dmypy/client.py
+index bc0b98034..4c6f1f0d7 100644
+--- a/mypy/dmypy/client.py
++++ b/mypy/dmypy/client.py
+@@ -17,10 +17,10 @@ import traceback
+ from collections.abc import Callable, Mapping
+ from typing import Any, NoReturn
+ 
++from mypy.defaults import RECURSION_LIMIT
+ from mypy.dmypy_os import alive, kill
+ from mypy.dmypy_util import DEFAULT_STATUS_FILE, receive, send
+-from mypy.ipc import IPCClient, IPCException
+-from mypy.main import RECURSION_LIMIT
++from mypy.ipc import BadStatus, IPCClient, IPCException, read_status
+ from mypy.util import check_python_version, get_terminal_width, should_force_color
+ from mypy.version import __version__
+ 
+@@ -256,16 +256,6 @@ help_parser = p = subparsers.add_parser("help")
+ del p
+ 
+ 
+-class BadStatus(Exception):
+-    """Exception raised when there is something wrong with the status file.
+-
+-    For example:
+-    - No status file found
+-    - Status file malformed
+-    - Process whose pid is in the status file does not exist
+-    """
+-
+-
+ def main(argv: list[str]) -> None:
+     """The code is top-down."""
+     check_python_version("dmypy")
+@@ -727,24 +717,6 @@ def check_status(data: dict[str, Any]) -> tuple[int, str]:
+     return pid, connection_name
+ 
+ 
+-def read_status(status_file: str) -> dict[str, object]:
+-    """Read status file.
+-
+-    Raise BadStatus if the status file doesn't exist or contains
+-    invalid JSON or the JSON is not a dict.
+-    """
+-    if not os.path.isfile(status_file):
+-        raise BadStatus("No status file found")
+-    with open(status_file) as f:
+-        try:
+-            data = json.load(f)
+-        except Exception as e:
+-            raise BadStatus("Malformed status file (not JSON)") from e
+-    if not isinstance(data, dict):
+-        raise BadStatus("Invalid status file (not a dict)")
+-    return data
+-
+-
+ def is_running(status_file: str) -> bool:
+     """Check if the server is running cleanly"""
+     try:
+diff --git a/mypy/ipc.py b/mypy/ipc.py
+index d3c97df8d..3c10acc2b 100644
+--- a/mypy/ipc.py
++++ b/mypy/ipc.py
+@@ -8,13 +8,19 @@ from __future__ import annotations
+ 
+ import base64
+ import codecs
++import json
+ import os
+ import shutil
+ import sys
+ import tempfile
+ from collections.abc import Callable
++from select import select
+ from types import TracebackType
+-from typing import Final
++from typing import Any, Final
++
++from librt.internal import ReadBuffer, WriteBuffer
++
++from mypy.cache import read_json, write_json
+ 
+ if sys.platform == "win32":
+     # This may be private, but it is needed for IPC on Windows, and is basically stable
+@@ -65,6 +71,9 @@ class IPCBase:
+         return bdata
+ 
+     def read(self, size: int = 100000) -> str:
++        return self.read_bytes(size).decode("utf-8")
++
++    def read_bytes(self, size: int = 100000) -> bytes:
+         """Read bytes from an IPC connection until we have a full frame."""
+         bdata: bytearray | None = bytearray()
+         if sys.platform == "win32":
+@@ -119,14 +128,17 @@ class IPCBase:
+         if not bdata:
+             # Socket was empty and we didn't get any frame.
+             # This should only happen if the socket was closed.
+-            return ""
+-        return codecs.decode(bdata, "base64").decode("utf8")
++            return b""
++        return codecs.decode(bdata, "base64")
+ 
+     def write(self, data: str) -> None:
++        self.write_bytes(data.encode("utf-8"))
++
++    def write_bytes(self, data: bytes) -> None:
+         """Write to an IPC connection."""
+ 
+         # Frame the data by urlencoding it and separating by space.
+-        encoded_data = codecs.encode(data.encode("utf8"), "base64") + b" "
++        encoded_data = codecs.encode(data, "base64") + b" "
+ 
+         if sys.platform == "win32":
+             try:
+@@ -312,3 +324,71 @@ class IPCServer(IPCBase):
+             name = self.sock.getsockname()
+             assert isinstance(name, str)
+             return name
++
++
++class BadStatus(Exception):
++    """Exception raised when there is something wrong with the status file.
++
++    For example:
++    - No status file found
++    - Status file malformed
++    - Process whose pid is in the status file does not exist
++    """
++
++
++def read_status(status_file: str) -> dict[str, object]:
++    """Read status file.
++
++    Raise BadStatus if the status file doesn't exist or contains
++    invalid JSON or the JSON is not a dict.
++    """
++    if not os.path.isfile(status_file):
++        raise BadStatus("No status file found")
++    with open(status_file) as f:
++        try:
++            data = json.load(f)
++        except Exception as e:
++            raise BadStatus("Malformed status file (not JSON)") from e
++    if not isinstance(data, dict):
++        raise BadStatus("Invalid status file (not a dict)")
++    return data
++
++
++def ready_to_read(conns: list[IPCClient], timeout: float | None = None) -> list[int]:
++    """Wait until some connections are readable.
++
++    Return index of each readable connection in the original list.
++    """
++    # TODO: add Windows support for this.
++    assert sys.platform != "win32"
++    connections = [conn.connection for conn in conns]
++    ready, _, _ = select(connections, [], [], timeout)
++    return [connections.index(r) for r in ready]
++
++
++# TODO: switch send() and receive() to proper fixed binary format.
++def send(connection: IPCBase, data: dict[str, Any]) -> None:
++    """Send data to a connection encoded and framed.
++
++    The data must be a JSON object. We assume that a single send call is a
++    single frame to be sent.
++    """
++    buf = WriteBuffer()
++    write_json(buf, data)
++    connection.write_bytes(buf.getvalue())
++
++
++def receive(connection: IPCBase) -> dict[str, Any]:
++    """Receive single JSON data frame from a connection.
++
++    Raise OSError if the data received is not valid.
++    """
++    bdata = connection.read_bytes()
++    if not bdata:
++        raise OSError("No data received")
++    try:
++        buf = ReadBuffer(bdata)
++        data = read_json(buf)
++    except Exception as e:
++        raise OSError("Data received is not valid JSON dict") from e
++    return data
+diff --git a/mypy/main.py b/mypy/main.py
+index 7d5721851..0217867d7 100644
+--- a/mypy/main.py
++++ b/mypy/main.py
+@@ -20,6 +20,7 @@ from mypy.config_parser import (
+     parse_version,
+     validate_package_allow_list,
+ )
++from mypy.defaults import RECURSION_LIMIT
+ from mypy.error_formatter import OUTPUT_CHOICES
+ from mypy.errors import CompileError
+ from mypy.find_sources import InvalidSourceList, create_source_list
+@@ -42,7 +43,6 @@ if TYPE_CHECKING:
+ 
+ orig_stat: Final = os.stat
+ MEM_PROFILE: Final = False  # If True, dump memory profile
+-RECURSION_LIMIT: Final = 2**14
+ 
+ 
+ def stat_proxy(path: str) -> os.stat_result:
+@@ -1152,6 +1152,11 @@ def define_options(
+     # This undocumented feature exports limited line-level dependency information.
+     internals_group.add_argument("--export-ref-info", action="store_true", help=argparse.SUPPRESS)
+ 
++    # Experimental parallel type-checking support.
++    internals_group.add_argument(
++        "-n", "--num-workers", type=int, default=0, help=argparse.SUPPRESS
++    )
++
+     report_group = parser.add_argument_group(
+         title="Report generation", description="Generate a report in the specified format."
+     )
+diff --git a/mypy/metastore.py b/mypy/metastore.py
+index 442c7dc77..4f204d4b8 100644
+--- a/mypy/metastore.py
++++ b/mypy/metastore.py
+@@ -145,16 +145,21 @@ CREATE INDEX IF NOT EXISTS path_idx on files2(path);
+ """
+ 
+ 
+-def connect_db(db_file: str) -> sqlite3.Connection:
++def connect_db(db_file: str, sync_off: bool = False) -> sqlite3.Connection:
+     import sqlite3.dbapi2
+ 
+     db = sqlite3.dbapi2.connect(db_file)
++    if sync_off:
++        # This is a bit unfortunate (as we may get corrupt cache after e.g. Ctrl + C),
++        # but without this flag, commits are *very* slow, especially when using HDDs,
++        # see https://www.sqlite.org/faq.html#q19 for details.
++        db.execute("PRAGMA synchronous=OFF")
+     db.executescript(SCHEMA)
+     return db
+ 
+ 
+ class SqliteMetadataStore(MetadataStore):
+-    def __init__(self, cache_dir_prefix: str) -> None:
++    def __init__(self, cache_dir_prefix: str, sync_off: bool = False) -> None:
+         # We check startswith instead of equality because the version
+         # will have already been appended by the time the cache dir is
+         # passed here.
+@@ -163,7 +168,7 @@ class SqliteMetadataStore(MetadataStore):
+             return
+ 
+         os.makedirs(cache_dir_prefix, exist_ok=True)
+-        self.db = connect_db(os.path.join(cache_dir_prefix, "cache.db"))
++        self.db = connect_db(os.path.join(cache_dir_prefix, "cache.db"), sync_off=sync_off)
+ 
+     def _query(self, name: str, field: str) -> Any:
+         # Raises FileNotFound for consistency with the file system version
+diff --git a/mypy/options.py b/mypy/options.py
+index 3da92bf30..da3e61a3b 100644
+--- a/mypy/options.py
++++ b/mypy/options.py
+@@ -359,6 +359,7 @@ class Options:
+         self.test_env = False
+ 
+         # -- experimental options --
++        self.num_workers: int = 0
+         self.shadow_file: list[list[str]] | None = None
+         self.show_column_numbers: bool = False
+         self.show_error_end: bool = False
+diff --git a/mypy/test/data.py b/mypy/test/data.py
+index 501070a3f..726076e0c 100644
+--- a/mypy/test/data.py
++++ b/mypy/test/data.py
+@@ -603,6 +603,12 @@ def pytest_addoption(parser: Any) -> None:
+         default=False,
+         help="Update test data to reflect actual output (supported only for certain tests)",
+     )
++    group.addoption(
++        "--mypy-num-workers",
++        type=int,
++        default=0,
++        help="Run tests using multiple worker processes for each test case",
++    )
+     group.addoption(
+         "--save-failures-to",
+         default=None,
+diff --git a/mypy/test/helpers.py b/mypy/test/helpers.py
+index 3459163bb..d5f1cd787 100644
+--- a/mypy/test/helpers.py
++++ b/mypy/test/helpers.py
+@@ -365,6 +365,8 @@ def parse_options(
+ 
+     if testcase.config.getoption("--mypy-verbose"):
+         options.verbosity = testcase.config.getoption("--mypy-verbose")
++    if testcase.config.getoption("--mypy-num-workers"):
++        options.num_workers = testcase.config.getoption("--mypy-num-workers")
+ 
+     return options
+ 
+@@ -482,3 +484,7 @@ def find_test_files(pattern: str, exclude: list[str] | None = None) -> list[str]
+         for path in (pathlib.Path(test_data_prefix).rglob(pattern))
+         if path.name not in (exclude or [])
+     ]
++
++
++def remove_typevar_ids(a: list[str]) -> list[str]:
++    return [re.sub(r"`-?\d+", "", line) for line in a]
+diff --git a/mypy/test/testcheck.py b/mypy/test/testcheck.py
+index 05c3bce51..a8841392f 100644
+--- a/mypy/test/testcheck.py
++++ b/mypy/test/testcheck.py
+@@ -22,6 +22,7 @@ from mypy.test.helpers import (
+     normalize_error_messages,
+     parse_options,
+     perform_file_operations,
++    remove_typevar_ids,
+ )
+ from mypy.test.update_data import update_testcase_output
+ 
+@@ -131,6 +132,13 @@ class TypeCheckSuite(DataSuite):
+         options.use_builtins_fixtures = True
+         options.show_traceback = True
+ 
++        if options.num_workers:
++            options.fixed_format_cache = True
++            if testcase.output_files:
++                raise pytest.skip("Reports are not supported in parallel mode")
++            if testcase.name.endswith("_no_parallel"):
++                raise pytest.skip("Test not supported in parallel mode yet")
++
+         # Enable some options automatically based on test file name.
+         if "columns" in testcase.file:
+             options.show_column_numbers = True
+@@ -141,7 +149,7 @@ class TypeCheckSuite(DataSuite):
+         if "union-error" not in testcase.file and "Pep604" not in testcase.name:
+             options.force_union_syntax = True
+ 
+-        if incremental_step and options.incremental:
++        if incremental_step and options.incremental or options.num_workers > 0:
+             # Don't overwrite # flags: --no-incremental in incremental test cases
+             options.incremental = True
+         else:
+@@ -158,12 +166,24 @@ class TypeCheckSuite(DataSuite):
+             )
+ 
+         plugin_dir = os.path.join(test_data_prefix, "plugins")
+-        sys.path.insert(0, plugin_dir)
+ 
++        worker_env = None
++        if options.num_workers > 0:
++            worker_env = os.environ.copy()
++            # Make sure we are running tests with current worktree files, *not* with
++            # an installed version of mypy.
++            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
++            worker_env["PYTHONPATH"] = os.pathsep.join([root_dir, plugin_dir])
++            worker_env["MYPY_TEST_PREFIX"] = root_dir
++            worker_env["MYPY_ALT_LIB_PATH"] = test_temp_dir
++
++        sys.path.insert(0, plugin_dir)
+         res = None
+         blocker = False
+         try:
+-            res = build.build(sources=sources, options=options, alt_lib_path=test_temp_dir)
++            res = build.build(
++                sources=sources, options=options, alt_lib_path=test_temp_dir, worker_env=worker_env
++            )
+             a = res.errors
+         except CompileError as e:
+             a = e.messages
+@@ -194,6 +214,10 @@ class TypeCheckSuite(DataSuite):
+         if output != a and testcase.config.getoption("--update-data", False):
+             update_testcase_output(testcase, a, incremental_step=incremental_step)
+ 
++        if options.num_workers > 0:
++            # TypeVarIds are not stable in parallel checking, normalize.
++            a = remove_typevar_ids(a)
++            output = remove_typevar_ids(output)
+         assert_string_arrays_equal(output, a, msg.format(testcase.file, testcase.line))
+ 
+         if res:
+@@ -209,7 +233,8 @@ class TypeCheckSuite(DataSuite):
+                 for module, target in res.manager.processed_targets
+                 if module in testcase.test_modules
+             ]
+-            if expected is not None:
++            # TODO: check targets in parallel mode (e.g. per SCC).
++            if options.num_workers == 0 and expected is not None:
+                 assert_target_equivalence(name, expected, actual)
+             if incremental_step > 1:
+                 suffix = "" if incremental_step == 2 else str(incremental_step - 1)
+diff --git a/setup.py b/setup.py
+index 83571406e..7c5a1a83d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -81,6 +81,7 @@ if USE_MYPYC:
+             "__main__.py",
+             "pyinfo.py",
+             os.path.join("dmypy", "__main__.py"),
++            os.path.join("build_worker", "__main__.py"),
+             "exportjson.py",
+             # Uses __getattr__/__setattr__
+             "split_namespace.py",
+diff --git a/test-data/unit/check-classes.test b/test-data/unit/check-classes.test
+index 8c359deb4..0bd400139 100644
+--- a/test-data/unit/check-classes.test
++++ b/test-data/unit/check-classes.test
+@@ -7683,7 +7683,7 @@ class Child(metaclass=M, thing=0):
+     pass
+ [builtins fixtures/object_with_init_subclass.pyi]
+ 
+-[case testTooManyArgsForObject]
++[case testTooManyArgsForObject_no_parallel]
+ class A(thing=5):
+     pass
+ [out]
+@@ -8498,7 +8498,7 @@ def identity_wrapper(func: FuncT) -> FuncT:
+ def foo(self: Any) -> str:
+     return ""
+ 
+-[case testParentClassWithTypeAliasAndSubclassWithMethod]
++[case testParentClassWithTypeAliasAndSubclassWithMethod_no_parallel]
+ from typing import Any, Callable, TypeVar
+ 
+ class Parent:
+diff --git a/test-data/unit/check-ctypes.test b/test-data/unit/check-ctypes.test
+index a0a5c44b2..88cb52403 100644
+--- a/test-data/unit/check-ctypes.test
++++ b/test-data/unit/check-ctypes.test
+@@ -166,11 +166,11 @@ reveal_type(intarr4(*int_values))  # N: Revealed type is "_ctypes.Array[ctypes.c
+ reveal_type(intarr4(*c_int_values))  # N: Revealed type is "_ctypes.Array[ctypes.c_int]"
+ reveal_type(intarr6(1, ctypes.c_int(2), *int_values))  # N: Revealed type is "_ctypes.Array[ctypes.c_int]"
+ reveal_type(intarr6(1, ctypes.c_int(2), *c_int_values))  # N: Revealed type is "_ctypes.Array[ctypes.c_int]"
+-[typing fixtures/typing-medium.pyi]
+ 
+ float_values = [1.0, 2.0, 3.0, 4.0]
+-intarr4(*float_values) # E: Array constructor argument 1 of type "List[float]" is not convertible to the array element type "Iterable[c_int]"
++intarr4(*float_values) # E: Array constructor argument 1 of type "list[float]" is not convertible to the array element type "Iterable[c_int]"
+ [builtins fixtures/floatdict.pyi]
++[typing fixtures/typing-medium.pyi]
+ 
+ [case testCtypesArrayConstructorKwargs]
+ import ctypes
+diff --git a/test-data/unit/check-flags.test b/test-data/unit/check-flags.test
+index 8eec97902..a892aeba5 100644
+--- a/test-data/unit/check-flags.test
++++ b/test-data/unit/check-flags.test
+@@ -2477,7 +2477,7 @@ cb(lambda x: a)  # OK
+ fn = lambda x: a
+ cb(fn)
+ 
+-[case testShowErrorCodeLinks]
++[case testShowErrorCodeLinks_no_parallel]
+ # flags: --show-error-codes --show-error-code-links
+ 
+ x: int = ""  # E: Incompatible types in assignment (expression has type "str", variable has type "int")  [assignment]
+diff --git a/test-data/unit/check-functions.test b/test-data/unit/check-functions.test
+index 1882f235f..4bdb7e1f8 100644
+--- a/test-data/unit/check-functions.test
++++ b/test-data/unit/check-functions.test
+@@ -1224,24 +1224,20 @@ import b
+ from d import dec
+ @dec
+ def f(x: int) -> None: pass
+-b.g(1) # E
++b.g(1)  # E: Argument 1 to "g" has incompatible type "int"; expected "str"
+ 
+ [file b.py]
+ import a
+ from d import dec
+ @dec
+ def g(x: str) -> None: pass
+-a.f('')
++a.f('')  # E: Argument 1 to "f" has incompatible type "str"; expected "int"
+ 
+ [file d.py]
+ from typing import TypeVar
+ T = TypeVar('T')
+ def dec(f: T) -> T: return f
+ 
+-[out]
+-tmp/b.py:5: error: Argument 1 to "f" has incompatible type "str"; expected "int"
+-tmp/a.py:5: error: Argument 1 to "g" has incompatible type "int"; expected "str"
+-
+ [case testDecoratorWithNoAnnotationInImportCycle]
+ import a
+ 
+@@ -1270,23 +1266,19 @@ import b
+ from d import dec
+ @dec
+ def f(x: int) -> str: pass
+-b.g(1)()
++b.g(1)()  # E: "str" not callable
+ 
+ [file b.py]
+ import a
+ from d import dec
+ @dec
+ def g(x: int) -> str: pass
+-a.f(1)()
++a.f(1)()  # E: "str" not callable
+ 
+ [file d.py]
+ from typing import Callable
+ def dec(f: Callable[[int], str]) -> Callable[[int], str]: return f
+ 
+-[out]
+-tmp/b.py:5: error: "str" not callable
+-tmp/a.py:5: error: "str" not callable
+-
+ [case testDecoratorWithCallAndFixedReturnTypeInImportCycle]
+ import a
+ 
+@@ -1295,50 +1287,40 @@ import b
+ from d import dec
+ @dec()
+ def f(x: int) -> str: pass
+-b.g(1)()
++b.g(1)()  # E: "str" not callable
+ 
+ [file b.py]
+ import a
+ from d import dec
+ @dec()
+ def g(x: int) -> str: pass
+-a.f(1)()
++a.f(1)()  # E: "str" not callable
+ 
+ [file d.py]
+ from typing import Callable
+ def dec() -> Callable[[Callable[[int], str]], Callable[[int], str]]: pass
+ 
+-[out]
+-tmp/b.py:5: error: "str" not callable
+-tmp/a.py:5: error: "str" not callable
+-
+ [case testDecoratorWithCallAndFixedReturnTypeInImportCycleAndDecoratorArgs]
+ import a
+ 
+ [file a.py]
+ import b
+ from d import dec
+-@dec(1)
++@dec(1)  # E: Argument 1 to "dec" has incompatible type "int"; expected "str"
+ def f(x: int) -> str: pass
+-b.g(1)()
++b.g(1)()  # E: "str" not callable
+ 
+ [file b.py]
+ import a
+ from d import dec
+-@dec(1)
++@dec(1)  # E: Argument 1 to "dec" has incompatible type "int"; expected "str"
+ def g(x: int) -> str: pass
+-a.f(1)()
++a.f(1)()  # E: "str" not callable
+ 
+ [file d.py]
+ from typing import Callable
+ def dec(x: str) -> Callable[[Callable[[int], str]], Callable[[int], str]]: pass
+ 
+-[out]
+-tmp/b.py:3: error: Argument 1 to "dec" has incompatible type "int"; expected "str"
+-tmp/b.py:5: error: "str" not callable
+-tmp/a.py:3: error: Argument 1 to "dec" has incompatible type "int"; expected "str"
+-tmp/a.py:5: error: "str" not callable
+-
+ [case testUndefinedDecoratorInImportCycle]
+ # cmd: mypy -m foo.base
+ [file foo/__init__.py]
+diff --git a/test-data/unit/check-ignore.test b/test-data/unit/check-ignore.test
+index d0f6bb6ae..0c373c0e2 100644
+--- a/test-data/unit/check-ignore.test
++++ b/test-data/unit/check-ignore.test
+@@ -198,7 +198,7 @@ bar(Child())
+ [out]
+ main:19: error: Argument 1 to "bar" has incompatible type "Child"; expected "Base[str, str]"
+ 
+-[case testTypeIgnoreLineNumberWithinFile]
++[case testTypeIgnoreLineNumberWithinFile_no_parallel]
+ import m
+ pass # type: ignore
+ m.f(kw=1)
+diff --git a/test-data/unit/check-incremental.test b/test-data/unit/check-incremental.test
+index 170a883ce..f40dd0bdb 100644
+--- a/test-data/unit/check-incremental.test
++++ b/test-data/unit/check-incremental.test
+@@ -6902,7 +6902,7 @@ class TheClass:
+ tmp/a.py:3: note: Revealed type is "def (value: builtins.object) -> lib.TheClass.pyenum@6"
+ 
+ 
+-[case testIncrementalFunctoolsPartial]
++[case testIncrementalFunctoolsPartial_no_parallel]
+ import a
+ 
+ [file a.py]
+diff --git a/test-data/unit/check-inference.test b/test-data/unit/check-inference.test
+index bc4b56e49..d473c3d83 100644
+--- a/test-data/unit/check-inference.test
++++ b/test-data/unit/check-inference.test
+@@ -1747,7 +1747,7 @@ def f(blocks: Any): # E: Name "Any" is not defined \
+     to_process = list(blocks)
+ [builtins fixtures/list.pyi]
+ 
+-[case testSpecialCaseEmptyListInitialization2]
++[case testSpecialCaseEmptyListInitialization2_no_parallel]
+ def f(blocks: object):
+     to_process = []
+     to_process = list(blocks) # E: No overload variant of "list" matches argument type "object" \
+@@ -3644,17 +3644,14 @@ class A:
+ import a
+ [file a.py]
+ import b
+-reveal_type(b.B.x)
++reveal_type(b.B.x)  # N: Revealed type is "builtins.int"
+ class A:
+     x = 42
+ [file b.py]
+ import a
+-reveal_type(a.A.x)
++reveal_type(a.A.x)  # N: Revealed type is "builtins.int"
+ class B:
+     x = 42
+-[out]
+-tmp/b.py:2: note: Revealed type is "builtins.int"
+-tmp/a.py:2: note: Revealed type is "builtins.int"
+ 
+ [case testUnionTypeCallableInference]
+ from typing import Callable, Type, TypeVar, Union
+diff --git a/test-data/unit/check-kwargs.test b/test-data/unit/check-kwargs.test
+index 689553445..708b66626 100644
+--- a/test-data/unit/check-kwargs.test
++++ b/test-data/unit/check-kwargs.test
+@@ -464,7 +464,7 @@ class A:
+             pass
+ A.B(x=1)  # E: Unexpected keyword argument "x" for "B"
+ 
+-[case testUnexpectedMethodKwargFromOtherModule]
++[case testUnexpectedMethodKwargFromOtherModule_no_parallel]
+ import m
+ m.A(x=1)
+ [file m.py]
+diff --git a/test-data/unit/check-modules.test b/test-data/unit/check-modules.test
+index 862cd8ea3..a9070247c 100644
+--- a/test-data/unit/check-modules.test
++++ b/test-data/unit/check-modules.test
+@@ -947,21 +947,16 @@ accept_float(a.b.c.value)
+ 
+ [file a/__init__.py]
+ value = 3
+-b.value
+-a.b.value
++b.value  # E: Name "b" is not defined
++a.b.value  # E: Name "a" is not defined
+ 
+ [file a/b/__init__.py]
+ value = "a"
+-c.value
+-a.b.c.value
++c.value  # E: Name "c" is not defined
++a.b.c.value  # E: Name "a" is not defined
+ 
+ [file a/b/c.py]
+ value = 3.2
+-[out]
+-tmp/a/__init__.py:2: error: Name "b" is not defined
+-tmp/a/__init__.py:3: error: Name "a" is not defined
+-tmp/a/b/__init__.py:2: error: Name "c" is not defined
+-tmp/a/b/__init__.py:3: error: Name "a" is not defined
+ 
+ [case testSubmoduleMixingLocalAndQualifiedNames]
+ from a.b import MyClass
+@@ -2496,54 +2491,43 @@ y = int()
+ 
+ [case testImportFromReExportInCycleUsingRelativeImport1]
+ from m import One
+-reveal_type(One)
++reveal_type(One)  # N: Revealed type is "def () -> m.one.One"
+ [file m/__init__.py]
+ from .one import One
+ from .two import Two
+-reveal_type(One)
++reveal_type(One)  # N: Revealed type is "def () -> m.one.One"
+ [file m/one.py]
+ class One:
+     pass
+ [file m/two.py]
+ from m import One
+-reveal_type(One)
++reveal_type(One)  # N: Revealed type is "def () -> m.one.One"
+ x: One
+-reveal_type(x)
++reveal_type(x)  # N: Revealed type is "m.one.One"
+ 
+ class Two(One):
+     pass
+ y: Two
+-y = x
++y = x  # E: Incompatible types in assignment (expression has type "One", variable has type "Two")
+ x = y
+-[out]
+-tmp/m/two.py:2: note: Revealed type is "def () -> m.one.One"
+-tmp/m/two.py:4: note: Revealed type is "m.one.One"
+-tmp/m/two.py:9: error: Incompatible types in assignment (expression has type "One", variable has type "Two")
+-tmp/m/__init__.py:3: note: Revealed type is "def () -> m.one.One"
+-main:2: note: Revealed type is "def () -> m.one.One"
+ 
+ [case testImportReExportInCycleUsingRelativeImport2]
+ from m import One
+-reveal_type(One)
++reveal_type(One)  # N: Revealed type is "def () -> m.one.One"
+ [file m/__init__.py]
+ from .one import One
+ from .two import Two
+-reveal_type(One)
++reveal_type(One)  # N: Revealed type is "def () -> m.one.One"
+ [file m/one.py]
+ class One:
+     pass
+ [file m/two.py]
+ import m
+-reveal_type(m.One)
++reveal_type(m.One)  # N: Revealed type is "def () -> m.one.One"
+ x: m.One
+-reveal_type(x)
++reveal_type(x)  # N: Revealed type is "m.one.One"
+ class Two:
+     pass
+-[out]
+-tmp/m/two.py:2: note: Revealed type is "def () -> m.one.One"
+-tmp/m/two.py:4: note: Revealed type is "m.one.One"
+-tmp/m/__init__.py:3: note: Revealed type is "def () -> m.one.One"
+-main:2: note: Revealed type is "def () -> m.one.One"
+ 
+ [case testImportReExportedNamedTupleInCycle1]
+ from m import One
+@@ -2604,7 +2588,7 @@ import p
+ [file p/__init__.py]
+ from . import a
+ from . import b
+-reveal_type(a.foo())
++reveal_type(a.foo())  # N: Revealed type is "builtins.int"
+ [file p/a.py]
+ import p
+ def foo() -> int: pass
+@@ -2612,11 +2596,8 @@ def foo() -> int: pass
+ import p
+ 
+ def run() -> None:
+-    reveal_type(p.a.foo())
++    reveal_type(p.a.foo())  # N: Revealed type is "builtins.int"
+ [builtins fixtures/module.pyi]
+-[out]
+-tmp/p/b.py:4: note: Revealed type is "builtins.int"
+-tmp/p/__init__.py:3: note: Revealed type is "builtins.int"
+ 
+ [case testMissingSubmoduleImportedWithIgnoreMissingImports]
+ # flags: --ignore-missing-imports
+@@ -2960,7 +2941,7 @@ class Some:
+     name = __name__
+ reveal_type(Some.name)  # N: Revealed type is "builtins.str"
+ 
+-[case testReExportAllInStub]
++[case testReExportAllInStub_no_parallel]
+ from m1 import C
+ from m1 import D  # E: Module "m1" has no attribute "D"
+ C()
+@@ -3184,7 +3165,7 @@ from b import no_such_export
+ [file b.py]
+ from a import no_such_export  # E: Module "a" has no attribute "no_such_export"
+ 
+-[case testCyclicUndefinedImportWithStar1]
++[case testCyclicUndefinedImportWithStar1_no_parallel]
+ import a
+ [file a.py]
+ from b import no_such_export
+@@ -3194,7 +3175,7 @@ from a import *
+ tmp/b.py:1: error: Cannot resolve name "no_such_export" (possible cyclic definition)
+ tmp/a.py:1: error: Module "b" has no attribute "no_such_export"
+ 
+-[case testCyclicUndefinedImportWithStar2]
++[case testCyclicUndefinedImportWithStar2_no_parallel]
+ import a
+ [file a.py]
+ from b import no_such_export
+diff --git a/test-data/unit/check-namedtuple.test b/test-data/unit/check-namedtuple.test
+index 66eb55542..6be3f2b3e 100644
+--- a/test-data/unit/check-namedtuple.test
++++ b/test-data/unit/check-namedtuple.test
+@@ -115,7 +115,7 @@ a, b = x
+ a, b, c = x  # E: Need more than 2 values to unpack (3 expected)
+ [builtins fixtures/tuple.pyi]
+ 
+-[case testNamedTupleAdditionalArgs]
++[case testNamedTupleAdditionalArgs_no_parallel]
+ from collections import namedtuple
+ 
+ A = namedtuple('A', 'a b')
+@@ -125,7 +125,6 @@ D = namedtuple('D', 'a b', unrecognized_arg=False)
+ E = namedtuple('E', 'a b', 0)
+ 
+ [builtins fixtures/bool.pyi]
+-
+ [out]
+ main:4: error: Boolean literal expected as the "rename" argument to namedtuple()
+ main:5: error: Boolean literal expected as the "rename" argument to namedtuple()
+diff --git a/test-data/unit/check-newsemanal.test b/test-data/unit/check-newsemanal.test
+index 61bf08018..00c2d899f 100644
+--- a/test-data/unit/check-newsemanal.test
++++ b/test-data/unit/check-newsemanal.test
+@@ -54,15 +54,12 @@ import a
+ from b import B
+ class A: pass
+ y: B
+-y()
++y()  # E: "B" not callable
+ [file b.py]
+ from a import A
+ class B: pass
+ x: A
+-x()
+-[out]
+-tmp/b.py:4: error: "A" not callable
+-tmp/a.py:4: error: "B" not callable
++x()  # E: "A" not callable
+ 
+ [case testNewAnalyzerTypeAnnotationCycle3]
+ import b
+@@ -2205,7 +2202,8 @@ from typing import TypeVar, Any
+ from b import B, C
+ 
+ T = TypeVar('T', bound=B[Any])
+-T = TypeVar('T', bound=C)
++T = TypeVar('T', bound=C)  # E: Cannot redefine "T" as a type variable \
++                           # E: Invalid assignment target
+ 
+ [file b.py]
+ from typing import Generic, Any
+@@ -2215,16 +2213,11 @@ class B(Generic[T]):
+     x: T
+ class C: ...
+ 
+-x: B[int]
++x: B[int]  # E: Type argument "int" of "B" must be a subtype of "B[Any]"
+ y: B[B[Any]]
+-reveal_type(y.x)
++reveal_type(y.x)  # N: Revealed type is "b.B[Any]"
+ [builtins fixtures/tuple.pyi]
+ [typing fixtures/typing-full.pyi]
+-[out]
+-tmp/b.py:8: error: Type argument "int" of "B" must be a subtype of "B[Any]"
+-tmp/b.py:10: note: Revealed type is "b.B[Any]"
+-tmp/a.py:5: error: Cannot redefine "T" as a type variable
+-tmp/a.py:5: error: Invalid assignment target
+ 
+ [case testNewAnalyzerDuplicateTypeVarImportCycleWithAliases]
+ # flags: --disable-error-code used-before-def
+@@ -2234,7 +2227,8 @@ from typing import TypeVar, Any
+ from b import BA, C
+ 
+ T = TypeVar('T', bound=BAA[Any])
+-T = TypeVar('T', bound=C)
++T = TypeVar('T', bound=C)  # E: Cannot redefine "T" as a type variable \
++                           # E: Invalid assignment target
+ BAA = BA
+ 
+ [file b.py]
+@@ -2246,14 +2240,9 @@ class B(Generic[T]):
+     x: T
+ class C: ...
+ 
+-x: B[int]
++x: B[int]  # E: Type argument "int" of "B" must be a subtype of "B[Any]"
+ y: B[B[Any]]
+-reveal_type(y.x)
+-[out]
+-tmp/b.py:9: error: Type argument "int" of "B" must be a subtype of "B[Any]"
+-tmp/b.py:11: note: Revealed type is "b.B[Any]"
+-tmp/a.py:5: error: Cannot redefine "T" as a type variable
+-tmp/a.py:5: error: Invalid assignment target
++reveal_type(y.x)  # N: Revealed type is "b.B[Any]"
+ 
+ [case testNewAnalyzerTypeVarBoundInCycle]
+ import factory, box
+diff --git a/test-data/unit/check-plugin-attrs.test b/test-data/unit/check-plugin-attrs.test
+index 42f21e945..91c53f012 100644
+--- a/test-data/unit/check-plugin-attrs.test
++++ b/test-data/unit/check-plugin-attrs.test
+@@ -1861,10 +1861,10 @@ from typing import Callable
+ 
+ @attr.s
+ class C:
+-    a = attr.ib(type=Lst[int])
++    a = attr.ib(type=Lst[int])  # E: Name "Lst" is not defined
+     # Note that for this test, the 'Value of type "int" is not indexable' errors are silly,
+     # and a consequence of Callable etc. being set to an int in the test stub.
+-    b = attr.ib(type=Callable[[], C])
++    b = attr.ib(type=Callable[[], C])  # E: Value of type "int" is not indexable
+ [file b.py]
+ import attr
+ import a
+@@ -1873,12 +1873,8 @@ from typing import List as Lst, Optional
+ @attr.s
+ class D:
+     a = attr.ib(type=Lst[int])
+-    b = attr.ib(type=Optional[int])
++    b = attr.ib(type=Optional[int])  # E: Value of type "int" is not indexable
+ [builtins fixtures/list.pyi]
+-[out]
+-tmp/b.py:8: error: Value of type "int" is not indexable
+-tmp/a.py:7: error: Name "Lst" is not defined
+-tmp/a.py:10: error: Value of type "int" is not indexable
+ 
+ [case testAttrsGenericInheritanceSpecialCase1]
+ import attr
+diff --git a/test-data/unit/check-plugin-error-codes.test b/test-data/unit/check-plugin-error-codes.test
+index 957894779..10f475b35 100644
+--- a/test-data/unit/check-plugin-error-codes.test
++++ b/test-data/unit/check-plugin-error-codes.test
+@@ -3,7 +3,7 @@
+ 
+ def main() -> None:
+     return
+-main() # E: Custom error  [custom]
++main()  # E: Custom error  [custom]
+ 
+ [file mypy.ini]
+ \[mypy]
+@@ -25,7 +25,7 @@ plugins=<ROOT>/test-data/unit/plugins/custom_errorcode.py
+ 
+ def main() -> None:
+     return
+-main() # E: Custom error  [custom]
++main()  # E: Custom error  [custom]
+ 
+ [file mypy.ini]
+ \[mypy]
+diff --git a/test-data/unit/check-protocols.test b/test-data/unit/check-protocols.test
+index fd7f0c344..99fd94a69 100644
+--- a/test-data/unit/check-protocols.test
++++ b/test-data/unit/check-protocols.test
+@@ -3890,7 +3890,7 @@ other_flag = False
+ def update() -> str: ...
+ [builtins fixtures/module.pyi]
+ 
+-[case testModuleAsProtocolImplementationClassObject]
++[case testModuleAsProtocolImplementationClassObject_no_parallel]
+ import runner
+ import bad_runner
+ from typing import Callable, Protocol
+@@ -3922,7 +3922,7 @@ class Run:
+     def __init__(self, arg: str) -> None: ...
+ [builtins fixtures/module.pyi]
+ 
+-[case testModuleAsProtocolImplementationTypeAlias]
++[case testModuleAsProtocolImplementationTypeAlias_no_parallel]
+ import runner
+ import bad_runner
+ from typing import Callable, Protocol
+diff --git a/test-data/unit/check-selftype.test b/test-data/unit/check-selftype.test
+index 89603efaf..53754bf3c 100644
+--- a/test-data/unit/check-selftype.test
++++ b/test-data/unit/check-selftype.test
+@@ -749,7 +749,7 @@ def bad(x: str) -> str: ...
+ reveal_type(ci.from_item(conv))  # N: Revealed type is "builtins.str"
+ ci.from_item(bad)  # E: Argument 1 to "from_item" of "C" has incompatible type "Callable[[str], str]"; expected "Callable[[int], str]"
+ 
+-[case testSelfTypeRestrictedMethodOverloadInit]
++[case testSelfTypeRestrictedMethodOverloadInit_no_parallel]
+ from typing import TypeVar
+ from lib import P, C
+ 
+diff --git a/test-data/unit/check-type-aliases.test b/test-data/unit/check-type-aliases.test
+index 1fb2b038a..302357517 100644
+--- a/test-data/unit/check-type-aliases.test
++++ b/test-data/unit/check-type-aliases.test
+@@ -1339,7 +1339,7 @@ a: A
+ reveal_type(a)  # N: Revealed type is "builtins.list[builtins.str]"
+ [builtins fixtures/tuple.pyi]
+ 
+-[case testTypeAliasDict]
++[case testTypeAliasDict_no_parallel]
+ D = dict[str, int]
+ d = D()
+ reveal_type(d)  # N: Revealed type is "builtins.dict[builtins.str, builtins.int]"
+diff --git a/test-data/unit/lib-stub/typing_extensions.pyi b/test-data/unit/lib-stub/typing_extensions.pyi
+index 71a17a939..43b5ef3a0 100644
+--- a/test-data/unit/lib-stub/typing_extensions.pyi
++++ b/test-data/unit/lib-stub/typing_extensions.pyi
+@@ -1,3 +1,6 @@
++# Do not delete this import. Dependency structure of core modules for fixtures should match
++# the real dependency structure, otherwise things like add_typing_extension_aliases() will break.
++import collections
+ import typing
+ from typing import Any, Callable, Mapping, Iterable, Iterator, NoReturn as NoReturn, Dict, Tuple, Type, Union
+ from typing import TYPE_CHECKING as TYPE_CHECKING

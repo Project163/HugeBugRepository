@@ -1,0 +1,213 @@
+diff --git a/src/yb/integration-tests/minicluster-snapshot-test.cc b/src/yb/integration-tests/minicluster-snapshot-test.cc
+index c54d46ead4..a75b49310b 100644
+--- a/src/yb/integration-tests/minicluster-snapshot-test.cc
++++ b/src/yb/integration-tests/minicluster-snapshot-test.cc
+@@ -613,7 +613,7 @@ TEST_P(MasterExportSnapshotTest, ExportSnapshotAsOfTimeWithHiddenTables) {
+   messenger_->Shutdown();
+ }
+ 
+-class PgCloneTest : public PostgresMiniClusterTest {
++class PgCloneInitiallyEmptyDBTest : public PostgresMiniClusterTest {
+  protected:
+   void SetUp() override {
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_initial_delay_secs) = 0;
+@@ -645,8 +645,6 @@ class PgCloneTest : public PostgresMiniClusterTest {
+         master_backup_proxy_.get(), YQL_DATABASE_PGSQL, kSourceNamespaceName, kInterval, kRetention,
+         kTimeout));
+     RETURN_NOT_OK(WaitScheduleSnapshot(master_backup_proxy_.get(), schedule_id_, kTimeout));
+-    RETURN_NOT_OK(source_conn_->ExecuteFormat(
+-        "CREATE TABLE $0 (key INT PRIMARY KEY, value INT)", kSourceTableName));
+      return Status::OK();
+   }
+ 
+@@ -696,6 +694,15 @@ class PgCloneTest : public PostgresMiniClusterTest {
+   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+ };
+ 
++class PgCloneTest : public PgCloneInitiallyEmptyDBTest {
++ protected:
++  void SetUp() override {
++    PgCloneInitiallyEmptyDBTest::SetUp();
++    ASSERT_OK(source_conn_->ExecuteFormat(
++        "CREATE TABLE $0 (key INT PRIMARY KEY, value INT)", kSourceTableName));
++  }
++};
++
+ class PgCloneTestWithColocatedDBParam
+     : public PgCloneTest,
+       public ::testing::WithParamInterface<master::YsqlColocationConfig> {
+@@ -773,6 +780,28 @@ TEST_P(PgCloneTestWithColocatedDBParam, YB_DISABLE_TEST_IN_SANITIZERS(CloneYsqlS
+   ASSERT_VECTORS_EQ(rows, kRows);
+ }
+ 
++TEST_F_EX(PgCloneTest, TestOidsAdvancedAfterClone, PgCloneInitiallyEmptyDBTest) {
++  ASSERT_OK(source_conn_->Execute("CREATE TABLE my_table (a INT, b INT)"));
++  auto timestamp = ASSERT_RESULT(GetCurrentTime());
++
++  ASSERT_OK(source_conn_->ExecuteFormat(
++      "CREATE DATABASE $0 TEMPLATE $1 AS OF $2", kTargetNamespaceName1, kSourceNamespaceName,
++      timestamp.ToInt64()));
++
++  // Ensure that the DROP below will only hide the table, not delete it.
++  SnapshotScheduleId schedule_id = ASSERT_RESULT(CreateSnapshotSchedule(
++      master_backup_proxy_.get(), YQL_DATABASE_PGSQL, kTargetNamespaceName1, kInterval, kRetention,
++      kTimeout));
++  ASSERT_OK(WaitScheduleSnapshot(master_backup_proxy_.get(), schedule_id, kTimeout));
++
++  auto target_conn = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName1));
++  ASSERT_OK(target_conn.Execute("DROP TABLE my_table"));
++
++  // At this point, if we have not advanced the normal space OID counter, then we will be attempting
++  // to create a table with the same OID as the one we just dropped.  That would fail.
++  ASSERT_OK(target_conn.Execute("CREATE TABLE my_table (a INT, b INT)"));
++}
++
+ TEST_F(PgCloneTest, CloneVectorIndex) {
+   ASSERT_OK(source_conn_->Execute("CREATE EXTENSION vector"));
+   ASSERT_OK(source_conn_->Execute(
+diff --git a/src/yb/master/catalog_entity_info.h b/src/yb/master/catalog_entity_info.h
+index efbb8814f0..a70dc22e92 100644
+--- a/src/yb/master/catalog_entity_info.h
++++ b/src/yb/master/catalog_entity_info.h
+@@ -98,6 +98,10 @@ struct ExternalNamespaceSnapshotData {
+   NamespaceId new_namespace_id;
+   YQLDatabase db_type;
+   bool just_created;
++
++  std::string ToString() const {
++    return YB_STRUCT_TO_STRING(new_namespace_id, db_type, just_created);
++  }
+ };
+ // Map: old_namespace_id (key) -> new_namespace_id + db_type + created-flag.
+ using NamespaceMap = std::unordered_map<NamespaceId, ExternalNamespaceSnapshotData>;
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index f4712a2959..fea72ad26e 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -10087,6 +10087,21 @@ Status CatalogManager::ListUDTypes(const ListUDTypesRequestPB* req,
+   return Status::OK();
+ }
+ 
++Status CatalogManager::AdvanceOidCounters(NamespaceId namespace_id) {
++  auto database_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(namespace_id));
++  VLOG(1) << "Calling ReadHighestNormalPreservableOid on database OID " << database_oid;
++  auto highest_oid = VERIFY_RESULT(sys_catalog_->ReadHighestNormalPreservableOid(database_oid));
++  auto* yb_client = master_->client_future().get();
++  SCHECK(yb_client, IllegalState, "Client not initialized or shutting down");
++  VLOG(1) << "Bumping normal space OID for database OID " << database_oid << " above "
++          << highest_oid;
++  uint32_t begin_oid, end_oid;
++  RETURN_NOT_OK(yb_client->ReservePgsqlOids(
++      namespace_id, /*next_oid=*/highest_oid, /*count=*/1, &begin_oid, &end_oid,
++      /*use_secondary_space=*/false));
++  return Status::OK();
++}
++
+ Status CatalogManager::InvalidateTserverOidCaches() {
+   auto cluster_config = ClusterConfig();
+   SCHECK_NOTNULL(cluster_config);
+diff --git a/src/yb/master/catalog_manager.h b/src/yb/master/catalog_manager.h
+index 94dab1268b..92c57c134f 100644
+--- a/src/yb/master/catalog_manager.h
++++ b/src/yb/master/catalog_manager.h
+@@ -755,6 +755,13 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
+       const TableId& producer_table_id, const std::vector<cdc::CDCStateTableEntry>& entries,
+       const std::unordered_set<xrepl::StreamId>& cdcsdk_stream_ids);
+ 
++  // Advance OID counters as needed to ensure future OID allocations do not run into trouble.
++  //
++  // So far this just ensures the normal-space OID counter is beyond any normal-space OID we need to
++  // preserve.
++  // TODO(#27944): also handle reserved space and OIDs used by hidden tables.
++  Status AdvanceOidCounters(NamespaceId namespace_id);
++
+   // Invalidate all the TServer OID caches in this universe.  After this returns, each TServer cache
+   // will be effectively invalidated when that TServer receives a heartbeat response from master.
+   Status InvalidateTserverOidCaches() override;
+diff --git a/src/yb/master/catalog_manager_ext.cc b/src/yb/master/catalog_manager_ext.cc
+index 83ad991f17..f4a39348a5 100644
+--- a/src/yb/master/catalog_manager_ext.cc
++++ b/src/yb/master/catalog_manager_ext.cc
+@@ -20,6 +20,7 @@
+ 
+ #include "yb/common/colocated_util.h"
+ #include "yb/common/common_fwd.h"
++#include "yb/common/common_types.pb.h"
+ #include "yb/common/constants.h"
+ #include "yb/common/common.pb.h"
+ #include "yb/common/entity_ids.h"
+@@ -739,6 +740,13 @@ Status CatalogManager::DoImportSnapshotMeta(
+ 
+   ImportSnapshotRemoveInvalidTables(use_relfilenode, tables_data);
+ 
++  // PHASE 6: Adjust OID counters.
++  for (const auto& [_old_namespace_id, external_namespace_snapshot_data] : *namespace_map) {
++    if (external_namespace_snapshot_data.db_type == YQL_DATABASE_PGSQL) {
++      RETURN_NOT_OK(AdvanceOidCounters(external_namespace_snapshot_data.new_namespace_id));
++    }
++  }
++
+   if (PREDICT_FALSE(FLAGS_TEST_import_snapshot_failed)) {
+     const string msg = "ImportSnapshotMeta interrupted due to test flag";
+     LOG_WITH_FUNC(WARNING) << msg;
+diff --git a/src/yb/master/xcluster/xcluster_source_manager.cc b/src/yb/master/xcluster/xcluster_source_manager.cc
+index 8bf6673f4e..74caa4b21b 100644
+--- a/src/yb/master/xcluster/xcluster_source_manager.cc
++++ b/src/yb/master/xcluster/xcluster_source_manager.cc
+@@ -541,18 +541,7 @@ class XClusterCreateStreamContextImpl : public XClusterCreateStreamsContext {
+ };
+ 
+ Status XClusterSourceManager::SetNormalOidCounterAboveAllNormalOids(NamespaceId namespace_id) {
+-  auto database_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(namespace_id));
+-  VLOG(1) << "Calling ReadHighestNormalPreservableOid on database OID " << database_oid;
+-  auto highest_oid = VERIFY_RESULT(sys_catalog_.ReadHighestNormalPreservableOid(database_oid));
+-  auto* yb_client = master_.client_future().get();
+-  SCHECK(yb_client, IllegalState, "Client not initialized or shutting down");
+-  VLOG(1) << "Bumping normal space OID for database OID " << database_oid << " above "
+-          << highest_oid;
+-  uint32_t begin_oid, end_oid;
+-  RETURN_NOT_OK(yb_client->ReservePgsqlOids(
+-      namespace_id, /*next_oid=*/highest_oid, /*count=*/1, &begin_oid, &end_oid,
+-      /*use_secondary_space=*/false));
+-  VLOG(1) << "Invalidating TServer OID caches for database OID " << database_oid;
++  RETURN_NOT_OK(catalog_manager_.AdvanceOidCounters(namespace_id));
+   return catalog_manager_.InvalidateTserverOidCaches();
+ }
+ 
+diff --git a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+index 0f4d407c5a..7b695ec344 100644
+--- a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
++++ b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+@@ -3316,6 +3316,32 @@ TEST_F_EX(
+   }
+ }
+ 
++TEST_F_EX(
++    YBBackupTest, YB_DISABLE_TEST_IN_SANITIZERS(TestOidsAdvancedAfterRestore),
++    YBBackupTestOneTablet) {
++  ASSERT_NO_FATALS(CreateTable(
++      Format("CREATE TABLE my_table (a INT, b INT)", "my_table")));
++
++  // Backup then restore to a new database.
++  const string backup_dir = GetTempDir("backup");
++  ASSERT_OK(RunBackupCommand(
++      {"--backup_location", backup_dir, "--keyspace", "ysql.yugabyte", "create"}));
++  ASSERT_OK(RunBackupCommand(
++      {"--backup_location", backup_dir, "--keyspace", "ysql.yugabyte_new", "restore"}));
++
++  // Ensure that the DROP below will only hide the table, not delete it.
++  ASSERT_OK(snapshot_util_->CreateSchedule(
++      nullptr, YQL_DATABASE_PGSQL, "yugabyte_new", client::WaitSnapshot::kTrue,
++      2s * kTimeMultiplier, 20h));
++
++  SetDbName("yugabyte_new");
++  ASSERT_NO_FATALS(RunPsqlCommand("DROP TABLE my_table", "DROP TABLE"));
++
++  // At this point, if we have not advanced the normal space OID counter, then we will be attempting
++  // to create a table with the same OID as the one we just dropped.  That would fail.
++  ASSERT_NO_FATALS(RunPsqlCommand("CREATE TABLE my_table (a INT, b INT)", "CREATE TABLE"));
++}
++
+ TEST_F(
+     YBBackupTest, YB_DISABLE_TEST_IN_SANITIZERS(TestRenamedColumns)) {
+   ASSERT_NO_FATALS(CreateTable("CREATE TABLE table_1 (a INT, b INT, c INT, d INT)"));

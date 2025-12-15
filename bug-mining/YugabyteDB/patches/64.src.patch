@@ -1,0 +1,142 @@
+diff --git a/src/yb/yql/cql/ql/exec/exec_context.cc b/src/yb/yql/cql/ql/exec/exec_context.cc
+index a2bbf9cb57..e9b0787956 100644
+--- a/src/yb/yql/cql/ql/exec/exec_context.cc
++++ b/src/yb/yql/cql/ql/exec/exec_context.cc
+@@ -34,7 +34,10 @@ ExecContext::ExecContext(const ParseTree& parse_tree, const StatementParameters&
+ 
+ ExecContext::~ExecContext() {
+   // Reset to abort transaction explicitly instead of letting it expire.
+-  Reset(client::Restart::kFalse);
++  // Should be ok not to take a rescheduler here since the `ExecContext` clean up should happen
++  // only when we return a response to the CQL client, which is now guaranteed to happen in
++  // CQL proxy's handler thread.
++  Reset(client::Restart::kFalse, nullptr);
+ }
+ 
+ TnodeContext* ExecContext::AddTnode(const TreeNode *tnode) {
+@@ -122,8 +125,29 @@ bool ExecContext::HasPendingOperations() const {
+   return false;
+ }
+ 
++class AbortTransactionTask : public rpc::ThreadPoolTask {
++ public:
++  explicit AbortTransactionTask(YBTransactionPtr transaction)
++      : transaction_(std::move(transaction)) {}
++
++  void Run() override {
++    transaction_->Abort();
++    transaction_ = nullptr;
++  }
++
++  void Done(const Status& status) override {
++    delete this;
++  }
++
++  virtual ~AbortTransactionTask() {
++  }
++
++ private:
++  YBTransactionPtr transaction_;
++};
++
+ //--------------------------------------------------------------------------------------------------
+-void ExecContext::Reset(const Restart restart) {
++void ExecContext::Reset(const Restart restart, Rescheduler* rescheduler) {
+   if (transactional_session_) {
+     transactional_session_->Abort();
+     transactional_session_->SetTransaction(nullptr);
+@@ -131,7 +155,11 @@ void ExecContext::Reset(const Restart restart) {
+   if (transaction_ && !(transaction_->IsRestartRequired() && restart)) {
+     YBTransactionPtr transaction = std::move(transaction_);
+     TRACE("Abort Transaction");
+-    transaction->Abort();
++    if (rescheduler && rescheduler->NeedReschedule()) {
++      rescheduler->Reschedule(new AbortTransactionTask(std::move(transaction)));
++    } else {
++      transaction->Abort();
++    }
+   }
+   restart_ = restart;
+   tnode_contexts_.clear();
+diff --git a/src/yb/yql/cql/ql/exec/exec_context.h b/src/yb/yql/cql/ql/exec/exec_context.h
+index c9ffe9a345..3a5ed57807 100644
+--- a/src/yb/yql/cql/ql/exec/exec_context.h
++++ b/src/yb/yql/cql/ql/exec/exec_context.h
+@@ -174,6 +174,16 @@ class TnodeContext {
+   std::unique_ptr<QLRowBlock> keys_;
+ };
+ 
++// Processing could take a while, we are rescheduling it to our thread pool, if not yet
++// running in it.
++class Rescheduler {
++ public:
++  virtual bool NeedReschedule() = 0;
++  virtual void Reschedule(rpc::ThreadPoolTask* task) = 0;
++ protected:
++  ~Rescheduler() {}
++};
++
+ // The context for execution of a statement. Inside the statement parse tree, there may be one or
+ // more statement tnodes to be executed.
+ class ExecContext : public ProcessContextBase {
+@@ -257,7 +267,7 @@ class ExecContext : public ProcessContextBase {
+   }
+ 
+   // Reset this ExecContext.
+-  void Reset(client::Restart restart);
++  void Reset(client::Restart restart, Rescheduler* rescheduler);
+ 
+  private:
+   // Statement parse tree to execute and parameters to execute with.
+diff --git a/src/yb/yql/cql/ql/exec/executor.cc b/src/yb/yql/cql/ql/exec/executor.cc
+index d88477d95a..ae1390ce0b 100644
+--- a/src/yb/yql/cql/ql/exec/executor.cc
++++ b/src/yb/yql/cql/ql/exec/executor.cc
+@@ -1349,7 +1349,7 @@ void Executor::CommitDone(Status s, ExecContext* exec_context) {
+     }
+   } else {
+     if (NeedsRestart(s)) {
+-      exec_context->Reset(client::Restart::kTrue);
++      exec_context->Reset(client::Restart::kTrue, rescheduler_);
+     } else {
+       std::lock_guard<std::mutex> lock(status_mutex_);
+       async_status_ = s;
+@@ -1543,7 +1543,7 @@ Result<bool> Executor::ProcessTnodeResults(TnodeContext* tnode_context) {
+         const auto& result = response.child_transaction_result();
+         const Status s = exec_context_->ApplyChildTransactionResult(result);
+         if (NeedsRestart(s)) {
+-          exec_context_->Reset(client::Restart::kTrue);
++          exec_context_->Reset(client::Restart::kTrue, rescheduler_);
+           break;
+         }
+         RETURN_NOT_OK(s);
+@@ -1944,7 +1944,7 @@ Status Executor::ProcessAsyncStatus(const OpErrors& op_errors, ExecContext* exec
+             s = ProcessOpStatus(static_cast<const PTDmlStmt *>(tnode), op, exec_context);
+           }
+           if (NeedsRestart(s)) {
+-            exec_context->Reset(client::Restart::kTrue);
++            exec_context->Reset(client::Restart::kTrue, rescheduler_);
+             return true; // done
+           }
+           RETURN_NOT_OK(ProcessStatementStatus(exec_context->parse_tree(), s));
+diff --git a/src/yb/yql/cql/ql/exec/executor.h b/src/yb/yql/cql/ql/exec/executor.h
+index 6067c467b9..9a880c6cd9 100644
+--- a/src/yb/yql/cql/ql/exec/executor.h
++++ b/src/yb/yql/cql/ql/exec/executor.h
+@@ -52,16 +52,6 @@ class QLMetrics;
+ typedef std::vector<std::pair<std::reference_wrapper<const ParseTree>,
+                               std::reference_wrapper<const StatementParameters>>> StatementBatch;
+ 
+-// Processing could take a while, we are rescheduling it to our thread pool, if not yet
+-// running in it.
+-class Rescheduler {
+- public:
+-  virtual bool NeedReschedule() = 0;
+-  virtual void Reschedule(rpc::ThreadPoolTask* task) = 0;
+- protected:
+-  ~Rescheduler() {}
+-};
+-
+ class Executor : public QLExprExecutor {
+  public:
+   //------------------------------------------------------------------------------------------------

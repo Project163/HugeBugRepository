@@ -1,0 +1,814 @@
+diff --git a/doc/build/changelog/migration_13.rst b/doc/build/changelog/migration_13.rst
+index eab13bef9..7cab28a2b 100644
+--- a/doc/build/changelog/migration_13.rst
++++ b/doc/build/changelog/migration_13.rst
+@@ -225,6 +225,78 @@ value.   This assertion is now skipped in the case of loading the "old" value.
+ 
+ :ticket:`4353`
+ 
++.. _change_4359:
++
++Improvement to the behavior of many-to-one query expressions
++------------------------------------------------------------
++
++When building a query that compares a many-to-one relationship to an
++object value, such as::
++
++    u1 = session.query(User).get(5)
++
++    query = session.query(Address).filter(Address.user == u1)
++
++The above expression ``Address.user == u1``, which ultimately compiles to a SQL
++expression normally based on the primary key columns of the ``User`` object
++like ``"address.user_id = 5"``, uses a deferred callable in order to retrieve
++the value ``5`` within the bound expression until  as late as possible.  This
++is to suit both the use case where the ``Address.user == u1`` expression may be
++against a ``User`` object that isn't flushed yet which relies upon a server-
++generated primary key value, as well as that the expression always returns the
++correct result even if the primary key value of ``u1`` has been changed since
++the expression was created.
++
++However, a side effect of this behavior is that if ``u1`` ends up being expired
++by the time the expression is evaluated, it results in an additional SELECT
++statement, and in the case that ``u1`` was also detached from the
++:class:`.Session`, it would raise an error::
++
++    u1 = session.query(User).get(5)
++
++    query = session.query(Address).filter(Address.user == u1)
++
++    session.expire(u1)
++    session.expunge(u1)
++
++    query.all()  # <-- would raise DetachedInstanceError
++
++The expiration / expunging of the object can occur implicitly when the
++:class:`.Session` is committed and the ``u1`` instance falls out of scope,
++as the ``Address.user == u1`` expression does not strongly reference the
++object itself, only its :class:`.InstanceState`.
++
++The fix is to allow the ``Address.user == u1`` expression to evaluate the value
++``5`` based on attempting to retrieve or load the value normally at expression
++compilation time as it does now, but if the object is detached and has
++been expired, it is retrieved from a new mechanism upon the
++:class:`.InstanceState` which will memoize the last known value for a
++particular attribute on that state when that attribute is expired.  This
++mechanism is only enabled for a specific attribute / :class:`.InstanceState`
++when needed by the expression feature to conserve performance / memory
++overhead.
++
++Originally, simpler approaches such as evaluating the expression immediately
++with various arrangements for trying to load the value later if not present
++were attempted, however the difficult edge case is that of the value  of a
++column attribute (typically a natural primary key) that is being changed.   In
++order to ensure that an expression like ``Address.user == u1`` always returns
++the correct answer for the current state of ``u1``, it will return the current
++database-persisted value for a persistent object, unexpiring via SELECT query
++if necessary, and for a detached object it will return the most recent known
++value, regardless of when the object was expired using a new feature within the
++:class:`.InstanceState` that tracks the last known value of a column attribute
++whenever the attribute is to be expired.
++
++Modern attribute API features are used to indicate specific error messages when
++the value cannot be evaluated, the two cases of which are when the column
++attributes have never been set, and when the object was already expired
++when the first evaluation was made and is now detached. In all cases,
++:class:`.DetachedInstanceError` is no longer raised.
++
++
++:ticket:`4359`
++
+ .. _change_3423:
+ 
+ AssociationProxy stores class-specific state in a separate container
+diff --git a/doc/build/changelog/unreleased_13/4359.rst b/doc/build/changelog/unreleased_13/4359.rst
+new file mode 100644
+index 000000000..1131ed6d8
+--- /dev/null
++++ b/doc/build/changelog/unreleased_13/4359.rst
+@@ -0,0 +1,17 @@
++.. change::
++   :tags: bug, orm
++   :tickets: 4359
++
++   Improved the behavior of a relationship-bound many-to-one object expression
++   such that the retrieval of column values on the related object are now
++   resilient against the object being detached from its parent
++   :class:`.Session`, even if the attribute has been expired.  New features
++   within the :class:`.InstanceState` are used to memoize the last known value
++   of a particular column attribute before its expired, so that the expression
++   can still evaluate when the object is detached and expired at the same
++   time.  Error conditions are also improved using modern attribute state
++   features to produce more specific messages as needed.
++
++   .. seealso::
++
++        :ref:`change_4359`
+diff --git a/lib/sqlalchemy/orm/relationships.py b/lib/sqlalchemy/orm/relationships.py
+index 818f1c0ae..e92d10a5b 100644
+--- a/lib/sqlalchemy/orm/relationships.py
++++ b/lib/sqlalchemy/orm/relationships.py
+@@ -25,6 +25,8 @@ from ..sql.util import (
+     join_condition, _shallow_annotate, visit_binary_product,
+     _deep_deannotate, selectables_overlap, adapt_criterion_to_null
+ )
++from .base import state_str
++
+ from ..sql import operators, expression, visitors
+ from .interfaces import (MANYTOMANY, MANYTOONE, ONETOMANY,
+                          StrategizedProperty, PropComparator)
+@@ -1274,9 +1276,7 @@ class RelationshipProperty(StrategizedProperty):
+                     return sql.bindparam(
+                         x, unique=True,
+                         callable_=self.property._get_attr_w_warn_on_none(
+-                            col,
+-                            self.property.mapper._get_state_attr_by_column,
+-                            state, dict_, col, passive=attributes.PASSIVE_OFF
++                            self.property.mapper, state, dict_, col
+                         )
+                     )
+ 
+@@ -1406,11 +1406,8 @@ class RelationshipProperty(StrategizedProperty):
+         def visit_bindparam(bindparam):
+             if bindparam._identifying_key in bind_to_col:
+                 bindparam.callable = self._get_attr_w_warn_on_none(
+-                    bind_to_col[bindparam._identifying_key],
+-                    mapper._get_state_attr_by_column,
+-                    state, dict_,
+-                    bind_to_col[bindparam._identifying_key],
+-                    passive=attributes.PASSIVE_OFF)
++                    mapper, state, dict_,
++                    bind_to_col[bindparam._identifying_key])
+ 
+         if self.secondary is not None and alias_secondary:
+             criterion = ClauseAdapter(
+@@ -1424,16 +1421,94 @@ class RelationshipProperty(StrategizedProperty):
+             criterion = adapt_source(criterion)
+         return criterion
+ 
+-    def _get_attr_w_warn_on_none(self, column, fn, *arg, **kw):
++    def _get_attr_w_warn_on_none(self, mapper, state, dict_, column):
++        """Create the callable that is used in a many-to-one expression.
++
++        E.g.::
++
++            u1 = s.query(User).get(5)
++
++            expr = Address.user == u1
++
++        Above, the SQL should be "address.user_id = 5". The callable
++        returned by this method produces the value "5" based on the identity
++        of ``u1`.
++
++        """
++
++        # in this callable, we're trying to thread the needle through
++        # a wide variety of scenarios, including:
++        #
++        # * the object hasn't been flushed yet and there's no value for
++        #   the attribute as of yet
++        #
++        # * the object hasn't been flushed yet but it has a user-defined
++        #   value
++        #
++        # * the object has a value but it's expired and not locally present
++        #
++        # * the object has a value but it's expired and not locally present,
++        #   and the object is also detached
++        #
++        # * The object hadn't been flushed yet, there was no value, but
++        #   later, the object has been expired and detached, and *now*
++        #   they're trying to evaluate it
++        #
++        # * the object had a value, but it was changed to a new value, and
++        #   then expired
++        #
++        # * the object had a value, but it was changed to a new value, and
++        #   then expired, then the object was detached
++        #
++        # * the object has a user-set value, but it's None and we don't do
++        #   the comparison correctly for that so warn
++        #
++
++        prop = mapper.get_property_by_column(column)
++
++        # by invoking this method, InstanceState will track the last known
++        # value for this key each time the attribute is to be expired.
++        # this feature was added explicitly for use in this method.
++        state._track_last_known_value(prop.key)
++
+         def _go():
+-            value = fn(*arg, **kw)
+-            if value is None:
++            last_known = to_return = state._last_known_values[prop.key]
++            existing_is_available = last_known is not attributes.NO_VALUE
++
++            # we support that the value may have changed.  so here we
++            # try to get the most recent value including re-fetching.
++            # only if we can't get a value now due to detachment do we return
++            # the last known value
++            current_value = mapper._get_state_attr_by_column(
++                state, dict_, column,
++                passive=attributes.PASSIVE_RETURN_NEVER_SET
++                if state.persistent
++                else attributes.PASSIVE_NO_FETCH ^ attributes.INIT_OK)
++
++            if current_value is attributes.NEVER_SET:
++                if not existing_is_available:
++                    raise sa_exc.InvalidRequestError(
++                        "Can't resolve value for column %s on object "
++                        "%s; no value has been set for this column" % (
++                            column, state_str(state))
++                    )
++            elif current_value is attributes.PASSIVE_NO_RESULT:
++                if not existing_is_available:
++                    raise sa_exc.InvalidRequestError(
++                        "Can't resolve value for column %s on object "
++                        "%s; the object is detached and the value was "
++                        "expired" % (
++                            column, state_str(state))
++                    )
++            else:
++                to_return = current_value
++            if to_return is None:
+                 util.warn(
+                     "Got None for value of column %s; this is unsupported "
+                     "for a relationship comparison and will not "
+                     "currently produce an IS comparison "
+                     "(but may in a future release)" % column)
+-            return value
++            return to_return
+         return _go
+ 
+     def _lazy_none_clause(self, reverse_direction=False, adapt_source=None):
+diff --git a/lib/sqlalchemy/orm/state.py b/lib/sqlalchemy/orm/state.py
+index 935e7df19..944dc8177 100644
+--- a/lib/sqlalchemy/orm/state.py
++++ b/lib/sqlalchemy/orm/state.py
+@@ -64,6 +64,7 @@ class InstanceState(interfaces.InspectionAttrInfo):
+     _orphaned_outside_of_session = False
+     is_instance = True
+     identity_token = None
++    _last_known_values = ()
+ 
+     callables = ()
+     """A namespace where a per-state loader callable can be associated.
+@@ -229,6 +230,18 @@ class InstanceState(interfaces.InspectionAttrInfo):
+         return self.session_id is not None and \
+             self.session_id in sessionlib._sessions
+ 
++    def _track_last_known_value(self, key):
++        """Track the last known value of a particular key after expiration
++        operations.
++
++        .. versionadded:: 1.3
++
++        """
++
++        if key not in self._last_known_values:
++            self._last_known_values = dict(self._last_known_values)
++            self._last_known_values[key] = NO_VALUE
++
+     @property
+     @util.dependencies("sqlalchemy.orm.session")
+     def session(self, sessionlib):
+@@ -569,6 +582,12 @@ class InstanceState(interfaces.InspectionAttrInfo):
+             collection = dict_.pop(k)
+             collection._sa_adapter.invalidated = True
+ 
++        if self._last_known_values:
++            self._last_known_values.update(
++                (k, dict_[k]) for k in self._last_known_values
++                if k in dict_
++            )
++
+         for key in self.manager._all_key_set.intersection(dict_):
+             del dict_[key]
+ 
+@@ -591,10 +610,14 @@ class InstanceState(interfaces.InspectionAttrInfo):
+                 self.expired_attributes.add(key)
+                 if callables and key in callables:
+                     del callables[key]
+-            old = dict_.pop(key, None)
+-            if impl.collection and old is not None:
++            old = dict_.pop(key, NO_VALUE)
++            if impl.collection and old is not NO_VALUE:
+                 impl._invalidate_collection(old)
+ 
++            if self._last_known_values and key in self._last_known_values \
++                    and old is not NO_VALUE:
++                self._last_known_values[key] = old
++
+             self.committed_state.pop(key, None)
+             if pending:
+                 pending.pop(key, None)
+@@ -690,6 +713,9 @@ class InstanceState(interfaces.InspectionAttrInfo):
+                         previous = attr.copy(previous)
+                 self.committed_state[attr.key] = previous
+ 
++            if attr.key in self._last_known_values:
++                self._last_known_values[attr.key] = NO_VALUE
++
+         # assert self._strong_obj is None or self.modified
+ 
+         if (self.session_id and self._strong_obj is None) \
+diff --git a/test/orm/test_attributes.py b/test/orm/test_attributes.py
+index 6d2610fd6..fa060af1d 100644
+--- a/test/orm/test_attributes.py
++++ b/test/orm/test_attributes.py
+@@ -994,6 +994,58 @@ class AttributesTest(fixtures.ORMTest):
+         except sa_exc.ArgumentError as e:
+             assert False
+ 
++    def test_last_known_tracking(self):
++        class Foo(object):
++            pass
++
++        instrumentation.register_class(Foo)
++        attributes.register_attribute(Foo, 'a', useobject=False)
++        attributes.register_attribute(Foo, 'b', useobject=False)
++        attributes.register_attribute(Foo, 'c', useobject=False)
++
++        f1 = Foo()
++        state = attributes.instance_state(f1)
++
++        f1.a = 'a1'
++        f1.b = 'b1'
++        f1.c = 'c1'
++
++        assert not state._last_known_values
++
++        state._track_last_known_value('b')
++        state._track_last_known_value('c')
++
++        eq_(
++            state._last_known_values,
++            {'b': attributes.NO_VALUE, 'c': attributes.NO_VALUE})
++
++        state._expire_attributes(state.dict, ['b'])
++        eq_(
++            state._last_known_values,
++            {'b': 'b1', 'c': attributes.NO_VALUE})
++
++        state._expire(state.dict, set())
++        eq_(
++            state._last_known_values,
++            {'b': 'b1', 'c': 'c1'})
++
++        f1.b = 'b2'
++
++        eq_(
++            state._last_known_values,
++            {'b': attributes.NO_VALUE, 'c': 'c1'})
++
++        f1.c = 'c2'
++
++        eq_(
++            state._last_known_values,
++            {'b': attributes.NO_VALUE, 'c': attributes.NO_VALUE})
++
++        state._expire(state.dict, set())
++        eq_(
++            state._last_known_values,
++            {'b': 'b2', 'c': 'c2'})
++
+ 
+ class GetNoValueTest(fixtures.ORMTest):
+     def _fixture(self, expected):
+diff --git a/test/orm/test_naturalpks.py b/test/orm/test_naturalpks.py
+index e8360bb83..eb20c3815 100644
+--- a/test/orm/test_naturalpks.py
++++ b/test/orm/test_naturalpks.py
+@@ -3,7 +3,8 @@ Primary key changing capabilities and passive/non-passive cascading updates.
+ 
+ """
+ 
+-from sqlalchemy.testing import fixtures, eq_, ne_, assert_raises
++from sqlalchemy.testing import fixtures, eq_, ne_, assert_raises, \
++    assert_raises_message
+ import sqlalchemy as sa
+ from sqlalchemy import testing, Integer, String, ForeignKey
+ from sqlalchemy.testing.schema import Table, Column
+@@ -496,6 +497,106 @@ class NaturalPKTest(fixtures.MappedTest):
+         r = sess.query(Item).with_parent(u2).all()
+         eq_(Item(itemname='item2'), r[0])
+ 
++    def test_manytoone_deferred_relationship_expr(self):
++        """for [ticket:4359], test that updates to the columns embedded
++        in an object expression are also updated."""
++        users, Address, addresses, User = (self.tables.users,
++                                           self.classes.Address,
++                                           self.tables.addresses,
++                                           self.classes.User)
++
++        mapper(User, users)
++        mapper(Address, addresses, properties={
++            'user': relationship(
++                User,
++                passive_updates=testing.requires.on_update_cascade.enabled)
++        })
++
++        s = Session()
++        a1 = Address(email='jack1')
++        u1 = User(username='jack', fullname='jack')
++
++        a1.user = u1
++
++        # scenario 1.  object is still transient, we get a value.
++        expr = Address.user == u1
++
++        eq_(expr.left.callable(), 'jack')
++
++        # scenario 2.  value has been changed while we are transient.
++        # we get the updated value.
++        u1.username = 'ed'
++        eq_(expr.left.callable(), 'ed')
++
++        s.add_all([u1, a1])
++        s.commit()
++
++        eq_(a1.username, 'ed')
++
++        # scenario 3.  the value is changed and flushed, we get the new value.
++        u1.username = 'fred'
++        s.flush()
++
++        eq_(expr.left.callable(), 'fred')
++
++        # scenario 4.  the value is changed, flushed, and expired.
++        # the callable goes out to get that value.
++        u1.username = 'wendy'
++        s.commit()
++        assert 'username' not in u1.__dict__
++
++        eq_(expr.left.callable(), 'wendy')
++
++        # scenario 5.  the value is changed flushed, expired,
++        # and then when we hit the callable, we are detached.
++        u1.username = 'jack'
++        s.commit()
++        assert 'username' not in u1.__dict__
++
++        s.expunge(u1)
++
++        # InstanceState has a "last known values" feature we use
++        # to pick up on this
++        eq_(expr.left.callable(), 'jack')
++
++        # doesn't unexpire the attribute
++        assert 'username' not in u1.__dict__
++
++        # once we are persistent again, we check the DB
++        s.add(u1)
++        eq_(expr.left.callable(), 'jack')
++        assert 'username' in u1.__dict__
++
++        # scenario 6.  we are using del
++        u2 = User(username='jack', fullname='jack')
++        expr = Address.user == u2
++
++        eq_(expr.left.callable(), 'jack')
++
++        del u2.username
++
++        assert_raises_message(
++            sa.exc.InvalidRequestError,
++            "Can't resolve value for column users.username",
++            expr.left.callable
++        )
++
++        u2.username = 'ed'
++        eq_(expr.left.callable(), 'ed')
++
++        s.add(u2)
++        s.commit()
++
++        eq_(expr.left.callable(), 'ed')
++
++        del u2.username
++
++        assert_raises_message(
++            sa.exc.InvalidRequestError,
++            "Can't resolve value for column users.username",
++            expr.left.callable
++        )
++
+ 
+ class TransientExceptionTesst(_fixtures.FixtureTest):
+     run_inserts = None
+diff --git a/test/orm/test_query.py b/test/orm/test_query.py
+index 880497501..6d959a054 100644
+--- a/test/orm/test_query.py
++++ b/test/orm/test_query.py
+@@ -3927,13 +3927,49 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+                     users.c.name == addresses.c.email_address))
+         })
+ 
+-    def test_filter_with_transient_assume_pk(self):
++    def test_filter_with_transient_dont_assume_pk(self):
+         self._fixture1()
+         User, Address = self.classes.User, self.classes.Address
+ 
+         sess = Session()
+ 
+         q = sess.query(Address).filter(Address.user == User())
++        assert_raises_message(
++            sa_exc.StatementError,
++            "Can't resolve value for column users.id on object "
++            ".User at .*; no value has been set for this column",
++            q.all
++        )
++
++    def test_filter_with_transient_given_pk(self):
++        self._fixture1()
++        User, Address = self.classes.User, self.classes.Address
++
++        sess = Session()
++
++        q = sess.query(Address).filter(Address.user == User(id=None))
++        with expect_warnings("Got None for value of column "):
++            self.assert_compile(
++                q,
++                "SELECT addresses.id AS addresses_id, "
++                "addresses.user_id AS addresses_user_id, "
++                "addresses.email_address AS addresses_email_address "
++                "FROM addresses WHERE :param_1 = addresses.user_id",
++                checkparams={'param_1': None}
++            )
++
++    def test_filter_with_transient_given_pk_but_only_later(self):
++        self._fixture1()
++        User, Address = self.classes.User, self.classes.Address
++
++        sess = Session()
++
++        u1 = User()
++        # id is not set, so evaluates to NEVER_SET
++        q = sess.query(Address).filter(Address.user == u1)
++
++        # but we set it, so we should get the warning
++        u1.id = None
+         with expect_warnings("Got None for value of column "):
+             self.assert_compile(
+                 q,
+@@ -3949,7 +3985,8 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+         User, Address = self.classes.User, self.classes.Address
+ 
+         s = Session()
+-        q = s.query(Address).filter(Address.special_user == User())
++        q = s.query(Address).filter(
++            Address.special_user == User(id=None, name=None))
+         with expect_warnings("Got None for value of column"):
+ 
+             self.assert_compile(
+@@ -3968,7 +4005,7 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+ 
+         sess = Session()
+ 
+-        q = sess.query(User).with_parent(Address(), "user")
++        q = sess.query(User).with_parent(Address(user_id=None), "user")
+         with expect_warnings("Got None for value of column"):
+             self.assert_compile(
+                 q,
+@@ -3982,7 +4019,8 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+         User, Address = self.classes.User, self.classes.Address
+ 
+         s = Session()
+-        q = s.query(User).with_parent(Address(), "special_user")
++        q = s.query(User).with_parent(
++            Address(user_id=None, email_address=None), "special_user")
+         with expect_warnings("Got None for value of column"):
+ 
+             self.assert_compile(
+@@ -3998,7 +4036,7 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+         User, Address = self.classes.User, self.classes.Address
+ 
+         s = Session()
+-        q = s.query(Address).filter(Address.user != User())
++        q = s.query(Address).filter(Address.user != User(id=None))
+         with expect_warnings("Got None for value of column"):
+             self.assert_compile(
+                 q,
+@@ -4020,7 +4058,7 @@ class WithTransientOnNone(_fixtures.FixtureTest, AssertsCompiledSQL):
+ 
+         # this one does *not* warn because we do the criteria
+         # without deferral
+-        q = s.query(Address).filter(Address.special_user != User())
++        q = s.query(Address).filter(Address.special_user != User(id=None))
+         self.assert_compile(
+             q,
+             "SELECT addresses.id AS addresses_id, "
+diff --git a/test/orm/test_session.py b/test/orm/test_session.py
+index adfb21497..b141b9965 100644
+--- a/test/orm/test_session.py
++++ b/test/orm/test_session.py
+@@ -387,37 +387,6 @@ class SessionStateTest(_fixtures.FixtureTest):
+                 r"expected to delete 1 row\(s\); 0 were matched."):
+             sess.commit()
+ 
+-    def test_autoflush_expressions(self):
+-        """test that an expression which is dependent on object state is
+-        evaluated after the session autoflushes.   This is the lambda
+-        inside of strategies.py lazy_clause.
+-
+-        """
+-
+-        users, Address, addresses, User = (self.tables.users,
+-                                           self.classes.Address,
+-                                           self.tables.addresses,
+-                                           self.classes.User)
+-
+-        mapper(User, users, properties={
+-            'addresses': relationship(Address, backref="user")})
+-        mapper(Address, addresses)
+-
+-        sess = create_session(autoflush=True, autocommit=False)
+-        u = User(name='ed', addresses=[Address(email_address='foo')])
+-        sess.add(u)
+-        eq_(sess.query(Address).filter(Address.user == u).one(),
+-            Address(email_address='foo'))
+-
+-        # still works after "u" is garbage collected
+-        sess.commit()
+-        sess.close()
+-        u = sess.query(User).get(u.id)
+-        q = sess.query(Address).filter(Address.user == u)
+-        del u
+-        gc_collect()
+-        eq_(q.one(), Address(email_address='foo'))
+-
+     @testing.requires.independent_connections
+     @engines.close_open_connections
+     def test_autoflush_unbound(self):
+@@ -801,6 +770,171 @@ class SessionStateTest(_fixtures.FixtureTest):
+         assert object_session(u1) is None
+ 
+ 
++class DeferredRelationshipExpressionTest(_fixtures.FixtureTest):
++    run_inserts = None
++    run_deletes = 'each'
++
++    @classmethod
++    def setup_mappers(cls):
++        users, Address, addresses, User = (cls.tables.users,
++                                           cls.classes.Address,
++                                           cls.tables.addresses,
++                                           cls.classes.User)
++
++        mapper(User, users, properties={
++            'addresses': relationship(Address, backref="user")})
++        mapper(Address, addresses)
++
++    def test_deferred_expression_unflushed(self):
++        """test that an expression which is dependent on object state is
++        evaluated after the session autoflushes.   This is the lambda
++        inside of strategies.py lazy_clause.
++
++        """
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++        sess.add(u)
++        eq_(sess.query(Address).filter(Address.user == u).one(),
++            Address(email_address='foo'))
++
++    def test_deferred_expression_obj_was_gced(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++        sess.add(u)
++
++        sess.commit()
++        sess.close()
++        u = sess.query(User).get(u.id)
++        q = sess.query(Address).filter(Address.user == u)
++        del u
++        gc_collect()
++        eq_(q.one(), Address(email_address='foo'))
++
++    def test_deferred_expression_favors_immediate(self):
++        """Test that a deferred expression will return an immediate value
++        if available, rather than invoking after the object is detached
++
++        """
++
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++        sess.add(u)
++        sess.commit()
++
++        q = sess.query(Address).filter(Address.user == u)
++        sess.expire(u)
++        sess.expunge(u)
++        eq_(q.one(), Address(email_address='foo'))
++
++    def test_deferred_expression_obj_was_never_flushed(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++
++        assert_raises_message(
++            sa.exc.InvalidRequestError,
++            "Can't resolve value for column users.id on object "
++            ".User.*.; no value has been set for this column",
++            (Address.user == u).left.callable
++        )
++
++        q = sess.query(Address).filter(Address.user == u)
++        assert_raises_message(
++            sa.exc.StatementError,
++            "Can't resolve value for column users.id on object "
++            ".User.*.; no value has been set for this column",
++            q.one
++        )
++
++    def test_deferred_expression_transient_but_manually_set(self):
++        User, Address = self.classes("User", "Address")
++
++        u = User(id=5, name='ed', addresses=[Address(email_address='foo')])
++
++        expr = Address.user == u
++        eq_(expr.left.callable(), 5)
++
++    def test_deferred_expression_unflushed_obj_became_detached_unexpired(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++
++        q = sess.query(Address).filter(Address.user == u)
++
++        sess.add(u)
++        sess.flush()
++
++        sess.expunge(u)
++        eq_(q.one(), Address(email_address='foo'))
++
++    def test_deferred_expression_unflushed_obj_became_detached_expired(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++
++        q = sess.query(Address).filter(Address.user == u)
++
++        sess.add(u)
++        sess.flush()
++
++        sess.expire(u)
++        sess.expunge(u)
++        eq_(q.one(), Address(email_address='foo'))
++
++    def test_deferred_expr_unflushed_obj_became_detached_expired_by_key(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(autoflush=True, autocommit=False)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++
++        q = sess.query(Address).filter(Address.user == u)
++
++        sess.add(u)
++        sess.flush()
++
++        sess.expire(u, ['id'])
++        sess.expunge(u)
++        eq_(q.one(), Address(email_address='foo'))
++
++    def test_deferred_expression_expired_obj_became_detached_expired(self):
++        User, Address = self.classes("User", "Address")
++
++        sess = create_session(
++            autoflush=True, autocommit=False, expire_on_commit=True)
++        u = User(name='ed', addresses=[Address(email_address='foo')])
++
++        sess.add(u)
++        sess.commit()
++
++        assert 'id' not in u.__dict__  # it's expired
++
++        # should not emit SQL
++        def go():
++            Address.user == u
++        self.assert_sql_count(testing.db, go, 0)
++
++        # create the expression here, but note we weren't tracking 'id'
++        # yet so we don't have the old value
++        q = sess.query(Address).filter(Address.user == u)
++
++        sess.expunge(u)
++        assert_raises_message(
++            sa.exc.StatementError,
++            "Can't resolve value for column users.id on object "
++            ".User.*.; the object is detached and the value was expired ",
++            q.one
++        )
++
++
+ class SessionStateWFixtureTest(_fixtures.FixtureTest):
+     __backend__ = True
+ 

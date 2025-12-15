@@ -1,0 +1,1048 @@
+diff --git a/ent/src/yb/cdc/cdc_service.cc b/ent/src/yb/cdc/cdc_service.cc
+index 4fc7dcbef7..5a31a40a62 100644
+--- a/ent/src/yb/cdc/cdc_service.cc
++++ b/ent/src/yb/cdc/cdc_service.cc
+@@ -140,6 +140,8 @@ DECLARE_int32(cdc_checkpoint_opid_interval_ms);
+ 
+ DECLARE_int32(rpc_workers_limit);
+ 
++DECLARE_int64(cdc_intent_retention_ms);
++
+ METRIC_DEFINE_entity(cdc);
+ 
+ namespace yb {
+@@ -305,6 +307,7 @@ class CDCServiceImpl::Impl {
+       .tablet_id = tablet_id
+     };
+     CoarseTimePoint time;
++
+     if (producer_entries_modified) {
+       producer_entries_modified->push_back(producer_tablet);
+       time = CoarseMonoClock::Now();
+@@ -317,8 +320,8 @@ class CDCServiceImpl::Impl {
+     }
+     tablet_checkpoints_.emplace(TabletCheckpointInfo {
+       .producer_tablet_info = producer_tablet,
+-      .cdc_state_checkpoint = {op_id, time},
+-      .sent_checkpoint = {op_id, time},
++      .cdc_state_checkpoint = {op_id, time, time},
++      .sent_checkpoint = {op_id, time, time},
+     });
+   }
+ 
+@@ -355,10 +358,12 @@ class CDCServiceImpl::Impl {
+     TabletCheckpoint sent_checkpoint = {
+       .op_id = sent_op_id,
+       .last_update_time = now,
++      .last_active_time = now,
+     };
+     TabletCheckpoint commit_checkpoint = {
+       .op_id = commit_op_id,
+       .last_update_time = now,
++      .last_active_time = now,
+     };
+ 
+     std::lock_guard<decltype(mutex_)> l(mutex_);
+@@ -366,7 +371,7 @@ class CDCServiceImpl::Impl {
+     if (it != tablet_checkpoints_.end()) {
+       it->sent_checkpoint = sent_checkpoint;
+ 
+-      if (commit_op_id.index > 0) {
++      if (commit_op_id.index >= 0) {
+         it->cdc_state_checkpoint.op_id = commit_op_id;
+       }
+ 
+@@ -504,6 +509,60 @@ class CDCServiceImpl::Impl {
+     return tablet_checkpoints_;
+   }
+ 
++  CoarseTimePoint GetLatestActiveTime(
++      const ProducerTabletInfo& producer_tablet, const OpId& checkpoint) {
++    auto now = CoarseMonoClock::Now();
++    TabletCheckpoint sent_checkpoint = {
++        .op_id = OpId::Max(),
++        .last_update_time = now,
++        .last_active_time = now,
++    };
++    TabletCheckpoint commit_checkpoint = {
++        .op_id = checkpoint,
++        .last_update_time = now,
++        .last_active_time = now,
++    };
++
++    SharedLock<rw_spinlock> lock(mutex_);
++    auto it = tablet_checkpoints_.find(producer_tablet);
++    // This happen when node is restarted, but Getchange call happen for some stream, not for this
++    // stream, so there is no cache entry for the searched producer_tablet.
++    // create an entry for this.
++    if (it == tablet_checkpoints_.end()) {
++      tablet_checkpoints_.emplace(TabletCheckpointInfo{
++          .producer_tablet_info = producer_tablet,
++          .cdc_state_checkpoint = commit_checkpoint,
++          .sent_checkpoint = sent_checkpoint});
++    }
++    it = tablet_checkpoints_.find(producer_tablet);
++    return it->cdc_state_checkpoint.last_active_time;
++  }
++
++  Status CheckStreamActive(const ProducerTabletInfo& producer_tablet) {
++    SharedLock<rw_spinlock> l(mutex_);
++    auto it = tablet_checkpoints_.find(producer_tablet);
++
++    if (it != tablet_checkpoints_.end()) {
++      if (it->cdc_state_checkpoint.last_active_time.time_since_epoch().count() != 0 &&
++          CoarseMonoClock::Now() >
++              it->cdc_state_checkpoint.last_active_time +
++                  MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms))) {
++        return STATUS_FORMAT(
++            InternalError, "stream ID $0 is expired for Tablet ID $1", producer_tablet.stream_id,
++            producer_tablet.tablet_id);
++      }
++    }
++    return Status::OK();
++  }
++
++  void UpdateActiveTime(const ProducerTabletInfo& producer_tablet) {
++    SharedLock<rw_spinlock> l(mutex_);
++    auto it = tablet_checkpoints_.find(producer_tablet);
++    if (it != tablet_checkpoints_.end()) {
++      it->cdc_state_checkpoint.last_active_time = CoarseMonoClock::Now();
++    }
++  }
++
+   boost::optional<client::AsyncClientInitialiser> async_client_init_;
+ 
+   // this will be used for the std::call_once call while caching the client
+@@ -933,6 +992,12 @@ Result<SetCDCCheckpointResponsePB> CDCServiceImpl::SetCDCCheckpoint(
+   }
+   auto session = client()->NewSession();
+   session->SetDeadline(deadline);
++
++  if (record->source_type == CDCSDK) {
++    RETURN_NOT_OK_SET_CODE(
++        impl_->CheckStreamActive(producer_tablet), CDCError(CDCErrorPB::INTERNAL_ERROR));
++    impl_->UpdateActiveTime(producer_tablet);
++  }
+   RETURN_NOT_OK_SET_CODE(
+       UpdateCheckpoint(
+           producer_tablet, checkpoint, checkpoint, session, GetCurrentTimeMicros(), true),
+@@ -1112,14 +1177,19 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
+     return;
+   }
+ 
+-  // This is the leader tablet, so mark cdc as enabled.
+-  SetCDCServiceEnabled();
+-
+   auto res = GetStream(stream_id);
+   RPC_CHECK_AND_RETURN_ERROR(res.ok(), res.status(), resp->mutable_error(),
+                              CDCErrorPB::INTERNAL_ERROR, context);
+   StreamMetadata record = **res;
+ 
++  if (record.source_type == CDCSDK) {
++    auto result = impl_->CheckStreamActive(producer_tablet);
++    RPC_STATUS_RETURN_ERROR(result, resp->mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);
++    impl_->UpdateActiveTime(producer_tablet);
++  }
++  // This is the leader tablet, so mark cdc as enabled.
++  SetCDCServiceEnabled();
++
+   OpId op_id;
+   CDCSDKCheckpointPB cdc_sdk_op_id;
+   // Get opId from request.
+@@ -1181,7 +1251,6 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
+   } else {
+     std::string commit_timestamp;
+     OpId last_streamed_op_id;
+-
+     auto cached_schema = impl_->GetOrAddSchema(producer_tablet, req->need_schema_info());
+     s = cdc::GetChangesForCDCSDK(
+         req->stream_id(), req->tablet_id(), cdc_sdk_op_id, record, tablet_peer, mem_tracker,
+@@ -1217,11 +1286,12 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
+ 
+   if (record.checkpoint_type == IMPLICIT) {
+     if (UpdateCheckpointRequired(record, cdc_sdk_op_id)) {
+-      s = UpdateCheckpoint(producer_tablet, OpId::FromPB(resp->checkpoint().op_id()),
+-                           op_id, session, last_record_hybrid_time);
++      s = UpdateCheckpoint(
++          producer_tablet, OpId::FromPB(resp->checkpoint().op_id()), op_id, session,
++          last_record_hybrid_time);
++      RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);
+     }
+ 
+-    RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::INTERNAL_ERROR, context);
+     s = DoUpdateCDCConsumerOpId(tablet_peer,
+                                 impl_->GetMinSentCheckpointForTablet(req->tablet_id()),
+                                 req->tablet_id());
+@@ -1251,6 +1321,8 @@ Status CDCServiceImpl::UpdatePeersCdcMinReplicatedIndex(
+     update_index_req.add_replicated_indices(cdc_checkpoint_min.cdc_op_id.index);
+     update_index_req.add_replicated_terms(cdc_checkpoint_min.cdc_op_id.term);
+     cdc_checkpoint_min.cdc_sdk_op_id.ToPB(update_index_req.add_cdc_sdk_consumed_ops());
++    update_index_req.add_cdc_sdk_ops_expiration_ms(
++        cdc_checkpoint_min.cdc_sdk_op_id_expiration.ToMilliseconds());
+ 
+     rpc::RpcController rpc;
+     rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_write_rpc_timeout_ms));
+@@ -1262,19 +1334,6 @@ Status CDCServiceImpl::UpdatePeersCdcMinReplicatedIndex(
+   return Status::OK();
+ }
+ 
+-Status CDCServiceImpl::RetainIntents(
+-    const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const OpId& cdc_sdk_op_id) {
+-  if (cdc_sdk_op_id == OpId::Invalid()) {
+-    return Status::OK();
+-  }
+-  RETURN_NOT_OK(tablet_peer->set_cdc_sdk_min_checkpoint_op_id(cdc_sdk_op_id));
+-  auto txn_participant = tablet_peer->tablet()->transaction_participant();
+-  if (txn_participant) {
+-    txn_participant->SetRetainOpId(cdc_sdk_op_id);
+-  }
+-  return Status::OK();
+-}
+-
+ void CDCServiceImpl::ComputeLagMetric(
+     int64_t last_replicated_micros,
+     int64_t metric_last_timestamp_micros,
+@@ -1475,10 +1534,10 @@ void SetMinCDCSDKCheckpoint(const OpId& checkpoint, OpId* cdc_sdk_op_id) {
+ 
+ void PopulateTabletMinCheckpoint(
+     const string& tablet_id, const OpId& checkpoint, CDCRequestSource cdc_source_type,
+-    TabletOpIdMap* tablet_min_checkpoint_index) {
+-  auto& tablet_op_id = (*tablet_min_checkpoint_index)[tablet_id];
++    const CoarseTimePoint& last_active_time, TabletOpIdMap* tablet_min_checkpoint_index) {
++  auto& tablet_info = (*tablet_min_checkpoint_index)[tablet_id];
+ 
+-  tablet_op_id.cdc_op_id = min(tablet_op_id.cdc_op_id, checkpoint);
++  tablet_info.cdc_op_id = min(tablet_info.cdc_op_id, checkpoint);
+   // Case:1  2 different CDCSDK stream(stream-1 and stream-2) on same tablet_id.
+   //        for stream-1 there is get changes call and stream-2 there is not get change
+   //        call(i.e initial checkpoint is -1.-1).
+@@ -1488,7 +1547,9 @@ void PopulateTabletMinCheckpoint(
+   //       update cdc_sdk_op_id to checkpoint.
+   //
+   if (cdc_source_type == CDCSDK) {
+-    SetMinCDCSDKCheckpoint(checkpoint, &tablet_op_id.cdc_sdk_op_id);
++    SetMinCDCSDKCheckpoint(checkpoint, &tablet_info.cdc_sdk_op_id);
++    tablet_info.cdc_sdk_most_active_time =
++        max(tablet_info.cdc_sdk_most_active_time, last_active_time);
+   }
+ }
+ 
+@@ -1496,13 +1557,14 @@ Status CDCServiceImpl::SetInitialCheckPoint(
+     const OpId& checkpoint, const string& tablet_id,
+     const std::shared_ptr<tablet::TabletPeer>& tablet_peer) {
+   VLOG(1) << "Setting the checkpoint is " << checkpoint.ToString()
+-            << " and the latest entry OpID is " << tablet_peer->log()->GetLatestEntryOpId();
++          << " and the latest entry OpID is " << tablet_peer->log()->GetLatestEntryOpId();
+   auto result = PopulateTabletCheckPointInfo(tablet_id);
+   RETURN_NOT_OK_SET_CODE(result, CDCError(CDCErrorPB::INTERNAL_ERROR));
+   TabletOpIdMap& tablet_min_checkpoint_map = *result;
+   auto& tablet_op_id = tablet_min_checkpoint_map[tablet_id];
+-  tablet_op_id.cdc_op_id = min(checkpoint, tablet_op_id.cdc_op_id);
+   SetMinCDCSDKCheckpoint(checkpoint, &tablet_op_id.cdc_sdk_op_id);
++  tablet_op_id.cdc_sdk_op_id_expiration =
++      MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms));
+ 
+   // Update the minimum checkpoint op_id on LEADER for log cache eviction for all stream type.
+   RETURN_NOT_OK_SET_CODE(
+@@ -1511,7 +1573,9 @@ Status CDCServiceImpl::SetInitialCheckPoint(
+ 
+   // Update the minimum checkpoint op_id for LEADER for intent cleanup for CDCSDK Stream type.
+   RETURN_NOT_OK_SET_CODE(
+-      RetainIntents(tablet_peer, tablet_op_id.cdc_sdk_op_id), CDCError(CDCErrorPB::INTERNAL_ERROR));
++      tablet_peer->SetCDCSDKRetainOpIdAndTime(
++          tablet_op_id.cdc_sdk_op_id, tablet_op_id.cdc_sdk_op_id_expiration),
++      CDCError(CDCErrorPB::INTERNAL_ERROR));
+ 
+   //  Even if the flag is enable_update_local_peer_min_index is set, for the first time
+   //  we need to set it to follower too.
+@@ -1583,10 +1647,31 @@ Result<TabletOpIdMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
+     if (!input_tablet_id.empty() && input_tablet_id != tablet_id) {
+       continue;
+     }
++
++    // Check that requested tablet_id is part of the CDC stream.
++    ProducerTabletInfo producer_tablet = {"" /* UUID */, stream_id, tablet_id};
++
++    // Check stream associated with the tablet is active or not.
++    // don't consider those inactive stream for the min_checkpoint
++    // calculation.
++    CoarseTimePoint latest_active_time = CoarseTimePoint ::min();
++    if (record.source_type == CDCSDK) {
++      auto status = impl_->CheckStreamActive(producer_tablet);
++      if (!status.ok()) {
++        // Give dummy entry in tablet_min_checkpoint_map for the tablet,
++        // if tablet is associated with a single stream.
++        auto& tablet_info = tablet_min_checkpoint_map[tablet_id];
++        tablet_info.cdc_op_id = *result;
++        tablet_info.cdc_sdk_op_id = *result;
++        continue;
++      }
++      latest_active_time = impl_->GetLatestActiveTime(producer_tablet, *result);
++    }
++
+     // Ignoring those non-bootstarped CDCSDK stream
+     if (*result != OpId::Invalid()) {
+       PopulateTabletMinCheckpoint(
+-          tablet_id, *result, record.source_type, &tablet_min_checkpoint_map);
++          tablet_id, *result, record.source_type, latest_active_time, &tablet_min_checkpoint_map);
+     }
+   }
+ 
+@@ -1602,12 +1687,11 @@ Result<TabletOpIdMap> CDCServiceImpl::PopulateTabletCheckPointInfo(
+ }
+ 
+ void CDCServiceImpl::UpdateTabletPeersWithMinReplicatedIndex(
+-    const TabletOpIdMap& tablet_min_checkpoint_map) {
++    TabletOpIdMap* tablet_min_checkpoint_map) {
+   auto enable_update_local_peer_min_index =
+       GetAtomicFlag(&FLAGS_enable_update_local_peer_min_index);
+ 
+-  for (const auto& tablet : tablet_min_checkpoint_map) {
+-    auto tablet_id = tablet.first;
++  for (auto& [tablet_id, tablet_info] : *tablet_min_checkpoint_map) {
+     std::shared_ptr<tablet::TabletPeer> tablet_peer;
+ 
+     Status s = tablet_manager_->GetTabletPeer(tablet_id, &tablet_peer);
+@@ -1623,24 +1707,36 @@ void CDCServiceImpl::UpdateTabletPeersWithMinReplicatedIndex(
+       continue;
+     }
+ 
+-    auto min_index = tablet.second.cdc_op_id.index;
+-    auto current_term = tablet.second.cdc_op_id.term;
++    auto min_index = tablet_info.cdc_op_id.index;
++    auto current_term = tablet_info.cdc_op_id.term;
+     s = tablet_peer->set_cdc_min_replicated_index(min_index);
+     if (!s.ok()) {
+       LOG(WARNING) << "Unable to set cdc min index for tablet peer "
+-                   << tablet_peer->permanent_uuid()
+-                   << " and tablet " << tablet_peer->tablet_id()
++                   << tablet_peer->permanent_uuid() << " and tablet " << tablet_peer->tablet_id()
+                    << ": " << s;
++      continue;
+     }
+ 
++    auto result = tablet_peer->GetCDCSDKIntentRetainTime(tablet_info.cdc_sdk_most_active_time);
++    if (!result.ok()) {
++      LOG(WARNING) << "Unable to get the intent retain time for tablet peer "
++                   << tablet_peer->permanent_uuid() << " and tablet " << tablet_peer->tablet_id()
++                   << ": " << s;
++      continue;
++    }
++    tablet_info.cdc_sdk_op_id_expiration = *result;
++
+     if (!enable_update_local_peer_min_index) {
+       VLOG(1) << "Updating followers for tablet " << tablet_id << " with index " << min_index
+-              << " term " << current_term;
++              << " term " << current_term
++              << " cdc_sdk_op_id: " << tablet_info.cdc_sdk_op_id.ToString()
++              << " expiration: " << tablet_info.cdc_sdk_op_id_expiration.ToMilliseconds();
+       WARN_NOT_OK(
+-          UpdatePeersCdcMinReplicatedIndex(tablet_id, tablet.second),
++          UpdatePeersCdcMinReplicatedIndex(tablet_id, tablet_info),
+           "UpdatePeersCdcMinReplicatedIndex failed");
+     } else {
+-      s = RetainIntents(tablet_peer, tablet.second.cdc_sdk_op_id);
++      s = tablet_peer->SetCDCSDKRetainOpIdAndTime(
++          tablet_info.cdc_sdk_op_id, tablet_info.cdc_sdk_op_id_expiration);
+       if (!s.ok()) {
+         LOG(WARNING) << "Unable to set CDCSDK min checkpoint for tablet peer "
+                      << tablet_peer->permanent_uuid()
+@@ -1699,7 +1795,7 @@ void CDCServiceImpl::UpdatePeersAndMetrics() {
+     TabletOpIdMap& tablet_checkpoint_map = *result;
+     VLOG(3) << "List of tablets with checkpoint info read from cdc_state table: "
+             << tablet_checkpoint_map.size();
+-    UpdateTabletPeersWithMinReplicatedIndex(tablet_checkpoint_map);
++    UpdateTabletPeersWithMinReplicatedIndex(&tablet_checkpoint_map);
+     {
+       YB_LOG_EVERY_N_SECS(INFO, 300)
+           << "Done reading all the indices for all tablets and updating peers";
+@@ -1944,8 +2040,12 @@ void CDCServiceImpl::UpdateCdcReplicatedIndex(const UpdateCdcReplicatedIndexRequ
+     if (req->has_replicated_term()) {
+       replicated_term = req->replicated_term();
+     }
+-    Status s = UpdateCdcReplicatedIndexEntry(req->tablet_id(), req->replicated_index(),
+-                                             replicated_term, OpId::Max());
++    Status s = UpdateCdcReplicatedIndexEntry(
++        req->tablet_id(),
++        req->replicated_index(),
++        replicated_term,
++        OpId::Max(),
++        MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms)));
+     RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+     context.RespondSuccess();
+     return;
+@@ -1966,10 +2066,17 @@ void CDCServiceImpl::UpdateCdcReplicatedIndex(const UpdateCdcReplicatedIndexRequ
+   // Todo: Add better failure handling? Modifications reverted by the caller right now.
+   for (int i = 0; i < req->tablet_ids_size(); i++) {
+     const OpId& cdc_sdk_op = req->cdc_sdk_consumed_ops().empty()
+-                                ? OpId::Max()
+-                                : OpId::FromPB(req->cdc_sdk_consumed_ops(i));
++                                 ? OpId::Max()
++                                 : OpId::FromPB(req->cdc_sdk_consumed_ops(i));
++    const MonoDelta cdc_sdk_op_id_expiration = MonoDelta::FromMilliseconds(
++        req->cdc_sdk_ops_expiration_ms().empty() ? GetAtomicFlag(&FLAGS_cdc_intent_retention_ms)
++                                                 : req->cdc_sdk_ops_expiration_ms(i));
+     Status s = UpdateCdcReplicatedIndexEntry(
+-        req->tablet_ids(i), req->replicated_indices(i), req->replicated_terms(i), cdc_sdk_op);
++        req->tablet_ids(i),
++        req->replicated_indices(i),
++        req->replicated_terms(i),
++        cdc_sdk_op,
++        cdc_sdk_op_id_expiration);
+     RPC_STATUS_RETURN_ERROR(s, resp->mutable_error(), CDCErrorPB::INVALID_REQUEST, context);
+   }
+   context.RespondSuccess();
+@@ -1977,15 +2084,15 @@ void CDCServiceImpl::UpdateCdcReplicatedIndex(const UpdateCdcReplicatedIndexRequ
+ 
+ Status CDCServiceImpl::UpdateCdcReplicatedIndexEntry(
+     const string& tablet_id, int64 replicated_index, boost::optional<int64> replicated_term,
+-    const OpId& cdc_sdk_replicated_op) {
++    const OpId& cdc_sdk_replicated_op, const MonoDelta& cdc_sdk_op_id_expiration) {
+   std::shared_ptr<tablet::TabletPeer> tablet_peer;
+       RETURN_NOT_OK(tablet_manager_->GetTabletPeer(tablet_id, &tablet_peer));
+   if (!tablet_peer->log_available()) {
+     return STATUS(TryAgain, "Tablet peer is not ready to set its log cdc index");
+   }
+   RETURN_NOT_OK(tablet_peer->set_cdc_min_replicated_index(replicated_index));
+-  RETURN_NOT_OK(RetainIntents(tablet_peer, cdc_sdk_replicated_op));
+-
++  RETURN_NOT_OK(
++      tablet_peer->SetCDCSDKRetainOpIdAndTime(cdc_sdk_replicated_op, cdc_sdk_op_id_expiration));
+   return Status::OK();
+ }
+ 
+diff --git a/ent/src/yb/cdc/cdc_service.h b/ent/src/yb/cdc/cdc_service.h
+index 5f9faf6ce7..dc9959ce72 100644
+--- a/ent/src/yb/cdc/cdc_service.h
++++ b/ent/src/yb/cdc/cdc_service.h
+@@ -71,6 +71,8 @@ struct TabletCheckpoint {
+   OpId op_id;
+   // Timestamp at which the op ID was last updated.
+   CoarseTimePoint last_update_time;
++  // Timestamp at which stream polling happen.
++  CoarseTimePoint last_active_time;
+ 
+   bool ExpiredAt(std::chrono::milliseconds duration, std::chrono::time_point<CoarseMonoClock> now) {
+     return (now - last_update_time) > duration;
+@@ -82,6 +84,8 @@ struct TabletCheckpoint {
+ struct TabletCDCCheckpointInfo {
+   OpId cdc_op_id = OpId::Max();
+   OpId cdc_sdk_op_id = OpId::Invalid();
++  MonoDelta cdc_sdk_op_id_expiration = MonoDelta::kZero;
++  CoarseTimePoint cdc_sdk_most_active_time = CoarseTimePoint::min();
+ };
+ 
+ using TabletOpIdMap = std::unordered_map<TabletId, TabletCDCCheckpointInfo>;
+@@ -134,7 +138,7 @@ class CDCServiceImpl : public CDCServiceIf {
+ 
+   Status UpdateCdcReplicatedIndexEntry(
+       const string& tablet_id, int64 replicated_index, boost::optional<int64> replicated_term,
+-      const OpId& cdc_sdk_replicated_op);
++      const OpId& cdc_sdk_replicated_op, const MonoDelta& cdc_sdk_op_id_expiration);
+ 
+   Result<SetCDCCheckpointResponsePB> SetCDCCheckpoint(
+       const SetCDCCheckpointRequestPB& req, CoarseTimePoint deadline) override;
+@@ -170,8 +174,6 @@ class CDCServiceImpl : public CDCServiceIf {
+   // Returns true if this server is a producer of a valid replication stream.
+   bool CDCEnabled();
+ 
+-  Status RetainIntents(
+-      const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const OpId& cdc_sdk_op_id);
+ 
+   // Marks the CDC enable flag as true.
+   void SetCDCServiceEnabled();
+@@ -232,7 +234,7 @@ class CDCServiceImpl : public CDCServiceIf {
+                                  rpc::RpcContext* context,
+                                  const std::shared_ptr<tablet::TabletPeer>& peer);
+ 
+-  void UpdateTabletPeersWithMinReplicatedIndex(const TabletOpIdMap& tablet_min_checkpoint_map);
++  void UpdateTabletPeersWithMinReplicatedIndex(TabletOpIdMap* tablet_min_checkpoint_map);
+ 
+   Result<OpId> TabletLeaderLatestEntryOpId(const TabletId& tablet_id);
+ 
+diff --git a/ent/src/yb/cdc/cdcsdk_producer.cc b/ent/src/yb/cdc/cdcsdk_producer.cc
+index 55ae05e61d..87557da896 100644
+--- a/ent/src/yb/cdc/cdcsdk_producer.cc
++++ b/ent/src/yb/cdc/cdcsdk_producer.cc
+@@ -28,6 +28,8 @@ TAG_FLAG(cdc_snapshot_batch_size, runtime);
+ DEFINE_bool(stream_truncate_record, false, "Enable streaming of TRUNCATE record");
+ TAG_FLAG(stream_truncate_record, runtime);
+ 
++DECLARE_int64(cdc_intent_retention_ms);
++
+ namespace yb {
+ namespace cdc {
+ 
+@@ -608,7 +610,8 @@ Status GetChangesForCDCSDK(
+         return STATUS_SUBSTITUTE(
+             Corruption, "Cannot read data as the transaction participant context is null");
+       }
+-      txn_participant->SetRetainOpId(data.op_id);
++      txn_participant->SetIntentRetainOpIdAndTime(
++          data.op_id, MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms)));
+       RETURN_NOT_OK(txn_participant->context()->GetLastReplicatedData(&data));
+       time = ReadHybridTime::SingleTime(data.log_ht);
+ 
+diff --git a/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc b/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
+index d7166bd717..d2b04e438a 100644
+--- a/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
++++ b/ent/src/yb/integration-tests/cdcsdk_ysql-test.cc
+@@ -566,7 +566,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+   void TestIntentGarbageCollectionFlag(
+       const uint32_t num_tservers,
+       const bool set_flag_to_a_smaller_value,
+-      const uint32_t cdc_intent_retention_ms) {
++      const uint32_t cdc_intent_retention_ms,
++      const bool extend_expiration = false) {
+     if (set_flag_to_a_smaller_value) {
+       FLAGS_cdc_intent_retention_ms = cdc_intent_retention_ms;
+     }
+@@ -600,26 +601,24 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+     }
+ 
+     ASSERT_OK(WriteRowsHelper(1, 2, &test_cluster_, true));
+-    ASSERT_OK(test_client()->FlushTables(
+-        {table.table_id()}, /* add_indexes = */ false,
+-        /* timeout_secs = */ 30, /* is_compaction = */ false));
+-
+     // Sleep for 60s for the background thread to update the consumer op_id so that garbage
+     // collection can happen.
+     vector<int64> intent_counts(num_tservers, -1);
+     ASSERT_OK(WaitFor(
+-        [this, &num_tservers, &set_flag_to_a_smaller_value, &intent_counts, &stream_id,
+-         &tablets]() -> Result<bool> {
++        [this, &num_tservers, &set_flag_to_a_smaller_value, &extend_expiration, &intent_counts,
++         &stream_id, &tablets]() -> Result<bool> {
+           uint32_t i = 0;
+           while (i < num_tservers) {
+-            // Call GetChanges once to set the initial value in the cdc_state table.
+-            auto result = GetChangesFromCDC(stream_id, tablets);
+-            if (!result.ok()) {
+-              return false;
+-            }
+-            yb::cdc::GetChangesResponsePB change_resp = *result;
+-            if (change_resp.has_error()) {
+-              return false;
++            if (extend_expiration) {
++              // Call GetChanges once to set the initial value in the cdc_state table.
++              auto result = GetChangesFromCDC(stream_id, tablets);
++              if (!result.ok()) {
++                return false;
++              }
++              yb::cdc::GetChangesResponsePB change_resp = *result;
++              if (change_resp.has_error()) {
++                return false;
++              }
+             }
+ 
+             auto status = GetIntentCounts(i, &intent_counts[i]);
+@@ -627,7 +626,7 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+               continue;
+             }
+ 
+-            if (set_flag_to_a_smaller_value) {
++            if (set_flag_to_a_smaller_value && !extend_expiration) {
+               if (intent_counts[i] != 0) {
+                 continue;
+               }
+@@ -639,11 +638,33 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+         MonoDelta::FromSeconds(60), "Waiting for all the tservers intent counts"));
+ 
+     for (uint32_t i = 0; i < num_tservers; ++i) {
+-      if (set_flag_to_a_smaller_value) {
+-        ASSERT_EQ(0, intent_counts[i]);
++      if (set_flag_to_a_smaller_value && !extend_expiration) {
++        ASSERT_EQ(intent_counts[i], 0);
+       } else {
+-        ASSERT_NE(0, intent_counts[i]);
++        ASSERT_GE(intent_counts[i], 0);
++      }
++    }
++
++    // After time expired insert few more records
++    if (set_flag_to_a_smaller_value && extend_expiration) {
++      ASSERT_OK(WriteRowsHelper(10, 20, &test_cluster_, true));
++      ASSERT_OK(test_client()->FlushTables(
++          {table.table_id()}, /* add_indexes = */ false,
++          /* timeout_secs = */ 30, /* is_compaction = */ false));
++
++      SleepFor(MonoDelta::FromMilliseconds(100));
++
++      change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
++      uint32_t record_size = change_resp.cdc_sdk_proto_records_size();
++      uint32_t insert_count = 0;
++      for (uint32_t idx = 0; idx < record_size; idx++) {
++        const CDCSDKProtoRecordPB& record = change_resp.cdc_sdk_proto_records(idx);
++        if (record.row_message().op() == RowMessage::INSERT) {
++          insert_count += 1;
++        }
+       }
++      ASSERT_GE(insert_count, 10);
++      LOG(INFO) << "Got insert record after expiration: " << insert_count;
+     }
+   }
+ 
+@@ -1330,6 +1351,10 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestNoGarbageCollectionBeforeInte
+   TestIntentGarbageCollectionFlag(3, false, 0);
+ }
+ 
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestExtendingIntentRetentionTime)) {
++  TestIntentGarbageCollectionFlag(3, true, 3000, true);
++}
++
+ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestSetCDCCheckpoint)) {
+   TestSetCDCCheckpoint(1, false);
+ }
+@@ -1437,7 +1462,7 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCheckPointPersistencyNodeRest
+         // transaction participant tablet peer.
+         ASSERT_EQ(
+             peer->cdc_sdk_min_checkpoint_op_id(),
+-            peer->tablet()->transaction_participant()->GetRetainOpId());
++            peer->tablet()->transaction_participant()->TEST_GetRetainOpId());
+       }
+     }
+   }
+@@ -1630,6 +1655,256 @@ TEST_F(
+   VerifyTransactionParticipant(tablets.Get(0).tablet_id(), OpId::Max());
+ }
+ 
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestMultpleStreamOnSameTablet)) {
++  FLAGS_update_min_cdc_indices_interval_secs = 1;
++  FLAGS_cdc_intent_retention_ms = 2000;
++  FLAGS_cdc_state_checkpoint_update_interval_ms = 0;
++  ASSERT_OK(SetUpWithParams(1, 1, false));
++
++  const uint32_t num_tablets = 1;
++  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName, num_tablets));
++  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
++  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
++  ASSERT_EQ(tablets.size(), num_tablets);
++
++  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
++
++  vector<CDCStreamId> stream_id;
++  // Create 2 streams
++  for (uint32_t idx = 0; idx < 2; idx++) {
++    stream_id.push_back(ASSERT_RESULT(CreateDBStream(IMPLICIT)));
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id[idx], tablets));
++    ASSERT_FALSE(resp.has_error());
++  }
++
++  // Insert some records in transaction.
++  vector<GetChangesResponsePB> change_resp_01(2);
++  vector<GetChangesResponsePB> change_resp_02(2);
++  ASSERT_OK(WriteRowsHelper(0 /* start */, 100 /* end */, &test_cluster_, true));
++  for (uint32_t stream_idx = 0; stream_idx < 2; stream_idx++) {
++    uint32_t record_size = 0;
++    change_resp_01[stream_idx] = ASSERT_RESULT(GetChangesFromCDC(stream_id[stream_idx], tablets));
++    record_size = change_resp_01[stream_idx].cdc_sdk_proto_records_size();
++    LOG(INFO) << "Total records read by get change call on stream_id_" << stream_idx
++              << " total records: " << record_size;
++  }
++
++  // Keep inserting some records into the table and call GetChange on stream_id_02
++  // to see the inserted record count.
++  uint32_t idx = 0;
++  const uint32_t loop_count = 10;
++  GetChangesResponsePB change_resp_2_stream_id_02;
++  while (idx < loop_count) {
++    change_resp_02[1] = ASSERT_RESULT(UpdateCheckpoint(stream_id[1], tablets, &change_resp_01[1]));
++    idx += 1;
++    change_resp_01[0] = change_resp_02[1];
++    SleepFor(MonoDelta::FromMilliseconds(200));
++  }
++
++  // Now call GetChanges for stream_01.
++  auto result = GetChangesFromCDC(stream_id[0], tablets, &change_resp_01[0].cdc_sdk_checkpoint());
++  ASSERT_EQ(!result.ok(), true);
++}
++
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestMultpleActiveStreamOnSameTablet)) {
++  FLAGS_enable_update_local_peer_min_index = false;
++  FLAGS_update_min_cdc_indices_interval_secs = 1;
++  FLAGS_cdc_state_checkpoint_update_interval_ms = 0;
++  ASSERT_OK(SetUpWithParams(3, 1, false));
++
++  const uint32_t num_tablets = 1;
++  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName, num_tablets));
++  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
++  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
++  ASSERT_EQ(tablets.size(), num_tablets);
++
++  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
++
++  // Create 2 streams
++  vector<CDCStreamId> stream_id(2);
++  for (uint32_t idx = 0; idx < 2; idx++) {
++    stream_id[idx] = ASSERT_RESULT(CreateDBStream(IMPLICIT));
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id[idx], tablets));
++    ASSERT_FALSE(resp.has_error());
++  }
++  // GetChanges for the stream-1 and stream-2
++  vector<GetChangesResponsePB> change_resp_01(2);
++  vector<GetChangesResponsePB> change_resp_02(2);
++  uint32_t start = 0;
++  uint32_t end = 100;
++  for (uint32_t insert_idx = 0; insert_idx < 3; insert_idx++) {
++    ASSERT_OK(WriteRowsHelper(start /* start */, end /* end */, &test_cluster_, true));
++    ASSERT_OK(test_client()->FlushTables(
++        {table.table_id()}, /* add_indexes = */
++        false,              /* timeout_secs = */
++        30, /* is_compaction = */ false));
++    for (uint32_t stream_idx = 0; stream_idx < 2; stream_idx++) {
++      uint32_t record_size = 0;
++      if (insert_idx == 0) {
++        change_resp_01[stream_idx] =
++            ASSERT_RESULT(GetChangesFromCDC(stream_id[stream_idx], tablets));
++        record_size = change_resp_01[stream_idx].cdc_sdk_proto_records_size();
++      } else {
++        change_resp_02[stream_idx] = ASSERT_RESULT(
++            UpdateCheckpoint(stream_id[stream_idx], tablets, &change_resp_01[stream_idx]));
++        change_resp_01[stream_idx] = change_resp_02[stream_idx];
++        record_size = change_resp_02[stream_idx].cdc_sdk_proto_records_size();
++      }
++      ASSERT_GE(record_size, 100);
++    }
++    start = end;
++    end = start + 100;
++  }
++
++  OpId min_checkpoint = OpId::Max();
++  client::TableHandle table_handle_cdc;
++  client::YBTableName cdc_state_table(
++      YQL_DATABASE_CQL, master::kSystemNamespaceName, master::kCdcStateTableName);
++  ASSERT_OK(table_handle_cdc.Open(cdc_state_table, test_client()));
++  for (const auto& row : client::TableRange(table_handle_cdc)) {
++    auto tablet_id = row.column(master::kCdcTabletIdIdx).string_value();
++    auto stream_id = row.column(master::kCdcStreamIdIdx).string_value();
++    auto checkpoint = row.column(master::kCdcCheckpointIdx).string_value();
++    LOG(INFO) << "Read cdc_state table with tablet_id: " << tablet_id << " stream_id: " << stream_id
++              << " checkpoint is: " << checkpoint;
++    auto result = OpId::FromString(checkpoint);
++    ASSERT_OK(result);
++    OpId row_checkpoint = *result;
++    min_checkpoint = min(min_checkpoint, row_checkpoint);
++  }
++
++  ASSERT_OK(WaitFor(
++      [&]() {
++        // Read the tablet LEADER as well as FOLLOWER's transaction_participation
++        // Check all the tserver checkpoint info it's should be valid.
++        uint32_t i = 0;
++        while (i < test_cluster()->num_tablet_servers()) {
++          for (const auto& peer : test_cluster()->GetTabletPeers(i)) {
++            if (peer->tablet_id() == tablets[0].tablet_id()) {
++              if (peer->tablet()->transaction_participant()->TEST_GetRetainOpId() !=
++                  min_checkpoint) {
++                SleepFor(MonoDelta::FromMilliseconds(2));
++              } else {
++                i += 1;
++                LOG(INFO) << "In tserver: " << i
++                          << " tablet peer have transaction_participant op_id set as: "
++                          << peer->tablet()->transaction_participant()->TEST_GetRetainOpId();
++              }
++              break;
++            }
++          }
++        }
++        return true;
++      },
++      MonoDelta::FromSeconds(60), "Waiting for all the tservers intent counts"));
++}
++
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestActiveAndInActiveStreamOnSameTablet)) {
++  FLAGS_update_min_cdc_indices_interval_secs = 1;
++  FLAGS_cdc_state_checkpoint_update_interval_ms = 0;
++  FLAGS_cdc_intent_retention_ms = 5000;
++  ASSERT_OK(SetUpWithParams(3, 1, false));
++
++  const uint32_t num_tablets = 1;
++  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName, num_tablets));
++  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
++  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
++  ASSERT_EQ(tablets.size(), num_tablets);
++
++  TableId table_id = ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName));
++
++  vector<CDCStreamId> stream_id;
++  // Create 2 streams
++  for (uint32_t idx = 0; idx < 2; idx++) {
++    stream_id.push_back(ASSERT_RESULT(CreateDBStream(IMPLICIT)));
++    auto resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id[idx], tablets));
++    ASSERT_FALSE(resp.has_error());
++  }
++  // Insert some records in transaction.
++  ASSERT_OK(WriteRowsHelper(0 /* start */, 100 /* end */, &test_cluster_, true));
++  ASSERT_OK(test_client()->FlushTables(
++      {table.table_id()}, /* add_indexes = */ false, /* timeout_secs = */ 30,
++      /* is_compaction = */ false));
++
++  vector<GetChangesResponsePB> change_resp(2);
++  // Call GetChanges for the stream-1 and stream-2
++  for (uint32_t idx = 0; idx < 2; idx++) {
++    change_resp[idx] = ASSERT_RESULT(GetChangesFromCDC(stream_id[idx], tablets));
++    uint32_t record_size = change_resp[idx].cdc_sdk_proto_records_size();
++    ASSERT_GE(record_size, 100);
++    LOG(INFO) << "Total records read by GetChanges call on stream_id_1: " << record_size;
++  }
++
++  // Keep stream-1 active.
++  uint32_t idx = 0;
++  const uint32_t total_count = 10;
++  while (idx < total_count) {
++    uint32_t record_size = 0;
++    ASSERT_OK(WriteRowsHelper(100 + idx /* start */, 101 + idx /* end */, &test_cluster_, true));
++    ASSERT_OK(test_client()->FlushTables(
++        {table.table_id()}, /* add_indexes = */
++        false,              /* timeout_secs = */
++        30, /* is_compaction = */ false));
++    GetChangesResponsePB latest_change_resp =
++        ASSERT_RESULT(UpdateCheckpoint(stream_id[0], tablets, &change_resp[0]));
++    record_size = latest_change_resp.cdc_sdk_proto_records_size();
++    change_resp[0] = latest_change_resp;
++    ASSERT_GE(record_size, 1);
++    idx += 1;
++  }
++
++  OpId overall_min_checkpoint = OpId::Max();
++  OpId active_stream_checkpoint;
++  FLAGS_cdc_state_checkpoint_update_interval_ms = 100000;
++  client::TableHandle table_handle_cdc;
++  client::YBTableName cdc_state_table(
++      YQL_DATABASE_CQL, master::kSystemNamespaceName, master::kCdcStateTableName);
++  ASSERT_OK(table_handle_cdc.Open(cdc_state_table, test_client()));
++  for (const auto& row : client::TableRange(table_handle_cdc)) {
++    auto read_tablet_id = row.column(master::kCdcTabletIdIdx).string_value();
++    auto read_stream_id = row.column(master::kCdcStreamIdIdx).string_value();
++    auto read_checkpoint = row.column(master::kCdcCheckpointIdx).string_value();
++    GetChangesResponsePB latest_change_resp =
++        ASSERT_RESULT(UpdateCheckpoint(stream_id[0], tablets, &change_resp[0]));
++    auto result = OpId::FromString(read_checkpoint);
++    ASSERT_OK(result);
++    if (read_tablet_id == tablets[0].tablet_id() && stream_id[0] == read_stream_id) {
++      LOG(INFO) << "Read cdc_state table with tablet_id: " << read_tablet_id
++                << " stream_id: " << read_stream_id << " checkpoint is: " << read_checkpoint;
++      active_stream_checkpoint = *result;
++    } else {
++      overall_min_checkpoint = min(overall_min_checkpoint, *result);
++    }
++  }
++
++  ASSERT_OK(WaitFor(
++      [&]() -> Result<bool> {
++        // Read the tablet LEADER as well as FOLLOWER's transaction_participation
++        // Check all the tserver checkpoint info it's should be valid.
++        uint32_t i = 0;
++        while (i < test_cluster()->num_tablet_servers()) {
++          for (const auto& peer : test_cluster()->GetTabletPeers(i)) {
++            if (peer->tablet_id() == tablets[0].tablet_id()) {
++              if (peer->tablet()->transaction_participant()->TEST_GetRetainOpId() !=
++                      overall_min_checkpoint &&
++                  peer->tablet()->transaction_participant()->TEST_GetRetainOpId() !=
++                      active_stream_checkpoint) {
++                SleepFor(MonoDelta::FromMilliseconds(2));
++              } else {
++                i += 1;
++                LOG(INFO) << "In tserver: " << i
++                          << " tablet peer have transaction_participant op_id set as: "
++                          << peer->tablet()->transaction_participant()->TEST_GetRetainOpId();
++              }
++              break;
++            }
++          }
++        }
++        return true;
++      },
++      MonoDelta::FromSeconds(60), "Waiting for all the tservers intent counts"));
++}
++
+ }  // namespace enterprise
+ }  // namespace cdc
+ }  // namespace yb
+diff --git a/src/yb/cdc/cdc_service.proto b/src/yb/cdc/cdc_service.proto
+index f0577fc17e..694a22525b 100644
+--- a/src/yb/cdc/cdc_service.proto
++++ b/src/yb/cdc/cdc_service.proto
+@@ -410,6 +410,7 @@ message UpdateCdcReplicatedIndexRequestPB {
+   repeated int64 replicated_terms = 6;
+   // Minimum checkpoint term and index  for CDCSDK stream, to do intent cleanup for this tablet.
+   repeated OpIdPB cdc_sdk_consumed_ops = 7;
++  repeated uint64 cdc_sdk_ops_expiration_ms = 8;
+ }
+ 
+ message UpdateCdcReplicatedIndexResponsePB {
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index 7701223dab..d988232332 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -101,12 +101,6 @@ DEFINE_int32(cdc_checkpoint_opid_interval_ms, 60 * 1000,
+              "specified by cdc_checkpoint_opid_interval, then log cache does not consider that "
+              "consumer while determining which op IDs to evict.");
+ 
+-DEFINE_int64(cdc_intent_retention_ms, 4 * 3600 * 1000,
+-             "Interval up to which CDC consumer's checkpoint is considered for retaining intents."
+-             "If we haven't received an updated checkpoint from CDC consumer within the interval "
+-             "specified by cdc_checkpoint_opid_interval, then CDC does not consider that "
+-             "consumer while determining which op IDs to delete from the intent.");
+-
+ DEFINE_bool(enable_consensus_exponential_backoff, true,
+             "Whether exponential backoff based on number of retransmissions at tablet leader "
+             "for number of entries to replicate to lagging follower is enabled.");
+@@ -119,6 +113,14 @@ DEFINE_int32(consensus_lagging_follower_threshold, 10,
+ TAG_FLAG(consensus_lagging_follower_threshold, advanced);
+ TAG_FLAG(consensus_lagging_follower_threshold, runtime);
+ 
++DEFINE_int64(cdc_intent_retention_ms, 4 * 3600 * 1000,
++             "Interval up to which CDC consumer's checkpoint is considered for retaining intents."
++             "If we haven't received an updated checkpoint from CDC consumer within the interval "
++             "specified by cdc_checkpoint_opid_interval, then CDC does not consider that "
++             "consumer while determining which op IDs to delete from the intent.");
++TAG_FLAG(cdc_intent_retention_ms, advanced);
++TAG_FLAG(cdc_intent_retention_ms, runtime);
++
+ DEFINE_test_flag(bool, disallow_lmp_failures, false,
+                  "Whether we disallow PRECEDING_ENTRY_DIDNT_MATCH failures for non new peers.");
+ 
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index 9c715f3e03..83d5ee7dd0 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -108,6 +108,8 @@ DEFINE_bool(propagate_safe_time, true, "Propagate safe time to read from leader
+ 
+ DECLARE_int32(ysql_transaction_abort_timeout_ms);
+ 
++DECLARE_int64(cdc_intent_retention_ms);
++
+ namespace yb {
+ namespace tablet {
+ 
+@@ -313,7 +315,9 @@ Status TabletPeer::InitTabletPeer(
+ 
+   RETURN_NOT_OK(set_cdc_min_replicated_index(meta_->cdc_min_replicated_index()));
+   if (tablet_->transaction_participant()) {
+-    tablet_->transaction_participant()->SetRetainOpId(meta_->cdc_sdk_min_checkpoint_op_id());
++    tablet_->transaction_participant()->SetIntentRetainOpIdAndTime(
++        meta_->cdc_sdk_min_checkpoint_op_id(),
++        MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms)));
+   }
+ 
+   TRACE("TabletPeer::Init() finished");
+@@ -1024,6 +1028,45 @@ OpId TabletPeer::cdc_sdk_min_checkpoint_op_id() {
+   return meta_->cdc_sdk_min_checkpoint_op_id();
+ }
+ 
++Status TabletPeer::SetCDCSDKRetainOpIdAndTime(
++    const OpId& cdc_sdk_op_id, const MonoDelta& cdc_sdk_op_id_expiration) {
++  if (cdc_sdk_op_id == OpId::Invalid()) {
++    return Status::OK();
++  }
++  RETURN_NOT_OK(set_cdc_sdk_min_checkpoint_op_id(cdc_sdk_op_id));
++  auto txn_participant = tablet()->transaction_participant();
++  if (txn_participant) {
++    txn_participant->SetIntentRetainOpIdAndTime(cdc_sdk_op_id, cdc_sdk_op_id_expiration);
++  }
++  return Status::OK();
++}
++
++Result<MonoDelta> TabletPeer::GetCDCSDKIntentRetainTime(
++    const CoarseTimePoint& cdc_sdk_latest_active_time) {
++  MonoDelta cdc_sdk_intent_retention = MonoDelta::kZero;
++  // If cdc_sdk_latest_update_time is not updated to default CoarseTimePoint::min() value,
++  // It's mean that, no need to retain the intents. This can happen in below case:-
++  //      a. Only XCluster stream are defined for the tablet.
++  //      b. CDCSDK stream for the tablet is expired.
++  if (cdc_sdk_latest_active_time == CoarseTimePoint::min()) {
++    return cdc_sdk_intent_retention;
++  }
++
++  auto txn_participant = tablet()->transaction_participant();
++  if (txn_participant) {
++    // Get the current tablet LEADER's intent retention expiration time.
++    // check how much milliseconds time remaining w.r.t current time, update
++    // all the FOLLOWERs as their cdc_sdk_min_checkpoint_op_id_expiration_.
++    MonoDelta max_retain_time =
++        MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms));
++    MonoDelta lastest_active_time(CoarseMonoClock::Now() - cdc_sdk_latest_active_time);
++    if (max_retain_time >= lastest_active_time) {
++      cdc_sdk_intent_retention = max_retain_time - lastest_active_time;
++    }
++  }
++  return cdc_sdk_intent_retention;
++}
++
+ std::unique_ptr<Operation> TabletPeer::CreateOperation(consensus::ReplicateMsg* replicate_msg) {
+   switch (replicate_msg->op_type()) {
+     case consensus::WRITE_OP:
+diff --git a/src/yb/tablet/tablet_peer.h b/src/yb/tablet/tablet_peer.h
+index c98518ed3e..b1c04b6eef 100644
+--- a/src/yb/tablet/tablet_peer.h
++++ b/src/yb/tablet/tablet_peer.h
+@@ -384,6 +384,11 @@ class TabletPeer : public consensus::ConsensusContext,
+ 
+   OpId cdc_sdk_min_checkpoint_op_id();
+ 
++  Status SetCDCSDKRetainOpIdAndTime(
++      const OpId& cdc_sdk_op_id, const MonoDelta& cdc_sdk_op_id_expiration);
++
++  Result<MonoDelta> GetCDCSDKIntentRetainTime(const CoarseTimePoint& cdc_sdk_latest_active_time);
++
+   TableType table_type();
+ 
+   // Returns the number of segments in log_.
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index 7b783d39c1..5021888133 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -353,14 +353,10 @@ class TransactionParticipant::Impl
+   }
+ 
+   // Cleans the intents those are consumed by consumers.
+-  void SetRetainOpId(const OpId& op_id) {
++  void SetIntentRetainOpIdAndTime(const OpId& op_id, const MonoDelta& cdc_sdk_op_id_expiration) {
+     MinRunningNotifier min_running_notifier(&applier_);
+     std::lock_guard<std::mutex> lock(mutex_);
+-    if (cdc_sdk_min_checkpoint_op_id_ != op_id) {
+-      cdc_sdk_min_checkpoint_op_id_expiration_ =
+-          CoarseMonoClock::now() +
+-          MonoDelta::FromMilliseconds(GetAtomicFlag(&FLAGS_cdc_intent_retention_ms));
+-    }
++    cdc_sdk_min_checkpoint_op_id_expiration_ = CoarseMonoClock::now() + cdc_sdk_op_id_expiration;
+     cdc_sdk_min_checkpoint_op_id_ = op_id;
+ 
+     // If new op_id same as  cdc_sdk_min_checkpoint_op_id_ it means already intent before it are
+@@ -1790,13 +1786,14 @@ HybridTime TransactionParticipantContext::Now() {
+   return clock_ptr()->Now();
+ }
+ 
+-void TransactionParticipant::SetRetainOpId(const yb::OpId& op_id) const {
+-  impl_->SetRetainOpId(op_id);
++void TransactionParticipant::SetIntentRetainOpIdAndTime(
++    const yb::OpId& op_id, const MonoDelta& cdc_sdk_op_id_expiration) {
++  impl_->SetIntentRetainOpIdAndTime(op_id, cdc_sdk_op_id_expiration);
+ }
+ 
+-OpId TransactionParticipant::GetRetainOpId() const {
++OpId TransactionParticipant::TEST_GetRetainOpId() const {
+   return impl_->GetRetainOpId();
+ }
+ 
+-} // namespace tablet
+-} // namespace yb
++}  // namespace tablet
++}  // namespace yb
+diff --git a/src/yb/tablet/transaction_participant.h b/src/yb/tablet/transaction_participant.h
+index 7c415998f9..e33692a731 100644
+--- a/src/yb/tablet/transaction_participant.h
++++ b/src/yb/tablet/transaction_participant.h
+@@ -210,9 +210,9 @@ class TransactionParticipant : public TransactionStatusManager {
+ 
+   std::string DumpTransactions() const;
+ 
+-  void SetRetainOpId(const OpId& op_id) const;
++  void SetIntentRetainOpIdAndTime(const yb::OpId& op_id, const MonoDelta& cdc_sdk_op_id_expiration);
+ 
+-  OpId GetRetainOpId() const;
++  OpId TEST_GetRetainOpId() const;
+ 
+   const TabletId& tablet_id() const override;
+ 

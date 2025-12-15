@@ -1,0 +1,303 @@
+diff --git a/lib/model/model_test.go b/lib/model/model_test.go
+index ca2aee237..a8597ce9f 100644
+--- a/lib/model/model_test.go
++++ b/lib/model/model_test.go
+@@ -350,6 +350,24 @@ func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileI
+ 	f.fileData[name] = data
+ }
+ 
++func (f *fakeConnection) deleteFile(name string) {
++	f.mut.Lock()
++	defer f.mut.Unlock()
++
++	for i, fi := range f.files {
++		if fi.Name == name {
++			fi.Deleted = true
++			fi.ModifiedS = time.Now().Unix()
++			fi.Version = fi.Version.Update(f.id.Short())
++			fi.Sequence = time.Now().UnixNano()
++			fi.Blocks = nil
++
++			f.files = append(append(f.files[:i], f.files[i+1:]...), fi)
++			return
++		}
++	}
++}
++
+ func (f *fakeConnection) sendIndexUpdate() {
+ 	f.model.IndexUpdate(f.id, f.folder, f.files)
+ }
+diff --git a/lib/model/requests_test.go b/lib/model/requests_test.go
+index 20749d78f..03ab2ab93 100644
+--- a/lib/model/requests_test.go
++++ b/lib/model/requests_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"bytes"
+ 	"io/ioutil"
+ 	"os"
++	"path/filepath"
+ 	"runtime"
+ 	"strings"
+ 	"testing"
+@@ -204,6 +205,82 @@ func TestRequestCreateTmpSymlink(t *testing.T) {
+ 	}
+ }
+ 
++func TestRequestVersioningSymlinkAttack(t *testing.T) {
++	// Sets up a folder with trashcan versioning and tries to use a
++	// deleted symlink to escape
++
++	cfg := defaultConfig.RawCopy()
++	cfg.Folders[0] = config.NewFolderConfiguration("default", "_tmpfolder")
++	cfg.Folders[0].PullerSleepS = 1
++	cfg.Folders[0].Devices = []config.FolderDeviceConfiguration{
++		{DeviceID: device1},
++		{DeviceID: device2},
++	}
++	cfg.Folders[0].Versioning = config.VersioningConfiguration{
++		Type: "trashcan",
++	}
++	w := config.Wrap("/tmp/cfg", cfg)
++
++	db := db.OpenMemory()
++	m := NewModel(w, device1, "syncthing", "dev", db, nil)
++	m.AddFolder(cfg.Folders[0])
++	m.ServeBackground()
++	m.StartFolder("default")
++	defer m.Stop()
++
++	defer os.RemoveAll("_tmpfolder")
++
++	fc := addFakeConn(m, device2)
++	fc.folder = "default"
++
++	// Create a temporary directory that we will use as target to see if
++	// we can escape to it
++	tmpdir, err := ioutil.TempDir("", "syncthing-test")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// We listen for incoming index updates and trigger when we see one for
++	// the expected test file.
++	idx := make(chan int)
++	fc.mut.Lock()
++	fc.indexFn = func(folder string, fs []protocol.FileInfo) {
++		idx <- len(fs)
++	}
++	fc.mut.Unlock()
++
++	// Send an update for the test file, wait for it to sync and be reported back.
++	fc.addFile("foo", 0644, protocol.FileInfoTypeSymlink, []byte(tmpdir))
++	fc.sendIndexUpdate()
++
++	for updates := 0; updates < 1; updates += <-idx {
++	}
++
++	// Delete the symlink, hoping for it to get versioned
++	fc.deleteFile("foo")
++	fc.sendIndexUpdate()
++	for updates := 0; updates < 1; updates += <-idx {
++	}
++
++	// Recreate foo and a file in it with some data
++	fc.addFile("foo", 0755, protocol.FileInfoTypeDirectory, nil)
++	fc.addFile("foo/test", 0644, protocol.FileInfoTypeFile, []byte("testtesttest"))
++	fc.sendIndexUpdate()
++	for updates := 0; updates < 1; updates += <-idx {
++	}
++
++	// Remove the test file and see if it escaped
++	fc.deleteFile("foo/test")
++	fc.sendIndexUpdate()
++	for updates := 0; updates < 1; updates += <-idx {
++	}
++
++	path := filepath.Join(tmpdir, "test")
++	if _, err := os.Lstat(path); !os.IsNotExist(err) {
++		t.Fatal("File escaped to", path)
++	}
++}
++
+ func setupModelWithConnection() (*Model, *fakeConnection) {
+ 	cfg := defaultConfig.RawCopy()
+ 	cfg.Folders[0] = config.NewFolderConfiguration("default", "_tmpfolder")
+diff --git a/lib/model/rwfolder.go b/lib/model/rwfolder.go
+index ad19c3e3f..a8c24c29c 100644
+--- a/lib/model/rwfolder.go
++++ b/lib/model/rwfolder.go
+@@ -855,7 +855,7 @@ func (f *sendReceiveFolder) deleteFile(file protocol.FileInfo) {
+ 		err = osutil.InWritableDir(func(name string) error {
+ 			return f.moveForConflict(name, file.ModifiedBy.String())
+ 		}, realName)
+-	} else if f.versioner != nil {
++	} else if f.versioner != nil && !cur.IsSymlink() {
+ 		err = osutil.InWritableDir(f.versioner.Archive, realName)
+ 	} else {
+ 		err = osutil.InWritableDir(os.Remove, realName)
+@@ -1463,7 +1463,7 @@ func (f *sendReceiveFolder) performFinish(state *sharedPullerState) error {
+ 				return err
+ 			}
+ 
+-		case f.versioner != nil:
++		case f.versioner != nil && !state.file.IsSymlink():
+ 			// If we should use versioning, let the versioner archive the old
+ 			// file before we replace it. Archiving a non-existent file is not
+ 			// an error.
+diff --git a/lib/versioner/external.go b/lib/versioner/external.go
+index d53d30f13..b32f0adad 100644
+--- a/lib/versioner/external.go
++++ b/lib/versioner/external.go
+@@ -27,6 +27,8 @@ type External struct {
+ }
+ 
+ func NewExternal(folderID, folderPath string, params map[string]string) Versioner {
++	cleanSymlinks(folderPath)
++
+ 	command := params["command"]
+ 
+ 	s := External{
+@@ -41,13 +43,16 @@ func NewExternal(folderID, folderPath string, params map[string]string) Versione
+ // Archive moves the named file away to a version archive. If this function
+ // returns nil, the named file does not exist any more (has been archived).
+ func (v External) Archive(filePath string) error {
+-	_, err := osutil.Lstat(filePath)
++	info, err := osutil.Lstat(filePath)
+ 	if os.IsNotExist(err) {
+ 		l.Debugln("not archiving nonexistent file", filePath)
+ 		return nil
+ 	} else if err != nil {
+ 		return err
+ 	}
++	if info.Mode()&os.ModeSymlink != 0 {
++		panic("bug: attempting to version a symlink")
++	}
+ 
+ 	l.Debugln("archiving", filePath)
+ 
+diff --git a/lib/versioner/simple.go b/lib/versioner/simple.go
+index 8615fd54f..58a6abc61 100644
+--- a/lib/versioner/simple.go
++++ b/lib/versioner/simple.go
+@@ -26,6 +26,8 @@ type Simple struct {
+ }
+ 
+ func NewSimple(folderID, folderPath string, params map[string]string) Versioner {
++	cleanSymlinks(folderPath)
++
+ 	keep, err := strconv.Atoi(params["keep"])
+ 	if err != nil {
+ 		keep = 5 // A reasonable default
+@@ -50,6 +52,9 @@ func (v Simple) Archive(filePath string) error {
+ 	} else if err != nil {
+ 		return err
+ 	}
++	if fileInfo.Mode()&os.ModeSymlink != 0 {
++		panic("bug: attempting to version a symlink")
++	}
+ 
+ 	versionsDir := filepath.Join(v.folderPath, ".stversions")
+ 	_, err = os.Stat(versionsDir)
+diff --git a/lib/versioner/staggered.go b/lib/versioner/staggered.go
+index 3290ae119..72a8bf866 100644
+--- a/lib/versioner/staggered.go
++++ b/lib/versioner/staggered.go
+@@ -39,6 +39,8 @@ type Staggered struct {
+ }
+ 
+ func NewStaggered(folderID, folderPath string, params map[string]string) Versioner {
++	cleanSymlinks(folderPath)
++
+ 	maxAge, err := strconv.ParseInt(params["maxAge"], 10, 0)
+ 	if err != nil {
+ 		maxAge = 31536000 // Default: ~1 year
+@@ -244,13 +246,16 @@ func (v *Staggered) Archive(filePath string) error {
+ 	v.mutex.Lock()
+ 	defer v.mutex.Unlock()
+ 
+-	_, err := osutil.Lstat(filePath)
++	info, err := osutil.Lstat(filePath)
+ 	if os.IsNotExist(err) {
+ 		l.Debugln("not archiving nonexistent file", filePath)
+ 		return nil
+ 	} else if err != nil {
+ 		return err
+ 	}
++	if info.Mode()&os.ModeSymlink != 0 {
++		panic("bug: attempting to version a symlink")
++	}
+ 
+ 	if _, err := os.Stat(v.versionsPath); err != nil {
+ 		if os.IsNotExist(err) {
+diff --git a/lib/versioner/trashcan.go b/lib/versioner/trashcan.go
+index 11256de14..6a11d3b33 100644
+--- a/lib/versioner/trashcan.go
++++ b/lib/versioner/trashcan.go
+@@ -28,6 +28,8 @@ type Trashcan struct {
+ }
+ 
+ func NewTrashcan(folderID, folderPath string, params map[string]string) Versioner {
++	cleanSymlinks(folderPath)
++
+ 	cleanoutDays, _ := strconv.Atoi(params["cleanoutDays"])
+ 	// On error we default to 0, "do not clean out the trash can"
+ 
+@@ -44,13 +46,16 @@ func NewTrashcan(folderID, folderPath string, params map[string]string) Versione
+ // Archive moves the named file away to a version archive. If this function
+ // returns nil, the named file does not exist any more (has been archived).
+ func (t *Trashcan) Archive(filePath string) error {
+-	_, err := osutil.Lstat(filePath)
++	info, err := osutil.Lstat(filePath)
+ 	if os.IsNotExist(err) {
+ 		l.Debugln("not archiving nonexistent file", filePath)
+ 		return nil
+ 	} else if err != nil {
+ 		return err
+ 	}
++	if info.Mode()&os.ModeSymlink != 0 {
++		panic("bug: attempting to version a symlink")
++	}
+ 
+ 	versionsDir := filepath.Join(t.folderPath, ".stversions")
+ 	if _, err := os.Stat(versionsDir); err != nil {
+diff --git a/lib/versioner/versioner.go b/lib/versioner/versioner.go
+index 0fdda359e..fdb69eb9c 100644
+--- a/lib/versioner/versioner.go
++++ b/lib/versioner/versioner.go
+@@ -8,6 +8,12 @@
+ // simple default versioning scheme.
+ package versioner
+ 
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++)
++
+ type Versioner interface {
+ 	Archive(filePath string) error
+ }
+@@ -18,3 +24,23 @@ const (
+ 	TimeFormat = "20060102-150405"
+ 	TimeGlob   = "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]" // glob pattern matching TimeFormat
+ )
++
++func cleanSymlinks(dir string) {
++	if runtime.GOOS == "windows" {
++		// We don't do symlinks on Windows. Additionally, there may
++		// be things that look like symlinks that are not, which we
++		// should leave alone. Deduplicated files, for example.
++		return
++	}
++	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		if info.Mode()&os.ModeSymlink != 0 {
++			l.Infoln("Removing incorrectly versioned symlink", path)
++			os.Remove(path)
++			return filepath.SkipDir
++		}
++		return nil
++	})
++}

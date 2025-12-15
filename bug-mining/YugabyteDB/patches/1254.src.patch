@@ -1,0 +1,1102 @@
+diff --git a/src/yb/client/client-internal.cc b/src/yb/client/client-internal.cc
+index 270f27944a..4c149c1866 100644
+--- a/src/yb/client/client-internal.cc
++++ b/src/yb/client/client-internal.cc
+@@ -203,7 +203,7 @@ Status YBClient::Data::SyncLeaderMasterRpc(
+                          const rpc::ResponseCallback& callback) {
+         (proxy->*func)(req, resp, controller, callback);
+       });
+-  rpcs_.RegisterAndStart(rpc, rpc->RpcHandle());
++  RETURN_NOT_OK(rpcs_.RegisterAndStartStatus(rpc, rpc->RpcHandle()));
+   auto result = rpc->synchronizer().Wait();
+   if (attempts) {
+     *attempts = rpc->num_attempts();
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index 3544c0a383..5389bbaf25 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -2771,8 +2771,9 @@ void YBClient::OpenTableAsync(
+ }
+ 
+ void YBClient::OpenTableAsync(const TableId& table_id, const OpenTableAsyncCallback& callback,
++                              master::IncludeHidden include_hidden,
+                               master::GetTableSchemaResponsePB* resp) {
+-  DoOpenTableAsync(table_id, callback, master::IncludeHidden::kFalse, resp);
++  DoOpenTableAsync(table_id, callback, include_hidden, resp);
+ }
+ 
+ template <class Id>
+@@ -3016,5 +3017,9 @@ int64_t YBClient::GetRaftConfigOpidIndex(const TabletId& tablet_id) {
+   return data_->meta_cache_->GetRaftConfigOpidIndex(tablet_id);
+ }
+ 
++void YBClient::RequestAbortAllRpcs() {
++  data_->rpcs_.RequestAbortAll();
++}
++
+ }  // namespace client
+ }  // namespace yb
+diff --git a/src/yb/client/client.h b/src/yb/client/client.h
+index 47e0380277..ccb923a02b 100644
+--- a/src/yb/client/client.h
++++ b/src/yb/client/client.h
+@@ -863,6 +863,7 @@ class YBClient {
+ 
+   void OpenTableAsync(const YBTableName& table_name, const OpenTableAsyncCallback& callback);
+   void OpenTableAsync(const TableId& table_id, const OpenTableAsyncCallback& callback,
++                      master::IncludeHidden include_hidden = master::IncludeHidden::kFalse,
+                       master::GetTableSchemaResponsePB* resp = nullptr);
+ 
+   Result<YBTablePtr> OpenTable(const TableId& table_id);
+@@ -1048,6 +1049,8 @@ class YBClient {
+ 
+   int64_t GetRaftConfigOpidIndex(const TabletId& tablet_id);
+ 
++  void RequestAbortAllRpcs();
++
+  private:
+   class Data;
+ 
+diff --git a/src/yb/client/table.h b/src/yb/client/table.h
+index 105ecf3808..889a4e63f1 100644
+--- a/src/yb/client/table.h
++++ b/src/yb/client/table.h
+@@ -25,6 +25,7 @@
+ 
+ #include "yb/qlexpr/qlexpr_fwd.h"
+ 
++#include "yb/util/enums.h"
+ #include "yb/util/locks.h"
+ #include "yb/util/status_callback.h"
+ #include "yb/util/status_fwd.h"
+@@ -36,13 +37,9 @@ namespace client {
+ 
+ // This must match TableType in common.proto.
+ // We have static_assert's in tablet-test.cc to verify this.
+-enum class YBTableType {
+-  YQL_TABLE_TYPE = 2,
+-  REDIS_TABLE_TYPE = 3,
+-  PGSQL_TABLE_TYPE = 4,
+-  TRANSACTION_STATUS_TABLE_TYPE = 5,
+-  UNKNOWN_TABLE_TYPE = -1
+-};
++YB_DEFINE_ENUM(YBTableType,
++               ((YQL_TABLE_TYPE, 2))((REDIS_TABLE_TYPE, 3))((PGSQL_TABLE_TYPE, 4))
++               ((TRANSACTION_STATUS_TABLE_TYPE, 5))((UNKNOWN_TABLE_TYPE, -1)));
+ 
+ struct VersionedTablePartitionList {
+   TablePartitionList keys;
+diff --git a/src/yb/docdb/conflict_resolution.cc b/src/yb/docdb/conflict_resolution.cc
+index 6f10c969cc..d134c47903 100644
+--- a/src/yb/docdb/conflict_resolution.cc
++++ b/src/yb/docdb/conflict_resolution.cc
+@@ -959,7 +959,8 @@ class StrongConflictChecker {
+           return STATUS_EC_FORMAT(
+               TryAgain, TransactionError(TransactionErrorCode::kConflict),
+               "Conflict with concurrently committed data. Value write after transaction start: "
+-              "doc ht ($0) >= read time ($1)", doc_ht.hybrid_time(), read_time_);
++              "doc ht ($0) >= read time ($1), key: $2",
++              doc_ht.hybrid_time(), read_time_, SubDocKey::DebugSliceToString(intent_key));
+         }
+       }
+       buffer_.Reset(existing_key);
+diff --git a/src/yb/docdb/pgsql_operation.cc b/src/yb/docdb/pgsql_operation.cc
+index fd80a66480..8b6d1c6015 100644
+--- a/src/yb/docdb/pgsql_operation.cc
++++ b/src/yb/docdb/pgsql_operation.cc
+@@ -653,6 +653,7 @@ struct IndexState {
+   FilteringIterator iter;
+   const size_t ybbasectid_idx;
+   uint64_t scanned_rows;
++  Status delayed_failure;
+ };
+ 
+ Result<FetchResult> FetchTableRow(
+@@ -682,15 +683,16 @@ Result<FetchResult> FetchTableRow(
+       index ? table_iter->FetchTuple(tuple_id, row) : table_iter->FetchNext(row));
+   switch(fetch_result) {
+     case FetchResult::NotFound: {
+-      if (!index) {
+-        break;
+-      }
+-      if (FLAGS_TEST_ysql_suppress_ybctid_corruption_details) {
+-        return STATUS(Corruption, "ybctid not found in indexed table");
++      if (index && index->delayed_failure.ok()) {
++        const auto* fmt = FLAGS_TEST_ysql_suppress_ybctid_corruption_details
++            ? "ybctid not found in indexed table"
++            : "$0 not found in indexed table. Index table id is $1, row $2";
++        index->delayed_failure = STATUS_FORMAT(
++            Corruption, fmt,
++            DocKey::DebugSliceToString(tuple_id), table_id,
++            DocKey::DebugSliceToString(index->iter.impl().GetTupleId()));
+       }
+-      return STATUS_FORMAT(
+-          Corruption, "ybctid $0 not found in indexed table. index table id is $1",
+-          DocKey::DebugSliceToString(tuple_id), table_id);
++      break;
+     }
+     case FetchResult::FilteredOut:
+       VLOG(1) << "Row filtered out by the condition";
+@@ -1901,6 +1903,9 @@ Result<size_t> PgsqlReadOperation::Execute() {
+   if (index_iter_) {
+     restart_read_ht_->MakeAtLeast(VERIFY_RESULT(index_iter_->RestartReadHt()));
+   }
++  if (!restart_read_ht_->is_valid()) {
++    RETURN_NOT_OK(delayed_failure_);
++  }
+ 
+   // Versions of pggate < 2.17.1 are not capable of processing response protos that contain RPC
+   // sidecars holding data other than the rows returned by DocDB. During an upgrade, it is possible
+@@ -2266,6 +2271,9 @@ Result<std::tuple<size_t, bool>> PgsqlReadOperation::ExecuteScalar() {
+ 
+   if (index_state) {
+     scanned_index_rows_ += index_state->scanned_rows;
++    if (delayed_failure_.ok()) {
++      delayed_failure_ = index_state->delayed_failure;
++    }
+   }
+   return std::tuple<size_t, bool>{fetched_rows, has_paging_state};
+ }
+diff --git a/src/yb/docdb/pgsql_operation.h b/src/yb/docdb/pgsql_operation.h
+index 9a0f293a10..0b384f4f1b 100644
+--- a/src/yb/docdb/pgsql_operation.h
++++ b/src/yb/docdb/pgsql_operation.h
+@@ -231,6 +231,7 @@ class PgsqlReadOperation : public DocExprExecutor {
+   YQLRowwiseIteratorIf::UniPtr index_iter_;
+   uint64_t scanned_table_rows_ = 0;
+   uint64_t scanned_index_rows_ = 0;
++  Status delayed_failure_;
+ };
+ 
+ Status GetIntents(
+diff --git a/src/yb/docdb/wait_queue.cc b/src/yb/docdb/wait_queue.cc
+index ef1c205a8a..59ec97898d 100644
+--- a/src/yb/docdb/wait_queue.cc
++++ b/src/yb/docdb/wait_queue.cc
+@@ -2095,8 +2095,8 @@ class WaitQueue::Impl {
+   TransactionStatusManager* const txn_status_manager_;
+   const std::string& permanent_uuid_;
+   WaitingTxnRegistry* const waiting_txn_registry_;
+-  const std::shared_future<client::YBClient*>& client_future_;
+-  const server::ClockPtr& clock_;
++  std::shared_future<client::YBClient*> client_future_;
++  server::ClockPtr clock_;
+   std::unique_ptr<ThreadPoolToken> thread_pool_token_;
+   ResumedWaiterRunner waiter_runner_;
+   scoped_refptr<EventStats> pending_time_waiting_;
+diff --git a/src/yb/master/ysql_backends_manager.cc b/src/yb/master/ysql_backends_manager.cc
+index 48daa7c20d..9a2732844d 100644
+--- a/src/yb/master/ysql_backends_manager.cc
++++ b/src/yb/master/ysql_backends_manager.cc
+@@ -59,6 +59,8 @@ DEFINE_test_flag(bool, wait_for_ysql_backends_catalog_version_take_leader_lock,
+     "Take leader lock in WaitForYsqlBackendsCatalogVersion.");
+ DEFINE_test_flag(bool, ysql_backends_catalog_version_disable_abort_all_jobs, false,
+     "Make YsqlBackendsManager::AbortAllJobs a no-op.");
++DEFINE_test_flag(bool, skip_wait_for_ysql_backends_catalog_version, false,
++    "Set WaitForYsqlBackendsCatalogVersion to immediately return success.");
+ 
+ namespace yb {
+ namespace master {
+@@ -129,6 +131,10 @@ Status YsqlBackendsManager::WaitForYsqlBackendsCatalogVersion(
+     WaitForYsqlBackendsCatalogVersionResponsePB* resp,
+     rpc::RpcContext* rpc) {
+   LOG_WITH_FUNC(INFO) << req->ShortDebugString();
++  if (FLAGS_TEST_skip_wait_for_ysql_backends_catalog_version) {
++    resp->set_num_lagging_backends(0);
++    return Status::OK();
++  }
+ 
+   if (PREDICT_FALSE(FLAGS_TEST_block_wait_for_ysql_backends_catalog_version)) {
+     TestDoBlock(1 /* id */, __func__, __LINE__);
+diff --git a/src/yb/tablet/running_transaction.cc b/src/yb/tablet/running_transaction.cc
+index a3101b960f..ac3f302a68 100644
+--- a/src/yb/tablet/running_transaction.cc
++++ b/src/yb/tablet/running_transaction.cc
+@@ -196,8 +196,14 @@ void RunningTransaction::Abort(client::YBClient* client,
+           nullptr /* tablet */,
+           client,
+           &req,
+-          std::bind(&RunningTransaction::AbortReceived, this, status_tablet,
+-                    _1, _2, shared_from_this())),
++          [status_tablet, self = shared_from_this(), weak_context = context_.RetainWeak()](
++              const Status& status, const tserver::AbortTransactionResponsePB& response) {
++            auto context_lock = weak_context.lock();
++            if (!context_lock) {
++              return;
++            }
++            self->AbortReceived(status_tablet, status, response);
++          }),
+       &abort_handle_);
+ }
+ 
+@@ -523,8 +529,7 @@ Result<TransactionStatusResult> RunningTransaction::MakeAbortResult(
+ 
+ void RunningTransaction::AbortReceived(const TabletId& status_tablet,
+                                        const Status& status,
+-                                       const tserver::AbortTransactionResponsePB& response,
+-                                       const RunningTransactionPtr& shared_self) {
++                                       const tserver::AbortTransactionResponsePB& response) {
+   if (response.has_propagated_hybrid_time()) {
+     context_.participant_context_.UpdateClock(HybridTime(response.propagated_hybrid_time()));
+   }
+@@ -532,7 +537,7 @@ void RunningTransaction::AbortReceived(const TabletId& status_tablet,
+   decltype(abort_waiters_) abort_waiters;
+   auto result = MakeAbortResult(status, response);
+ 
+-  VLOG_WITH_PREFIX(3) << "AbortReceived: " << yb::ToString(result);
++  VLOG_WITH_PREFIX(3) << "AbortReceived: " << AsString(result);
+ 
+   bool did_abort_txn = false;
+   {
+@@ -543,7 +548,7 @@ void RunningTransaction::AbortReceived(const TabletId& status_tablet,
+         << "inconsistentcy issues in case of Geo-Partition workloads.";
+     abort_request_in_progress_ = false;
+ 
+-    LOG_IF(DFATAL, status_tablet != shared_self->status_tablet())
++    LOG_IF(DFATAL, status_tablet != this->status_tablet())
+         << "Status Tablet switched while Abort txn request was in progress. This might lead "
+         << "to data consistency issues.";
+ 
+diff --git a/src/yb/tablet/running_transaction.h b/src/yb/tablet/running_transaction.h
+index a0254da90a..51051bea57 100644
+--- a/src/yb/tablet/running_transaction.h
++++ b/src/yb/tablet/running_transaction.h
+@@ -193,8 +193,7 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
+ 
+   void AbortReceived(const TabletId& status_tablet,
+                      const Status& status,
+-                     const tserver::AbortTransactionResponsePB& response,
+-                     const RunningTransactionPtr& shared_self);
++                     const tserver::AbortTransactionResponsePB& response);
+ 
+   TransactionMetadata metadata_;
+   TransactionalBatchData last_batch_data_;
+diff --git a/src/yb/tablet/running_transaction_context.h b/src/yb/tablet/running_transaction_context.h
+index 7ea9c77b3e..274bbb5432 100644
+--- a/src/yb/tablet/running_transaction_context.h
++++ b/src/yb/tablet/running_transaction_context.h
+@@ -93,6 +93,8 @@ class RunningTransactionContext {
+     return delayer_;
+   }
+ 
++  virtual std::weak_ptr<void> RetainWeak() = 0;
++
+   virtual bool Closing() const = 0;
+ 
+  protected:
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index fda8f28148..f4d059b198 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -191,7 +191,8 @@ void UpdateHistoricalMaxOpId(std::atomic<OpId>* historical_max_op_id, OpId const
+ }
+ 
+ class TransactionParticipant::Impl
+-    : public RunningTransactionContext, public TransactionLoaderContext {
++    : public RunningTransactionContext, public TransactionLoaderContext,
++      public std::enable_shared_from_this<Impl> {
+  public:
+   Impl(TransactionParticipantContext* context, TransactionIntentApplier* applier,
+        const scoped_refptr<MetricEntity>& entity,
+@@ -1495,6 +1496,10 @@ class TransactionParticipant::Impl
+         retryable_requests_flushed_op_id_, true /* persist */));
+   }
+ 
++  std::weak_ptr<void> RetainWeak() override {
++    return shared_from_this();
++  }
++
+  private:
+   class AbortCheckTimeTag;
+   class StartTimeTag;
+diff --git a/src/yb/tablet/transaction_participant.h b/src/yb/tablet/transaction_participant.h
+index edc2c5dd2a..a9c3fded09 100644
+--- a/src/yb/tablet/transaction_participant.h
++++ b/src/yb/tablet/transaction_participant.h
+@@ -269,7 +269,7 @@ class TransactionParticipant : public TransactionStatusManager {
+   void UnregisterRequest(int64_t request) override;
+ 
+   class Impl;
+-  std::unique_ptr<Impl> impl_;
++  std::shared_ptr<Impl> impl_;
+ };
+ 
+ } // namespace tablet
+diff --git a/src/yb/tserver/pg_table_cache.cc b/src/yb/tserver/pg_table_cache.cc
+index 820be95dbd..3477a18a27 100644
+--- a/src/yb/tserver/pg_table_cache.cc
++++ b/src/yb/tserver/pg_table_cache.cc
+@@ -24,20 +24,49 @@
+ 
+ #include "yb/util/scope_exit.h"
+ 
+-namespace yb {
+-namespace tserver {
++namespace yb::tserver {
+ 
+ namespace {
+ 
+-struct CacheEntry {
+-  std::promise<Result<client::YBTablePtr>> promise;
+-  std::shared_future<Result<client::YBTablePtr>> future;
+-  master::GetTableSchemaResponsePB schema;
++class CacheEntry {
++ public:
++  CacheEntry() : future_(promise_.get_future()) {
++  }
++
++  void SetValue(const Result<client::YBTablePtr>& value) {
++    promise_.set_value(value);
++    has_value_.store(true);
++  }
++
++  const Result<client::YBTablePtr>& Get() const {
++    return future_.get();
++  }
++
++  master::GetTableSchemaResponsePB& schema() {
++    return schema_;
++  }
+ 
+-  CacheEntry() : future(promise.get_future()) {
++  bool Failed() const {
++    return has_value_.load() && !future_.get().ok();
+   }
++
++ private:
++  std::atomic<bool> has_value_{false};
++  std::promise<Result<client::YBTablePtr>> promise_;
++  std::shared_future<Result<client::YBTablePtr>> future_;
++  master::GetTableSchemaResponsePB schema_;
+ };
+ 
++Result<client::YBTablePtr> CheckTableType(const Result<client::YBTablePtr>& result) {
++  RETURN_NOT_OK(result);
++  RSTATUS_DCHECK(
++      (**result).table_type() == client::YBTableType::PGSQL_TABLE_TYPE, RuntimeError,
++      "Wrong table type: $0", (**result).table_type());
++  return *result;
++}
++
++using CacheEntryPtr = std::shared_ptr<CacheEntry>;
++
+ } // namespace
+ 
+ class PgTableCache::Impl {
+@@ -51,21 +80,21 @@ class PgTableCache::Impl {
+       client::YBTablePtr* table,
+       master::GetTableSchemaResponsePB* schema) {
+     auto entry = GetEntry(table_id, include_hidden);
+-    const auto& table_result = entry->future.get();
++    const auto& table_result = entry->Get();
+     RETURN_NOT_OK(table_result);
+     *table = *table_result;
+-    *schema = entry->schema;
++    *schema = entry->schema();
+     return Status::OK();
+   }
+ 
+   Result<client::YBTablePtr> Get(const TableId& table_id) {
+-    return GetEntry(table_id)->future.get();
++    return GetEntry(table_id)->Get();
+   }
+ 
+   void Invalidate(const TableId& table_id) {
+-    std::lock_guard lock(mutex_);
+     const auto db_oid = CHECK_RESULT(GetPgsqlDatabaseOid(table_id));
+     VLOG(2) << "Invalidate table " << table_id << " in table cache of database " << db_oid;
++    std::lock_guard lock(mutex_);
+     auto iter = caches_.find(db_oid);
+     if (iter != caches_.end()) {
+       iter->second.first.erase(table_id);
+@@ -120,67 +149,46 @@ class PgTableCache::Impl {
+     return *client_future_.get();
+   }
+ 
+-  std::shared_ptr<CacheEntry> GetEntry(
++  CacheEntryPtr GetEntry(
+       const TableId& table_id,
+       master::IncludeHidden include_hidden = master::IncludeHidden::kFalse) {
+     auto p = DoGetEntry(table_id);
+     if (p.second) {
+-      LoadEntry(table_id, include_hidden, p.first.get());
++      LoadEntry(table_id, include_hidden, p.first);
+     }
+     return p.first;
+   }
+ 
+-  std::pair<std::shared_ptr<CacheEntry>, bool> DoGetEntry(const TableId& table_id) {
+-    std::lock_guard lock(mutex_);
++  std::pair<CacheEntryPtr, bool> DoGetEntry(const TableId& table_id) {
+     const auto db_oid = CHECK_RESULT(GetPgsqlDatabaseOid(table_id));
++    std::lock_guard lock(mutex_);
+     const auto iter = caches_.find(db_oid);
+     auto& entry = iter != caches_.end() ? iter->second : caches_[db_oid];
+     auto& cache = entry.first;
+     auto it = cache.find(table_id);
+     if (it != cache.end()) {
++      if (it->second->Failed()) {
++        it->second = std::make_shared<CacheEntry>();
++        return {it->second, true};
++      }
+       return std::make_pair(it->second, false);
+     }
+     it = cache.emplace(table_id, std::make_shared<CacheEntry>()).first;
+     return std::make_pair(it->second, true);
+   }
+ 
+-  Status OpenTable(
+-      const TableId& table_id,
+-      master::IncludeHidden include_hidden,
+-      client::YBTablePtr* table,
+-      master::GetTableSchemaResponsePB* schema) {
+-    RETURN_NOT_OK(client().OpenTable(table_id, table, include_hidden, schema));
+-    RSTATUS_DCHECK(
+-        (**table).table_type() == client::YBTableType::PGSQL_TABLE_TYPE, RuntimeError,
+-        "Wrong table type");
+-    return Status::OK();
+-  }
+-
+   void LoadEntry(
+-      const TableId& table_id, master::IncludeHidden include_hidden, CacheEntry* entry) {
+-    client::YBTablePtr table;
+-    bool finished = false;
+-    auto se = ScopeExit([entry, &finished] {
+-      if (finished) {
+-        return;
+-      }
+-      entry->promise.set_value(STATUS(InternalError, "Unexpected return"));
+-    });
+-    auto status = OpenTable(table_id, include_hidden, &table, &entry->schema);
+-    if (!status.ok()) {
+-      Invalidate(table_id);
+-      entry->promise.set_value(std::move(status));
+-      finished = true;
+-      return;
+-    }
++      const TableId& table_id, master::IncludeHidden include_hidden, const CacheEntryPtr& entry) {
++    auto callback = [entry](const Result<client::YBTablePtr>& result) {
++      entry->SetValue(CheckTableType(result));
++    };
+ 
+-    entry->promise.set_value(table);
+-    finished = true;
++    client().OpenTableAsync(table_id, callback, include_hidden, &entry->schema());
+   }
+ 
+   std::shared_future<client::YBClient*> client_future_;
+   std::mutex mutex_;
+-  using PgTableMap = std::unordered_map<TableId, std::shared_ptr<CacheEntry>>;
++  using PgTableMap = std::unordered_map<TableId, CacheEntryPtr>;
+   std::unordered_map<uint32_t, std::pair<PgTableMap, CoarseTimePoint>> caches_ GUARDED_BY(mutex_);
+   CoarseTimePoint last_cache_invalidation_ GUARDED_BY(mutex_);
+ };
+@@ -219,5 +227,4 @@ void PgTableCache::InvalidateDbTables(
+   impl_->InvalidateDbTables(db_oids_updated, db_oids_deleted, invalidation_time);
+ }
+ 
+-}  // namespace tserver
+-}  // namespace yb
++}  // namespace yb::tserver
+diff --git a/src/yb/tserver/tablet_server.cc b/src/yb/tserver/tablet_server.cc
+index 7f54d02174..0be742288c 100644
+--- a/src/yb/tserver/tablet_server.cc
++++ b/src/yb/tserver/tablet_server.cc
+@@ -724,29 +724,33 @@ void TabletServer::Shutdown() {
+   LOG(INFO) << "TabletServer shutting down...";
+ 
+   bool expected = true;
+-  if (initted_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
+-    auto xcluster_consumer = GetXClusterConsumer();
+-    if (xcluster_consumer) {
+-      xcluster_consumer->Shutdown();
+-    }
++  if (!initted_.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
++    return;
++  }
+ 
+-    maintenance_manager_->Shutdown();
+-    WARN_NOT_OK(heartbeater_->Stop(), "Failed to stop TS Heartbeat thread");
++  auto xcluster_consumer = GetXClusterConsumer();
++  if (xcluster_consumer) {
++    xcluster_consumer->Shutdown();
++  }
+ 
+-    if (FLAGS_tserver_enable_metrics_snapshotter) {
+-      WARN_NOT_OK(metrics_snapshotter_->Stop(), "Failed to stop TS Metrics Snapshotter thread");
+-    }
++  maintenance_manager_->Shutdown();
++  WARN_NOT_OK(heartbeater_->Stop(), "Failed to stop TS Heartbeat thread");
+ 
+-    if (pg_table_mutation_count_sender_) {
+-      WARN_NOT_OK(pg_table_mutation_count_sender_->Stop(),
+-          "Failed to stop table mutation count sender thread");
+-    }
++  if (FLAGS_tserver_enable_metrics_snapshotter) {
++    WARN_NOT_OK(metrics_snapshotter_->Stop(), "Failed to stop TS Metrics Snapshotter thread");
++  }
+ 
+-    tablet_manager_->StartShutdown();
+-    RpcAndWebServerBase::Shutdown();
+-    tablet_manager_->CompleteShutdown();
++  if (pg_table_mutation_count_sender_) {
++    WARN_NOT_OK(pg_table_mutation_count_sender_->Stop(),
++        "Failed to stop table mutation count sender thread");
+   }
+ 
++  client()->RequestAbortAllRpcs();
++
++  tablet_manager_->StartShutdown();
++  RpcAndWebServerBase::Shutdown();
++  tablet_manager_->CompleteShutdown();
++
+   LOG(INFO) << "TabletServer shut down complete. Bye!";
+ }
+ 
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 28eaa7426c..12733d857f 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -92,6 +92,7 @@
+ #include "yb/tablet/transaction_participant.h"
+ #include "yb/tablet/write_query.h"
+ 
++#include "yb/tserver/heartbeater.h"
+ #include "yb/tserver/read_query.h"
+ #include "yb/tserver/service_util.h"
+ #include "yb/tserver/tablet_server.h"
+@@ -2081,8 +2082,9 @@ void TabletServiceAdminImpl::WaitForYsqlBackendsCatalogVersion(
+   const std::string db_ver_tag = Format("[DB $0, V $1]", database_oid, catalog_version);
+   uint64_t ts_catalog_version = 0;
+   SCOPED_WAIT_STATUS(WaitForYSQLBackendsCatalogVersion);
++  bool first_run = true;
+   Status s = Wait(
+-      [catalog_version, database_oid, this, &ts_catalog_version]() -> Result<bool> {
++      [catalog_version, database_oid, this, &ts_catalog_version, &first_run]() -> Result<bool> {
+         // TODO(jason): using the gflag to determine per-db mode may not work for initdb, so make
+         // sure to handle that case if initdb ever goes through this codepath.
+         bool perdb_mode = false;
+@@ -2103,7 +2105,14 @@ void TabletServiceAdminImpl::WaitForYsqlBackendsCatalogVersion(
+           server_->get_ysql_catalog_version(
+               &ts_catalog_version, nullptr /* last_breaking_catalog_version */);
+         }
+-        return ts_catalog_version >= catalog_version;
++        if (ts_catalog_version >= catalog_version) {
++          return true;
++        }
++        if (first_run) {
++          first_run = false;
++          server_->heartbeater()->TriggerASAP();
++        }
++        return false;
+       },
+       modified_deadline,
+       Format("Wait for tserver catalog version to reach $0", db_ver_tag));
+diff --git a/src/yb/tserver/tablet_validator.cc b/src/yb/tserver/tablet_validator.cc
+index b325d4a49b..5f712d405a 100644
+--- a/src/yb/tserver/tablet_validator.cc
++++ b/src/yb/tserver/tablet_validator.cc
+@@ -151,7 +151,8 @@ class TabletMetadataValidator::Impl final {
+ 
+   Status Init();
+   void ScheduleValidation(const tablet::RaftGroupMetadata& metadata);
+-  void Shutdown();
++  void StartShutdown();
++  void CompleteShutdown();
+ 
+  private:
+   const std::string& LogPrefix() const {
+@@ -424,14 +425,20 @@ bool TabletMetadataValidator::Impl::ScheduleTabletPropertiesValidation(
+   return true;
+ }
+ 
+-void TabletMetadataValidator::Impl::Shutdown() {
++void TabletMetadataValidator::Impl::StartShutdown() {
+   bool expected = false;
+   if (!shutting_down_.compare_exchange_strong(expected, true)) {
+     return;
+   }
+ 
+   if (validation_task_) {
+-    validation_task_->Shutdown();
++    validation_task_->StartShutdown();
++  }
++}
++
++void TabletMetadataValidator::Impl::CompleteShutdown() {
++  if (validation_task_) {
++    validation_task_->CompleteShutdown();
+   }
+ }
+ 
+@@ -545,8 +552,12 @@ void TabletMetadataValidator::ScheduleValidation(const tablet::RaftGroupMetadata
+   impl_->ScheduleValidation(metadata);
+ }
+ 
+-void TabletMetadataValidator::Shutdown() {
+-  impl_->Shutdown();
++void TabletMetadataValidator::StartShutdown() {
++  impl_->StartShutdown();
++}
++
++void TabletMetadataValidator::CompleteShutdown() {
++  impl_->CompleteShutdown();
+ }
+ 
+ } // namespace yb::tserver
+diff --git a/src/yb/tserver/tablet_validator.h b/src/yb/tserver/tablet_validator.h
+index 7b04b91794..c7e8557f74 100644
+--- a/src/yb/tserver/tablet_validator.h
++++ b/src/yb/tserver/tablet_validator.h
+@@ -35,7 +35,8 @@ class TabletMetadataValidator final {
+   explicit TabletMetadataValidator(const std::string& log_prefix, TSTabletManager* tablet_manager);
+ 
+   Status Init();
+-  void Shutdown();
++  void StartShutdown();
++  void CompleteShutdown();
+ 
+   // Checks if a tablet is a candidate for the validation.
+   void ScheduleValidation(const tablet::RaftGroupMetadata& metadata);
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index 7345942544..ca36839a98 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -2250,7 +2250,7 @@ void TSTabletManager::StartShutdown() {
+ 
+   verify_tablet_data_poller_->Shutdown();
+ 
+-  tablet_metadata_validator_->Shutdown();
++  tablet_metadata_validator_->StartShutdown();
+ 
+   data_size_metric_updater_->Shutdown();
+ 
+@@ -2286,9 +2286,15 @@ void TSTabletManager::StartShutdown() {
+   if (waiting_txn_registry_) {
+     waiting_txn_registry_->StartShutdown();
+   }
++
++  if (superblock_flush_bg_task_) {
++    superblock_flush_bg_task_->StartShutdown();
++  }
+ }
+ 
+ void TSTabletManager::CompleteShutdown() {
++  tablet_metadata_validator_->CompleteShutdown();
++
+   for (const TabletPeerPtr& peer : shutting_down_peers_) {
+     peer->CompleteShutdown(
+         tablet::DisableFlushOnShutdown(FLAGS_TEST_disable_flush_on_shutdown),
+@@ -2324,7 +2330,7 @@ void TSTabletManager::CompleteShutdown() {
+     admin_triggered_compaction_pool_->Shutdown();
+   }
+   if (superblock_flush_bg_task_) {
+-    superblock_flush_bg_task_->Shutdown();
++    superblock_flush_bg_task_->CompleteShutdown();
+   }
+   if (full_compaction_pool_) {
+     full_compaction_pool_->Shutdown();
+diff --git a/src/yb/util/background_task-test.cc b/src/yb/util/background_task-test.cc
+index 7b0e35881c..f3586a8d84 100644
+--- a/src/yb/util/background_task-test.cc
++++ b/src/yb/util/background_task-test.cc
+@@ -73,7 +73,8 @@ TEST_F(BackgroundTaskTest, RunsTaskOnWake) {
+     }, 1s * kTimeMultiplier, Format("Wait for i-th ($0) task run.", i)));
+   }
+ 
+-  bg_task->Shutdown();
++  bg_task->StartShutdown();
++  bg_task->CompleteShutdown();
+ }
+ 
+ TEST_F(BackgroundTaskTest, YB_DISABLE_TEST_ON_MACOS(RunsTaskOnInterval)) {
+@@ -89,7 +90,8 @@ TEST_F(BackgroundTaskTest, YB_DISABLE_TEST_ON_MACOS(RunsTaskOnInterval)) {
+     }, interval / 10, Format("Wait for i-th ($0) task run.", i)));
+   }
+ 
+-  bg_task->Shutdown();
++  bg_task->StartShutdown();
++  bg_task->CompleteShutdown();
+ }
+ 
+ class BackgroundTaskShutdownTest :
+@@ -99,7 +101,8 @@ TEST_P(BackgroundTaskShutdownTest, InitAndShutdown) {
+   auto interval = GetParam() * kTimeMultiplier;
+   auto bg_task = GetTask(interval);
+   std::this_thread::sleep_for(1s * kTimeMultiplier);
+-  bg_task->Shutdown();
++  bg_task->StartShutdown();
++  bg_task->CompleteShutdown();
+ }
+ 
+ INSTANTIATE_TEST_CASE_P(
+diff --git a/src/yb/util/background_task.cc b/src/yb/util/background_task.cc
+index f42261c5fe..8393136538 100644
+--- a/src/yb/util/background_task.cc
++++ b/src/yb/util/background_task.cc
+@@ -43,6 +43,11 @@ void BackgroundTask::SetInterval(std::chrono::milliseconds interval_msec) {
+ 
+ // Wait for pending tasks and shut down
+ void BackgroundTask::Shutdown() {
++  StartShutdown();
++  CompleteShutdown();
++}
++
++void BackgroundTask::StartShutdown() {
+   {
+     std::unique_lock lock(mutex_);
+     if (closing_) {
+@@ -52,6 +57,9 @@ void BackgroundTask::Shutdown() {
+     closing_ = true;
+   }
+   YB_PROFILE(cond_.notify_one());
++}
++
++void BackgroundTask::CompleteShutdown() {
+   CHECK_OK(ThreadJoiner(thread_.get()).Join());
+ }
+ 
+diff --git a/src/yb/util/background_task.h b/src/yb/util/background_task.h
+index 69c2553423..6314efecb8 100644
+--- a/src/yb/util/background_task.h
++++ b/src/yb/util/background_task.h
+@@ -41,6 +41,9 @@ class BackgroundTask {
+   void SetInterval(std::chrono::milliseconds interval_msec);
+ 
+   // Wait for pending tasks and shut down.
++  void StartShutdown();
++  void CompleteShutdown();
++
+   void Shutdown();
+ 
+   Status Wake();
+diff --git a/src/yb/util/thread.cc b/src/yb/util/thread.cc
+index 8e76688e50..7fe784fcda 100644
+--- a/src/yb/util/thread.cc
++++ b/src/yb/util/thread.cc
+@@ -698,10 +698,17 @@ Status ThreadJoiner::Join() {
+ 
+   MonoDelta waited = MonoDelta::kZero;
+   bool keep_trying = true;
++  int stack_trace_report_counter = -5;
+   while (keep_trying) {
+     if (waited >= warn_after_) {
+       LOG(WARNING) << Format("Waited for $0 trying to join with $1 (tid $2)",
+                              waited, thread_->name_, thread_->tid_);
++      if (++stack_trace_report_counter == 0) {
++        auto stack_trace = ThreadStack(thread_->tid_for_stack());
++        if (stack_trace.ok()) {
++          LOG(WARNING) << "Stack trace for " << thread_->tid_ << ":\n" << stack_trace->Symbolize();
++        }
++      }
+     }
+ 
+     auto remaining_before_giveup = give_up_after_;
+diff --git a/src/yb/yql/pgwrapper/pg_ddl_atomicity_stress-test.cc b/src/yb/yql/pgwrapper/pg_ddl_atomicity_stress-test.cc
+index 9607d8ac18..4671197c23 100644
+--- a/src/yb/yql/pgwrapper/pg_ddl_atomicity_stress-test.cc
++++ b/src/yb/yql/pgwrapper/pg_ddl_atomicity_stress-test.cc
+@@ -51,16 +51,19 @@ namespace pgwrapper {
+ YB_STRONGLY_TYPED_BOOL(ColocatedDatabase);
+ YB_STRONGLY_TYPED_BOOL(PartitionedTables);
+ 
+-class PgDdlAtomicityStressTest
+-    : public PgDdlAtomicityTestBase,
+-      public ::testing::WithParamInterface<std::tuple<ColocatedDatabase, PartitionedTables,
+-                                                      std::string>> {
++using Params = std::tuple<ColocatedDatabase, PartitionedTables, std::string>;
++
++class PgDdlAtomicityStressTest : public PgDdlAtomicityTestBase,
++                                 public testing::WithParamInterface<Params> {
+  protected:
+   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+     options->extra_tserver_flags.push_back("--yb_enable_read_committed_isolation=false");
+     options->extra_tserver_flags.push_back("--ysql_pg_conf_csv=log_statement=all");
+-    options->extra_master_flags.push_back("--vmodule=ysql_ddl_handler=3,rwc_lock=1");
+     options->extra_master_flags.push_back("--ysql_ddl_transaction_wait_for_ddl_verification=false");
++    if (IsTsan()) {
++      options->extra_master_flags.push_back(
++          "--TEST_skip_wait_for_ysql_backends_catalog_version=true");
++    }
+   }
+ 
+   Status SetupTables();
+@@ -73,11 +76,11 @@ class PgDdlAtomicityStressTest
+ 
+   // Return a cached global connection that is used for test table/data setup, and test
+   // result verification.
+-  PGConn* GetGlobalConn() {
+-    if (!global_conn) {
+-      global_conn = std::make_unique<PGConn>(CHECK_RESULT(Connect()));
++  PGConn& GetGlobalConn() {
++    if (!global_conn_) {
++      global_conn_.emplace(CHECK_RESULT(Connect()));
+     }
+-    return global_conn.get();
++    return *global_conn_;
+   }
+ 
+   bool IsColocated() const {
+@@ -92,24 +95,24 @@ class PgDdlAtomicityStressTest
+     return std::get<2>(GetParam());
+   }
+ 
+-  Status TestDdl(PGConn* conn, const std::vector<std::string>& ddl, const int iteration);
++  Status TestDdl(const std::vector<std::string>& ddl, int iteration);
+ 
+-  Status TestConcurrentIndex(PGConn* conn, const int num_iterations);
++  Status TestConcurrentIndex(int num_iterations);
+ 
+-  Status TestDml(PGConn* conn, const int num_iterations);
++  Status TestDml(int num_iterations);
+ 
+   template<class... Args>
+   Result<bool> ExecuteFormatWithRetry(
+-      PGConn* conn, bool is_ddl, const std::string& format, Args&&... args) {
++      PGConn& conn, bool is_ddl, const std::string& format, Args&&... args) {
+     return DoExecuteWithRetry(conn, is_ddl, Format(format, std::forward<Args>(args)...));
+   }
+ 
+-  Result<bool> DoExecuteWithRetry(PGConn* conn, bool is_ddl, const std::string& stmt);
++  Result<bool> DoExecuteWithRetry(PGConn& conn, bool is_ddl, const std::string& stmt);
+ 
+   Status InsertTestData(const int num_rows);
+ 
+  private:
+-  std::unique_ptr<PGConn> global_conn;
++  std::optional<PGConn> global_conn_;
+ };
+ 
+ Status PgDdlAtomicityStressTest::SetupTables() {
+@@ -119,23 +122,23 @@ Status PgDdlAtomicityStressTest::SetupTables() {
+     auto conn_init = VERIFY_RESULT(LibPqTestBase::Connect());
+     RETURN_NOT_OK(conn_init.ExecuteFormat("CREATE DATABASE $0 WITH colocated = true", database()));
+   }
+-  auto global_conn = GetGlobalConn();
++  auto& global_conn = GetGlobalConn();
+   if (IsPartitioned()) {
+-    RETURN_NOT_OK(global_conn->ExecuteFormat(
++    RETURN_NOT_OK(global_conn.ExecuteFormat(
+         "CREATE TABLE $0 (key INT PRIMARY KEY, value TEXT, num real) "
+         " PARTITION BY RANGE(key)", kTable));
+-    RETURN_NOT_OK(global_conn->ExecuteFormat(
++    RETURN_NOT_OK(global_conn.ExecuteFormat(
+         "CREATE TABLE $0_$1 PARTITION OF $0 FOR VALUES FROM ($1) TO ($2)",
+         kTable, 1, NumIterations()));
+     // Create a default partition.
+-    return global_conn->ExecuteFormat("CREATE TABLE $0_default PARTITION OF $0 DEFAULT", kTable);
++    return global_conn.ExecuteFormat("CREATE TABLE $0_default PARTITION OF $0 DEFAULT", kTable);
+   }
+-  return global_conn->Execute(CreateTableStmt(kTable));
++  return global_conn.Execute(CreateTableStmt(kTable));
+ }
+ 
+ Status PgDdlAtomicityStressTest::InsertTestData(const int num_rows) {
+-  auto global_conn = GetGlobalConn();
+-  return global_conn->ExecuteFormat(
++  auto& global_conn = GetGlobalConn();
++  return global_conn.ExecuteFormat(
+     "INSERT INTO $0 VALUES (generate_series(1, $1))",
+     kTable,
+     num_rows);
+@@ -154,7 +157,7 @@ int PgDdlAtomicityStressTest::NumIterations() {
+     // internally invokes (num_partitions + 1) DDLs.
+     return 3;
+   }
+-  return RegularBuildVsSanitizers(10, 5);
++  return RegularBuildVsSanitizers(10, 3);
+ }
+ 
+ std::string PgDdlAtomicityStressTest::database() {
+@@ -162,7 +165,8 @@ std::string PgDdlAtomicityStressTest::database() {
+ }
+ 
+ Status PgDdlAtomicityStressTest::TestDdl(
+-    PGConn* conn, const std::vector<std::string>& ddls, const int num_iterations) {
++    const std::vector<std::string>& ddls, const int num_iterations) {
++  auto conn = VERIFY_RESULT(Connect());
+   for (int i = 0; i < num_iterations; ++i) {
+     for (const auto& ddl : ddls) {
+       auto stmt = Format(ddl, kTable, i);
+@@ -176,8 +180,8 @@ Status PgDdlAtomicityStressTest::TestDdl(
+ }
+ 
+ Result<bool> PgDdlAtomicityStressTest::DoExecuteWithRetry(
+-    PGConn* conn, bool is_ddl, const std::string& stmt) {
+-  auto s = conn->Execute(stmt);
++    PGConn& conn, bool is_ddl, const std::string& stmt) {
++  auto s = conn.Execute(stmt);
+   if (s.ok()) {
+     LOG(INFO) << "Execution of stmt " << stmt << " succeeded";
+     return true;
+@@ -229,31 +233,28 @@ Result<bool> PgDdlAtomicityStressTest::DoExecuteWithRetry(
+   return s;
+ }
+ 
+-Status PgDdlAtomicityStressTest::TestConcurrentIndex(PGConn* conn, const int num_iterations) {
++Status PgDdlAtomicityStressTest::TestConcurrentIndex(const int num_iterations) {
++  auto conn = VERIFY_RESULT(Connect());
+   const bool is_ddl = true;
+-  for (int i = 0; i < num_iterations; ++i) {
+-    bool index_created = false;
+-    while (!index_created) {
+-      // If concurrent index creation fails, it does not clean up the invalid index. Thus to
+-      // make the statement idempotent, drop the index if the create index failed before retrying.
+-      index_created = VERIFY_RESULT(ExecuteFormatWithRetry(
+-          conn, is_ddl, "CREATE INDEX idx_$0 ON $1(key)", i, kTable));
+-      if (!index_created) {
+-        auto stmt = Format("DROP INDEX IF EXISTS idx_$0", i);
+-        while (!VERIFY_RESULT(ExecuteFormatWithRetry(conn, is_ddl, stmt))) {
+-          LOG(INFO) << "Retry executing stmt " << stmt;
+-        }
+-      }
+-    }
+-    auto stmt = Format("DROP INDEX idx_$0", i);
++  int num_created = 0;
++  for (int i = 0;; ++i) {
++    // If concurrent index creation fails, it does not clean up the invalid index. Thus to
++    // make the statement idempotent, drop the index if the create index failed before retrying.
++    bool index_created = VERIFY_RESULT(ExecuteFormatWithRetry(
++        conn, is_ddl, "CREATE INDEX idx_$0 ON $1(key)", i, kTable));
++    auto stmt = Format("DROP INDEX $0 idx_$1", index_created ? "" : "IF EXISTS", i);
+     while (!VERIFY_RESULT(ExecuteFormatWithRetry(conn, is_ddl, stmt))) {
+       LOG(INFO) << "Retry executing stmt " << stmt;
+     }
++    if (index_created && ++num_created >= num_iterations) {
++      break;
++    }
+   }
+   return Status::OK();
+ }
+ 
+-Status PgDdlAtomicityStressTest::TestDml(PGConn* conn, const int num_iterations) {
++Status PgDdlAtomicityStressTest::TestDml(const int num_iterations) {
++  auto conn = VERIFY_RESULT(Connect());
+   for (int i = 1; i <= num_iterations;) {
+     auto stmt = Format("UPDATE $0 SET value = 'value_$1' WHERE key = $1", kTable, i);
+     if (VERIFY_RESULT(ExecuteFormatWithRetry(conn, false /* is_ddl */, stmt))) {
+@@ -263,9 +264,27 @@ Status PgDdlAtomicityStressTest::TestDml(PGConn* conn, const int num_iterations)
+   return Status::OK();
+ }
+ 
++std::string PgDdlAtomicityStressTestParamToString(const testing::TestParamInfo<Params>& info) {
++  const auto& params = info.param;
++  std::vector<std::string> options;
++  if (get<0>(params)) {
++    options.push_back("colocated");
++  }
++  if (get<1>(params)) {
++    options.push_back("partitioned");
++  }
++  auto flag = get<2>(params);
++  if (!flag.empty()) {
++    options.push_back(flag.substr(10));
++  }
++  if (options.empty()) {
++    options.push_back("none");
++  }
++  return JoinElements(options, "_");
++}
+ 
+ INSTANTIATE_TEST_CASE_P(
+-    PgDdlAtomicityStressTest,
++    ,
+     PgDdlAtomicityStressTest,
+     ::testing::Combine(
+         ::testing::Values(ColocatedDatabase::kFalse, ColocatedDatabase::kTrue),
+@@ -274,68 +293,64 @@ INSTANTIATE_TEST_CASE_P(
+                           "TEST_ysql_ddl_transaction_verification_failure_probability",
+                           "TEST_ysql_fail_probability_of_catalog_writes_by_ddl_verification",
+                           "TEST_ysql_ddl_rollback_failure_probability",
+-                          "TEST_ysql_ddl_verification_failure_probability")));
++                          "TEST_ysql_ddl_verification_failure_probability")),
++    PgDdlAtomicityStressTestParamToString);
+ 
+-TEST_P(PgDdlAtomicityStressTest, StressTest) {
++TEST_P(PgDdlAtomicityStressTest, Main) {
+   ASSERT_OK(SetupTables());
+ 
+-  ASSERT_OK(InsertTestData(NumIterations() * 2));
++  const int num_iterations = NumIterations();
++  ASSERT_OK(InsertTestData(num_iterations * 2));
+ 
+   if (!ErrorProbability().empty()) {
+     ASSERT_OK(cluster_->SetFlagOnMasters(ErrorProbability(), "0.1"));
+   }
+ 
+-  const int num_iterations = NumIterations();
+   TestThreadHolder thread_holder;
+ 
+   // We test creation/deletion together so that we can be sure that the entity we are dropping
+   // exists when it is executed. Each thread uses its own connection for its entire duration.
+ 
+   // Create a thread to add and drop columns.
+-  auto conn1 = ASSERT_RESULT(Connect());
+-  thread_holder.AddThreadFunctor([this, &conn1, num_iterations] {
++  thread_holder.AddThreadFunctor([this, num_iterations] {
+     std::vector<std::string> ddls = {
+       "ALTER TABLE $0 ADD COLUMN col_$1 TEXT",
+       "ALTER TABLE $0 DROP COLUMN col_$1"
+     };
+-    ASSERT_OK(TestDdl(&conn1, ddls, num_iterations));
++    ASSERT_OK(TestDdl(ddls, num_iterations));
+     LOG(INFO) << "Thread to add and drop columns has completed";
+   });
+ 
+   // Create a thread to add and drop columns with default values.
+-  auto conn2 = ASSERT_RESULT(Connect());
+-  thread_holder.AddThreadFunctor([this, &conn2, num_iterations] {
++  thread_holder.AddThreadFunctor([this, num_iterations] {
+     std::vector<std::string> ddls = {
+       "ALTER TABLE $0 ADD COLUMN col_def_$1 TEXT DEFAULT 'def'",
+       "ALTER TABLE $0 DROP COLUMN col_def_$1"
+     };
+-    ASSERT_OK(TestDdl(&conn2, ddls, num_iterations));
++    ASSERT_OK(TestDdl(ddls, num_iterations));
+     LOG(INFO) << "Thread to add and drop columns with default values has completed";
+   });
+ 
+   // Create a thread to create/drop an index on this table.
+-  auto conn3 = ASSERT_RESULT(Connect());
+-  thread_holder.AddThreadFunctor([this, &conn3, num_iterations] {
++  thread_holder.AddThreadFunctor([this, num_iterations] {
+     std::vector<std::string> ddls = {
+       "CREATE INDEX NONCONCURRENTLY non_concurrent_idx_$1 ON $0(key)",
+       "DROP INDEX non_concurrent_idx_$1"
+     };
+-    ASSERT_OK(TestDdl(&conn3, ddls, num_iterations));
++    ASSERT_OK(TestDdl(ddls, num_iterations));
+     LOG(INFO) << "Thread to create/drop an index has completed";
+   });
+ 
+   // ConcurrentIndex is a very long running operation. Cleaning up a failed ConcurrentIndex is
+   // also a DDL, and this can be a very long running test. Reduce the number of iterations.
+-  auto conn4 = ASSERT_RESULT(Connect());
+-  thread_holder.AddThreadFunctor([this, &conn4, num_iterations] {
+-    ASSERT_OK(TestConcurrentIndex(&conn4, num_iterations / 2));
++  thread_holder.AddThreadFunctor([this, num_iterations] {
++    ASSERT_OK(TestConcurrentIndex(num_iterations / 2));
+     LOG(INFO) << "Thread to run concurrent index has completed";
+   });
+ 
+   // Create a thread to update the rows on this table.
+-  auto conn5 = ASSERT_RESULT(Connect());
+-  thread_holder.AddThreadFunctor([this, &conn5, num_iterations] {
+-    ASSERT_OK(TestDml(&conn5, num_iterations));
++  thread_holder.AddThreadFunctor([this, num_iterations] {
++    ASSERT_OK(TestDml(num_iterations));
+     LOG(INFO) << "Thread to update the rows has completed";
+   });
+ 
+@@ -352,9 +367,9 @@ TEST_P(PgDdlAtomicityStressTest, StressTest) {
+   }
+ 
+   LOG(INFO) << "Verify that all the rows on this table are updated correctly";
+-  auto global_conn = GetGlobalConn();
++  auto& global_conn = GetGlobalConn();
+   for (int i = 1; i <= num_iterations; ++i) {
+-    auto res = ASSERT_RESULT(global_conn->FetchFormat(
++    auto res = ASSERT_RESULT(global_conn.FetchFormat(
+         "SELECT value FROM $0 WHERE key = $1", kTable, i));
+     auto num_rows = PQntuples(res.get());
+     ASSERT_EQ(num_rows, 1);

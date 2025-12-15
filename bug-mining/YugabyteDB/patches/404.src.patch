@@ -1,0 +1,394 @@
+diff --git a/java/yb-cql/src/test/java/org/yb/cql/TestJsonIndex.java b/java/yb-cql/src/test/java/org/yb/cql/TestJsonIndex.java
+index c49b7995e5..02e760f004 100644
+--- a/java/yb-cql/src/test/java/org/yb/cql/TestJsonIndex.java
++++ b/java/yb-cql/src/test/java/org/yb/cql/TestJsonIndex.java
+@@ -230,4 +230,46 @@ public class TestJsonIndex extends BaseCQLTest {
+                 "  WHERE \"C$_col->>'$J_attr'\"->>'\"J$_attr->>C$_col\"' = 'json_hash_value';",
+                 rowDesc);
+   }
++
++  @Test
++  public void testIndexSimilarColumnName() throws Exception {
++    session.execute("CREATE TABLE test_similar_column_name" +
++                    "  ( h INT PRIMARY KEY, v INT, vv INT, j JSONB )" +
++                    "  with transactions = {'enabled' : true};");
++
++    // Test case for covering-check using ID resolution.
++    // Index "vidx" is NOT by expression, so ID matching is used to resolve column references.
++    session.execute("CREATE INDEX vidx ON test_similar_column_name(v)");
++
++    // Test case for covering-check using name resolution.
++    // Index "jidx" uses json expression, so name-resolution is used to resolve column references.
++    session.execute("CREATE INDEX jidx ON test_similar_column_name(j->'a'->>'b')" +
++                    "  INCLUDE (v)");
++
++    // Insert into table.
++    int h = 7;
++    int v = h * 2;
++    int vv = h * 3;
++    String jvalue = String.format("{ \"a\" : { \"b\" : \"bvalue_%d\" }," +
++                                  "  \"a_column\" : %d }", h, h );
++    String stmt = String.format("INSERT INTO test_similar_column_name(h, v, vv, j)" +
++                                "  VALUES (%d, %d, %d, '%s');", h, v, vv, jvalue);
++    session.execute(stmt);
++
++    // Query using "vidx" to test ID resolution.
++    String query = String.format("SELECT vv FROM test_similar_column_name WHERE v = %d;", v);
++    assertEquals(1, session.execute(query).all().size());
++
++    query = String.format("SELECT vv FROM test_similar_column_name WHERE v = %d;", v * 2);
++    assertEquals(0, session.execute(query).all().size());
++
++    // Query using "jidx" to test NAME resolution.
++    query = String.format("SELECT vv FROM test_similar_column_name" +
++                          "  WHERE j->'a'->>'b' = 'bvalue_%d';", h);
++    assertEquals(1, session.execute(query).all().size());
++
++    query = String.format("SELECT vv FROM test_similar_column_name" +
++                          "  WHERE j->'a'->>'b' = 'bvalue_%d';", h * 2);
++    assertEquals(0, session.execute(query).all().size());
++  }
+ }
+diff --git a/src/yb/common/index.cc b/src/yb/common/index.cc
+index 633e542cbd..66fd87903f 100644
+--- a/src/yb/common/index.cc
++++ b/src/yb/common/index.cc
+@@ -78,7 +78,17 @@ IndexInfo::IndexInfo(const IndexInfoPB& pb)
+       index_permissions_(pb.index_permissions()),
+       use_mangled_column_name_(pb.use_mangled_column_name()) {
+   for (const IndexInfo::IndexColumn &index_col : columns_) {
+-    covered_column_ids_.insert(index_col.indexed_column_id);
++    // Mark column as covered if the index column is the column itself.
++    // Do not mark a column as covered when indexing by an expression of that column.
++    // - When an expression such as "jsonb->>'field'" is used, then the "jsonb" column should not
++    //   be included in the covered list.
++    // - Currently we only support "jsonb->>" expression, but this is true for all expressions.
++    if (index_col.colexpr.expr_case() == QLExpressionPB::ExprCase::kColumnId ||
++        index_col.colexpr.expr_case() == QLExpressionPB::ExprCase::EXPR_NOT_SET) {
++      covered_column_ids_.insert(index_col.indexed_column_id);
++    } else {
++      has_index_by_expr_ = true;
++    }
+   }
+ }
+ 
+@@ -132,6 +142,15 @@ bool IndexInfo::IsColumnCovered(const ColumnId column_id) const {
+   return covered_column_ids_.find(column_id) != covered_column_ids_.end();
+ }
+ 
++bool IndexInfo::IsColumnCovered(const std::string& column_name) const {
++  for (const auto &col : columns_) {
++    if (column_name == col.column_name) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ int32_t IndexInfo::IsExprCovered(const string& expr_name) const {
+   // CHECKING if an expression is covered.
+   // - If IndexColumn name is a substring of "expr_name", the given expression is covered. That is,
+diff --git a/src/yb/common/index.h b/src/yb/common/index.h
+index 7b8ce66494..55d447adf4 100644
+--- a/src/yb/common/index.h
++++ b/src/yb/common/index.h
+@@ -77,6 +77,7 @@ class IndexInfo {
+ 
+   // Is column covered by this index? (Note: indexed columns are always covered)
+   bool IsColumnCovered(ColumnId column_id) const;
++  bool IsColumnCovered(const std::string& column_name) const;
+ 
+   // Check if this INDEX contain the column being referenced by the given selected expression.
+   // - If found, return the location of the column (columns_[loc]).
+@@ -115,6 +116,10 @@ class IndexInfo {
+     return use_mangled_column_name_;
+   }
+ 
++  bool has_index_by_expr() const {
++    return has_index_by_expr_;
++  }
++
+  private:
+   const TableId table_id_;            // Index table id.
+   const TableId indexed_table_id_;    // Indexed table id.
+@@ -133,6 +138,7 @@ class IndexInfo {
+ 
+   // Newer INDEX use mangled column name instead of ID.
+   bool use_mangled_column_name_ = false;
++  bool has_index_by_expr_ = false;
+ };
+ 
+ // A map to look up an index by its index table id.
+diff --git a/src/yb/yql/cql/ql/ptree/pt_bcall.cc b/src/yb/yql/cql/ql/ptree/pt_bcall.cc
+index e624d32c34..b3e126e5b1 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_bcall.cc
++++ b/src/yb/yql/cql/ql/ptree/pt_bcall.cc
+@@ -59,6 +59,12 @@ PTBcall::PTBcall(MemoryContext *memctx,
+ PTBcall::~PTBcall() {
+ }
+ 
++void PTBcall::CollectReferencedIndexColnames(MCSet<string> *col_names) const {
++  for (auto arg : args_->node_list()) {
++    arg->CollectReferencedIndexColnames(col_names);
++  }
++}
++
+ string PTBcall::QLName(QLNameOption option) const {
+   string arg_names;
+   string keyspace;
+diff --git a/src/yb/yql/cql/ql/ptree/pt_bcall.h b/src/yb/yql/cql/ql/ptree/pt_bcall.h
+index 7eb481d5c1..3bca84c321 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_bcall.h
++++ b/src/yb/yql/cql/ql/ptree/pt_bcall.h
+@@ -94,6 +94,8 @@ class PTBcall : public PTExpr {
+ 
+   CHECKED_STATUS CheckOperatorAfterArgAnalyze(SemContext *sem_context);
+ 
++  void CollectReferencedIndexColnames(MCSet<string> *col_names) const override;
++
+   virtual string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+   virtual bool IsAggregateCall() const override;
+   virtual yb::bfql::TSOpcode aggregate_opcode() const override {
+diff --git a/src/yb/yql/cql/ql/ptree/pt_expr.h b/src/yb/yql/cql/ql/ptree/pt_expr.h
+index 568aa32ece..681ce706d5 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_expr.h
++++ b/src/yb/yql/cql/ql/ptree/pt_expr.h
+@@ -170,6 +170,24 @@ class PTExpr : public TreeNode {
+     return ql_type_->main() != DataType::UNKNOWN_DATA;
+   }
+ 
++  // Seeks index-columns that referenced by this expression and output mangled colum names.
++  // NOTE:
++  // - index-column can be either a column or an expression of the column.
++  // - Currently, name of a column in an INDEX must be one of the following.
++  //   * Mangled name of a column of scalar type (not a collection type such as map, jsonb).
++  //   * Mangled name of a "jsonb->>field" expresion.
++  virtual void CollectReferencedIndexColnames(MCSet<string> *col_names) const {
++    if (op1()) {
++      op1()->CollectReferencedIndexColnames(col_names);
++    }
++    if (op2()) {
++      op2()->CollectReferencedIndexColnames(col_names);
++    }
++    if (op3()) {
++      op3()->CollectReferencedIndexColnames(col_names);
++    }
++  }
++
+   // Return name of expression.
+   // - Option kUserOriginalName
+   //     When report data to user, we use the original name that users enterred. In SELECT,
+@@ -1086,6 +1104,11 @@ class PTRef : public PTOperator0 {
+   using PTOperatorExpr::AnalyzeOperator;
+   virtual CHECKED_STATUS AnalyzeOperator(SemContext *sem_context) override;
+ 
++  // Add the name of column that is being referenced to output parameter.
++  void CollectReferencedIndexColnames(MCSet<string> *col_names) const override {
++    col_names->insert(QLName(QLNameOption::kMangledName));
++  }
++
+   // Selected name.
+   virtual string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+     if (option == QLNameOption::kMetadataName) {
+@@ -1162,6 +1185,11 @@ class PTJsonColumnWithOperators : public PTOperator0 {
+     return name_;
+   }
+ 
++  // Add the name of this JSONB expression to output parameter.
++  void CollectReferencedIndexColnames(MCSet<string> *col_names) const override {
++    col_names->insert(QLName(QLNameOption::kMangledName));
++  }
++
+   // Selected name.
+   virtual string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+     string qlname;
+diff --git a/src/yb/yql/cql/ql/ptree/pt_select.cc b/src/yb/yql/cql/ql/ptree/pt_select.cc
+index 99e3b789ea..7bb85afe94 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_select.cc
++++ b/src/yb/yql/cql/ql/ptree/pt_select.cc
+@@ -264,7 +264,8 @@ PTSelectStmt::PTSelectStmt(MemoryContext *memctx,
+       order_by_clause_(order_by_clause),
+       limit_clause_(limit_clause),
+       offset_clause_(offset_clause),
+-      covering_exprs_(memctx) {
++      covering_exprs_(memctx),
++      referenced_index_colnames_(memctx) {
+ }
+ 
+ // Construct a nested select tnode to select from the index. Only the syntactic information
+@@ -288,7 +289,8 @@ PTSelectStmt::PTSelectStmt(MemoryContext *memctx,
+       offset_clause_(other.offset_clause_),
+       covering_exprs_(memctx),
+       index_id_(index_id),
+-      covers_fully_(covers_fully) {
++      covers_fully_(covers_fully),
++      referenced_index_colnames_(memctx) {
+ }
+ 
+ PTSelectStmt::~PTSelectStmt() {
+@@ -383,6 +385,34 @@ CHECKED_STATUS PTSelectStmt::Analyze(SemContext *sem_context) {
+     // ORDER BY clause can only be analyzed after an INDEX is chosen.
+     RETURN_NOT_OK(ValidateOrderByExprs(sem_context));
+ 
++    // TODO(neil) Remove this construction if "referenced_index_colnames_" is no longer needed.
++    //
++    // Constructing a list of index column names that is being referenced.
++    // - This is similar to the list "column_refs_", but this is a list of column names instead of
++    //   column ids. When indexing by expression, a mangled-name of the expression is used to
++    //   represent the column, so column id cannot be used to identify coverage.
++    //
++    // - This list is to support a quick fix for github #4881. Once column and expression names
++    //   are mangled correctly, this code should be removed.
++    //
++    // - In CQL semantics, ORDER BY must used only indexed column, so not need to check for its
++    //   coverage. Neither "column_refs_" nor "referenced_index_colnames_" has ORDER BY columns.
++    for (const PTExpr *expr : covering_exprs_) {
++      if (!expr->HaveColumnRef()) {
++        continue;
++      }
++      if (expr->opcode() == TreeNodeOpcode::kPTAllColumns) {
++        for (const ColumnDesc coldesc : static_cast<const PTAllColumns*>(expr)->columns()) {
++          referenced_index_colnames_.insert(coldesc.MangledName());
++        }
++      } else {
++        expr->CollectReferencedIndexColnames(&referenced_index_colnames_);
++      }
++    }
++    for (const PTExpr *expr : filtering_exprs_) {
++      expr->CollectReferencedIndexColnames(&referenced_index_colnames_);
++    }
++
+     RETURN_NOT_OK(AnalyzeIndexes(sem_context));
+     if (child_select_ && child_select_->covers_fully_) {
+       return Status::OK();
+@@ -550,46 +580,87 @@ CHECKED_STATUS PTSelectStmt::AnalyzeIndexes(SemContext *sem_context) {
+ }
+ 
+ // Return whether the index covers the read fully.
++// INDEXes that were created before v2.0 are defined by column IDs instead of mangled_names.
++// - Returns TRUE if a list of column refs of a statement is a subset of INDEX columns.
++// - Use ColumnID to check if a column in a query is covered by the index.
++// - The list "column_refs_" contains IDs of all columns that are referred to by SELECT.
++// - The list "IndexInfo::columns_" contains the IDs of all columns in the INDEX.
+ bool PTSelectStmt::CoversFully(const IndexInfo& index_info) const {
+-  // INDEXes that were created before v2.0 are defined by column IDs instead of mangled_names.
+-  // - Returns TRUE if a list of column refs of a statement is a subset of INDEX columns.
+-  // - Use ColumnID to check if a column in a query is covered by the index.
+-  // - The list "column_refs_" contains IDs of all columns that are referred to by SELECT.
+-  // - The list "IndexInfo::columns_" contains the IDs of all columns in the INDEX.
+-  if (!index_info.use_mangled_column_name()) {
+-    for (const int32 table_col_id : column_refs_) {
+-      if (!index_info.IsColumnCovered(ColumnId(table_col_id))) {
+-        return false;
+-      }
++  // First, check covering by ID.
++  bool all_ref_id_covered = true;
++  for (const int32 table_col_id : column_refs_) {
++    if (!index_info.IsColumnCovered(ColumnId(table_col_id))) {
++      all_ref_id_covered = false;
++    }
++  }
++
++  // Return result if name-resolution for covering is NOT needed.
++  // - If all column references are found by ID, return true without further resolution.
++  // - Index is not by expression, so name resolution for covering is not needed.
++  // - Index uses older Protobuf versions, which doesn't use column name (id only).
++  if (all_ref_id_covered ||
++      !index_info.has_index_by_expr() ||
++      !index_info.use_mangled_column_name()) {
++    return all_ref_id_covered;
++  }
++
++  // Now, check for covering by column names to support index by expression.
++  //
++  // TODO(neil) We use a quick fix for now, but eventually we should mangle column name correctly
++  // and remove the following quick fix and its associated code. See github #4881 for the bug
++  // in column name mangling.
++  //
++  // Iterating names in "referenced_index_colnames_", which consists of names of all columns that
++  // are referenced by SELECT and check if the name is covered in the index.
++  for (const string &column_name : referenced_index_colnames_) {
++    if (!index_info.IsColumnCovered(column_name)) {
++      return false;
+     }
+-    return true;
+   }
+ 
+-  // Check all ColumnRef in selected list.
+-  for (const PTExpr *expr : covering_exprs_) {
+-    // If this expression does not have column reference, it is considered "coverred".
+-    if (!expr->HaveColumnRef()) {
+-      continue;
+-    }
++  // TODO(neil) Change INDEX's metadata for column name-mangling to support the following code.
++  // As shown in github #4881, the following is not working correctly.
++  //   CREATE INDEX idx ON a_table(v);
++  //   - Index column "v" is named as "$C_v"
++  //   - Index column "v1" is named as "$C_v1"
++  // As a result, IsExprCovered("$C_v1") would return true as it thought "$C_v1" is just an
++  // expression for "$C_v" column.
++
++  // Correct fix for #4881 would be adding a postfix when mangling column name. For example:
++  // - column name "v" is mangled to "$C_v_E$"
++  // - column name "v1" is mangled to "$C_v1_E$"
++  // That way, IsExprCovered() would know that "$C_v1_E$" is NOT an expression of "$C_v_E$".
++  // However, this changes metadata for INDEX, so compatible flag must be added to distinguish
++  // between different mangling method, such as
++  //   "use_mangled_column_name" versus "use_mangled_column_name_2"
++  if (false) {
++    // Check all ColumnRef in selected list.
++    for (const PTExpr *expr : covering_exprs_) {
++      // If this expression does not have column reference, it is considered "coverred".
++      if (!expr->HaveColumnRef()) {
++        continue;
++      }
+ 
+-    if (expr->opcode() == TreeNodeOpcode::kPTAllColumns) {
+-      for (const ColumnDesc coldesc : static_cast<const PTAllColumns*>(expr)->columns()) {
+-        if (index_info.IsExprCovered(coldesc.MangledName()) < 0) {
+-          return false;
++      if (expr->opcode() == TreeNodeOpcode::kPTAllColumns) {
++        for (const ColumnDesc coldesc : static_cast<const PTAllColumns*>(expr)->columns()) {
++          if (index_info.IsExprCovered(coldesc.MangledName()) < 0) {
++            return false;
++          }
+         }
++      } else if (index_info.IsExprCovered(expr->MangledName()) < 0) {
++        return false;
+       }
+-    } else if (index_info.IsExprCovered(expr->MangledName()) < 0) {
+-      return false;
+     }
+-  }
+ 
+-  // Check all ColumnRef in filtering list.
+-  for (const PTExpr *expr : filtering_exprs_) {
+-    if (index_info.IsExprCovered(expr->MangledName()) < 0) {
+-      return false;
++    // Check all ColumnRef in filtering list.
++    for (const PTExpr *expr : filtering_exprs_) {
++      if (index_info.IsExprCovered(expr->MangledName()) < 0) {
++        return false;
++      }
+     }
+   }
+ 
++  // All referenced columns are covered.
+   return true;
+ }
+ 
+diff --git a/src/yb/yql/cql/ql/ptree/pt_select.h b/src/yb/yql/cql/ql/ptree/pt_select.h
+index 4454f28168..0e57c7738c 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_select.h
++++ b/src/yb/yql/cql/ql/ptree/pt_select.h
+@@ -301,6 +301,10 @@ class PTSelectStmt : public PTDmlStmt {
+   // For nested select from an index: the index id and whether it covers the query fully.
+   TableId index_id_;
+   bool covers_fully_ = false;
++
++  // Name of all columns the SELECT statement is referenced. Similar to the list "column_refs_",
++  // but this is a list of column names instead of column ids.
++  MCSet<string> referenced_index_colnames_;
+ };
+ 
+ }  // namespace ql

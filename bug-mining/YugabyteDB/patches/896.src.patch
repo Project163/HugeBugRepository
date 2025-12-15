@@ -1,0 +1,318 @@
+diff --git a/src/yb/docdb/cql_operation.cc b/src/yb/docdb/cql_operation.cc
+index fad2b11b2f..adbc9ee17d 100644
+--- a/src/yb/docdb/cql_operation.cc
++++ b/src/yb/docdb/cql_operation.cc
+@@ -882,6 +882,8 @@ Status QLWriteOperation::ApplyForRegularColumns(const QLColumnValuePB& column_va
+ }
+ 
+ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
++  data.doc_write_batch->SetDocReadContext(doc_read_context_);
++
+   QLTableRow existing_row;
+   if (request_.has_if_expr()) {
+     // Check if the if-condition is satisfied.
+diff --git a/src/yb/docdb/doc_write_batch.cc b/src/yb/docdb/doc_write_batch.cc
+index b9fd1fe419..3640d56ebf 100644
+--- a/src/yb/docdb/doc_write_batch.cc
++++ b/src/yb/docdb/doc_write_batch.cc
+@@ -18,6 +18,7 @@
+ #include "yb/docdb/docdb_fwd.h"
+ #include "yb/docdb/doc_key.h"
+ #include "yb/docdb/doc_path.h"
++#include "yb/docdb/doc_read_context.h"
+ #include "yb/docdb/doc_ttl_util.h"
+ #include "yb/docdb/docdb.messages.h"
+ #include "yb/docdb/docdb-internal.h"
+@@ -36,6 +37,7 @@
+ #include "yb/util/bytes_formatter.h"
+ #include "yb/util/checked_narrow_cast.h"
+ #include "yb/util/enums.h"
++#include "yb/util/fast_varint.h"
+ #include "yb/util/logging.h"
+ #include "yb/util/result.h"
+ #include "yb/util/status_format.h"
+@@ -102,38 +104,99 @@ Status DocWriteBatch::SeekToKeyPrefix(IntentAwareIterator* doc_iter, HasAncestor
+ 
+   // Seek the value.
+   doc_iter->Seek(key_prefix_.AsSlice());
+-  if (!doc_iter->valid()) {
+-    return Status::OK();
++  VLOG_WITH_FUNC(4)
++      << SubDocKey::DebugSliceToString(key_prefix_.AsSlice()) << ", valid: " << doc_iter->valid()
++      << ", prev_subdoc_ht: " << prev_subdoc_ht << ", prev_key_prefix_exact: "
++      << prev_key_prefix_exact << ", has_ancestor: " << has_ancestor;
++
++  FetchKeyResult key_data;
++  if (doc_iter->valid()) {
++    key_data = VERIFY_RESULT(doc_iter->FetchKey());
++    VLOG_WITH_FUNC(4)
++        << "Found: " << SubDocKey::DebugSliceToString(key_data.key) << ", good: "
++        << key_prefix_.IsPrefixOf(key_data.key);
++  }
++
++  bool use_packed_row = false;
++  Slice recent_value;
++  if (!packed_row_key_.empty() && key_prefix_.AsSlice().starts_with(packed_row_key_.AsSlice())) {
++    auto subkeys = key_prefix_.AsSlice().WithoutPrefix(packed_row_key_.size());
++    if (!subkeys.empty() && IsColumnId(static_cast<KeyEntryType>(subkeys[0]))) {
++      if (key_data.key.empty() || key_data.write_time < packed_row_write_time_) {
++        KeyEntryType entry_type = static_cast<KeyEntryType>(subkeys.consume_byte());
++        int64_t column_id_as_int64 = VERIFY_RESULT(util::FastDecodeSignedVarIntUnsafe(&subkeys));
++        ColumnId column_id_ref;
++        RETURN_NOT_OK(ColumnId::FromInt64(column_id_as_int64, &column_id_ref));
++        if (subkeys.empty()) {
++          key_data.write_time = packed_row_write_time_;
++          key_data.key = key_prefix_.AsSlice();
++          auto value_opt = packed_row_packing_->GetValue(
++              column_id_ref, packed_row_value_.AsSlice());
++          if (value_opt) {
++            recent_value = *value_opt;
++            use_packed_row = true;
++          }
++          VLOG_WITH_FUNC(4)
++              << "Has packed row for: " << AsString(entry_type) << ", " << column_id_ref << ": "
++              << recent_value.ToDebugHexString();
++        }
++      }
++    }
+   }
+ 
+-  auto key_data = VERIFY_RESULT(doc_iter->FetchKey());
+-  if (!key_prefix_.IsPrefixOf(key_data.key)) {
++  if (key_data.key.empty() || !key_prefix_.IsPrefixOf(key_data.key)) {
+     return Status::OK();
+   }
+ 
+   // Checking for expiration.
+-  Slice recent_value = doc_iter->value();
++  if (!use_packed_row) {
++    recent_value = doc_iter->value();
++  }
+   ValueControlFields control_fields;
+   {
+     auto value_copy = recent_value;
+     control_fields = VERIFY_RESULT(ValueControlFields::Decode(&value_copy));
+     current_entry_.user_timestamp = control_fields.timestamp;
+     current_entry_.value_type = DecodeValueEntryType(value_copy);
++    if (doc_read_context_ && value_copy.TryConsumeByte(ValueEntryTypeAsChar::kPackedRow)) {
++      packed_row_key_.Assign(key_data.key);
++      packed_row_packing_ = &VERIFY_RESULT_REF(
++          doc_read_context_->schema_packing_storage.GetPacking(&value_copy));
++      packed_row_value_.Assign(value_copy);
++      packed_row_write_time_ = key_data.write_time;
++
++      VLOG_WITH_FUNC(4)
++          << "Init packed row: " << SubDocKey::DebugSliceToString(packed_row_key_.AsSlice())
++          << ", value: " << packed_row_key_.AsSlice().ToDebugHexString() << ", write time: "
++          << packed_row_write_time_.ToString();
++    }
+   }
+ 
+-  if (HasExpiredTTL(
+-          key_data.write_time.hybrid_time(), control_fields.ttl, doc_iter->read_time().read)) {
++  bool expired = HasExpiredTTL(
++          key_data.write_time.hybrid_time(), control_fields.ttl, doc_iter->read_time().read);
++
++  VLOG_WITH_FUNC(4)
++      << "Value: " << recent_value.ToDebugHexString() << ", control_fields: "
++      << control_fields.ToString() << ", expired: " << expired << ", use_packed_row: "
++      << use_packed_row << ", write time: " << key_data.write_time.ToString();
++
++  if (expired) {
+     current_entry_.value_type = ValueEntryType::kTombstone;
+     current_entry_.doc_hybrid_time = key_data.write_time;
++    current_entry_.found_exact_key_prefix = key_prefix_ == key_data.key;
+     cache_.Put(key_prefix_, current_entry_);
+     return Status::OK();
+   }
+ 
+   Slice value;
+-  RETURN_NOT_OK(doc_iter->NextFullValue(&key_data.write_time, &value, &key_data.key));
++  if (use_packed_row) {
++    RETURN_NOT_OK(doc_iter->NextFullValue(&key_data.write_time, &value, &key_data.key));
+ 
+-  if (!doc_iter->valid()) {
+-    return Status::OK();
++    if (!doc_iter->valid()) {
++      return Status::OK();
++    }
++  } else {
++    value = recent_value;
+   }
+ 
+   // If the first key >= key_prefix_ in RocksDB starts with key_prefix_, then a
+@@ -148,6 +211,10 @@ Status DocWriteBatch::SeekToKeyPrefix(IntentAwareIterator* doc_iter, HasAncestor
+     }
+     current_entry_.found_exact_key_prefix = key_prefix_ == key_data.key;
+     current_entry_.doc_hybrid_time = key_data.write_time;
++    VLOG_WITH_FUNC(4)
++        << "Current found_exact_key_prefix: " << current_entry_.found_exact_key_prefix
++        << ", doc_hybrid_time: " << current_entry_.doc_hybrid_time << ", value_type: "
++        << AsString(current_entry_.value_type);
+ 
+     // TODO: with optional init markers we can find something that is more than one level
+     //       deep relative to the current prefix.
+@@ -198,6 +265,15 @@ Result<bool> DocWriteBatch::SetPrimitiveInternalHandleUserTimestamp(
+   // NOOP if we've already performed the seek due to the cache.
+   RETURN_NOT_OK(SeekToKeyPrefix(iter, HasAncestor::kFalse));
+   // We'd like to include tombstones in our timestamp comparisons as well.
++
++  VLOG_WITH_FUNC(4)
++      << "found_exact_key_prefix: " << current_entry_.found_exact_key_prefix
++      << ", subdoc_exists: " << subdoc_exists_ << ", value_type: "
++      << AsString(current_entry_.value_type) << ", user_timestamp: "
++      << current_entry_.user_timestamp << ", control fields: " << control_fields.ToString()
++      << ", doc_hybrid_time: "
++      << current_entry_.doc_hybrid_time.hybrid_time().GetPhysicalValueMicros();
++
+   if (!current_entry_.found_exact_key_prefix) {
+     return true;
+   }
+diff --git a/src/yb/docdb/doc_write_batch.h b/src/yb/docdb/doc_write_batch.h
+index 3a7ca14e2d..748b565c07 100644
+--- a/src/yb/docdb/doc_write_batch.h
++++ b/src/yb/docdb/doc_write_batch.h
+@@ -301,6 +301,10 @@ class DocWriteBatch {
+     put_batch_.pop_back();
+   }
+ 
++  void SetDocReadContext(const DocReadContextPtr& doc_read_context) {
++    doc_read_context_ = doc_read_context;
++  }
++
+  private:
+   struct LazyIterator;
+ 
+@@ -343,9 +347,10 @@ class DocWriteBatch {
+   DocWriteBatchCache cache_;
+ 
+   DocDB doc_db_;
+-
+   InitMarkerBehavior init_marker_behavior_;
++  DocReadContextPtr doc_read_context_;
+   std::atomic<int64_t>* monotonic_counter_;
++
+   std::vector<DocWriteBatchEntry> put_batch_;
+ 
+   // Taken from internal_doc_iterator
+@@ -353,6 +358,11 @@ class DocWriteBatch {
+   bool subdoc_exists_ = true;
+   DocWriteBatchCache::Entry current_entry_;
+ 
++  KeyBuffer packed_row_key_;
++  const SchemaPacking* packed_row_packing_;
++  ValueBuffer packed_row_value_;
++  DocHybridTime packed_row_write_time_;
++
+   MonoDelta ttl_;
+ };
+ 
+diff --git a/src/yb/docdb/primitive_value.cc b/src/yb/docdb/primitive_value.cc
+index cc26477283..ddb33ea019 100644
+--- a/src/yb/docdb/primitive_value.cc
++++ b/src/yb/docdb/primitive_value.cc
+@@ -2862,7 +2862,7 @@ double KeyEntryValue::GetDouble() const {
+ }
+ 
+ bool KeyEntryValue::IsColumnId() const {
+-  return type_ == KeyEntryType::kColumnId || type_ == KeyEntryType::kSystemColumnId;
++  return docdb::IsColumnId(type_);
+ }
+ 
+ ColumnId KeyEntryValue::GetColumnId() const {
+diff --git a/src/yb/docdb/value_type.h b/src/yb/docdb/value_type.h
+index 7cebfda7b3..f9449695a9 100644
+--- a/src/yb/docdb/value_type.h
++++ b/src/yb/docdb/value_type.h
+@@ -305,5 +305,9 @@ inline bool IsMergeRecord(const Slice& value) {
+   return DecodeKeyEntryType(value) == KeyEntryType::kMergeFlags;
+ }
+ 
++inline bool IsColumnId(KeyEntryType type) {
++  return type == KeyEntryType::kColumnId || type == KeyEntryType::kSystemColumnId;
++}
++
+ }  // namespace docdb
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/cql-packed-row-test.cc b/src/yb/integration-tests/cql-packed-row-test.cc
+index b09c595fd7..9ec923a133 100644
+--- a/src/yb/integration-tests/cql-packed-row-test.cc
++++ b/src/yb/integration-tests/cql-packed-row-test.cc
+@@ -25,6 +25,20 @@ class CqlPackedRowTest : public PackedRowTestBase<CqlTestBase<MiniCluster>> {
+   virtual ~CqlPackedRowTest() = default;
+ };
+ 
++Status CheckTableContent(
++    CassandraSession* session, const std::string& expected,
++    const std::string& where = "", const std::string& table_name = "t") {
++  auto expr = "SELECT * FROM " + table_name;
++  if (!where.empty()) {
++    expr += " WHERE " + where;
++  }
++  auto content = VERIFY_RESULT(session->ExecuteAndRenderToString(expr));
++  SCHECK_EQ(content, expected, IllegalState,
++            Format("Wrong table '$0' content$1",
++                   table_name, where.empty() ? "" : Format("(WHERE $0)", where)));
++  return Status::OK();
++}
++
+ TEST_F(CqlPackedRowTest, Simple) {
+   auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+ 
+@@ -32,21 +46,16 @@ TEST_F(CqlPackedRowTest, Simple) {
+       "CREATE TABLE t (key INT PRIMARY KEY, v1 TEXT, v2 TEXT) WITH tablets = 1"));
+   ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1, v2) VALUES (1, 'one', 'two')"));
+ 
+-  auto value = ASSERT_RESULT(session.ExecuteAndRenderToString(
+-      "SELECT v1, v2 FROM t WHERE key = 1"));
+-  ASSERT_EQ(value, "one,two");
++  ASSERT_OK(CheckTableContent(&session, "1,one,two", "key = 1"));
+ 
+   ASSERT_OK(session.ExecuteQuery("UPDATE t SET v2 = 'three' where key = 1"));
+-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT v1, v2 FROM t WHERE key = 1"));
+-  ASSERT_EQ(value, "one,three");
++  ASSERT_OK(CheckTableContent(&session, "1,one,three", "key = 1"));
+ 
+   ASSERT_OK(session.ExecuteQuery("DELETE FROM t WHERE key = 1"));
+-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
+-  ASSERT_EQ(value, "");
++  ASSERT_OK(CheckTableContent(&session, ""));
+ 
+   ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v2, v1) VALUES (1, 'four', 'five')"));
+-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT v1, v2 FROM t WHERE key = 1"));
+-  ASSERT_EQ(value, "five,four");
++  ASSERT_OK(CheckTableContent(&session, "1,five,four", "key = 1"));
+ 
+   ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 4));
+ }
+@@ -234,9 +243,29 @@ TEST_F(CqlPackedRowTest, LivenessColumnExpiry) {
+ TEST_F(CqlPackedRowTest, BadCast) {
+   auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+ 
+-  ASSERT_OK(session.ExecuteQuery("CREATE TABLE test_cast (h int PRIMARY KEY, t text)"));
++  ASSERT_OK(session.ExecuteQuery(
++      "CREATE TABLE test_cast (h int PRIMARY KEY, t text) WITH tablets = 1"));
+ 
+   ASSERT_NOK(session.ExecuteQuery("INSERT INTO test_cast (h, t) values (2, cast(22 as text))"));
+ }
+ 
++TEST_F(CqlPackedRowTest, TimestampOverExpired) {
++  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
++
++  ASSERT_OK(session.ExecuteQuery("CREATE TABLE t (h INT, r INT, v INT, PRIMARY KEY((h), r))"));
++
++  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (h, r, v) values (1, 2, 3) USING TTL 1"));
++  auto write_time = ASSERT_RESULT(session.FetchValue<int64_t>(
++      "SELECT writetime(v) FROM t WHERE h = 1 AND r = 2"));
++  ASSERT_OK(CheckTableContent(&session, "1,2,3", "h = 1 AND r = 2"));
++
++  std::this_thread::sleep_for(1s);
++  ASSERT_OK(CheckTableContent(&session, ""));
++
++  ASSERT_OK(session.ExecuteQuery(
++      "INSERT INTO t (h, r, v) values (1, 2, 4) USING TIMESTAMP " +
++      std::to_string(write_time - 1)));
++  ASSERT_OK(CheckTableContent(&session, ""));
++}
++
+ } // namespace yb

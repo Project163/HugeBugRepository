@@ -1,0 +1,310 @@
+diff --git a/src/yb/master/catalog_loaders.cc b/src/yb/master/catalog_loaders.cc
+index 2dde440d91..3f23e0b295 100644
+--- a/src/yb/master/catalog_loaders.cc
++++ b/src/yb/master/catalog_loaders.cc
+@@ -259,8 +259,9 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
+       catalog_manager_->deleted_tablets_loaded_from_sys_catalog_.insert(tablet_id);
+     }
+ 
+-    // Assume we need to delete this tablet until we find an active table using this tablet.
++    // Assume we need to delete/hide this tablet until we find an active table using this tablet.
+     bool should_delete_tablet = !tablet_deleted;
++    bool should_hide_tablet = !tablet_deleted && !l.mutable_data()->is_hidden();
+ 
+     std::shared_ptr<std::atomic<size_t>> add_table_to_tablet_counter;
+     std::vector<std::shared_ptr<AsyncAddTableToTablet>> add_table_to_tablet_tasks;
+@@ -303,10 +304,10 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
+       }
+ 
+       auto tl = table->LockForRead();
+-      if (!tl->started_deleting()) {
+-        // Found an active table.
+-        should_delete_tablet = false;
+-      }
++
++      // Found an active table for this tablet
++      should_delete_tablet = should_delete_tablet && tl->started_deleting();
++      should_hide_tablet = should_hide_tablet && tl->started_hiding();
+ 
+       auto schema = tl->schema();
+       ColocationId colocation_id = kColocationIdNotSet;
+@@ -359,6 +360,14 @@ Status TabletLoader::Visit(const TabletId& tablet_id, const SysTabletsEntryPB& m
+       l.mutable_data()->set_state(SysTabletsEntryPB::DELETED, deletion_msg);
+       needs_async_write_to_sys_catalog = true;
+       catalog_manager_->deleted_tablets_loaded_from_sys_catalog_.insert(tablet_id);
++    } else if (should_hide_tablet) {
++      LOG(INFO) << "Will mark tablet " << tablet->id() << " for table " << first_table->ToString()
++                << " as HIDDEN post loading sys.catalog";
++      state_->AddPostLoadTask(
++          std::bind(
++              &CatalogManager::MarkTabletAsHiddenPostReload, catalog_manager_, tablet->id(),
++              state_->epoch),
++          Format("Marking tablet:$0 as HIDDEN post sys.catalog reload", tablet->id()));
+     }
+ 
+     l.Commit();
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index 683cf80e35..7664193b77 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -12374,7 +12374,7 @@ Status CatalogManager::CollectTable(
+   std::vector<std::string> indexes;
+   {
+     auto lock = table_description.table_info->LockForRead();
+-    if (lock->started_hiding()) {
++    if (!flags.Test(CollectFlag::kIncludeHiddenTables) && lock->started_hiding()) {
+       VLOG_WITH_PREFIX_AND_FUNC(4)
+           << "Rejected hidden table: " << AsString(table_description.table_info);
+       return Status::OK();
+@@ -13294,6 +13294,47 @@ Result<TabletDeleteRetainerInfo> CatalogManager::GetDeleteRetainerInfoForTableDr
+   return retainer;
+ }
+ 
++void CatalogManager::MarkTabletAsHiddenPostReload(TabletId tablet_id, const LeaderEpoch& epoch) {
++  auto tablet = GetTabletInfo(tablet_id);
++  if (!tablet.ok()) {
++    WARN_NOT_OK(tablet.status(), Format("Tablet: $0 not found", tablet_id));
++    return;
++  }
++  auto table = GetTableInfo((*tablet)->table()->id());
++  if (!table) {
++    LOG(WARNING) << Format("Table: $0 not found", (*tablet)->table()->id());
++    return;
++  }
++  auto schedules_to_tables_map =
++      master_->snapshot_coordinator().MakeSnapshotSchedulesToObjectIdsMap(
++          SysRowEntryType::TABLE, IncludeHiddenTables::kTrue);
++  if (!schedules_to_tables_map.ok()) {
++    WARN_NOT_OK(
++        schedules_to_tables_map.status(), Format(
++                                              "Error creating Snapshot Schedules To ObjectIds Map "
++                                              "for post reload Hide task of tablet: $0",
++                                              tablet_id));
++    return;
++  }
++  const auto delete_retainer = GetDeleteRetainerInfoForTableDrop(*table, *schedules_to_tables_map);
++  if (!delete_retainer.ok()) {
++    WARN_NOT_OK(
++        delete_retainer.status(),
++        Format("Unable to get the delete retainer for tablet: $0", tablet_id));
++    return;
++  }
++  auto l = (*tablet)->LockForWrite();
++  // Each tablet will have a different hide_hybrid_time. However, all of them will be earlier
++  // than the time we set the hide_hybrid_time of the table.
++  MarkTabletAsHidden(l.mutable_data()->pb, Clock()->Now(), *delete_retainer);
++  WARN_NOT_OK(
++      sys_catalog_->Upsert(epoch, *tablet),
++      Format("Failed to upsert tablet info with id: $0 into sys catalog.", tablet_id));
++  l.Commit();
++  LockGuard lock(mutex_);
++  hidden_tablets_.push_back(*tablet);
++}
++
+ void CatalogManager::MarkTabletAsHidden(
+     SysTabletsEntryPB& tablet_pb, const HybridTime& hide_ht,
+     const TabletDeleteRetainerInfo& delete_retainer) const {
+diff --git a/src/yb/master/catalog_manager.h b/src/yb/master/catalog_manager.h
+index d917993548..e747c4d405 100644
+--- a/src/yb/master/catalog_manager.h
++++ b/src/yb/master/catalog_manager.h
+@@ -2653,7 +2653,8 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
+       const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables, CollectFlags flags);
+ 
+   Result<SysRowEntries> CollectEntriesForSnapshot(
+-      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) override;
++      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
++      IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) override;
+ 
+   server::Clock* Clock() override;
+ 
+@@ -2917,6 +2918,7 @@ class CatalogManager : public CatalogManagerIf, public SnapshotCoordinatorContex
+       const TableInfo& table_info, const SnapshotSchedulesToObjectIdsMap& schedules_to_tables_map)
+       EXCLUDES(mutex_);
+ 
++  void MarkTabletAsHiddenPostReload(TabletId tablet, const LeaderEpoch& epoch);
+   void MarkTabletAsHidden(
+       SysTabletsEntryPB& tablet_pb, const HybridTime& hide_ht,
+       const TabletDeleteRetainerInfo& delete_retainer) const;
+diff --git a/src/yb/master/catalog_manager_ext.cc b/src/yb/master/catalog_manager_ext.cc
+index bb9d73862d..31568bf0ca 100644
+--- a/src/yb/master/catalog_manager_ext.cc
++++ b/src/yb/master/catalog_manager_ext.cc
+@@ -373,11 +373,14 @@ Result<SysRowEntries> CatalogManager::CollectEntriesForSequencesDataTable() {
+ }
+ 
+ Result<SysRowEntries> CatalogManager::CollectEntriesForSnapshot(
+-    const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) {
+-  SysRowEntries entries = VERIFY_RESULT(CollectEntries(
+-      tables,
+-      CollectFlags{CollectFlag::kAddIndexes, CollectFlag::kIncludeParentColocatedTable,
+-                   CollectFlag::kSucceedIfCreateInProgress}));
++    const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
++    IncludeHiddenTables includeHiddenTables) {
++  auto collect_flags = CollectFlags{
++      CollectFlag::kAddIndexes, CollectFlag::kIncludeParentColocatedTable,
++      CollectFlag::kSucceedIfCreateInProgress};
++  collect_flags.SetIf(CollectFlag::kIncludeHiddenTables, includeHiddenTables);
++
++  SysRowEntries entries = VERIFY_RESULT(CollectEntries(tables, collect_flags));
+   // Include sequences_data table if the filter is on a ysql database.
+   // For sequences, we have a special sequences_data (id=0000ffff00003000800000000000ffff)
+   // table in the system_postgres database.
+diff --git a/src/yb/master/master_fwd.h b/src/yb/master/master_fwd.h
+index 8307c7a28a..cf7fe57c9e 100644
+--- a/src/yb/master/master_fwd.h
++++ b/src/yb/master/master_fwd.h
+@@ -143,7 +143,9 @@ YB_STRONGLY_TYPED_BOOL(IsSystemObject);
+ 
+ YB_DEFINE_ENUM(
+     CollectFlag,
+-    (kAddIndexes)(kIncludeParentColocatedTable)(kSucceedIfCreateInProgress)(kAddUDTypes));
++    (kAddIndexes)(kIncludeParentColocatedTable)(kSucceedIfCreateInProgress)(kAddUDTypes)
++    (kIncludeHiddenTables));
++
+ using CollectFlags = EnumBitSet<CollectFlag>;
+ 
+ using TableToTablespaceIdMap = std::unordered_map<TableId, boost::optional<TablespaceId>>;
+diff --git a/src/yb/master/master_snapshot_coordinator.cc b/src/yb/master/master_snapshot_coordinator.cc
+index 24b2a1bd44..89fdf7d4a5 100644
+--- a/src/yb/master/master_snapshot_coordinator.cc
++++ b/src/yb/master/master_snapshot_coordinator.cc
+@@ -1015,7 +1015,7 @@ class MasterSnapshotCoordinator::Impl {
+   }
+ 
+   Result<SnapshotSchedulesToObjectIdsMap> MakeSnapshotSchedulesToObjectIdsMap(
+-      SysRowEntryType type) {
++      SysRowEntryType type, IncludeHiddenTables includeHiddenTables) {
+     std::vector<std::pair<SnapshotScheduleId, SnapshotScheduleFilterPB>> schedules;
+     {
+       std::lock_guard lock(mutex_);
+@@ -1027,7 +1027,7 @@ class MasterSnapshotCoordinator::Impl {
+     }
+     SnapshotSchedulesToObjectIdsMap result;
+     for (const auto& [schedule_id, filter] : schedules) {
+-      auto entries = VERIFY_RESULT(CollectEntries(filter));
++      auto entries = VERIFY_RESULT(CollectEntries(filter, includeHiddenTables));
+       auto& ids = result[schedule_id];
+       for (const auto& entry : entries.entries()) {
+         if (entry.type() == type) {
+@@ -1990,8 +1990,10 @@ class MasterSnapshotCoordinator::Impl {
+     return Status::OK();
+   }
+ 
+-  Result<SysRowEntries> CollectEntries(const SnapshotScheduleFilterPB& filter) const {
+-    return context_.CollectEntriesForSnapshot(filter.tables().tables());
++  Result<SysRowEntries> CollectEntries(
++      const SnapshotScheduleFilterPB& filter,
++      IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) const {
++    return context_.CollectEntriesForSnapshot(filter.tables().tables(), includeHiddenTables);
+   }
+ 
+   Status ForwardRestoreCheck(
+@@ -2434,8 +2436,9 @@ docdb::HistoryCutoff MasterSnapshotCoordinator::AllowedHistoryCutoffProvider(
+ }
+ 
+ Result<SnapshotSchedulesToObjectIdsMap>
+-    MasterSnapshotCoordinator::MakeSnapshotSchedulesToObjectIdsMap(SysRowEntryType type) {
+-  return impl_->MakeSnapshotSchedulesToObjectIdsMap(type);
++MasterSnapshotCoordinator::MakeSnapshotSchedulesToObjectIdsMap(
++    SysRowEntryType type, IncludeHiddenTables includeHiddenTables) {
++  return impl_->MakeSnapshotSchedulesToObjectIdsMap(type, includeHiddenTables);
+ }
+ 
+ Result<std::vector<SnapshotScheduleId>> MasterSnapshotCoordinator::GetSnapshotSchedules(
+diff --git a/src/yb/master/master_snapshot_coordinator.h b/src/yb/master/master_snapshot_coordinator.h
+index 28185b7de6..03b30b14fc 100644
+--- a/src/yb/master/master_snapshot_coordinator.h
++++ b/src/yb/master/master_snapshot_coordinator.h
+@@ -27,6 +27,7 @@
+ #include "yb/master/master_heartbeat.fwd.h"
+ #include "yb/master/master_types.h"
+ #include "yb/master/master_types.pb.h"
++#include "yb/master/snapshot_coordinator_context.h"
+ 
+ #include "yb/tablet/snapshot_coordinator.h"
+ #include "yb/tablet/tablet_retention_policy.h"
+@@ -168,9 +169,9 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
+   Result<docdb::KeyValuePairPB> UpdateRestorationAndGetWritePair(
+       SnapshotScheduleRestoration* restoration);
+ 
+-  // For each returns map from schedule id to sorted vectors of tablets id in this schedule.
++  // Returns a map from schedule id to a sorted vector of tablets' ids in this schedule.
+   Result<SnapshotSchedulesToObjectIdsMap> MakeSnapshotSchedulesToObjectIdsMap(
+-      SysRowEntryType type);
++      SysRowEntryType type, IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse);
+ 
+   Result<std::vector<SnapshotScheduleId>> GetSnapshotSchedules(
+       SysRowEntryType type, const std::string& object_id);
+diff --git a/src/yb/master/snapshot_coordinator_context.h b/src/yb/master/snapshot_coordinator_context.h
+index 79ec67bf4d..5e157cf8c8 100644
+--- a/src/yb/master/snapshot_coordinator_context.h
++++ b/src/yb/master/snapshot_coordinator_context.h
+@@ -38,6 +38,7 @@ using TabletSnapshotOperationCallback =
+     std::function<void(Result<const tserver::TabletSnapshotOpResponsePB&>)>;
+ 
+ YB_STRONGLY_TYPED_BOOL(SendMetadata);
++YB_STRONGLY_TYPED_BOOL(IncludeHiddenTables);
+ 
+ // Context class for MasterSnapshotCoordinator.
+ class SnapshotCoordinatorContext {
+@@ -55,7 +56,8 @@ class SnapshotCoordinatorContext {
+   virtual void ScheduleTabletSnapshotOp(const AsyncTabletSnapshotOpPtr& operation) = 0;
+ 
+   virtual Result<SysRowEntries> CollectEntriesForSnapshot(
+-      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) = 0;
++      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
++      IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) = 0;
+ 
+   virtual Status RestoreSysCatalog(
+       SnapshotScheduleRestoration* restoration, tablet::Tablet* tablet, bool leader_mode,
+diff --git a/src/yb/tools/yb-admin-snapshot-schedule-test.cc b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+index 740371d916..c09aca1842 100644
+--- a/src/yb/tools/yb-admin-snapshot-schedule-test.cc
++++ b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+@@ -5504,6 +5504,45 @@ TEST_F(YbAdminSnapshotScheduleFailoverTests, LeaderFailoverRestoreSnapshot) {
+   ASSERT_EQ(rows, "1,before");
+ }
+ 
++// Tests that if the master leader crashes while dropping a table (after marking the table as
++// HIDING), the table is marked as HIDDEN when the new leader reloads the sys.catalog. i.e ensure
++// that the table is never stuck in HIDING state.
++TEST_F(YbAdminSnapshotScheduleTest, DroppedTableMarkedHiddenAfterFailover) {
++  auto schedule_id = ASSERT_RESULT(PrepareQl(kRetention, kRetention + 1s));
++  LOG(INFO) << "Create table";
++  ASSERT_NO_FATALS(
++      client::kv_table_test::CreateTable(client::Transactional::kTrue, 3, client_.get(), &table_));
++  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_simulate_crash_after_table_marked_deleting", "true"));
++  LOG(INFO) << "Delete table";
++  ASSERT_NOK(client_->DeleteTable(client::kTableName));
++  LOG(INFO) << "Stepping down the master leader";
++  ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
++  MonoDelta timeout = 30s;
++  // Wait until the table is marked as hidden.
++  ASSERT_OK(Wait(
++      [&]() -> Result<bool> {
++        auto proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
++        master::ListTablesRequestPB req;
++        master::ListTablesResponsePB resp;
++        rpc::RpcController controller;
++        controller.set_timeout(timeout);
++        req.set_include_not_running(true);
++        RETURN_NOT_OK(proxy.ListTables(req, &resp, &controller));
++        RETURN_NOT_OK(ResponseStatus(resp));
++        for (const auto& table : resp.tables()) {
++          if (table.table_type() != TableType::TRANSACTION_STATUS_TABLE_TYPE &&
++              table.relation_type() != master::RelationType::SYSTEM_TABLE_RELATION &&
++              !table.hidden()) {
++            LOG(INFO) << "Not yet hidden table: " << table.ShortDebugString();
++            return false;
++          }
++        }
++        LOG(INFO) << "All Tables are Hidden";
++        return true;
++      },
++      CoarseMonoClock::now() + timeout, "Are Tables Hidden"));
++}
++
+ class YbAdminSnapshotScheduleTestWithLB : public YbAdminSnapshotScheduleTest {
+   std::vector<std::string> ExtraMasterFlags() override {
+     std::vector<std::string> flags;

@@ -1,0 +1,158 @@
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 1f362fd417..7dba6a56e2 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -1091,11 +1091,12 @@ size_t CountIntents(MiniCluster* cluster, const TabletPeerFilter& filter) {
+     if (filter && !filter(peer.get())) {
+       continue;
+     }
+-    auto intents_count = participant->TEST_CountIntents();
+-    if (intents_count.first) {
+-      result += intents_count.first;
++    auto intents_count_result = participant->TEST_CountIntents();
++    if (intents_count_result.ok() && intents_count_result->first) {
++      result += intents_count_result->first;
+       LOG(INFO) << Format("T $0 P $1: Intents present: $2, transactions: $3", peer->tablet_id(),
+-                          peer->permanent_uuid(), intents_count.first, intents_count.second);
++                          peer->permanent_uuid(), intents_count_result->first,
++                          intents_count_result->second);
+     }
+   }
+   return result;
+diff --git a/src/yb/integration-tests/tablet-split-itest-base.cc b/src/yb/integration-tests/tablet-split-itest-base.cc
+index 1312066595..58717051cb 100644
+--- a/src/yb/integration-tests/tablet-split-itest-base.cc
++++ b/src/yb/integration-tests/tablet-split-itest-base.cc
+@@ -289,11 +289,17 @@ Status TabletSplitITestBase<MiniClusterType>::FlushTestTable() {
+ 
+ Status TabletSplitITest::WaitForTableIntentsApplied(const TableId& table_id) {
+   for (const auto& peer : ListTableActiveTabletPeers(cluster_.get(), table_id)) {
+-    RETURN_NOT_OK(WaitFor(
+-        [&]() {
+-          return peer->shared_tablet()->transaction_participant()->TEST_CountIntents().first == 0;
+-        },
+-        30s, "Did not apply write transactions from intents db in time."));
++      RETURN_NOT_OK(WaitFor([&]() {
++        // This tablet might has been shut down or in the process of shutting down.
++        // Thus, we need to check whether shared_tablet is nullptr or not
++        // TEST_CountIntent return non ok status also means shutdown has started.
++        const auto shared_tablet = peer->shared_tablet();
++        if (!shared_tablet) {
++          return true;
++        }
++        auto result = shared_tablet->transaction_participant()->TEST_CountIntents();
++        return !result.ok() || result->first == 0;
++      }, 30s, "Did not apply write transactions from intents db in time."));
+   }
+   return Status::OK();
+ }
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index e2447ef8de..335ab995f1 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -961,10 +961,22 @@ class AutomaticTabletSplitITest : public TabletSplitITest {
+     // Wait for the write transaction to move from intents db to regular db on each peer before
+     // trying to flush.
+     for (const auto& peer : ListTableActiveTabletPeers(cluster_.get(), table_id)) {
+-      RETURN_NOT_OK(WaitFor([&]() {
+-        return peer->shared_tablet()->transaction_participant()->TEST_CountIntents().first == 0;
+-      }, 30s, "Did not apply write transactions from intents db in time."));
+       if (peer->tablet_id() == tablet_id) {
++        RETURN_NOT_OK(WaitFor([&]() {
++          // This tablet might has been shut down or in the process of shutting down.
++          // Thus, we need to check whether shared_tablet is nullptr or not
++          // TEST_CountIntent return non ok status also means shutdown has started.
++          const auto shared_tablet = peer->shared_tablet();
++          if (!shared_tablet) {
++            return true;
++          }
++          auto result = shared_tablet->transaction_participant()->TEST_CountIntents();
++          return !result.ok() || result->first == 0;
++        }, 30s, "Did not apply write transactions from intents db in time."));
++
++        if (peer->IsShutdownStarted()) {
++          return STATUS(NotFound, "The tablet has been shut down.");
++        }
+         RETURN_NOT_OK(peer->shared_tablet()->Flush(tablet::FlushMode::kSync));
+       }
+     }
+@@ -990,7 +1002,12 @@ class AutomaticTabletSplitITest : public TabletSplitITest {
+       }
+       // Flush all replicas of this shard to ensure that even if the leader changed we will be in a
+       // state where yb-master should initiate a split.
+-      RETURN_NOT_OK(FlushAllTabletReplicas(tablet_id, table_->id()));
++      auto status = FlushAllTabletReplicas(tablet_id, table_->id());
++      if (status.IsNotFound()) {
++        // The parent tablet has been shut down, which means tablet split is triggered.
++        break;
++      }
++      RETURN_NOT_OK(status);
+       for (const auto& peer : ListTableActiveTabletPeers(cluster_.get(), table_->id())) {
+         if (peer->tablet_id() == tablet_id) {
+           current_size = peer->shared_tablet()->GetCurrentVersionSstFilesSize();
+diff --git a/src/yb/tablet/transaction_participant.cc b/src/yb/tablet/transaction_participant.cc
+index 7fc4a4ec31..f7adb6c34b 100644
+--- a/src/yb/tablet/transaction_participant.cc
++++ b/src/yb/tablet/transaction_participant.cc
+@@ -240,7 +240,7 @@ class TransactionParticipant::Impl
+     });
+   }
+ 
+-  std::pair<size_t, size_t> TEST_CountIntents() {
++  Result<std::pair<size_t, size_t>> TEST_CountIntents() {
+     {
+       MinRunningNotifier min_running_notifier(&applier_);
+       std::lock_guard<std::mutex> lock(mutex_);
+@@ -248,6 +248,15 @@ class TransactionParticipant::Impl
+     }
+ 
+     std::pair<size_t, size_t> result(0, 0);
++    // There is possibility that a shutdown race could happen during this iterating
++    // operation in RocksDB. To prevent the race, we should increase the pending_op_counter_
++    // before the operation, then shutdown will be delayed if it detects there is still
++    // operation hasn't finished yet. In another case, if RocksDB has already been shutted down,
++    // the operation will have NOT_OK status.
++    ScopedRWOperation operation(pending_op_counter_);
++    if (!operation.ok()) {
++      return STATUS(NotFound, "RocksDB has been shut down.");
++    }
+     auto iter = docdb::CreateRocksDBIterator(db_.intents,
+                                              key_bounds_,
+                                              docdb::BloomFilterMode::DONT_USE_BLOOM_FILTER,
+@@ -1762,7 +1771,7 @@ boost::optional<TransactionLocalState> TransactionParticipant::LocalTxnData(
+   return impl_->LocalTxnData(id);
+ }
+ 
+-std::pair<size_t, size_t> TransactionParticipant::TEST_CountIntents() const {
++Result<std::pair<size_t, size_t>> TransactionParticipant::TEST_CountIntents() const {
+   return impl_->TEST_CountIntents();
+ }
+ 
+diff --git a/src/yb/tablet/transaction_participant.h b/src/yb/tablet/transaction_participant.h
+index 39a1decb94..386310d3b1 100644
+--- a/src/yb/tablet/transaction_participant.h
++++ b/src/yb/tablet/transaction_participant.h
+@@ -233,7 +233,7 @@ class TransactionParticipant : public TransactionStatusManager {
+   size_t TEST_GetNumRunningTransactions() const;
+ 
+   // Returns pair of number of intents and number of transactions.
+-  std::pair<size_t, size_t> TEST_CountIntents() const;
++  Result<std::pair<size_t, size_t>> TEST_CountIntents() const;
+ 
+   OneWayBitmap TEST_TransactionReplicatedBatches(const TransactionId& id) const;
+ 
+diff --git a/src/yb/yql/pgwrapper/pg_mini-test.cc b/src/yb/yql/pgwrapper/pg_mini-test.cc
+index 53defa3ac1..18f917c2c2 100644
+--- a/src/yb/yql/pgwrapper/pg_mini-test.cc
++++ b/src/yb/yql/pgwrapper/pg_mini-test.cc
+@@ -1827,7 +1827,9 @@ class PgMiniBigPrefetchTest : public PgMiniSingleTServerTest {
+     for (const auto& peer : peers) {
+       auto tp = peer->tablet()->transaction_participant();
+       if (tp) {
+-        LOG(INFO) << peer->LogPrefix() << "Intents: " << tp->TEST_CountIntents().first;
++        const auto count_intents_result = tp->TEST_CountIntents();
++        const auto count_intents = count_intents_result.ok() ? count_intents_result->first : 0;
++        LOG(INFO) << peer->LogPrefix() << "Intents: " << count_intents;
+       }
+     }
+ 

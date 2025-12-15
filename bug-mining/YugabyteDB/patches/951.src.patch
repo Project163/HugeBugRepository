@@ -1,0 +1,155 @@
+diff --git a/src/yb/master/async_rpc_tasks.cc b/src/yb/master/async_rpc_tasks.cc
+index 4c1d2132b6..deb39f6859 100644
+--- a/src/yb/master/async_rpc_tasks.cc
++++ b/src/yb/master/async_rpc_tasks.cc
+@@ -188,7 +188,18 @@ Status RetryingTSRpcTask::Run() {
+     std::this_thread::yield();
+   }
+ 
+-  Status s = ResetTSProxy();
++  auto s = replica_picker_->PickReplica(&target_ts_desc_);
++  if (!s.ok()) {
++    auto opt_transition = HandleReplicaLookupFailure(s);
++    if (opt_transition) {
++      TransitionToTerminalState(
++          MonitoredTaskState::kWaiting, opt_transition->first, opt_transition->second);
++      UnregisterAsyncTask();
++      return opt_transition->second;
++    }
++  } else {
++    s = ResetTSProxy();
++  }
+   if (!s.ok()) {
+     s = s.CloneAndPrepend("Failed to reset TS proxy");
+     LOG_WITH_PREFIX(INFO) << s;
+@@ -498,9 +509,6 @@ void RetryingTSRpcTask::AbortIfScheduled() {
+ }
+ 
+ Status RetryingTSRpcTask::ResetTSProxy() {
+-  // TODO: if there is no replica available, should we still keep the task running?
+-  RETURN_NOT_OK(replica_picker_->PickReplica(&target_ts_desc_));
+-
+   shared_ptr<tserver::TabletServerServiceProxy> ts_proxy;
+   shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy;
+   shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
+diff --git a/src/yb/master/async_rpc_tasks.h b/src/yb/master/async_rpc_tasks.h
+index 396bb6b4fb..51f43e0f41 100644
+--- a/src/yb/master/async_rpc_tasks.h
++++ b/src/yb/master/async_rpc_tasks.h
+@@ -178,6 +178,12 @@ class RetryingTSRpcTask : public server::MonitoredTask {
+   // Transition this task state from expected to failed with specified status.
+   void TransitionToFailedState(server::MonitoredTaskState expected, const Status& status);
+ 
++  // Some tasks needs to transition to a certain state in case of replica lookup failure
++  virtual std::optional<std::pair<server::MonitoredTaskState, Status>> HandleReplicaLookupFailure(
++      const Status& replica_lookup_status) {
++    return std::nullopt;
++  }
++
+   virtual void Finished(const Status& status) {}
+ 
+   void AbortTask(const Status& status);
+diff --git a/src/yb/master/async_snapshot_tasks.cc b/src/yb/master/async_snapshot_tasks.cc
+index 4270112a4b..7ad9daec4e 100644
+--- a/src/yb/master/async_snapshot_tasks.cc
++++ b/src/yb/master/async_snapshot_tasks.cc
+@@ -187,6 +187,16 @@ bool AsyncTabletSnapshotOp::SendRequest(int attempt) {
+   return true;
+ }
+ 
++std::optional<std::pair<server::MonitoredTaskState, Status>>
++AsyncTabletSnapshotOp::HandleReplicaLookupFailure(const Status& replica_lookup_status) {
++  // Deleting an already deleted tablet snapshot
++  if (replica_lookup_status.IsNotFound() &&
++      operation_ == tserver::TabletSnapshotOpRequestPB::DELETE_ON_TABLET) {
++    return std::make_pair(server::MonitoredTaskState::kComplete, Status::OK());
++  }
++  return std::nullopt;
++}
++
+ void AsyncTabletSnapshotOp::Finished(const Status& status) {
+   if (!callback_) {
+     return;
+diff --git a/src/yb/master/async_snapshot_tasks.h b/src/yb/master/async_snapshot_tasks.h
+index da8d425e35..9af061d0b9 100644
+--- a/src/yb/master/async_snapshot_tasks.h
++++ b/src/yb/master/async_snapshot_tasks.h
+@@ -75,6 +75,8 @@ class AsyncTabletSnapshotOp : public RetryingTSRpcTask {
+ 
+   void HandleResponse(int attempt) override;
+   bool SendRequest(int attempt) override;
++  std::optional<std::pair<server::MonitoredTaskState, Status>> HandleReplicaLookupFailure(
++      const Status& replica_lookup_status) override;
+   void Finished(const Status& status) override;
+   bool RetryAllowed(tserver::TabletServerErrorPB::Code code, const Status& status);
+ 
+diff --git a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+index 4ec5349bb5..acd2b0236e 100644
+--- a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
++++ b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+@@ -159,6 +159,65 @@ TEST_F(YBBackupTest, DeleteSnapshotAfterTabletSplitting) {
+   ASSERT_OK(snapshot_util_->WaitAllSnapshotsDeleted());
+ }
+ 
++// Test fixture class for tests that need multiple masters (ex: master failover scenarios)
++class YBBackupTestMultipleMasters : public YBBackupTest {
++ public:
++  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
++    YBBackupTest::UpdateMiniClusterOptions(options);
++    options->num_masters = 3;
++  }
++};
++
++// Test delete_snapshot operation completes successfully when one of the tablets involved in the
++// delete snapshot operation is already deleted (For example: due to tablet splitting) and a master
++// failover happens after that.
++// 1. create a table with 3 pre-split tablets.
++// 2. create a database snapshot
++// 3. split one of the tablets to make 4 tablets and wait for the parent tablet to be deleted
++// 4. perform a master leader failover - the new master will not have any state for this deleted
++// parent tablet
++// 5. delete the snapshot created at 2
++TEST_F_EX(
++    YBBackupTest, DeleteSnapshotAfterTabletSplittingAndMasterFailover,
++    YBBackupTestMultipleMasters) {
++  const string table_name = "mytbl";
++  const string default_db = "yugabyte";
++  LOG(INFO) << Format("Create table '$0'", table_name);
++  ASSERT_NO_FATALS(CreateTable(Format("CREATE TABLE $0 (k INT, v INT)", table_name)));
++  LOG(INFO) << "Insert values";
++  ASSERT_NO_FATALS(InsertRows(
++      Format("INSERT INTO $0 (k,v) SELECT i,i FROM generate_series(1,1000) AS i", table_name),
++      1000));
++  // Verify tablets count and get table_id
++  auto tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
++  LogTabletsInfo(tablets);
++  ASSERT_EQ(tablets.size(), 3);
++  TableId table_id = tablets[0].table_id();
++  LOG(INFO) << "Create snapshot";
++  auto snapshot_id = ASSERT_RESULT(snapshot_util_->CreateSnapshot(table_id));
++  LOG(INFO) << "Split one tablet Manually and wait for parent tablet to be deleted.";
++  constexpr int middle_index = 1;
++  string tablet_id = tablets[middle_index].tablet_id();
++  // Split it && Wait for split to complete.
++  ASSERT_OK(test_admin_client_->SplitTabletAndWait(
++      default_db, table_name, /* wait_for_parent_deletion */ true, tablet_id));
++  LOG(INFO) << "Finish tablet splitting";
++  tablets = ASSERT_RESULT(test_admin_client_->GetTabletLocations(default_db, table_name));
++  LogTabletsInfo(tablets);
++  constexpr int num_tablets = 4;
++  ASSERT_EQ(tablets.size(), num_tablets);
++  // Perform a master failover. the new master will not have any state for this deleted parent
++  // tablet.
++  LOG(INFO) << "Fail over the master leader";
++  ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
++  // Delete the snapshot after the parent tablet has been deleted
++  LOG(INFO) << "Delete snapshot";
++  ASSERT_OK(snapshot_util_->DeleteSnapshot(snapshot_id));
++  // Make sure the snapshot has been deleted
++  LOG(INFO) << "Wait snapshot to be Deleted";
++  ASSERT_OK(snapshot_util_->WaitAllSnapshotsDeleted());
++}
++
+ // Test backup/restore when a hash-partitioned table undergoes manual tablet splitting.  Most
+ // often, if tablets are split after creation, the partition boundaries will not be evenly spaced.
+ // This then differs from the boundaries of a hash table that is pre-split with the same number of

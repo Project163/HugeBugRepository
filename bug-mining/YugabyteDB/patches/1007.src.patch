@@ -1,0 +1,360 @@
+diff --git a/src/postgres/src/backend/postmaster/postmaster.c b/src/postgres/src/backend/postmaster/postmaster.c
+index 63cd4c2123..250cf103ef 100644
+--- a/src/postgres/src/backend/postmaster/postmaster.c
++++ b/src/postgres/src/backend/postmaster/postmaster.c
+@@ -289,7 +289,8 @@ static int	Shutdown = NoShutdown;
+ 
+ static bool FatalError = false; /* T if recovering from backend crash */
+ 
+-static bool YbCrashWhileLockIntermediateState = false; /* Crashed before fully acquiring a lock */
++/* Crashed before fully acquiring a lock, or with unexpected error code.  */
++static bool YbCrashInUnmanageableState = false;
+ 
+ #ifdef __linux__
+ static char *YbBackendOomScoreAdj = NULL;
+@@ -2929,10 +2930,10 @@ reaper(SIGNAL_ARGS)
+ 			 */
+ 			if (proc->ybAnyLockAcquired)
+ 			{
+-				YbCrashWhileLockIntermediateState = true;
+-				ereport(LOG,
++				YbCrashInUnmanageableState = true;
++				ereport(WARNING,
+ 						(errmsg("terminating active server processes due to backend crash while "
+-						"acquiring LWLock")));
++								"acquiring LWLock")));
+ 				break;
+ 			}
+ 
+@@ -2941,7 +2942,23 @@ reaper(SIGNAL_ARGS)
+ 			 */
+ 			if (WIFSIGNALED(exitstatus))
+ 			{
+-				CleanupKilledProcess(proc);
++				if (WTERMSIG(exitstatus) == SIGABRT ||
++					WTERMSIG(exitstatus) == SIGKILL ||
++					WTERMSIG(exitstatus) == SIGSEGV)
++				{
++					YBC_LOG_INFO("cleaning up after process with pid %d exited with status %d",
++								 pid, exitstatus);
++					CleanupKilledProcess(proc);
++				}
++				else
++				{
++					YbCrashInUnmanageableState = true;
++					ereport(WARNING,
++							(errmsg("terminating active server processes due to backend crash from "
++									"unexpected error code %d",
++							 WTERMSIG(exitstatus))));
++					break;
++				}
+ 				break;
+ 			}
+ 		}
+@@ -3017,7 +3034,7 @@ reaper(SIGNAL_ARGS)
+ 			 */
+ 			StartupStatus = STARTUP_NOT_RUNNING;
+ 			FatalError = false;
+-			YbCrashWhileLockIntermediateState = false;
++			YbCrashInUnmanageableState = false;
+ 			Assert(AbortStartTime == 0);
+ 			ReachedNormalRunning = true;
+ 			pmState = PM_RUN;
+@@ -3236,7 +3253,7 @@ reaper(SIGNAL_ARGS)
+ 		 * Else do standard backend child cleanup.
+ 		 */
+ 		CleanupBackend(pid, exitstatus);
+-		if (!YbCrashWhileLockIntermediateState && !FatalError)
++		if (!YbCrashInUnmanageableState && !FatalError)
+ 		{
+ 			/*
+ 			 * Since this is not a fatal crash, we are pursuing a clean exit. All
+@@ -3363,10 +3380,9 @@ CleanupBackgroundWorker(int pid,
+ 	return false;
+ }
+ 
+-static void CleanupKilledProcess(PGPROC *proc)
++static void
++CleanupKilledProcess(PGPROC *proc)
+ {
+-	PGPROC	   *volatile *procgloballist;
+-
+ 	if (proc->backendId == InvalidBackendId)
+ 	{
+ 		/* These come from ShutdownAuxiliaryProcess */
+@@ -3389,55 +3405,12 @@ static void CleanupKilledProcess(PGPROC *proc)
+ 		SyncRepCleanupAtProcExit(proc);
+ 		ConditionVariableCancelSleepForProc(proc);
+ 
+-		/*
+-		* Detach from any lock group of which we are a member.  If the leader
+-		* exist before all other group members, it's PGPROC will remain allocated
+-		* until the last group process exits; that process must return the
+-		* leader's PGPROC to the appropriate list.
+-		*/
+ 		if (proc->lockGroupLeader != NULL)
+-		{
+-			PGPROC	   *leader = proc->lockGroupLeader;
+-
+-			if (leader)
+-			{
+-				Assert(!dlist_is_empty(&leader->lockGroupMembers));
+-				dlist_delete(&proc->lockGroupLink);
+-				if (dlist_is_empty(&leader->lockGroupMembers))
+-				{
+-					leader->lockGroupLeader = NULL;
+-					if (leader != proc)
+-					{
+-						procgloballist = leader->procgloballist;
+-
+-						/* Leader exited first; return its PGPROC. */
+-						leader->links.next = (SHM_QUEUE *) *procgloballist;
+-						*procgloballist = leader;
+-					}
+-				}
+-				else if (leader != proc)
+-					proc->lockGroupLeader = NULL;
+-			}
+-		}
+-
+-		procgloballist = proc->procgloballist;
++			RemoveLockGroupLeader(proc);
+ 
+ 		DisownLatchOnBehalfOfPid(&proc->procLatch, proc->pid);
+ 
+-		/*
+-		* If we're still a member of a locking group, that means we're a leader
+-		* which has somehow exited before its children.  The last remaining child
+-		* will release our PGPROC.  Otherwise, release it now.
+-		*/
+-		if (proc->lockGroupLeader == NULL)
+-		{
+-			/* Since lockGroupLeader is NULL, lockGroupMembers should be empty. */
+-			Assert(dlist_is_empty(&proc->lockGroupMembers));
+-
+-			/* Return PGPROC structure (and semaphore) to appropriate freelist */
+-			proc->links.next = (SHM_QUEUE *) *procgloballist;
+-			*procgloballist = proc;
+-		}
++		ReleaseProcToFreeList(proc);
+ 	}
+ }
+ 
+@@ -3559,15 +3532,14 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
+ 	 */
+ 	if (YBIsEnabledInPostgresEnvVar() && !YBShouldRestartAllChildrenIfOneCrashes())
+ 	{
+-		take_action = take_action && YbCrashWhileLockIntermediateState;
+-		if (YbCrashWhileLockIntermediateState)
+-			YbCrashWhileLockIntermediateState = false;
++		take_action = take_action && YbCrashInUnmanageableState;
+ 	}
+ 
+ 	if (take_action)
+ 	{
+-		LogChildExit(LOG, procname, pid, exitstatus);
+-		ereport(LOG,
++		int level = YBIsEnabledInPostgresEnvVar() ? INFO : LOG;
++		LogChildExit(level, procname, pid, exitstatus);
++		ereport(level,
+ 				(errmsg("terminating any other active server processes")));
+ 	}
+ 
+@@ -3610,7 +3582,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
+ 			 */
+ 			if (take_action)
+ 			{
+-				ereport(DEBUG2,
++				ereport(INFO,
+ 						(errmsg_internal("sending %s to process %d",
+ 										 (SendStop ? "SIGSTOP" : "SIGQUIT"),
+ 										 (int) rw->rw_pid)));
+diff --git a/src/postgres/src/backend/storage/ipc/procarray.c b/src/postgres/src/backend/storage/ipc/procarray.c
+index d914ed0064..a9cd750dfd 100644
+--- a/src/postgres/src/backend/storage/ipc/procarray.c
++++ b/src/postgres/src/backend/storage/ipc/procarray.c
+@@ -384,7 +384,7 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
+ 	/* Oops */
+ 	LWLockRelease(ProcArrayLock);
+ 
+-	elog(LOG, "failed to find proc with pid %d in ProcArray", proc->pid);
++	elog(WARNING, "failed to find process with pid %d in ProcArray", proc->pid);
+ }
+ 
+ /*
+diff --git a/src/postgres/src/backend/storage/lmgr/lwlock.c b/src/postgres/src/backend/storage/lmgr/lwlock.c
+index 66de91819c..6c58180781 100644
+--- a/src/postgres/src/backend/storage/lmgr/lwlock.c
++++ b/src/postgres/src/backend/storage/lmgr/lwlock.c
+@@ -1325,11 +1325,17 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+ 	 */
+ 	HOLD_INTERRUPTS();
+ 
++	if (MyProc != NULL)
++		MyProc->ybAnyLockAcquired = true;
++
+ 	/* Check for the lock */
+ 	mustwait = LWLockAttemptLock(lock, mode);
+ 
+ 	if (mustwait)
+ 	{
++		if (MyProc != NULL && !num_held_lwlocks)
++			MyProc->ybAnyLockAcquired = false;
++
+ 		/* Failed to get lock, so release interrupt holdoff */
+ 		RESUME_INTERRUPTS();
+ 
+@@ -1339,8 +1345,6 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+ 	else
+ 	{
+ 		/* Add lock to list of locks held by this backend */
+-		if (MyProc != NULL)
+-			MyProc->ybAnyLockAcquired = true;
+ 		held_lwlocks[num_held_lwlocks].lock = lock;
+ 		held_lwlocks[num_held_lwlocks++].mode = mode;
+ 		TRACE_POSTGRESQL_LWLOCK_CONDACQUIRE(T_NAME(lock), mode);
+diff --git a/src/postgres/src/backend/storage/lmgr/proc.c b/src/postgres/src/backend/storage/lmgr/proc.c
+index cb8a89e550..870d23f05f 100644
+--- a/src/postgres/src/backend/storage/lmgr/proc.c
++++ b/src/postgres/src/backend/storage/lmgr/proc.c
+@@ -818,7 +818,6 @@ static void
+ ProcKill(int code, Datum arg)
+ {
+ 	PGPROC	   *proc;
+-	PGPROC	   *volatile *procgloballist;
+ 
+ 	Assert(MyProc != NULL);
+ 
+@@ -852,38 +851,8 @@ ProcKill(int code, Datum arg)
+ 	/* Also cleanup all the temporary slots. */
+ 	ReplicationSlotCleanup();
+ 
+-	/*
+-	 * Detach from any lock group of which we are a member.  If the leader
+-	 * exist before all other group members, it's PGPROC will remain allocated
+-	 * until the last group process exits; that process must return the
+-	 * leader's PGPROC to the appropriate list.
+-	 */
+ 	if (MyProc->lockGroupLeader != NULL)
+-	{
+-		PGPROC	   *leader = MyProc->lockGroupLeader;
+-		LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
+-
+-		LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
+-		Assert(!dlist_is_empty(&leader->lockGroupMembers));
+-		dlist_delete(&MyProc->lockGroupLink);
+-		if (dlist_is_empty(&leader->lockGroupMembers))
+-		{
+-			leader->lockGroupLeader = NULL;
+-			if (leader != MyProc)
+-			{
+-				procgloballist = leader->procgloballist;
+-
+-				/* Leader exited first; return its PGPROC. */
+-				SpinLockAcquire(ProcStructLock);
+-				leader->links.next = (SHM_QUEUE *) *procgloballist;
+-				*procgloballist = leader;
+-				SpinLockRelease(ProcStructLock);
+-			}
+-		}
+-		else if (leader != MyProc)
+-			MyProc->lockGroupLeader = NULL;
+-		LWLockRelease(leader_lwlock);
+-	}
++		RemoveLockGroupLeader(MyProc);
+ 
+ 	/*
+ 	 * Reset MyLatch to the process local one.  This is so that signal
+@@ -896,7 +865,60 @@ ProcKill(int code, Datum arg)
+ 	MyProc = NULL;
+ 	DisownLatch(&proc->procLatch);
+ 
+-	procgloballist = proc->procgloballist;
++	ReleaseProcToFreeList(proc);
++
++	/*
++	 * This process is no longer present in shared memory in any meaningful
++	 * way, so tell the postmaster we've cleaned up acceptably well. (XXX
++	 * autovac launcher should be included here someday)
++	 */
++	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
++		MarkPostmasterChildInactive();
++
++	/* wake autovac launcher if needed -- see comments in FreeWorkerInfo */
++	if (AutovacuumLauncherPid != 0)
++		kill(AutovacuumLauncherPid, SIGUSR2);
++}
++
++/*
++ * Detach from any lock group of which we are a member.  If the leader
++ * exits before all other group members, it's PGPROC will remain allocated
++ * until the last group process exits; that process must return the
++ * leader's PGPROC to the appropriate list.
++ */
++void
++RemoveLockGroupLeader(PGPROC *proc)
++{
++	PGPROC	   *volatile *procgloballist;
++	PGPROC	   *leader = MyProc->lockGroupLeader;
++	LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
++
++	LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
++	Assert(!dlist_is_empty(&leader->lockGroupMembers));
++	dlist_delete(&MyProc->lockGroupLink);
++	if (dlist_is_empty(&leader->lockGroupMembers))
++	{
++		leader->lockGroupLeader = NULL;
++		if (leader != MyProc)
++		{
++			procgloballist = leader->procgloballist;
++
++			/* Leader exited first; return its PGPROC. */
++			SpinLockAcquire(ProcStructLock);
++			leader->links.next = (SHM_QUEUE *) *procgloballist;
++			*procgloballist = leader;
++			SpinLockRelease(ProcStructLock);
++		}
++	}
++	else if (leader != MyProc)
++		MyProc->lockGroupLeader = NULL;
++	LWLockRelease(leader_lwlock);
++}
++
++void
++ReleaseProcToFreeList(PGPROC *proc)
++{
++	PGPROC	   *volatile *procgloballist = proc->procgloballist;
+ 	SpinLockAcquire(ProcStructLock);
+ 
+ 	/*
+@@ -918,18 +940,6 @@ ProcKill(int code, Datum arg)
+ 	ProcGlobal->spins_per_delay = update_spins_per_delay(ProcGlobal->spins_per_delay);
+ 
+ 	SpinLockRelease(ProcStructLock);
+-
+-	/*
+-	 * This process is no longer present in shared memory in any meaningful
+-	 * way, so tell the postmaster we've cleaned up acceptably well. (XXX
+-	 * autovac launcher should be included here someday)
+-	 */
+-	if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess())
+-		MarkPostmasterChildInactive();
+-
+-	/* wake autovac launcher if needed -- see comments in FreeWorkerInfo */
+-	if (AutovacuumLauncherPid != 0)
+-		kill(AutovacuumLauncherPid, SIGUSR2);
+ }
+ 
+ /*
+diff --git a/src/postgres/src/include/storage/proc.h b/src/postgres/src/include/storage/proc.h
+index 905a526ecb..6f32210d0c 100644
+--- a/src/postgres/src/include/storage/proc.h
++++ b/src/postgres/src/include/storage/proc.h
+@@ -345,4 +345,7 @@ extern PGPROC *AuxiliaryPidGetProc(int pid);
+ extern void BecomeLockGroupLeader(void);
+ extern bool BecomeLockGroupMember(PGPROC *leader, int pid);
+ 
++extern void RemoveLockGroupLeader(PGPROC *proc);
++extern void ReleaseProcToFreeList(PGPROC *proc);
++
+ #endif							/* PROC_H */

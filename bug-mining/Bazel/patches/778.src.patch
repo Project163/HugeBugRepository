@@ -1,0 +1,747 @@
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCache.java b/src/main/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCache.java
+index b5dbc4cb40..95f61b58d7 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCache.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCache.java
+@@ -87,7 +87,7 @@ import javax.annotation.Nullable;
+ 
+ /** A cache for storing artifacts (input and output) as well as the output of running an action. */
+ @ThreadSafety.ThreadSafe
+-public abstract class AbstractRemoteActionCache implements AutoCloseable {
++public abstract class AbstractRemoteActionCache implements MissingDigestsFinder, AutoCloseable {
+ 
+   /** See {@link SpawnExecutionContext#lockOutputFiles()}. */
+   @FunctionalInterface
+@@ -147,9 +147,6 @@ public abstract class AbstractRemoteActionCache implements AutoCloseable {
+    */
+   protected abstract ListenableFuture<Void> uploadBlob(Digest digest, ByteString data);
+ 
+-  protected abstract ImmutableSet<Digest> getMissingDigests(Iterable<Digest> digests)
+-      throws IOException, InterruptedException;
+-
+   /**
+    * Upload the result of a locally executed action to the remote cache.
+    *
+@@ -212,7 +209,7 @@ public abstract class AbstractRemoteActionCache implements AutoCloseable {
+     digests.addAll(digestToFile.keySet());
+     digests.addAll(digestToBlobs.keySet());
+ 
+-    ImmutableSet<Digest> digestsToUpload = getMissingDigests(digests);
++    ImmutableSet<Digest> digestsToUpload = Utils.getFromFuture(findMissingDigests(digests));
+     ImmutableList.Builder<ListenableFuture<Void>> uploads = ImmutableList.builder();
+     for (Digest digest : digestsToUpload) {
+       Path file = digestToFile.get(digest);
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploader.java b/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploader.java
+index a97b8a730b..b312d572a3 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploader.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploader.java
+@@ -16,7 +16,9 @@ package com.google.devtools.build.lib.remote;
+ import build.bazel.remote.execution.v2.Digest;
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Strings;
++import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableSet;
++import com.google.common.collect.Iterables;
+ import com.google.common.hash.HashCode;
+ import com.google.common.util.concurrent.Futures;
+ import com.google.common.util.concurrent.ListenableFuture;
+@@ -25,11 +27,14 @@ import com.google.common.util.concurrent.MoreExecutors;
+ import com.google.devtools.build.lib.buildeventstream.BuildEvent.LocalFile;
+ import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;
+ import com.google.devtools.build.lib.buildeventstream.PathConverter;
++import com.google.devtools.build.lib.collect.ImmutableIterable;
+ import com.google.devtools.build.lib.remote.util.DigestUtil;
+ import com.google.devtools.build.lib.vfs.Path;
+ import io.grpc.Context;
++import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -46,11 +51,13 @@ class ByteStreamBuildEventArtifactUploader implements BuildEventArtifactUploader
+   private final Context ctx;
+   private final ByteStreamUploader uploader;
+   private final String remoteServerInstanceName;
++  private final MissingDigestsFinder missingDigestsFinder;
+ 
+   private final AtomicBoolean shutdown = new AtomicBoolean();
+ 
+   ByteStreamBuildEventArtifactUploader(
+       ByteStreamUploader uploader,
++      MissingDigestsFinder missingDigestsFinder,
+       String remoteServerName,
+       Context ctx,
+       @Nullable String remoteInstanceName,
+@@ -66,53 +73,168 @@ class ByteStreamBuildEventArtifactUploader implements BuildEventArtifactUploader
+     this.uploadExecutor =
+         MoreExecutors.listeningDecorator(
+             Executors.newFixedThreadPool(Math.min(maxUploadThreads, 1000)));
++    this.missingDigestsFinder = missingDigestsFinder;
+   }
+ 
++  /** Returns {@code true} if Bazel knows that the file is stored on a remote system. */
+   private static boolean isRemoteFile(Path file) {
+     return file.getFileSystem() instanceof RemoteActionFileSystem
+         && ((RemoteActionFileSystem) file.getFileSystem()).isRemote(file);
+   }
+ 
++  private static final class PathMetadata {
++
++    private final Path path;
++    private final Digest digest;
++    private final boolean directory;
++    private final boolean remote;
++
++    PathMetadata(Path path, Digest digest, boolean directory, boolean remote) {
++      this.path = path;
++      this.digest = digest;
++      this.directory = directory;
++      this.remote = remote;
++    }
++
++    public Path getPath() {
++      return path;
++    }
++
++    public Digest getDigest() {
++      return digest;
++    }
++
++    public boolean isDirectory() {
++      return directory;
++    }
++
++    public boolean isRemote() {
++      return remote;
++    }
++  }
++
++  /**
++   * Collects metadata for {@code file}. Depending on the underlying filesystem used this method
++   * might do I/O.
++   */
++  private static PathMetadata readPathMetadata(Path file) throws IOException {
++    if (file.isDirectory()) {
++      return new PathMetadata(file, /* digest= */ null, /* directory= */ true, /* remote= */ false);
++    }
++    DigestUtil digestUtil = new DigestUtil(file.getFileSystem().getDigestFunction());
++    Digest digest = digestUtil.compute(file);
++    return new PathMetadata(file, digest, /* directory= */ false, isRemoteFile(file));
++  }
++
++  private static List<PathMetadata> processQueryResult(
++      ImmutableSet<Digest> missingDigests, List<PathMetadata> filesToQuery) {
++    List<PathMetadata> allPaths = new ArrayList<>(filesToQuery.size());
++    for (PathMetadata file : filesToQuery) {
++      if (missingDigests.contains(file.getDigest())) {
++        allPaths.add(file);
++      } else {
++        PathMetadata remotePathMetadata =
++            new PathMetadata(
++                file.getPath(), file.getDigest(), file.isDirectory(), /* remote= */ true);
++        allPaths.add(remotePathMetadata);
++      }
++    }
++    return allPaths;
++  }
++
++  /**
++   * For files where {@link PathMetadata#isRemote()} returns {@code false} this method checks if the
++   * remote cache already contains the file. If so {@link PathMetadata#isRemote()} is set to {@code
++   * true}.
++   */
++  private ListenableFuture<ImmutableIterable<PathMetadata>> queryRemoteCache(
++      ImmutableList<ListenableFuture<PathMetadata>> allPaths) throws Exception {
++    List<PathMetadata> knownRemotePaths = new ArrayList<>(allPaths.size());
++    List<PathMetadata> filesToQuery = new ArrayList<>();
++    Set<Digest> digestsToQuery = new HashSet<>();
++    for (ListenableFuture<PathMetadata> pathMetadataFuture : allPaths) {
++      // This line is guaranteed to not block, as this code is only called after all futures in
++      // allPaths have completed.
++      PathMetadata pathMetadata = pathMetadataFuture.get();
++      if (pathMetadata.isRemote() || pathMetadata.isDirectory()) {
++        knownRemotePaths.add(pathMetadata);
++      } else {
++        filesToQuery.add(pathMetadata);
++        digestsToQuery.add(pathMetadata.getDigest());
++      }
++    }
++    if (digestsToQuery.isEmpty()) {
++      return Futures.immediateFuture(ImmutableIterable.from(knownRemotePaths));
++    }
++    return Futures.transform(
++        ctx.call(() -> missingDigestsFinder.findMissingDigests(digestsToQuery)),
++        (missingDigests) -> {
++          List<PathMetadata> filesToQueryUpdated = processQueryResult(missingDigests, filesToQuery);
++          return ImmutableIterable.from(Iterables.concat(knownRemotePaths, filesToQueryUpdated));
++        },
++        MoreExecutors.directExecutor());
++  }
++
++  /**
++   * Uploads any files from {@code allPaths} where {@link PathMetadata#isRemote()} returns {@code
++   * false}.
++   */
++  private ListenableFuture<List<PathMetadata>> uploadLocalFiles(
++      ImmutableIterable<PathMetadata> allPaths) {
++    ImmutableList.Builder<ListenableFuture<PathMetadata>> allPathsUploaded =
++        ImmutableList.builder();
++    for (PathMetadata path : allPaths) {
++      if (!path.isRemote() && !path.isDirectory()) {
++        Chunker chunker =
++            Chunker.builder().setInput(path.getDigest().getSizeBytes(), path.getPath()).build();
++        final ListenableFuture<Void> upload;
++        Context prevCtx = ctx.attach();
++        try {
++          upload =
++              uploader.uploadBlobAsync(
++                  HashCode.fromString(path.getDigest().getHash()),
++                  chunker,
++                  /* forceUpload=*/ false);
++        } finally {
++          ctx.detach(prevCtx);
++        }
++        allPathsUploaded.add(Futures.transform(upload, unused -> path, uploadExecutor));
++      } else {
++        allPathsUploaded.add(Futures.immediateFuture(path));
++      }
++    }
++    return Futures.allAsList(allPathsUploaded.build());
++  }
++
+   @Override
+   public ListenableFuture<PathConverter> upload(Map<Path, LocalFile> files) {
+     if (files.isEmpty()) {
+       return Futures.immediateFuture(PathConverter.NO_CONVERSION);
+     }
+-    List<ListenableFuture<PathDigestPair>> uploads = new ArrayList<>(files.size());
+-
+-      for (Path file : files.keySet()) {
+-      ListenableFuture<Boolean> isDirectoryFuture = uploadExecutor.submit(() -> file.isDirectory());
+-      ListenableFuture<PathDigestPair> digestFuture =
+-          Futures.transformAsync(
+-              isDirectoryFuture,
+-              isDirectory -> {
+-                if (isDirectory) {
+-                  return Futures.immediateFuture(new PathDigestPair(file, null));
+-                }
+-                DigestUtil digestUtil = new DigestUtil(file.getFileSystem().getDigestFunction());
+-                Digest digest = digestUtil.compute(file);
+-                if (isRemoteFile(file)) {
+-                  return Futures.immediateFuture(new PathDigestPair(file, digest));
+-                }
+-                Chunker chunker = Chunker.builder().setInput(digest.getSizeBytes(), file).build();
+-                final ListenableFuture<Void> upload;
+-                Context prevCtx = ctx.attach();
+-                try {
+-                  upload =
+-                      uploader.uploadBlobAsync(
+-                          HashCode.fromString(digest.getHash()), chunker, /* forceUpload=*/ false);
+-                } finally {
+-                  ctx.detach(prevCtx);
+-                }
+-                return Futures.transform(
+-                    upload, unused -> new PathDigestPair(file, digest), uploadExecutor);
+-              },
+-              MoreExecutors.directExecutor());
+-      uploads.add(digestFuture);
+-      }
++    // Collect metadata about each path
++    ImmutableList.Builder<ListenableFuture<PathMetadata>> allPathMetadata = ImmutableList.builder();
++    for (Path file : files.keySet()) {
++      ListenableFuture<PathMetadata> pathMetadata =
++          uploadExecutor.submit(() -> readPathMetadata(file));
++      allPathMetadata.add(pathMetadata);
++    }
++
++    // Query the remote cache to check which files need to be uploaded
++    ImmutableList<ListenableFuture<PathMetadata>> allPaths = allPathMetadata.build();
++    ListenableFuture<ImmutableIterable<PathMetadata>> allPathsUpdatedMetadata =
++        Futures.whenAllSucceed(allPaths)
++            .callAsync(() -> queryRemoteCache(allPaths), MoreExecutors.directExecutor());
++
++    // Upload local files (if any)
++    ListenableFuture<List<PathMetadata>> allPathsMetadata =
++        Futures.transformAsync(
++            allPathsUpdatedMetadata,
++            (paths) -> uploadLocalFiles(paths),
++            MoreExecutors.directExecutor());
++
+     return Futures.transform(
+-        Futures.allAsList(uploads),
+-        pathDigestPairs -> new PathConverterImpl(remoteServerInstanceName, pathDigestPairs),
++        allPathsMetadata,
++        (metadata) -> new PathConverterImpl(remoteServerInstanceName, metadata),
+         MoreExecutors.directExecutor());
+   }
+ 
+@@ -135,12 +257,12 @@ class ByteStreamBuildEventArtifactUploader implements BuildEventArtifactUploader
+     private final Map<Path, Digest> pathToDigest;
+     private final Set<Path> skippedPaths;
+ 
+-    PathConverterImpl(String remoteServerInstanceName, List<PathDigestPair> uploads) {
++    PathConverterImpl(String remoteServerInstanceName, List<PathMetadata> uploads) {
+       Preconditions.checkNotNull(uploads);
+       this.remoteServerInstanceName = remoteServerInstanceName;
+       pathToDigest = new HashMap<>(uploads.size());
+       ImmutableSet.Builder<Path> skippedPaths = ImmutableSet.builder();
+-      for (PathDigestPair pair : uploads) {
++      for (PathMetadata pair : uploads) {
+         Path path = pair.getPath();
+         Digest digest = pair.getDigest();
+         if (digest != null) {
+@@ -169,23 +291,4 @@ class ByteStreamBuildEventArtifactUploader implements BuildEventArtifactUploader
+           remoteServerInstanceName, digest.getHash(), digest.getSizeBytes());
+     }
+   }
+-
+-  private static class PathDigestPair {
+-
+-    private final Path path;
+-    private final Digest digest;
+-
+-    PathDigestPair(Path path, Digest digest) {
+-      this.path = path;
+-      this.digest = digest;
+-    }
+-
+-    public Path getPath() {
+-      return path;
+-    }
+-
+-    public Digest getDigest() {
+-      return digest;
+-    }
+-  }
+ }
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderFactory.java b/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderFactory.java
+index da8479ff08..e6b6cadedd 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderFactory.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderFactory.java
+@@ -29,12 +29,17 @@ class ByteStreamBuildEventArtifactUploaderFactory implements
+   private final ByteStreamUploader uploader;
+   private final String remoteServerName;
+   private final Context ctx;
++  private final MissingDigestsFinder missingDigestsFinder;
+   @Nullable private final String remoteInstanceName;
+ 
+   ByteStreamBuildEventArtifactUploaderFactory(
+-      ByteStreamUploader uploader, String remoteServerName, Context ctx,
++      ByteStreamUploader uploader,
++      MissingDigestsFinder missingDigestsFinder,
++      String remoteServerName,
++      Context ctx,
+       @Nullable String remoteInstanceName) {
+     this.uploader = uploader;
++    this.missingDigestsFinder = missingDigestsFinder;
+     this.remoteServerName = remoteServerName;
+     this.ctx = ctx;
+     this.remoteInstanceName = remoteInstanceName;
+@@ -44,6 +49,7 @@ class ByteStreamBuildEventArtifactUploaderFactory implements
+   public BuildEventArtifactUploader create(CommandEnvironment env) {
+     return new ByteStreamBuildEventArtifactUploader(
+         uploader.retain(),
++        missingDigestsFinder,
+         remoteServerName,
+         ctx,
+         remoteInstanceName,
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/GrpcRemoteCache.java b/src/main/java/com/google/devtools/build/lib/remote/GrpcRemoteCache.java
+index e9fdb160a5..9b7a720fc4 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/GrpcRemoteCache.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/GrpcRemoteCache.java
+@@ -35,7 +35,6 @@ import com.google.bytestream.ByteStreamProto.ReadResponse;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Ascii;
+ import com.google.common.base.Preconditions;
+-import com.google.common.base.Throwables;
+ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Maps;
+@@ -54,6 +53,7 @@ import com.google.devtools.build.lib.remote.merkletree.MerkleTree;
+ import com.google.devtools.build.lib.remote.options.RemoteOptions;
+ import com.google.devtools.build.lib.remote.util.DigestUtil;
+ import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
++import com.google.devtools.build.lib.remote.util.Utils;
+ import com.google.devtools.build.lib.vfs.Path;
+ import com.google.protobuf.ByteString;
+ import com.google.protobuf.Message;
+@@ -67,7 +67,6 @@ import java.io.OutputStream;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+-import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -161,46 +160,42 @@ public class GrpcRemoteCache extends AbstractRemoteActionCache {
+   }
+ 
+   @Override
+-  protected ImmutableSet<Digest> getMissingDigests(Iterable<Digest> digests)
+-      throws IOException, InterruptedException {
++  public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
+     if (Iterables.isEmpty(digests)) {
+-      return ImmutableSet.of();
++      return Futures.immediateFuture(ImmutableSet.of());
+     }
+     // Need to potentially split the digests into multiple requests.
+     FindMissingBlobsRequest.Builder requestBuilder =
+         FindMissingBlobsRequest.newBuilder().setInstanceName(options.remoteInstanceName);
+-    List<ListenableFuture<FindMissingBlobsResponse>> callFutures = new ArrayList<>();
++    List<ListenableFuture<FindMissingBlobsResponse>> getMissingDigestCalls = new ArrayList<>();
+     for (Digest digest : digests) {
+       requestBuilder.addBlobDigests(digest);
+       if (requestBuilder.getBlobDigestsCount() == maxMissingBlobsDigestsPerMessage) {
+-        callFutures.add(getMissingDigests(requestBuilder.build()));
++        getMissingDigestCalls.add(getMissingDigests(requestBuilder.build()));
+         requestBuilder.clearBlobDigests();
+       }
+     }
++
+     if (requestBuilder.getBlobDigestsCount() > 0) {
+-      callFutures.add(getMissingDigests(requestBuilder.build()));
+-    }
+-    ImmutableSet.Builder<Digest> result = ImmutableSet.builder();
+-    try {
+-      for (ListenableFuture<FindMissingBlobsResponse> callFuture : callFutures) {
+-        result.addAll(callFuture.get().getMissingBlobDigestsList());
+-      }
+-    } catch (ExecutionException e) {
+-      Throwable cause = e.getCause();
+-      Throwables.propagateIfInstanceOf(cause, IOException.class);
+-      throw new RuntimeException(cause);
++      getMissingDigestCalls.add(getMissingDigests(requestBuilder.build()));
+     }
+-    return result.build();
++
++    return Futures.whenAllSucceed(getMissingDigestCalls)
++        .call(
++            () -> {
++              ImmutableSet.Builder<Digest> result = ImmutableSet.builder();
++              for (ListenableFuture<FindMissingBlobsResponse> callFuture : getMissingDigestCalls) {
++                result.addAll(callFuture.get().getMissingBlobDigestsList());
++              }
++              return result.build();
++            },
++            MoreExecutors.directExecutor());
+   }
+ 
+   private ListenableFuture<FindMissingBlobsResponse> getMissingDigests(
+-      FindMissingBlobsRequest request) throws IOException, InterruptedException {
++      FindMissingBlobsRequest request) {
+     Context ctx = Context.current();
+-    try {
+-      return retrier.executeAsync(() -> ctx.call(() -> casFutureStub().findMissingBlobs(request)));
+-    } catch (StatusRuntimeException e) {
+-      throw new IOException(e);
+-    }
++    return retrier.executeAsync(() -> ctx.call(() -> casFutureStub().findMissingBlobs(request)));
+   }
+ 
+   /**
+@@ -218,8 +213,9 @@ public class GrpcRemoteCache extends AbstractRemoteActionCache {
+   public void ensureInputsPresent(
+       MerkleTree merkleTree, Map<Digest, Message> additionalInputs, Path execRoot)
+       throws IOException, InterruptedException {
+-    ImmutableSet<Digest> missingDigests =
+-        getMissingDigests(Iterables.concat(merkleTree.getAllDigests(), additionalInputs.keySet()));
++    Iterable<Digest> allDigests =
++        Iterables.concat(merkleTree.getAllDigests(), additionalInputs.keySet());
++    ImmutableSet<Digest> missingDigests = Utils.getFromFuture(findMissingDigests(allDigests));
+     Map<HashCode, Chunker> inputsToUpload = Maps.newHashMapWithExpectedSize(missingDigests.size());
+     for (Digest missingDigest : missingDigests) {
+       Directory node = merkleTree.getDirectoryByDigest(missingDigest);
+@@ -247,7 +243,7 @@ public class GrpcRemoteCache extends AbstractRemoteActionCache {
+ 
+       throw new IOException(
+           format(
+-              "getMissingDigests returned a missing digest that has not been requested: %s",
++              "findMissingDigests returned a missing digest that has not been requested: %s",
+               missingDigest));
+     }
+ 
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/MissingDigestsFinder.java b/src/main/java/com/google/devtools/build/lib/remote/MissingDigestsFinder.java
+new file mode 100644
+index 0000000000..1a6bd9e132
+--- /dev/null
++++ b/src/main/java/com/google/devtools/build/lib/remote/MissingDigestsFinder.java
+@@ -0,0 +1,30 @@
++// Copyright 2019 The Bazel Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++package com.google.devtools.build.lib.remote;
++
++import build.bazel.remote.execution.v2.Digest;
++import com.google.common.collect.ImmutableSet;
++import com.google.common.util.concurrent.ListenableFuture;
++
++/** Supports querying a remote cache whether it contains a list of blobs. */
++interface MissingDigestsFinder {
++
++  /**
++   * Returns a set of digests that the remote cache does not know about. The returned set is
++   * guaranteed to be a subset of {@code digests}.
++   *
++   * @param digests The list of digests to look for.
++   */
++  ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests);
++}
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java b/src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java
+index fc7c6583fe..b4865e4fe2 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/RemoteModule.java
+@@ -99,7 +99,8 @@ public final class RemoteModule extends BlazeModule {
+ 
+   @Override
+   public void serverInit(OptionsParsingResult startupOptions, ServerBuilder builder) {
+-    builder.addBuildEventArtifactUploaderFactory(buildEventArtifactUploaderFactoryDelegate, "remote");
++    builder.addBuildEventArtifactUploaderFactory(
++        buildEventArtifactUploaderFactoryDelegate, "remote");
+   }
+ 
+   private static final String VIOLATION_TYPE_MISSING = "MISSING";
+@@ -269,6 +270,7 @@ public final class RemoteModule extends BlazeModule {
+         buildEventArtifactUploaderFactoryDelegate.init(
+             new ByteStreamBuildEventArtifactUploaderFactory(
+                 uploader,
++                cache,
+                 cacheChannel.authority(),
+                 requestContext,
+                 remoteOptions.remoteInstanceName));
+diff --git a/src/main/java/com/google/devtools/build/lib/remote/SimpleBlobStoreActionCache.java b/src/main/java/com/google/devtools/build/lib/remote/SimpleBlobStoreActionCache.java
+index 2796f0fcb7..11a2fde42e 100644
+--- a/src/main/java/com/google/devtools/build/lib/remote/SimpleBlobStoreActionCache.java
++++ b/src/main/java/com/google/devtools/build/lib/remote/SimpleBlobStoreActionCache.java
+@@ -82,8 +82,8 @@ public class SimpleBlobStoreActionCache extends AbstractRemoteActionCache {
+   }
+ 
+   @Override
+-  protected ImmutableSet<Digest> getMissingDigests(Iterable<Digest> digests) {
+-    return ImmutableSet.copyOf(digests);
++  public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
++    return Futures.immediateFuture(ImmutableSet.copyOf(digests));
+   }
+ 
+   @Override
+diff --git a/src/test/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCacheTests.java b/src/test/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCacheTests.java
+index a9b274fc3d..141a4ddb7b 100644
+--- a/src/test/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCacheTests.java
++++ b/src/test/java/com/google/devtools/build/lib/remote/AbstractRemoteActionCacheTests.java
+@@ -1168,7 +1168,7 @@ public class AbstractRemoteActionCacheTests {
+     }
+ 
+     @Override
+-    protected ImmutableSet<Digest> getMissingDigests(Iterable<Digest> digests) {
++    public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
+       throw new UnsupportedOperationException();
+     }
+ 
+diff --git a/src/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java b/src/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java
+index 00053cbee1..650b7fb2cf 100644
+--- a/src/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java
++++ b/src/test/java/com/google/devtools/build/lib/remote/ByteStreamBuildEventArtifactUploaderTest.java
+@@ -15,15 +15,23 @@ package com.google.devtools.build.lib.remote;
+ 
+ import static com.google.common.truth.Truth.assertThat;
+ import static com.google.devtools.build.lib.testutil.MoreAsserts.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoMoreInteractions;
++import static org.mockito.Mockito.when;
+ 
+ import build.bazel.remote.execution.v2.Digest;
+ import com.google.bytestream.ByteStreamProto.WriteRequest;
+ import com.google.bytestream.ByteStreamProto.WriteResponse;
+ import com.google.common.collect.ImmutableMap;
++import com.google.common.collect.ImmutableSet;
+ import com.google.common.hash.HashCode;
+ import com.google.common.io.BaseEncoding;
++import com.google.common.util.concurrent.Futures;
++import com.google.common.util.concurrent.ListenableFuture;
+ import com.google.common.util.concurrent.ListeningScheduledExecutorService;
+ import com.google.common.util.concurrent.MoreExecutors;
+ import com.google.devtools.build.lib.actions.ActionInputMap;
+@@ -43,6 +51,7 @@ import com.google.devtools.build.lib.remote.util.TestUtils;
+ import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
+ import com.google.devtools.build.lib.vfs.DigestHashFunction;
+ import com.google.devtools.build.lib.vfs.FileSystem;
++import com.google.devtools.build.lib.vfs.FileSystemUtils;
+ import com.google.devtools.build.lib.vfs.Path;
+ import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
+ import io.grpc.Context;
+@@ -162,9 +171,7 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+     ReferenceCountedChannel refCntChannel = new ReferenceCountedChannel(channel);
+     ByteStreamUploader uploader =
+         new ByteStreamUploader("instance", refCntChannel, null, 3, retrier);
+-    ByteStreamBuildEventArtifactUploader artifactUploader =
+-        new ByteStreamBuildEventArtifactUploader(
+-            uploader, "localhost", withEmptyMetadata, "instance", /* maxUploadThreads= */ 100);
++    ByteStreamBuildEventArtifactUploader artifactUploader = newArtifactUploader(uploader);
+ 
+     PathConverter pathConverter = artifactUploader.upload(filesToUpload).get();
+     for (Path file : filesToUpload.keySet()) {
+@@ -188,9 +195,8 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+     Map<Path, LocalFile> filesToUpload = new HashMap<>();
+     filesToUpload.put(dir, new LocalFile(dir, LocalFileType.OUTPUT));
+     ByteStreamUploader uploader = mock(ByteStreamUploader.class);
+-    ByteStreamBuildEventArtifactUploader artifactUploader =
+-        new ByteStreamBuildEventArtifactUploader(
+-            uploader, "localhost", withEmptyMetadata, "instance", /* maxUploadThreads= */ 100);
++    ByteStreamBuildEventArtifactUploader artifactUploader = newArtifactUploader(uploader);
++
+     PathConverter pathConverter = artifactUploader.upload(filesToUpload).get();
+     assertThat(pathConverter.apply(dir)).isNull();
+     artifactUploader.shutdown();
+@@ -250,9 +256,7 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+     ReferenceCountedChannel refCntChannel = new ReferenceCountedChannel(channel);
+     ByteStreamUploader uploader =
+         new ByteStreamUploader("instance", refCntChannel, null, 3, retrier);
+-    ByteStreamBuildEventArtifactUploader artifactUploader =
+-        new ByteStreamBuildEventArtifactUploader(
+-            uploader, "localhost", withEmptyMetadata, "instance", /* maxUploadThreads= */ 100);
++    ByteStreamBuildEventArtifactUploader artifactUploader = newArtifactUploader(uploader);
+ 
+     ExecutionException e =
+         assertThrows(ExecutionException.class, () -> artifactUploader.upload(filesToUpload).get());
+@@ -265,7 +269,7 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+   }
+ 
+   @Test
+-  public void remoteFileShouldNotBeUploaded() throws Exception {
++  public void remoteFileShouldNotBeUploaded_actionFs() throws Exception {
+     // Test that we don't attempt to upload remotely stored file but convert the remote path
+     // to a bytestream:// URI.
+ 
+@@ -273,9 +277,7 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+ 
+     ByteStreamUploader uploader = Mockito.mock(ByteStreamUploader.class);
+     RemoteActionInputFetcher actionInputFetcher = Mockito.mock(RemoteActionInputFetcher.class);
+-    ByteStreamBuildEventArtifactUploader artifactUploader =
+-        new ByteStreamBuildEventArtifactUploader(
+-            uploader, "localhost", withEmptyMetadata, "instance", /* maxUploadThreads= */ 100);
++    ByteStreamBuildEventArtifactUploader artifactUploader = newArtifactUploader(uploader);
+ 
+     ActionInputMap outputs = new ActionInputMap(2);
+     Artifact artifact = createRemoteArtifact("file1.txt", "foo", outputs);
+@@ -310,6 +312,44 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+     verifyNoMoreInteractions(uploader);
+   }
+ 
++  @Test
++  public void remoteFileShouldNotBeUploaded_findMissingDigests() throws Exception {
++    // Test that findMissingDigests is called to check which files exist remotely
++    // and that those are not uploaded.
++
++    // arrange
++    Path remoteFile = fs.getPath("/remote-file");
++    FileSystemUtils.writeContent(remoteFile, StandardCharsets.UTF_8, "hello world");
++    Digest remoteDigest = DIGEST_UTIL.compute(remoteFile);
++    Path localFile = fs.getPath("/local-file");
++    FileSystemUtils.writeContent(localFile, StandardCharsets.UTF_8, "foo bar");
++    Digest localDigest = DIGEST_UTIL.compute(localFile);
++
++    StaticMissingDigestsFinder digestQuerier =
++        Mockito.spy(new StaticMissingDigestsFinder(ImmutableSet.of(remoteDigest)));
++    ByteStreamUploader uploader = Mockito.mock(ByteStreamUploader.class);
++    when(uploader.uploadBlobAsync(any(), any(), anyBoolean()))
++        .thenReturn(Futures.immediateFuture(null));
++    ByteStreamBuildEventArtifactUploader artifactUploader =
++        newArtifactUploader(uploader, digestQuerier);
++
++    // act
++    Map<Path, LocalFile> files =
++        ImmutableMap.of(
++            remoteFile,
++            new LocalFile(remoteFile, LocalFileType.OUTPUT),
++            localFile,
++            new LocalFile(localFile, LocalFileType.OUTPUT));
++    PathConverter pathConverter = artifactUploader.upload(files).get();
++
++    // assert
++    verify(digestQuerier).findMissingDigests(any());
++    verify(uploader)
++        .uploadBlobAsync(eq(HashCode.fromString(localDigest.getHash())), any(), anyBoolean());
++    assertThat(pathConverter.apply(remoteFile)).contains(remoteDigest.getHash());
++    assertThat(pathConverter.apply(localFile)).contains(localDigest.getHash());
++  }
++
+   /** Returns a remote artifact and puts its metadata into the action input map. */
+   private Artifact createRemoteArtifact(
+       String pathFragment, String contents, ActionInputMap inputs) {
+@@ -322,4 +362,49 @@ public class ByteStreamBuildEventArtifactUploaderTest {
+     inputs.putWithNoDepOwner(a, f);
+     return a;
+   }
++
++  private ByteStreamBuildEventArtifactUploader newArtifactUploader(
++      ByteStreamUploader uploader, MissingDigestsFinder missingDigestsFinder) {
++    return new ByteStreamBuildEventArtifactUploader(
++        uploader,
++        missingDigestsFinder,
++        "localhost",
++        withEmptyMetadata,
++        "instance",
++        /* maxUploadThreads= */ 100);
++  }
++
++  private ByteStreamBuildEventArtifactUploader newArtifactUploader(ByteStreamUploader uploader) {
++    return newArtifactUploader(uploader, AllMissingDigestsFinder.INSTANCE);
++  }
++
++  private static class StaticMissingDigestsFinder implements MissingDigestsFinder {
++
++    private final ImmutableSet<Digest> knownDigests;
++
++    public StaticMissingDigestsFinder(ImmutableSet<Digest> knownDigests) {
++      this.knownDigests = knownDigests;
++    }
++
++    @Override
++    public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
++      ImmutableSet.Builder<Digest> missingDigests = ImmutableSet.builder();
++      for (Digest digest : digests) {
++        if (!knownDigests.contains(digest)) {
++          missingDigests.add(digest);
++        }
++      }
++      return Futures.immediateFuture(missingDigests.build());
++    }
++  }
++
++  private static class AllMissingDigestsFinder implements MissingDigestsFinder {
++
++    public static final AllMissingDigestsFinder INSTANCE = new AllMissingDigestsFinder();
++
++    @Override
++    public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
++      return Futures.immediateFuture(ImmutableSet.copyOf(digests));
++    }
++  }
+ }
+diff --git a/src/test/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcherTest.java b/src/test/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcherTest.java
+index 6c5fe6d6bd..ddf5306fdc 100644
+--- a/src/test/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcherTest.java
++++ b/src/test/java/com/google/devtools/build/lib/remote/RemoteActionInputFetcherTest.java
+@@ -244,7 +244,7 @@ public class RemoteActionInputFetcherTest {
+     }
+ 
+     @Override
+-    protected ImmutableSet<Digest> getMissingDigests(Iterable<Digest> digests) {
++    public ListenableFuture<ImmutableSet<Digest>> findMissingDigests(Iterable<Digest> digests) {
+       throw new UnsupportedOperationException();
+     }
+ 

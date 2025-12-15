@@ -1,0 +1,149 @@
+diff --git a/src/yb/master/ysql/ysql_catalog_config.cc b/src/yb/master/ysql/ysql_catalog_config.cc
+index 320aff9a40..9718715c00 100644
+--- a/src/yb/master/ysql/ysql_catalog_config.cc
++++ b/src/yb/master/ysql/ysql_catalog_config.cc
+@@ -39,6 +39,12 @@ uint32 GetMajorVersionOfCurrentBuild() {
+   return version_info.ysql_major_version();
+ }
+ 
++bool IsYsqlMajorCatalogOperationRunning(YsqlMajorCatalogUpgradeInfoPB::State state) {
++  return state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_PG_UPGRADE ||
++         state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_INIT_DB ||
++         state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_ROLLBACK;
++}
++
+ }  // namespace
+ 
+ YsqlCatalogConfig::YsqlCatalogConfig(SysCatalogTable& sys_catalog) : sys_catalog_(sys_catalog) {}
+@@ -67,15 +73,22 @@ Status YsqlCatalogConfig::PrepareDefaultIfNeeded(const LeaderEpoch& epoch) {
+ void YsqlCatalogConfig::SetConfig(scoped_refptr<SysConfigInfo> config) {
+   {
+     auto l = config->LockForRead();
+-    if (l->pb.ysql_catalog_config().has_ysql_major_catalog_upgrade_info()) {
++    auto& ysql_catalog_config = l->pb.ysql_catalog_config();
++    if (ysql_catalog_config.has_ysql_major_catalog_upgrade_info()) {
+       const auto persisted_version =
+-          l->pb.ysql_catalog_config().ysql_major_catalog_upgrade_info().catalog_version();
+-      if (persisted_version > GetMajorVersionOfCurrentBuild()) {
+-        LOG(FATAL) << "Persisted major version in YSQL catalog config is not supported. Restart "
+-                      "the process in the correct version. Min required major version: "
+-                   << persisted_version
+-                   << ", Current version: " << VersionInfo::GetShortVersionString();
+-      }
++          ysql_catalog_config.ysql_major_catalog_upgrade_info().catalog_version();
++      LOG_IF(FATAL, persisted_version > GetMajorVersionOfCurrentBuild())
++          << "Persisted major version in YSQL catalog config is not supported. Restart "
++             "the process in the correct version. Min required major version: "
++          << persisted_version
++          << ", Current major version: " << VersionInfo::GetShortVersionString();
++
++      // A new yb-master leader has started. If we were in the middle of the ysql major catalog
++      // upgrade (initdb, pg_upgrade, or rollback) then mark the major upgrade as failed. No action
++      // is taken if we are in the monitoring phase.
++      // We cannot update the config right now, so do so after the sys_catalog is loaded.
++      restarted_during_major_upgrade_ = IsYsqlMajorCatalogOperationRunning(
++          ysql_catalog_config.ysql_major_catalog_upgrade_info().state());
+     }
+   }
+ 
+@@ -84,6 +97,17 @@ void YsqlCatalogConfig::SetConfig(scoped_refptr<SysConfigInfo> config) {
+   config_ = std::move(config);
+ }
+ 
++void YsqlCatalogConfig::SysCatalogLoaded(const LeaderEpoch& epoch) {
++  if (restarted_during_major_upgrade_) {
++    ERROR_NOT_OK(
++        TransitionMajorCatalogUpgradeState(
++            YsqlMajorCatalogUpgradeInfoPB::FAILED, epoch,
++            STATUS(InternalError, "yb-master restarted during ysql major catalog upgrade")),
++        "Failed to set major version upgrade state to FAILED");
++    restarted_during_major_upgrade_ = false;
++  }
++}
++
+ void YsqlCatalogConfig::Reset() {
+   std::lock_guard m_lock(mutex_);
+   config_.reset();
+@@ -188,9 +212,7 @@ IsOperationDoneResult YsqlCatalogConfig::IsYsqlMajorCatalogUpgradeDone() const {
+   }
+ 
+   const auto state = pb.ysql_major_catalog_upgrade_info().state();
+-  if (state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_PG_UPGRADE ||
+-      state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_INIT_DB ||
+-      state == YsqlMajorCatalogUpgradeInfoPB::PERFORMING_ROLLBACK) {
++  if (IsYsqlMajorCatalogOperationRunning(state)) {
+     return IsOperationDoneResult::NotDone();
+   }
+ 
+diff --git a/src/yb/master/ysql/ysql_catalog_config.h b/src/yb/master/ysql/ysql_catalog_config.h
+index 39609d96e7..fde1367ce2 100644
+--- a/src/yb/master/ysql/ysql_catalog_config.h
++++ b/src/yb/master/ysql/ysql_catalog_config.h
+@@ -37,6 +37,8 @@ class YsqlCatalogConfig {
+   void SetConfig(scoped_refptr<SysConfigInfo> config) EXCLUDES(mutex_);
+   void Reset() EXCLUDES(mutex_);
+ 
++  void SysCatalogLoaded(const LeaderEpoch& epoch);
++
+   uint64 GetVersion() const EXCLUDES(mutex_);
+ 
+   // Increments and return the new version.
+@@ -72,6 +74,8 @@ class YsqlCatalogConfig {
+   SysCatalogTable& sys_catalog_;
+   mutable std::shared_mutex mutex_;
+   scoped_refptr<SysConfigInfo> config_ GUARDED_BY(mutex_);
++
++  std::atomic<bool> restarted_during_major_upgrade_ = false;
+ };
+ 
+ }  // namespace master
+diff --git a/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.cc b/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.cc
+index fd050f9636..e7e7881bc9 100644
+--- a/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.cc
++++ b/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.cc
+@@ -49,19 +49,6 @@ YsqlInitDBAndMajorUpgradeHandler::YsqlInitDBAndMajorUpgradeHandler(
+       sys_catalog_(sys_catalog),
+       thread_pool_(thread_pool) {}
+ 
+-void YsqlInitDBAndMajorUpgradeHandler::SysCatalogLoaded(const LeaderEpoch& epoch) {
+-  // A new yb-master leader has started. If we were in the middle of the ysql major catalog upgrade
+-  // (initdb, pg_upgrade, or rollback) then mark the major upgrade as failed. No action is taken if
+-  // we are in the monitoring phase.
+-  if (IsYsqlMajorCatalogUpgradeInProgress()) {
+-    ERROR_NOT_OK(
+-        ysql_catalog_config_.TransitionMajorCatalogUpgradeState(
+-            YsqlMajorCatalogUpgradeInfoPB::FAILED, epoch,
+-            STATUS(InternalError, "yb-master restarted during ysql major catalog upgrade")),
+-        "Failed to set major version upgrade state to FAILED");
+-  }
+-}
+-
+ Status YsqlInitDBAndMajorUpgradeHandler::StartNewClusterGlobalInitDB(const LeaderEpoch& epoch) {
+   SCHECK(
+       !FLAGS_master_join_existing_universe, IllegalState,
+diff --git a/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.h b/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.h
+index 06185af412..4bf91a4715 100644
+--- a/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.h
++++ b/src/yb/master/ysql/ysql_initdb_major_upgrade_handler.h
+@@ -37,8 +37,6 @@ class YsqlInitDBAndMajorUpgradeHandler {
+ 
+   ~YsqlInitDBAndMajorUpgradeHandler() = default;
+ 
+-  void SysCatalogLoaded(const LeaderEpoch& epoch);
+-
+   // Starts the global initdb procedure to create the initial universe level ysql sys catalog using
+   // the initdb process.
+   Status StartNewClusterGlobalInitDB(const LeaderEpoch& epoch);
+diff --git a/src/yb/master/ysql/ysql_manager.cc b/src/yb/master/ysql/ysql_manager.cc
+index 8a97218ce9..093af7bacb 100644
+--- a/src/yb/master/ysql/ysql_manager.cc
++++ b/src/yb/master/ysql/ysql_manager.cc
+@@ -57,7 +57,7 @@ void YsqlManager::LoadConfig(scoped_refptr<SysConfigInfo> config) {
+ }
+ 
+ void YsqlManager::SysCatalogLoaded(const LeaderEpoch& epoch) {
+-  ysql_initdb_and_major_upgrade_helper_->SysCatalogLoaded(epoch);
++  ysql_catalog_config_.SysCatalogLoaded(epoch);
+ }
+ 
+ Result<bool> YsqlManager::StartRunningInitDbIfNeeded(const LeaderEpoch& epoch) {

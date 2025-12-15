@@ -1,0 +1,1068 @@
+diff --git a/crates/bevy_ecs/src/lib.rs b/crates/bevy_ecs/src/lib.rs
+index 46f1a8dc4..02780adff 100644
+--- a/crates/bevy_ecs/src/lib.rs
++++ b/crates/bevy_ecs/src/lib.rs
+@@ -1267,6 +1267,15 @@ mod tests {
+         assert_eq!(*world.non_send_resource_mut::<i64>(), 456);
+     }
+ 
++    #[test]
++    fn non_send_resource_points_to_distinct_data() {
++        let mut world = World::default();
++        world.insert_resource(A(123));
++        world.insert_non_send_resource(A(456));
++        assert_eq!(*world.resource::<A>(), A(123));
++        assert_eq!(*world.non_send_resource::<A>(), A(456));
++    }
++
+     #[test]
+     #[should_panic]
+     fn non_send_resource_panic() {
+@@ -1406,31 +1415,18 @@ mod tests {
+         assert_eq!(world.resource::<A>().0, 1);
+     }
+ 
+-    #[test]
+-    fn non_send_resource_scope() {
+-        let mut world = World::default();
+-        world.insert_non_send_resource(NonSendA::default());
+-        world.resource_scope(|world: &mut World, mut value: Mut<NonSendA>| {
+-            value.0 += 1;
+-            assert!(!world.contains_resource::<NonSendA>());
+-        });
+-        assert_eq!(world.non_send_resource::<NonSendA>().0, 1);
+-    }
+-
+     #[test]
+     #[should_panic(
+-        expected = "attempted to access NonSend resource bevy_ecs::tests::NonSendA off of the main thread"
++        expected = "Attempted to access or drop non-send resource bevy_ecs::tests::NonSendA from thread"
+     )]
+-    fn non_send_resource_scope_from_different_thread() {
++    fn non_send_resource_drop_from_different_thread() {
+         let mut world = World::default();
+         world.insert_non_send_resource(NonSendA::default());
+ 
+         let thread = std::thread::spawn(move || {
+-            // Accessing the non-send resource on a different thread
++            // Dropping the non-send resource on a different thread
+             // Should result in a panic
+-            world.resource_scope(|_: &mut World, mut value: Mut<NonSendA>| {
+-                value.0 += 1;
+-            });
++            drop(world);
+         });
+ 
+         if let Err(err) = thread.join() {
+@@ -1438,6 +1434,13 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn non_send_resource_drop_from_same_thread() {
++        let mut world = World::default();
++        world.insert_non_send_resource(NonSendA::default());
++        drop(world);
++    }
++
+     #[test]
+     fn insert_overwrite_drop() {
+         let (dropck1, dropped1) = DropCk::new_pair();
+diff --git a/crates/bevy_ecs/src/schedule/ambiguity_detection.rs b/crates/bevy_ecs/src/schedule/ambiguity_detection.rs
+index 558754c9d..5e1269309 100644
+--- a/crates/bevy_ecs/src/schedule/ambiguity_detection.rs
++++ b/crates/bevy_ecs/src/schedule/ambiguity_detection.rs
+@@ -335,6 +335,7 @@ mod tests {
+     fn read_only() {
+         let mut world = World::new();
+         world.insert_resource(R);
++        world.insert_non_send_resource(R);
+         world.spawn(A);
+         world.init_resource::<Events<E>>();
+ 
+@@ -394,6 +395,7 @@ mod tests {
+     fn nonsend() {
+         let mut world = World::new();
+         world.insert_resource(R);
++        world.insert_non_send_resource(R);
+ 
+         let mut test_stage = SystemStage::parallel();
+         test_stage
+@@ -497,6 +499,7 @@ mod tests {
+     fn ignore_all_ambiguities() {
+         let mut world = World::new();
+         world.insert_resource(R);
++        world.insert_non_send_resource(R);
+ 
+         let mut test_stage = SystemStage::parallel();
+         test_stage
+@@ -513,6 +516,7 @@ mod tests {
+     fn ambiguous_with_label() {
+         let mut world = World::new();
+         world.insert_resource(R);
++        world.insert_non_send_resource(R);
+ 
+         #[derive(SystemLabel)]
+         struct IgnoreMe;
+diff --git a/crates/bevy_ecs/src/storage/mod.rs b/crates/bevy_ecs/src/storage/mod.rs
+index 6e848a042..b2fab3fdc 100644
+--- a/crates/bevy_ecs/src/storage/mod.rs
++++ b/crates/bevy_ecs/src/storage/mod.rs
+@@ -14,5 +14,6 @@ pub use table::*;
+ pub struct Storages {
+     pub sparse_sets: SparseSets,
+     pub tables: Tables,
+-    pub resources: Resources,
++    pub resources: Resources<true>,
++    pub non_send_resources: Resources<false>,
+ }
+diff --git a/crates/bevy_ecs/src/storage/resource.rs b/crates/bevy_ecs/src/storage/resource.rs
+index 01fa742e0..40f555459 100644
+--- a/crates/bevy_ecs/src/storage/resource.rs
++++ b/crates/bevy_ecs/src/storage/resource.rs
+@@ -2,19 +2,61 @@ use crate::archetype::ArchetypeComponentId;
+ use crate::component::{ComponentId, ComponentTicks, Components, TickCells};
+ use crate::storage::{Column, SparseSet, TableRow};
+ use bevy_ptr::{OwningPtr, Ptr, UnsafeCellDeref};
++use std::{mem::ManuallyDrop, thread::ThreadId};
+ 
+ /// The type-erased backing storage and metadata for a single resource within a [`World`].
+ ///
++/// If `SEND` is false, values of this type will panic if dropped from a different thread.
++///
+ /// [`World`]: crate::world::World
+-pub struct ResourceData {
+-    column: Column,
++pub struct ResourceData<const SEND: bool> {
++    column: ManuallyDrop<Column>,
++    type_name: String,
+     id: ArchetypeComponentId,
++    origin_thread_id: Option<ThreadId>,
++}
++
++impl<const SEND: bool> Drop for ResourceData<SEND> {
++    fn drop(&mut self) {
++        if self.is_present() {
++            // If this thread is already panicking, panicking again will cause
++            // the entire process to abort. In this case we choose to avoid
++            // dropping or checking this altogether and just leak the column.
++            if std::thread::panicking() {
++                return;
++            }
++            self.validate_access();
++        }
++        // SAFETY: Drop is only called once upon dropping the ResourceData
++        // and is inaccessible after this as the parent ResourceData has
++        // been dropped. The validate_access call above will check that the
++        // data is dropped on the thread it was inserted from.
++        unsafe {
++            ManuallyDrop::drop(&mut self.column);
++        }
++    }
+ }
+ 
+-impl ResourceData {
++impl<const SEND: bool> ResourceData<SEND> {
+     /// The only row in the underlying column.
+     const ROW: TableRow = TableRow::new(0);
+ 
++    #[inline]
++    fn validate_access(&self) {
++        if SEND {
++            return;
++        }
++        if self.origin_thread_id != Some(std::thread::current().id()) {
++            // Panic in tests, as testing for aborting is nearly impossible
++            panic!(
++                "Attempted to access or drop non-send resource {} from thread {:?} on a thread {:?}. This is not allowed. Aborting.",
++                self.type_name,
++                self.origin_thread_id,
++                std::thread::current().id()
++            );
++        }
++    }
++
+     /// Returns true if the resource is populated.
+     #[inline]
+     pub fn is_present(&self) -> bool {
+@@ -28,9 +70,16 @@ impl ResourceData {
+     }
+ 
+     /// Gets a read-only pointer to the underlying resource, if available.
++    ///
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not accessed from the
++    /// original thread it was inserted from.
+     #[inline]
+     pub fn get_data(&self) -> Option<Ptr<'_>> {
+-        self.column.get_data(Self::ROW)
++        self.column.get_data(Self::ROW).map(|res| {
++            self.validate_access();
++            res
++        })
+     }
+ 
+     /// Gets a read-only reference to the change ticks of the underlying resource, if available.
+@@ -39,26 +88,35 @@ impl ResourceData {
+         self.column.get_ticks(Self::ROW)
+     }
+ 
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not accessed from the
++    /// original thread it was inserted in.
+     #[inline]
+     pub(crate) fn get_with_ticks(&self) -> Option<(Ptr<'_>, TickCells<'_>)> {
+-        self.column.get(Self::ROW)
++        self.column.get(Self::ROW).map(|res| {
++            self.validate_access();
++            res
++        })
+     }
+ 
+     /// Inserts a value into the resource. If a value is already present
+     /// it will be replaced.
+     ///
+-    /// # Safety
+-    /// `value` must be valid for the underlying type for the resource.
+-    ///
+-    /// The underlying type must be [`Send`] or be inserted from the main thread.
+-    /// This can be validated with [`World::validate_non_send_access_untyped`].
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not replaced from
++    /// the original thread it was inserted in.
+     ///
+-    /// [`World::validate_non_send_access_untyped`]: crate::world::World::validate_non_send_access_untyped
++    /// # Safety
++    /// - `value` must be valid for the underlying type for the resource.
+     #[inline]
+     pub(crate) unsafe fn insert(&mut self, value: OwningPtr<'_>, change_tick: u32) {
+         if self.is_present() {
++            self.validate_access();
+             self.column.replace(Self::ROW, value, change_tick);
+         } else {
++            if !SEND {
++                self.origin_thread_id = Some(std::thread::current().id());
++            }
+             self.column.push(value, ComponentTicks::new(change_tick));
+         }
+     }
+@@ -66,13 +124,12 @@ impl ResourceData {
+     /// Inserts a value into the resource with a pre-existing change tick. If a
+     /// value is already present it will be replaced.
+     ///
+-    /// # Safety
+-    /// `value` must be valid for the underlying type for the resource.
+-    ///
+-    /// The underlying type must be [`Send`] or be inserted from the main thread.
+-    /// This can be validated with [`World::validate_non_send_access_untyped`].
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not replaced from
++    /// the original thread it was inserted in.
+     ///
+-    /// [`World::validate_non_send_access_untyped`]: crate::world::World::validate_non_send_access_untyped
++    /// # Safety
++    /// - `value` must be valid for the underlying type for the resource.
+     #[inline]
+     pub(crate) unsafe fn insert_with_ticks(
+         &mut self,
+@@ -80,6 +137,7 @@ impl ResourceData {
+         change_ticks: ComponentTicks,
+     ) {
+         if self.is_present() {
++            self.validate_access();
+             self.column.replace_untracked(Self::ROW, value);
+             *self.column.get_added_ticks_unchecked(Self::ROW).deref_mut() = change_ticks.added;
+             *self
+@@ -87,35 +145,41 @@ impl ResourceData {
+                 .get_changed_ticks_unchecked(Self::ROW)
+                 .deref_mut() = change_ticks.changed;
+         } else {
++            if !SEND {
++                self.origin_thread_id = Some(std::thread::current().id());
++            }
+             self.column.push(value, change_ticks);
+         }
+     }
+ 
+     /// Removes a value from the resource, if present.
+     ///
+-    /// # Safety
+-    /// The underlying type must be [`Send`] or be removed from the main thread.
+-    /// This can be validated with [`World::validate_non_send_access_untyped`].
+-    ///
+-    /// The removed value must be used or dropped.
+-    ///
+-    /// [`World::validate_non_send_access_untyped`]: crate::world::World::validate_non_send_access_untyped
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not removed from the
++    /// original thread it was inserted from.
+     #[inline]
+     #[must_use = "The returned pointer to the removed component should be used or dropped"]
+-    pub(crate) unsafe fn remove(&mut self) -> Option<(OwningPtr<'_>, ComponentTicks)> {
+-        self.column.swap_remove_and_forget(Self::ROW)
++    pub(crate) fn remove(&mut self) -> Option<(OwningPtr<'_>, ComponentTicks)> {
++        if SEND {
++            self.column.swap_remove_and_forget(Self::ROW)
++        } else {
++            self.is_present()
++                .then(|| self.validate_access())
++                .and_then(|_| self.column.swap_remove_and_forget(Self::ROW))
++        }
+     }
+ 
+     /// Removes a value from the resource, if present, and drops it.
+     ///
+-    /// # Safety
+-    /// The underlying type must be [`Send`] or be removed from the main thread.
+-    /// This can be validated with [`World::validate_non_send_access_untyped`].
+-    ///
+-    /// [`World::validate_non_send_access_untyped`]: crate::world::World::validate_non_send_access_untyped
++    /// # Panics
++    /// If `SEND` is false, this will panic if a value is present and is not
++    /// accessed from the original thread it was inserted in.
+     #[inline]
+-    pub(crate) unsafe fn remove_and_drop(&mut self) {
+-        self.column.clear();
++    pub(crate) fn remove_and_drop(&mut self) {
++        if self.is_present() {
++            self.validate_access();
++            self.column.clear();
++        }
+     }
+ }
+ 
+@@ -124,11 +188,11 @@ impl ResourceData {
+ /// [`Resource`]: crate::system::Resource
+ /// [`World`]: crate::world::World
+ #[derive(Default)]
+-pub struct Resources {
+-    resources: SparseSet<ComponentId, ResourceData>,
++pub struct Resources<const SEND: bool> {
++    resources: SparseSet<ComponentId, ResourceData<SEND>>,
+ }
+ 
+-impl Resources {
++impl<const SEND: bool> Resources<SEND> {
+     /// The total number of resources stored in the [`World`]
+     ///
+     /// [`World`]: crate::world::World
+@@ -138,7 +202,7 @@ impl Resources {
+     }
+ 
+     /// Iterate over all resources that have been initialized, i.e. given a [`ComponentId`]
+-    pub fn iter(&self) -> impl Iterator<Item = (ComponentId, &ResourceData)> {
++    pub fn iter(&self) -> impl Iterator<Item = (ComponentId, &ResourceData<SEND>)> {
+         self.resources.iter().map(|(id, data)| (*id, data))
+     }
+ 
+@@ -153,13 +217,13 @@ impl Resources {
+ 
+     /// Gets read-only access to a resource, if it exists.
+     #[inline]
+-    pub fn get(&self, component_id: ComponentId) -> Option<&ResourceData> {
++    pub fn get(&self, component_id: ComponentId) -> Option<&ResourceData<SEND>> {
+         self.resources.get(component_id)
+     }
+ 
+     /// Gets mutable access to a resource, if it exists.
+     #[inline]
+-    pub(crate) fn get_mut(&mut self, component_id: ComponentId) -> Option<&mut ResourceData> {
++    pub(crate) fn get_mut(&mut self, component_id: ComponentId) -> Option<&mut ResourceData<SEND>> {
+         self.resources.get_mut(component_id)
+     }
+ 
+@@ -167,17 +231,23 @@ impl Resources {
+     ///
+     /// # Panics
+     /// Will panic if `component_id` is not valid for the provided `components`
++    /// If `SEND` is false, this will panic if `component_id`'s `ComponentInfo` is not registered as being `Send` + `Sync`.
+     pub(crate) fn initialize_with(
+         &mut self,
+         component_id: ComponentId,
+         components: &Components,
+         f: impl FnOnce() -> ArchetypeComponentId,
+-    ) -> &mut ResourceData {
++    ) -> &mut ResourceData<SEND> {
+         self.resources.get_or_insert_with(component_id, || {
+             let component_info = components.get_info(component_id).unwrap();
++            if SEND {
++                assert!(component_info.is_send_and_sync());
++            }
+             ResourceData {
+-                column: Column::with_capacity(component_info, 1),
++                column: ManuallyDrop::new(Column::with_capacity(component_info, 1)),
++                type_name: String::from(component_info.name()),
+                 id: f(),
++                origin_thread_id: None,
+             }
+         })
+     }
+diff --git a/crates/bevy_ecs/src/system/system_param.rs b/crates/bevy_ecs/src/system/system_param.rs
+index 814ac6316..11605b6bf 100644
+--- a/crates/bevy_ecs/src/system/system_param.rs
++++ b/crates/bevy_ecs/src/system/system_param.rs
+@@ -1038,7 +1038,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+             .add_unfiltered_read(component_id);
+ 
+         let archetype_component_id = world
+-            .get_resource_archetype_component_id(component_id)
++            .get_non_send_archetype_component_id(component_id)
+             .unwrap();
+         system_meta
+             .archetype_component_access
+@@ -1054,9 +1054,8 @@ unsafe impl<'a, T: 'static> SystemParam for NonSend<'a, T> {
+         world: &'w World,
+         change_tick: u32,
+     ) -> Self::Item<'w, 's> {
+-        world.validate_non_send_access::<T>();
+         let (ptr, ticks) = world
+-            .get_resource_with_ticks(component_id)
++            .get_non_send_with_ticks(component_id)
+             .unwrap_or_else(|| {
+                 panic!(
+                     "Non-send resource requested by {} does not exist: {}",
+@@ -1090,9 +1089,8 @@ unsafe impl<T: 'static> SystemParam for Option<NonSend<'_, T>> {
+         world: &'w World,
+         change_tick: u32,
+     ) -> Self::Item<'w, 's> {
+-        world.validate_non_send_access::<T>();
+         world
+-            .get_resource_with_ticks(component_id)
++            .get_non_send_with_ticks(component_id)
+             .map(|(ptr, ticks)| NonSend {
+                 value: ptr.deref(),
+                 ticks: ticks.read(),
+@@ -1130,7 +1128,7 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+             .add_unfiltered_write(component_id);
+ 
+         let archetype_component_id = world
+-            .get_resource_archetype_component_id(component_id)
++            .get_non_send_archetype_component_id(component_id)
+             .unwrap();
+         system_meta
+             .archetype_component_access
+@@ -1146,9 +1144,8 @@ unsafe impl<'a, T: 'static> SystemParam for NonSendMut<'a, T> {
+         world: &'w World,
+         change_tick: u32,
+     ) -> Self::Item<'w, 's> {
+-        world.validate_non_send_access::<T>();
+         let (ptr, ticks) = world
+-            .get_resource_with_ticks(component_id)
++            .get_non_send_with_ticks(component_id)
+             .unwrap_or_else(|| {
+                 panic!(
+                     "Non-send resource requested by {} does not exist: {}",
+@@ -1179,9 +1176,8 @@ unsafe impl<'a, T: 'static> SystemParam for Option<NonSendMut<'a, T>> {
+         world: &'w World,
+         change_tick: u32,
+     ) -> Self::Item<'w, 's> {
+-        world.validate_non_send_access::<T>();
+         world
+-            .get_resource_with_ticks(component_id)
++            .get_non_send_with_ticks(component_id)
+             .map(|(ptr, ticks)| NonSendMut {
+                 value: ptr.assert_unique().deref_mut(),
+                 ticks: Ticks::from_tick_cells(ticks, system_meta.last_change_tick, change_tick),
+diff --git a/crates/bevy_ecs/src/world/mod.rs b/crates/bevy_ecs/src/world/mod.rs
+index e4569f6be..3146f2a97 100644
+--- a/crates/bevy_ecs/src/world/mod.rs
++++ b/crates/bevy_ecs/src/world/mod.rs
+@@ -16,6 +16,7 @@ use crate::{
+     },
+     entity::{AllocAtWithoutReplacement, Entities, Entity, EntityLocation},
+     event::{Event, Events},
++    ptr::UnsafeCellDeref,
+     query::{QueryState, ReadOnlyWorldQuery, WorldQuery},
+     storage::{ResourceData, SparseSet, Storages},
+     system::Resource,
+@@ -60,7 +61,6 @@ pub struct World {
+     pub(crate) removed_components: SparseSet<ComponentId, Vec<Entity>>,
+     /// Access cache used by [WorldCell].
+     pub(crate) archetype_component_access: ArchetypeComponentAccess,
+-    main_thread_validator: MainThreadValidator,
+     pub(crate) change_tick: AtomicU32,
+     pub(crate) last_change_tick: u32,
+ }
+@@ -76,7 +76,6 @@ impl Default for World {
+             bundles: Default::default(),
+             removed_components: Default::default(),
+             archetype_component_access: Default::default(),
+-            main_thread_validator: Default::default(),
+             // Default value is `1`, and `last_change_tick`s default to `0`, such that changes
+             // are detected on first system runs and for direct world queries.
+             change_tick: AtomicU32::new(1),
+@@ -803,7 +802,7 @@ impl World {
+     /// Panics if called from a thread other than the main thread.
+     #[inline]
+     pub fn init_non_send_resource<R: 'static + FromWorld>(&mut self) {
+-        if !self.contains_resource::<R>() {
++        if !self.contains_non_send::<R>() {
+             let resource = R::from_world(self);
+             self.insert_non_send_resource(resource);
+         }
+@@ -816,16 +815,15 @@ impl World {
+     /// Systems with `NonSend` resources are always scheduled on the main thread.
+     ///
+     /// # Panics
+-    ///
+-    /// Panics if called from a thread other than the main thread.
++    /// If a value is already present, this function will panic if called
++    /// from a different thread than where the original value was inserted from.
+     #[inline]
+     pub fn insert_non_send_resource<R: 'static>(&mut self, value: R) {
+-        self.validate_non_send_access::<R>();
+         let component_id = self.components.init_non_send::<R>();
+         OwningPtr::make(value, |ptr| {
+             // SAFETY: component_id was just initialized and corresponds to resource of type R
+             unsafe {
+-                self.insert_resource_by_id(component_id, ptr);
++                self.insert_non_send_by_id(component_id, ptr);
+             }
+         });
+     }
+@@ -833,37 +831,51 @@ impl World {
+     /// Removes the resource of a given type and returns it, if it exists. Otherwise returns [None].
+     #[inline]
+     pub fn remove_resource<R: Resource>(&mut self) -> Option<R> {
+-        // SAFETY: R is Send + Sync
+-        unsafe { self.remove_resource_unchecked() }
++        let component_id = self.components.get_resource_id(TypeId::of::<R>())?;
++        let (ptr, _) = self.storages.resources.get_mut(component_id)?.remove()?;
++        // SAFETY: `component_id` was gotten via looking up the `R` type
++        unsafe { Some(ptr.read::<R>()) }
+     }
+ 
++    /// Removes a `!Send` resource from the world and returns it, if present.
++    ///
++    /// `NonSend` resources cannot be sent across threads,
++    /// and do not need the `Send + Sync` bounds.
++    /// Systems with `NonSend` resources are always scheduled on the main thread.
++    ///
++    /// Returns `None` if a value was not previously present.
++    ///
++    /// # Panics
++    /// If a value is present, this function will panic if called from a different
++    /// thread than where the value was inserted from.
+     #[inline]
+     pub fn remove_non_send_resource<R: 'static>(&mut self) -> Option<R> {
+-        self.validate_non_send_access::<R>();
+-        // SAFETY: we are on main thread
+-        unsafe { self.remove_resource_unchecked() }
++        let component_id = self.components.get_resource_id(TypeId::of::<R>())?;
++        let (ptr, _) = self
++            .storages
++            .non_send_resources
++            .get_mut(component_id)?
++            .remove()?;
++        // SAFETY: `component_id` was gotten via looking up the `R` type
++        unsafe { Some(ptr.read::<R>()) }
+     }
+ 
++    /// Returns `true` if a resource of type `R` exists. Otherwise returns `false`.
+     #[inline]
+-    /// # Safety
+-    /// Only remove `NonSend` resources from the main thread
+-    /// as they cannot be sent across threads
+-    #[allow(unused_unsafe)]
+-    pub unsafe fn remove_resource_unchecked<R: 'static>(&mut self) -> Option<R> {
+-        let component_id = self.components.get_resource_id(TypeId::of::<R>())?;
+-        // SAFETY: the resource is of type R and the value is returned back to the caller.
+-        unsafe {
+-            let (ptr, _) = self.storages.resources.get_mut(component_id)?.remove()?;
+-            Some(ptr.read::<R>())
+-        }
++    pub fn contains_resource<R: Resource>(&self) -> bool {
++        self.components
++            .get_resource_id(TypeId::of::<R>())
++            .and_then(|component_id| self.storages.resources.get(component_id))
++            .map(|info| info.is_present())
++            .unwrap_or(false)
+     }
+ 
+     /// Returns `true` if a resource of type `R` exists. Otherwise returns `false`.
+     #[inline]
+-    pub fn contains_resource<R: 'static>(&self) -> bool {
++    pub fn contains_non_send<R: 'static>(&self) -> bool {
+         self.components
+             .get_resource_id(TypeId::of::<R>())
+-            .and_then(|component_id| self.storages.resources.get(component_id))
++            .and_then(|component_id| self.storages.non_send_resources.get(component_id))
+             .map(|info| info.is_present())
+             .unwrap_or(false)
+     }
+@@ -979,6 +991,8 @@ impl World {
+     ///
+     /// Panics if the resource does not exist.
+     /// Use [`get_non_send_resource`](World::get_non_send_resource) instead if you want to handle this case.
++    ///
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
+     #[inline]
+     #[track_caller]
+     pub fn non_send_resource<R: 'static>(&self) -> &R {
+@@ -999,6 +1013,8 @@ impl World {
+     ///
+     /// Panics if the resource does not exist.
+     /// Use [`get_non_send_resource_mut`](World::get_non_send_resource_mut) instead if you want to handle this case.
++    ///
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
+     #[inline]
+     #[track_caller]
+     pub fn non_send_resource_mut<R: 'static>(&mut self) -> Mut<'_, R> {
+@@ -1014,7 +1030,10 @@ impl World {
+     }
+ 
+     /// Gets a reference to the non-send resource of the given type, if it exists.
+-    /// Otherwise returns [None]
++    /// Otherwise returns [None].
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
+     #[inline]
+     pub fn get_non_send_resource<R: 'static>(&self) -> Option<&R> {
+         let component_id = self.components.get_resource_id(TypeId::of::<R>())?;
+@@ -1024,6 +1043,9 @@ impl World {
+ 
+     /// Gets a mutable reference to the non-send resource of the given type, if it exists.
+     /// Otherwise returns [None]
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
+     #[inline]
+     pub fn get_non_send_resource_mut<R: 'static>(&mut self) -> Option<Mut<'_, R>> {
+         // SAFETY: unique world access
+@@ -1033,6 +1055,9 @@ impl World {
+     /// Gets a mutable reference to the non-send resource of the given type, if it exists.
+     /// Otherwise returns [None]
+     ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
++    ///
+     /// # Safety
+     /// This will allow aliased mutable access to the given non-send resource type. The caller must
+     /// ensure that there is either only one mutable access or multiple immutable accesses at a time.
+@@ -1051,6 +1076,21 @@ impl World {
+         self.storages.resources.get(component_id)?.get_with_ticks()
+     }
+ 
++    // Shorthand helper function for getting the data and change ticks for a resource.
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
++    #[inline]
++    pub(crate) fn get_non_send_with_ticks(
++        &self,
++        component_id: ComponentId,
++    ) -> Option<(Ptr<'_>, TickCells<'_>)> {
++        self.storages
++            .non_send_resources
++            .get(component_id)?
++            .get_with_ticks()
++    }
++
+     // Shorthand helper function for getting the [`ArchetypeComponentId`] for a resource.
+     #[inline]
+     pub(crate) fn get_resource_archetype_component_id(
+@@ -1061,6 +1101,16 @@ impl World {
+         Some(resource.id())
+     }
+ 
++    // Shorthand helper function for getting the [`ArchetypeComponentId`] for a resource.
++    #[inline]
++    pub(crate) fn get_non_send_archetype_component_id(
++        &self,
++        component_id: ComponentId,
++    ) -> Option<ArchetypeComponentId> {
++        let resource = self.storages.non_send_resources.get(component_id)?;
++        Some(resource.id())
++    }
++
+     /// For a given batch of ([Entity], [Bundle]) pairs, either spawns each [Entity] with the given
+     /// bundle (if the entity does not exist), or inserts the [Bundle] (if the entity already exists).
+     /// This is faster than doing equivalent operations one-by-one.
+@@ -1207,13 +1257,7 @@ impl World {
+     /// });
+     /// assert_eq!(world.get_resource::<A>().unwrap().0, 2);
+     /// ```
+-    pub fn resource_scope<
+-        R: 'static, /* The resource doesn't need to be Send nor Sync. */
+-        U,
+-    >(
+-        &mut self,
+-        f: impl FnOnce(&mut World, Mut<R>) -> U,
+-    ) -> U {
++    pub fn resource_scope<R: Resource, U>(&mut self, f: impl FnOnce(&mut World, Mut<R>) -> U) -> U {
+         let last_change_tick = self.last_change_tick();
+         let change_tick = self.change_tick();
+ 
+@@ -1222,17 +1266,11 @@ impl World {
+             .get_resource_id(TypeId::of::<R>())
+             .unwrap_or_else(|| panic!("resource does not exist: {}", std::any::type_name::<R>()));
+         // If the resource isn't send and sync, validate that we are on the main thread, so that we can access it.
+-        let component_info = self.components().get_info(component_id).unwrap();
+-        if !component_info.is_send_and_sync() {
+-            self.validate_non_send_access::<R>();
+-        }
+-
+         let (ptr, mut ticks) = self
+             .storages
+             .resources
+             .get_mut(component_id)
+-            // SAFETY: The type R is Send and Sync or we've already validated that we're on the main thread.
+-            .and_then(|info| unsafe { info.remove() })
++            .and_then(|info| info.remove())
+             .unwrap_or_else(|| panic!("resource does not exist: {}", std::any::type_name::<R>()));
+         // Read the value onto the stack to avoid potential mut aliasing.
+         // SAFETY: pointer is of type R
+@@ -1331,8 +1369,13 @@ impl World {
+         &self,
+         component_id: ComponentId,
+     ) -> Option<&R> {
+-        self.validate_non_send_access::<R>();
+-        self.get_resource_with_id(component_id)
++        Some(
++            self.storages
++                .non_send_resources
++                .get(component_id)?
++                .get_data()?
++                .deref::<R>(),
++        )
+     }
+ 
+     /// # Safety
+@@ -1343,8 +1386,20 @@ impl World {
+         &self,
+         component_id: ComponentId,
+     ) -> Option<Mut<'_, R>> {
+-        self.validate_non_send_access::<R>();
+-        self.get_resource_unchecked_mut_with_id(component_id)
++        let (ptr, ticks) = self
++            .storages
++            .non_send_resources
++            .get(component_id)?
++            .get_with_ticks()?;
++        Some(Mut {
++            value: ptr.assert_unique().deref_mut(),
++            ticks: Ticks {
++                added: ticks.added.deref_mut(),
++                changed: ticks.changed.deref_mut(),
++                last_change_tick: self.last_change_tick(),
++                change_tick: self.read_change_tick(),
++            },
++        })
+     }
+ 
+     /// Inserts a new resource with the given `value`. Will replace the value if it already existed.
+@@ -1353,8 +1408,7 @@ impl World {
+     /// use this in cases where the actual types are not known at compile time.**
+     ///
+     /// # Safety
+-    /// The value referenced by `value` must be valid for the given [`ComponentId`] of this world
+-    /// `component_id` must exist in this [`World`]
++    /// The value referenced by `value` must be valid for the given [`ComponentId`] of this world.
+     #[inline]
+     pub unsafe fn insert_resource_by_id(
+         &mut self,
+@@ -1363,18 +1417,43 @@ impl World {
+     ) {
+         let change_tick = self.change_tick();
+ 
+-        // SAFETY: component_id is valid, ensured by caller
++        // SAFETY: value is valid for component_id, ensured by caller
+         self.initialize_resource_internal(component_id)
+             .insert(value, change_tick);
+     }
+ 
++    /// Inserts a new `!Send` resource with the given `value`. Will replace the value if it already
++    /// existed.
++    ///
++    /// **You should prefer to use the typed API [`World::insert_non_send_resource`] where possible and only
++    /// use this in cases where the actual types are not known at compile time.**
++    ///
++    /// # Panics
++    /// If a value is already present, this function will panic if not called from the same
++    /// thread that the original value was inserted from.
++    ///
+     /// # Safety
+-    /// `component_id` must be valid for this world
++    /// The value referenced by `value` must be valid for the given [`ComponentId`] of this world.
+     #[inline]
+-    unsafe fn initialize_resource_internal(
++    pub unsafe fn insert_non_send_by_id(
+         &mut self,
+         component_id: ComponentId,
+-    ) -> &mut ResourceData {
++        value: OwningPtr<'_>,
++    ) {
++        let change_tick = self.change_tick();
++
++        // SAFETY: value is valid for component_id, ensured by caller
++        self.initialize_non_send_internal(component_id)
++            .insert(value, change_tick);
++    }
++
++    /// # Panics
++    /// Panics if `component_id` is not registered as a `Send` component type in this `World`
++    #[inline]
++    fn initialize_resource_internal(
++        &mut self,
++        component_id: ComponentId,
++    ) -> &mut ResourceData<true> {
+         let archetype_component_count = &mut self.archetypes.archetype_component_count;
+         self.storages
+             .resources
+@@ -1385,36 +1464,35 @@ impl World {
+             })
+     }
+ 
++    /// # Panics
++    /// panics if `component_id` is not registered in this world
++    #[inline]
++    fn initialize_non_send_internal(
++        &mut self,
++        component_id: ComponentId,
++    ) -> &mut ResourceData<false> {
++        let archetype_component_count = &mut self.archetypes.archetype_component_count;
++        self.storages
++            .non_send_resources
++            .initialize_with(component_id, &self.components, || {
++                let id = ArchetypeComponentId::new(*archetype_component_count);
++                *archetype_component_count += 1;
++                id
++            })
++    }
++
+     pub(crate) fn initialize_resource<R: Resource>(&mut self) -> ComponentId {
+         let component_id = self.components.init_resource::<R>();
+-        // SAFETY: resource initialized above
+-        unsafe { self.initialize_resource_internal(component_id) };
++        self.initialize_resource_internal(component_id);
+         component_id
+     }
+ 
+     pub(crate) fn initialize_non_send_resource<R: 'static>(&mut self) -> ComponentId {
+         let component_id = self.components.init_non_send::<R>();
+-        // SAFETY: resource initialized above
+-        unsafe { self.initialize_resource_internal(component_id) };
++        self.initialize_non_send_internal(component_id);
+         component_id
+     }
+ 
+-    pub(crate) fn validate_non_send_access<T: 'static>(&self) {
+-        assert!(
+-            self.main_thread_validator.is_main_thread(),
+-            "attempted to access NonSend resource {} off of the main thread",
+-            std::any::type_name::<T>(),
+-        );
+-    }
+-
+-    pub(crate) fn validate_non_send_access_untyped(&self, name: &str) {
+-        assert!(
+-            self.main_thread_validator.is_main_thread(),
+-            "attempted to access NonSend resource {} off of the main thread",
+-            name
+-        );
+-    }
+-
+     /// Empties queued entities and adds them to the empty [Archetype](crate::archetype::Archetype).
+     /// This should be called before doing operations that might operate on queued entities,
+     /// such as inserting a [Component].
+@@ -1464,9 +1542,16 @@ impl World {
+         // Iterate over all component change ticks, clamping their age to max age
+         // PERF: parallelize
+         let change_tick = self.change_tick();
+-        self.storages.tables.check_change_ticks(change_tick);
+-        self.storages.sparse_sets.check_change_ticks(change_tick);
+-        self.storages.resources.check_change_ticks(change_tick);
++        let Storages {
++            ref mut tables,
++            ref mut sparse_sets,
++            ref mut resources,
++            ref mut non_send_resources,
++        } = self.storages;
++        tables.check_change_ticks(change_tick);
++        sparse_sets.check_change_ticks(change_tick);
++        resources.check_change_ticks(change_tick);
++        non_send_resources.check_change_ticks(change_tick);
+     }
+ 
+     pub fn clear_entities(&mut self) {
+@@ -1486,10 +1571,6 @@ impl World {
+     /// use this in cases where the actual types are not known at compile time.**
+     #[inline]
+     pub fn get_resource_by_id(&self, component_id: ComponentId) -> Option<Ptr<'_>> {
+-        let info = self.components.get_info(component_id)?;
+-        if !info.is_send_and_sync() {
+-            self.validate_non_send_access_untyped(info.name());
+-        }
+         self.storages.resources.get(component_id)?.get_data()
+     }
+ 
+@@ -1501,13 +1582,7 @@ impl World {
+     /// use this in cases where the actual types are not known at compile time.**
+     #[inline]
+     pub fn get_resource_mut_by_id(&mut self, component_id: ComponentId) -> Option<MutUntyped<'_>> {
+-        let info = self.components.get_info(component_id)?;
+-        if !info.is_send_and_sync() {
+-            self.validate_non_send_access_untyped(info.name());
+-        }
+-
+         let change_tick = self.change_tick();
+-
+         let (ptr, ticks) = self.get_resource_with_ticks(component_id)?;
+ 
+         // SAFETY: This function has exclusive access to the world so nothing aliases `ticks`.
+@@ -1522,22 +1597,73 @@ impl World {
+         })
+     }
+ 
++    /// Gets a `!Send` resource to the resource with the id [`ComponentId`] if it exists.
++    /// The returned pointer must not be used to modify the resource, and must not be
++    /// dereferenced after the immutable borrow of the [`World`] ends.
++    ///
++    /// **You should prefer to use the typed API [`World::get_resource`] where possible and only
++    /// use this in cases where the actual types are not known at compile time.**
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
++    #[inline]
++    pub fn get_non_send_by_id(&self, component_id: ComponentId) -> Option<Ptr<'_>> {
++        self.storages
++            .non_send_resources
++            .get(component_id)?
++            .get_data()
++    }
++
++    /// Gets a `!Send` resource to the resource with the id [`ComponentId`] if it exists.
++    /// The returned pointer may be used to modify the resource, as long as the mutable borrow
++    /// of the [`World`] is still valid.
++    ///
++    /// **You should prefer to use the typed API [`World::get_resource_mut`] where possible and only
++    /// use this in cases where the actual types are not known at compile time.**
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
++    #[inline]
++    pub fn get_non_send_mut_by_id(&mut self, component_id: ComponentId) -> Option<MutUntyped<'_>> {
++        let change_tick = self.change_tick();
++        let (ptr, ticks) = self.get_non_send_with_ticks(component_id)?;
++
++        // SAFETY: This function has exclusive access to the world so nothing aliases `ticks`.
++        // - index is in-bounds because the column is initialized and non-empty
++        // - no other reference to the ticks of the same row can exist at the same time
++        let ticks = unsafe { Ticks::from_tick_cells(ticks, self.last_change_tick(), change_tick) };
++
++        Some(MutUntyped {
++            // SAFETY: This function has exclusive access to the world so nothing aliases `ptr`.
++            value: unsafe { ptr.assert_unique() },
++            ticks,
++        })
++    }
++
+     /// Removes the resource of a given type, if it exists. Otherwise returns [None].
+     ///
+     /// **You should prefer to use the typed API [`World::remove_resource`] where possible and only
+     /// use this in cases where the actual types are not known at compile time.**
+     pub fn remove_resource_by_id(&mut self, component_id: ComponentId) -> Option<()> {
+-        let info = self.components.get_info(component_id)?;
+-        if !info.is_send_and_sync() {
+-            self.validate_non_send_access_untyped(info.name());
+-        }
+-        // SAFETY: The underlying type is Send and Sync or we've already validated we're on the main thread
+-        unsafe {
+-            self.storages
+-                .resources
+-                .get_mut(component_id)?
+-                .remove_and_drop();
+-        }
++        self.storages
++            .resources
++            .get_mut(component_id)?
++            .remove_and_drop();
++        Some(())
++    }
++
++    /// Removes the resource of a given type, if it exists. Otherwise returns [None].
++    ///
++    /// **You should prefer to use the typed API [`World::remove_resource`] where possible and only
++    /// use this in cases where the actual types are not known at compile time.**
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
++    pub fn remove_non_send_by_id(&mut self, component_id: ComponentId) -> Option<()> {
++        self.storages
++            .non_send_resources
++            .get_mut(component_id)?
++            .remove_and_drop();
+         Some(())
+     }
+ 
+@@ -1546,6 +1672,9 @@ impl World {
+     ///
+     /// **You should prefer to use the typed API [`World::get_mut`] where possible and only
+     /// use this in cases where the actual types are not known at compile time.**
++    ///
++    /// # Panics
++    /// This function will panic if it isn't called from the same thread that the resource was inserted from.
+     #[inline]
+     pub fn get_by_id(&self, entity: Entity, component_id: ComponentId) -> Option<Ptr<'_>> {
+         let info = self.components().get_info(component_id)?;
+@@ -1622,24 +1751,6 @@ impl<T: Default> FromWorld for T {
+     }
+ }
+ 
+-struct MainThreadValidator {
+-    main_thread: std::thread::ThreadId,
+-}
+-
+-impl MainThreadValidator {
+-    fn is_main_thread(&self) -> bool {
+-        self.main_thread == std::thread::current().id()
+-    }
+-}
+-
+-impl Default for MainThreadValidator {
+-    fn default() -> Self {
+-        Self {
+-            main_thread: std::thread::current().id(),
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::World;
+diff --git a/crates/bevy_ecs/src/world/world_cell.rs b/crates/bevy_ecs/src/world/world_cell.rs
+index 5f0fb5aaa..8e6699e07 100644
+--- a/crates/bevy_ecs/src/world/world_cell.rs
++++ b/crates/bevy_ecs/src/world/world_cell.rs
+@@ -256,7 +256,7 @@ impl<'w> WorldCell<'w> {
+         let component_id = self.world.components.get_resource_id(TypeId::of::<T>())?;
+         let archetype_component_id = self
+             .world
+-            .get_resource_archetype_component_id(component_id)?;
++            .get_non_send_archetype_component_id(component_id)?;
+         WorldBorrow::try_new(
+             // SAFETY: ComponentId matches TypeId
+             || unsafe { self.world.get_non_send_with_id(component_id) },
+@@ -289,7 +289,7 @@ impl<'w> WorldCell<'w> {
+         let component_id = self.world.components.get_resource_id(TypeId::of::<T>())?;
+         let archetype_component_id = self
+             .world
+-            .get_resource_archetype_component_id(component_id)?;
++            .get_non_send_archetype_component_id(component_id)?;
+         WorldBorrowMut::try_new(
+             // SAFETY: ComponentId matches TypeId and access is checked by WorldBorrowMut
+             || unsafe { self.world.get_non_send_unchecked_mut_with_id(component_id) },
+diff --git a/crates/bevy_render/src/view/window.rs b/crates/bevy_render/src/view/window.rs
+index 8e6f82c66..c5b0499b0 100644
+--- a/crates/bevy_render/src/view/window.rs
++++ b/crates/bevy_render/src/view/window.rs
+@@ -29,7 +29,7 @@ impl Plugin for WindowRenderPlugin {
+             render_app
+                 .init_resource::<ExtractedWindows>()
+                 .init_resource::<WindowSurfaces>()
+-                .init_resource::<NonSendMarker>()
++                .init_non_send_resource::<NonSendMarker>()
+                 .add_system_to_stage(RenderStage::Extract, extract_windows)
+                 .add_system_to_stage(
+                     RenderStage::Prepare,

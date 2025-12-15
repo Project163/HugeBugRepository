@@ -1,0 +1,180 @@
+diff --git a/src/yb/client/ql-transaction-test.cc b/src/yb/client/ql-transaction-test.cc
+index 87dc764e5a..e02164f4f7 100644
+--- a/src/yb/client/ql-transaction-test.cc
++++ b/src/yb/client/ql-transaction-test.cc
+@@ -49,7 +49,7 @@ using yb::tablet::TabletPeer;
+ DECLARE_uint64(transaction_heartbeat_usec);
+ DECLARE_int32(log_min_seconds_to_retain);
+ DECLARE_uint64(max_clock_skew_usec);
+-DECLARE_bool(transaction_allow_rerequest_status_in_tests);
++DECLARE_bool(TEST_transaction_allow_rerequest_status);
+ DECLARE_uint64(TEST_transaction_delay_status_reply_usec_in_tests);
+ DECLARE_bool(enable_load_balancing);
+ DECLARE_bool(flush_rocksdb_on_shutdown);
+@@ -210,7 +210,7 @@ TEST_F(QLTransactionTest, ReadRestartWithIntents) {
+ }
+ 
+ TEST_F(QLTransactionTest, ReadRestartWithPendingIntents) {
+-  FLAGS_transaction_allow_rerequest_status_in_tests = false;
++  FLAGS_TEST_transaction_allow_rerequest_status = false;
+   DisableApplyingIntents();
+   TestReadRestart(false /* commit */);
+ }
+diff --git a/src/yb/docdb/intent_aware_iterator.cc b/src/yb/docdb/intent_aware_iterator.cc
+index 0a9d8d2bb6..171a6cf9a8 100644
+--- a/src/yb/docdb/intent_aware_iterator.cc
++++ b/src/yb/docdb/intent_aware_iterator.cc
+@@ -31,10 +31,11 @@
+ #include "yb/server/hybrid_clock.h"
+ #include "yb/util/backoff_waiter.h"
+ #include "yb/util/bytes_formatter.h"
++#include "yb/util/tsan_util.h"
+ 
+ using namespace std::literals;
+ 
+-DEFINE_bool(transaction_allow_rerequest_status_in_tests, true,
++DEFINE_bool(TEST_transaction_allow_rerequest_status, true,
+             "Allow rerequest transaction status when try again is received.");
+ 
+ namespace yb {
+@@ -108,6 +109,11 @@ Result<HybridTime> TransactionStatusCache::GetCommitTime(const TransactionId& tr
+   return result;
+ }
+ 
++Status StatusWaitTimedOut(const TransactionId& transaction_id) {
++  return STATUS_FORMAT(
++      TimedOut, "Timed out waiting for transaction status: $0", transaction_id);
++}
++
+ Result<HybridTime> TransactionStatusCache::DoGetCommitTime(const TransactionId& transaction_id) {
+   HybridTime local_commit_time = GetLocalCommitTime(transaction_id);
+   if (local_commit_time.is_valid()) {
+@@ -116,7 +122,9 @@ Result<HybridTime> TransactionStatusCache::DoGetCommitTime(const TransactionId&
+ 
+   // Since TransactionStatusResult does not have default ctor we should init it somehow.
+   TransactionStatusResult txn_status(TransactionStatus::ABORTED, HybridTime());
+-  const auto kMaxWait = 50ms;
++  const auto kMaxWait = 50ms * kTimeMultiplier;
++  const auto kRequestTimeout = kMaxWait;
++  bool retry_allowed = FLAGS_TEST_transaction_allow_rerequest_status;
+   CoarseBackoffWaiter waiter(deadline_, kMaxWait);
+   static const std::string kRequestReason = "get commit time"s;
+   for(;;) {
+@@ -130,7 +138,9 @@ Result<HybridTime> TransactionStatusCache::DoGetCommitTime(const TransactionId&
+               &kRequestReason,
+               TransactionLoadFlags{TransactionLoadFlag::kCleanup},
+               callback});
+-    auto future_status = future.wait_for(waiter.DelayForNow());
++    auto wait_start = CoarseMonoClock::now();
++    auto future_status = future.wait_until(
++        retry_allowed ? wait_start + kRequestTimeout : deadline_);
+     if (future_status == std::future_status::ready) {
+       auto txn_status_result = future.get();
+       if (txn_status_result.ok()) {
+@@ -143,19 +153,25 @@ Result<HybridTime> TransactionStatusCache::DoGetCommitTime(const TransactionId&
+         return HybridTime::kMin;
+       }
+       LOG(WARNING)
+-          << "Failed to request transaction " << yb::ToString(transaction_id) << " status: "
++          << "Failed to request transaction " << transaction_id << " status: "
+           <<  txn_status_result.status();
+       if (!txn_status_result.status().IsTryAgain()) {
+         return std::move(txn_status_result.status());
+       }
++      if (!waiter.Wait()) {
++        return StatusWaitTimedOut(transaction_id);
++      }
+     } else {
+-      LOG(INFO) << "Timed out waiting txn status, left to deadline: "
+-                << MonoDelta(deadline_ - CoarseMonoClock::now());
+-    }
+-    DCHECK(FLAGS_transaction_allow_rerequest_status_in_tests);
+-    if (!waiter.Wait()) {
+-      return STATUS(TimedOut, "Timed out waiting for transaction status");
++      LOG(INFO) << "TXN: " << transaction_id << ": Timed out waiting txn status, waited: "
++                << MonoDelta(CoarseMonoClock::now() - wait_start)
++                << ", future status: " << to_underlying(future_status)
++                << ", left to deadline: " << MonoDelta(deadline_ - CoarseMonoClock::now());
++      if (waiter.ExpiredNow()) {
++        return StatusWaitTimedOut(transaction_id);
++      }
++      waiter.NextAttempt();
+     }
++    DCHECK(retry_allowed);
+   }
+   VLOG(4) << "Transaction_id " << transaction_id << " at " << read_time_
+           << ": status: " << TransactionStatus_Name(txn_status.status)
+diff --git a/src/yb/util/backoff_waiter.h b/src/yb/util/backoff_waiter.h
+index 1b44bc32bb..a714428b86 100644
+--- a/src/yb/util/backoff_waiter.h
++++ b/src/yb/util/backoff_waiter.h
+@@ -29,34 +29,50 @@ class GenericBackoffWaiter {
+   typedef typename Clock::time_point TimePoint;
+   typedef typename Clock::duration Duration;
+ 
++  // deadline - time when waiter decides that it is expired.
++  // max_wait - max duration for single wait.
++  // base_delay - multiplier for wait duration.
+   explicit GenericBackoffWaiter(
+-      TimePoint deadline, Duration max_wait = Duration::max())
+-      : deadline_(deadline), max_wait_(max_wait) {}
++      TimePoint deadline, Duration max_wait = Duration::max(),
++      Duration base_delay = std::chrono::milliseconds(1))
++      : deadline_(deadline), max_wait_(max_wait), base_delay_(base_delay) {}
++
++  bool ExpiredNow() const {
++    return ExpiredAt(Clock::now());
++  }
++
++  bool ExpiredAt(TimePoint time) const {
++    return time >= deadline_;
++  }
+ 
+   bool Wait() {
+     auto now = Clock::now();
+-    if (now >= deadline_) {
++    if (ExpiredAt(now)) {
+       return false;
+     }
+ 
+-    ++attempt_;
++    NextAttempt();
+ 
+     std::this_thread::sleep_for(DelayForTime(now));
+     return true;
+   }
+ 
++  void NextAttempt() {
++    ++attempt_;
++  }
++
+   Duration DelayForNow() const {
+     return DelayForTime(Clock::now());
+   }
+ 
+   Duration DelayForTime(TimePoint now) const {
+-    auto max_wait = std::min(deadline_ - now, max_wait_);
+-    int64_t base_delay_ms = attempt_ >= 29
+-        ? std::numeric_limits<int32_t>::max()
+-        : 1LL << (attempt_ + 3); // 1st retry delayed 2^4 ms, 2nd 2^5, etc..
+-    int64_t jitter_ms = RandomUniformInt(0, 50);
+-    return std::min<decltype(max_wait)>(
+-        std::chrono::milliseconds(base_delay_ms + jitter_ms), max_wait);
++    Duration max_wait = std::min(deadline_ - now, max_wait_);
++    // 1st retry delayed 2^4 of base delays, 2nd 2^5 base delays, etc..
++    Duration attempt_delay =
++        base_delay_ *
++        (attempt_ >= 29 ? std::numeric_limits<int32_t>::max() : 1LL << (attempt_ + 3));
++    Duration jitter = std::chrono::milliseconds(RandomUniformInt(0, 50));
++    return std::min(attempt_delay + jitter, max_wait);
+   }
+ 
+   size_t attempt() const {
+@@ -72,6 +88,7 @@ class GenericBackoffWaiter {
+   TimePoint deadline_;
+   size_t attempt_ = 0;
+   Duration max_wait_;
++  Duration base_delay_;
+ };
+ 
+ typedef GenericBackoffWaiter<std::chrono::steady_clock> BackoffWaiter;

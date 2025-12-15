@@ -1,0 +1,313 @@
+diff --git a/src/yb/master/backfill_index.cc b/src/yb/master/backfill_index.cc
+index 9e3cec9038..74aab2255b 100644
+--- a/src/yb/master/backfill_index.cc
++++ b/src/yb/master/backfill_index.cc
+@@ -40,14 +40,15 @@
+ #include "yb/gutil/strings/escaping.h"
+ #include "yb/gutil/strings/substitute.h"
+ 
+-#include "yb/master/master_fwd.h"
+ #include "yb/master/async_rpc_tasks.h"
+ #include "yb/master/catalog_manager.h"
+ #include "yb/master/master.h"
+ #include "yb/master/master_ddl.pb.h"
++#include "yb/master/master_fwd.h"
+ #include "yb/master/sys_catalog.h"
+ #include "yb/master/tablet_split_manager.h"
+ #include "yb/master/xcluster/xcluster_manager_if.h"
++#include "yb/master/ysql/ysql_manager_if.h"
+ 
+ #include "yb/tablet/tablet.h"
+ #include "yb/tablet/tablet_metadata.h"
+@@ -137,47 +138,6 @@ using tserver::TabletServerErrorPB;
+ 
+ namespace {
+ 
+-// Peek into pg_index table to get an index (boolean) status from YSQL perspective.
+-Result<bool> GetPgIndexStatus(
+-    CatalogManager* catalog_manager,
+-    const TableId& idx_id,
+-    const std::string& status_col_name) {
+-  const auto pg_index_id =
+-      GetPgsqlTableId(VERIFY_RESULT(GetPgsqlDatabaseOid(idx_id)), kPgIndexTableOid);
+-
+-  const auto catalog_tablet = VERIFY_RESULT(catalog_manager->tablet_peer()->shared_tablet());
+-  const Schema& pg_index_schema =
+-      VERIFY_RESULT(catalog_tablet->metadata()->GetTableInfo(pg_index_id))->schema();
+-
+-  const auto indexrelid_col_id = VERIFY_RESULT(pg_index_schema.ColumnIdByName("indexrelid")).rep();
+-  const auto status_col_id = VERIFY_RESULT(pg_index_schema.ColumnIdByName(status_col_name)).rep();
+-  dockv::ReaderProjection projection(pg_index_schema, {indexrelid_col_id, status_col_id});
+-
+-  const auto idx_oid = VERIFY_RESULT(GetPgsqlTableOid(idx_id));
+-
+-  auto iter = VERIFY_RESULT(catalog_tablet->NewUninitializedDocRowIterator(
+-      projection, {} /* read_hybrid_time */, pg_index_id));
+-
+-  // Filtering by 'indexrelid' == idx_oid.
+-  {
+-    PgsqlConditionPB cond;
+-    cond.add_operands()->set_column_id(indexrelid_col_id);
+-    cond.set_op(QL_OP_EQUAL);
+-    cond.add_operands()->mutable_value()->set_uint32_value(idx_oid);
+-    docdb::DocPgsqlScanSpec spec(pg_index_schema, &cond);
+-    RETURN_NOT_OK(iter->Init(spec));
+-  }
+-
+-  // Expecting one row at most.
+-  qlexpr::QLTableRow row;
+-  if (VERIFY_RESULT(iter->FetchNext(&row))) {
+-    return row.GetColumn(status_col_id)->bool_value();
+-  }
+-
+-  // For practical purposes, an absent index is the same as having false status column value.
+-  return false;
+-}
+-
+ // Before advancing index permissions, we need to make sure Postgres side has advanced sufficiently
+ // - that the state tracked in pg_index haven't fallen behind from the desired permission
+ // for more than one step.
+@@ -188,14 +148,20 @@ Result<bool> ShouldProceedWithPgsqlIndexPermissionUpdate(
+   // TODO(alex, jason): Add the appropriate cases for dropping index path
+   switch (new_perm) {
+     case INDEX_PERM_WRITE_AND_DELETE: {
+-      auto live = VERIFY_RESULT(GetPgIndexStatus(catalog_manager, idx_id, "indislive"));
++      const auto db_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(idx_id));
++      const auto index_oid = VERIFY_RESULT(GetPgsqlTableOid(idx_id));
++      auto live = VERIFY_RESULT(
++          catalog_manager->GetYsqlManager().GetPgIndexStatus(db_oid, index_oid, "indislive"));
+       if (!live) {
+         VLOG(1) << "Index " << idx_id << " is not yet live, skipping permission update";
+       }
+       return live;
+     }
+     case INDEX_PERM_DO_BACKFILL: {
+-      auto ready = VERIFY_RESULT(GetPgIndexStatus(catalog_manager, idx_id, "indisready"));
++      const auto db_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(idx_id));
++      const auto index_oid = VERIFY_RESULT(GetPgsqlTableOid(idx_id));
++      auto ready = VERIFY_RESULT(
++          catalog_manager->GetYsqlManager().GetPgIndexStatus(db_oid, index_oid, "indisready"));
+       if (!ready) {
+         VLOG(1) << "Index " << idx_id << " is not yet ready, skipping permission update";
+       }
+diff --git a/src/yb/master/catalog_manager_ext.cc b/src/yb/master/catalog_manager_ext.cc
+index 3ee6e96b83..9cc431511d 100644
+--- a/src/yb/master/catalog_manager_ext.cc
++++ b/src/yb/master/catalog_manager_ext.cc
+@@ -11,6 +11,7 @@
+ // under the License.
+ 
+ #include <memory>
++#include <optional>
+ #include <queue>
+ #include <unordered_set>
+ 
+@@ -629,15 +630,13 @@ Status CatalogManager::RepackSnapshotsForBackup(
+ 
+     unordered_set<TableId> tables_to_skip;
+     for (SysRowEntry& entry : *sys_entry.mutable_entries()) {
+-      BackupRowEntryPB* const backup_entry = snapshot.add_backup_entries();
+-
+       // Setup BackupRowEntryPB fields.
+       // Set BackupRowEntryPB::pg_schema_name for YSQL table to disambiguate in case tables
+       // in different schema have same name.
++      std::optional<string> pg_schema_name_to_set;
+       if (entry.type() == SysRowEntryType::TABLE) {
+         // Skip repacking the special table sequences_data as sequences are backed up in ysql_dump
+         if (entry.id() == kPgSequencesDataTableId) {
+-          snapshot.mutable_backup_entries()->RemoveLast();
+           // Keep track of table so we skip its tablets as well. Note, since tablets always
+           // follow their table in sys_entry, we don't need to check previous tablet entries.
+           tables_to_skip.insert(entry.id());
+@@ -678,7 +677,6 @@ Status CatalogManager::RepackSnapshotsForBackup(
+             if (res.status().IsNotFound() &&
+                 MasterError(res.status()) == MasterErrorPB::DOCDB_TABLE_NOT_COMMITTED) {
+               LOG(WARNING) << "Skipping backup of table " << table_info->id() << " : " << res;
+-              snapshot.mutable_backup_entries()->RemoveLast();
+               // Keep track of table so we skip its tablets as well. Note, since tablets
+               // always follow their table in sys_entry, we don't need to check previous
+               // tablet entries.
+@@ -691,7 +689,22 @@ Status CatalogManager::RepackSnapshotsForBackup(
+           }
+           const string pg_schema_name = res.get();
+           VLOG(1) << "PG Schema: " << pg_schema_name << " for table " << table_info->ToString();
+-          backup_entry->set_pg_schema_name(pg_schema_name);
++          // If this DocDB table is an index, check pg_index.indisvalid as of the snapshot time and
++          // skip exporting invalid indexes.
++          if (table_info->is_index()) {
++            const auto oids = VERIFY_RESULT(table_info->GetPgTableAllOids());
++            const bool is_valid = VERIFY_RESULT(GetYsqlManager().GetPgIndexStatus(
++                oids.database_oid, oids.pg_table_oid, "indisvalid", snapshot_hybrid_time));
++            if (!is_valid) {
++              LOG(INFO) << "Skipping backup of invalid index table " << table_info->id();
++              // Keep track of table so we skip its tablets as well. Note, since tablets
++              // always follow their table in sys_entry, we don't need to check previous
++              // tablet entries.
++              tables_to_skip.insert(table_info->id());
++              continue;
++            }
++          }
++          pg_schema_name_to_set = pg_schema_name;
+         }
+       } else if (!tables_to_skip.empty() && entry.type() == SysRowEntryType::TABLET) {
+         // Note: Ordering here is important, we expect tablet entries only after their table entry.
+@@ -699,12 +712,14 @@ Status CatalogManager::RepackSnapshotsForBackup(
+         if (tables_to_skip.contains(meta.table_id())) {
+           LOG(WARNING) << "Skipping backup of tablet " << entry.id() << " since its table "
+                        << meta.table_id() << " was skipped.";
+-          snapshot.mutable_backup_entries()->RemoveLast();
+           continue;
+         }
+       }
+ 
+-      // Init BackupRowEntryPB::entry.
++      BackupRowEntryPB* const backup_entry = snapshot.add_backup_entries();
++      if (pg_schema_name_to_set.has_value()) {
++        backup_entry->set_pg_schema_name(*pg_schema_name_to_set);
++      }
+       backup_entry->mutable_entry()->Swap(&entry);
+     }
+ 
+diff --git a/src/yb/master/sys_catalog.cc b/src/yb/master/sys_catalog.cc
+index 9b39ecc38f..f538bc5803 100644
+--- a/src/yb/master/sys_catalog.cc
++++ b/src/yb/master/sys_catalog.cc
+@@ -1464,6 +1464,41 @@ Result<PgOid> SysCatalogTable::ReadPgClassColumnWithOidValue(
+   return oid;
+ }
+ 
++Result<bool> SysCatalogTable::ReadPgIndexBoolColumn(
++    const PgOid database_oid, const PgOid index_oid, const string& column_name,
++    const ReadHybridTime& read_time) {
++  TRACE_EVENT0("master", "ReadPgIndexBoolColumn");
++
++  auto read_data = VERIFY_RESULT(TableReadData(database_oid, kPgIndexTableOid, read_time));
++  const auto& schema = read_data.schema();
++
++  const auto indexrelid_col_id = VERIFY_RESULT(schema.ColumnIdByName("indexrelid")).rep();
++  const auto result_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(column_name));
++  const auto result_col_id = schema.column_id(result_col_idx).rep();
++
++  dockv::ReaderProjection projection(schema, {indexrelid_col_id, result_col_id});
++  auto iter = VERIFY_RESULT(read_data.NewUninitializedIterator(projection));
++  auto request_scope = VERIFY_RESULT(VERIFY_RESULT(Tablet())->CreateRequestScope());
++  {
++    PgsqlConditionPB cond;
++    cond.add_operands()->set_column_id(indexrelid_col_id);
++    cond.set_op(QL_OP_EQUAL);
++    cond.add_operands()->mutable_value()->set_uint32_value(index_oid);
++    docdb::DocPgsqlScanSpec spec(schema, &cond);
++    RETURN_NOT_OK(iter->Init(spec));
++  }
++
++  bool value = false;
++  qlexpr::QLTableRow row;
++  if (VERIFY_RESULT(iter->FetchNext(&row))) {
++    const auto& result_col = row.GetValue(result_col_id);
++    SCHECK(result_col, Corruption, "Could not read " + column_name + " column from pg_index");
++    value = result_col->get().bool_value();
++  }
++
++  return value;
++}
++
+ Result<PgOidToStringMap> SysCatalogTable::ReadPgNamespaceNspnameMap(const PgOid database_oid) {
+   TRACE_EVENT0("master", "ReadPgNamespaceNspnameMap");
+ 
+diff --git a/src/yb/master/sys_catalog.h b/src/yb/master/sys_catalog.h
+index 515f161f0b..9cc745c523 100644
+--- a/src/yb/master/sys_catalog.h
++++ b/src/yb/master/sys_catalog.h
+@@ -287,6 +287,12 @@ class SysCatalogTable {
+                                               const std::string& column_name,
+                                               const ReadHybridTime& read_time = ReadHybridTime());
+ 
++  // Read 'column_name' (e.g. indisvalid/indisready/indislive) boolean value from the pg_index
++  // catalog table for the given index OID.
++  Result<bool> ReadPgIndexBoolColumn(
++      const PgOid database_oid, const PgOid index_oid, const std::string& column_name,
++      const ReadHybridTime& read_time = ReadHybridTime());
++
+   // Read all nspname strings from the pg_namespace catalog table.
+   // Return map: relnamespace oid -> nspname string.
+   Result<PgOidToStringMap> ReadPgNamespaceNspnameMap(const PgOid database_oid);
+diff --git a/src/yb/master/ysql/ysql_manager.cc b/src/yb/master/ysql/ysql_manager.cc
+index 6751b88115..eb002e10c6 100644
+--- a/src/yb/master/ysql/ysql_manager.cc
++++ b/src/yb/master/ysql/ysql_manager.cc
+@@ -328,6 +328,12 @@ Result<std::string> YsqlManager::GetPgSchemaName(
+   return sys_catalog_.ReadPgNamespaceNspname(oids.database_oid, relnamespace_oid, read_time);
+ }
+ 
++Result<bool> YsqlManager::GetPgIndexStatus(
++    PgOid database_oid, PgOid index_oid, const std::string& status_col_name,
++    const ReadHybridTime& read_time) const {
++  return sys_catalog_.ReadPgIndexBoolColumn(database_oid, index_oid, status_col_name, read_time);
++}
++
+ void YsqlManager::RunBgTasks(const LeaderEpoch& epoch) {
+   if (!FLAGS_enable_ysql) {
+     return;
+diff --git a/src/yb/master/ysql/ysql_manager.h b/src/yb/master/ysql/ysql_manager.h
+index 716d677c09..0f5737a5c4 100644
+--- a/src/yb/master/ysql/ysql_manager.h
++++ b/src/yb/master/ysql/ysql_manager.h
+@@ -135,6 +135,10 @@ class YsqlManager : public YsqlManagerIf {
+       const PgTableAllOids& oids,
+       const ReadHybridTime& read_time = ReadHybridTime()) const override;
+ 
++  Result<bool> GetPgIndexStatus(
++      PgOid database_oid, PgOid index_oid, const std::string& status_col_name,
++      const ReadHybridTime& read_time = ReadHybridTime()) const override;
++
+   void RunBgTasks(const LeaderEpoch& epoch);
+ 
+  private:
+diff --git a/src/yb/master/ysql/ysql_manager_if.h b/src/yb/master/ysql/ysql_manager_if.h
+index 438ced226d..ae015693a8 100644
+--- a/src/yb/master/ysql/ysql_manager_if.h
++++ b/src/yb/master/ysql/ysql_manager_if.h
+@@ -50,6 +50,12 @@ class YsqlManagerIf {
+       const PgTableAllOids& oids, PgDbRelNamespaceMap& cache) const = 0;
+   virtual Result<std::string> GetPgSchemaName(
+       const PgTableAllOids& oids, const ReadHybridTime& read_time = ReadHybridTime()) const = 0;
++
++  // Returns a boolean pg_index status column (e.g. indislive/indisready/indisvalid) for the
++  // given PG OIDs.
++  virtual Result<bool> GetPgIndexStatus(
++      PgOid database_oid, PgOid index_oid, const std::string& status_col_name,
++      const ReadHybridTime& read_time = ReadHybridTime()) const = 0;
+ };
+ 
+ }  // namespace master
+diff --git a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+index d384cba1eb..4ec9846fd3 100644
+--- a/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
++++ b/src/yb/tools/yb-backup/yb-backup-cross-feature-test.cc
+@@ -2558,9 +2558,8 @@ INSTANTIATE_TEST_CASE_P(
+ 
+ class YBBackupCrossColocation : public YBBackupTestWithPackedRowsAndColocation {};
+ 
++// TODO(Yamen): Enable test in sasnitizers tracked by GH-29039.
+ TEST_P(YBBackupCrossColocation, YB_DISABLE_TEST_IN_SANITIZERS(TestYSQLRestoreWithInvalidIndex)) {
+-  // TODO(Yamen): Remove this skip once GH-28986 is fixed.
+-  GTEST_SKIP() << "Temporarily disabled until GH-28986 is fixed";
+   ASSERT_NO_FATALS(CreateTable("CREATE TABLE t1 (id INT NOT NULL, c1 INT, PRIMARY KEY (id))"));
+   for (int i = 0; i < 3; ++i) {
+     ASSERT_NO_FATALS(InsertOneRow(Format("INSERT INTO t1 (id, c1) VALUES ($0, $0)", i)));
+@@ -3037,12 +3036,12 @@ TEST_P(YBBackupTestWithTableRewrite,
+   ));
+ }
+ 
++// TODO(Yamen): Enable test in sasnitizers tracked by GH-29039.
+ // Test that backup and restore succeed after unsuccessful rewrite operations are executed
+ // on tables, indexes and materialized views.
+-TEST_P(YBBackupTestWithTableRewrite,
++TEST_P(
++    YBBackupTestWithTableRewrite,
+     YB_DISABLE_TEST_IN_SANITIZERS(TestYSQLBackupAndRestoreAfterFailedRewrite)) {
+-  // TODO(Yamen): Remove this skip once GH-28986 is fixed.
+-  GTEST_SKIP() << "Temporarily disabled until GH-28986 is fixed";
+   ASSERT_OK(cluster_->SetFlagOnMasters("enable_transactional_ddl_gc", "false"));
+   ASSERT_OK(cluster_->SetFlagOnTServers("ysql_yb_ddl_rollback_enabled", "false"));
+   SetUpTestData(true /* failedRewrite */);

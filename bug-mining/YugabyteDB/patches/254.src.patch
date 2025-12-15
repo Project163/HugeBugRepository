@@ -1,0 +1,1081 @@
+diff --git a/src/yb/client/ql-tablet-test.cc b/src/yb/client/ql-tablet-test.cc
+index 935b8b8cfb..326cc42aba 100644
+--- a/src/yb/client/ql-tablet-test.cc
++++ b/src/yb/client/ql-tablet-test.cc
+@@ -65,6 +65,8 @@ DECLARE_int32(memstore_size_mb);
+ DECLARE_int64(global_memstore_size_mb_max);
+ DECLARE_bool(TEST_allow_stop_writes);
+ DECLARE_int32(yb_num_shards_per_tserver);
++DECLARE_int32(tablet_inject_latency_on_apply_write_txn_ms);
++DECLARE_bool(TEST_log_cache_skip_eviction);
+ 
+ namespace yb {
+ namespace client {
+@@ -947,5 +949,69 @@ TEST_F_EX(QLTabletTest, DoubleFlush, QLTabletTestSmallMemstore) {
+   cluster_.reset();
+ }
+ 
++TEST_F(QLTabletTest, OperationMemTracking) {
++  FLAGS_TEST_log_cache_skip_eviction = true;
++
++  constexpr size_t kValueSize = 64_KB;
++  const auto kWaitInterval = 50ms;
++
++  YBSchemaBuilder builder;
++  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
++  builder.AddColumn(kValueColumn)->Type(STRING);
++
++  TableHandle table;
++  ASSERT_OK(table.Create(kTable1Name, CalcNumTablets(3), client_.get(), &builder));
++
++  FLAGS_tablet_inject_latency_on_apply_write_txn_ms = 1000;
++
++  const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
++  auto* const req = op->mutable_request();
++  QLAddInt32HashValue(req, 42);
++  auto session = CreateSession();
++  table.AddStringColumnValue(req, kValueColumn, std::string(kValueSize, 'X'));
++  ASSERT_OK(session->Apply(op));
++  auto future = session->FlushFuture();
++  auto server_tracker = MemTracker::GetRootTracker()->FindChild("server 1");
++  auto tablets_tracker = server_tracker->FindChild("Tablets");
++  auto log_tracker = server_tracker->FindChild("log_cache");
++
++  std::chrono::steady_clock::time_point deadline;
++  bool tracked_by_tablets = false;
++  bool tracked_by_log_cache = false;
++  for (;;) {
++    // The consumption get order is important, otherwise we could get into situation where
++    // mem tracking changed between gets.
++    auto log_cache_consumption = log_tracker->consumption();
++    tracked_by_log_cache = tracked_by_log_cache || log_cache_consumption >= kValueSize;
++    int64_t operation_tracker_consumption = 0;
++    for (auto& child : tablets_tracker->ListChildren()) {
++      operation_tracker_consumption += child->FindChild("operation_tracker")->consumption();
++    }
++
++    tracked_by_tablets = tracked_by_tablets || operation_tracker_consumption >= kValueSize;
++    LOG(INFO) << "Operation tracker consumption: " << operation_tracker_consumption
++              << ", log cache consumption: " << log_cache_consumption;
++    // We have overhead in both log cache and tablets.
++    // So if value is double tracked then sum consumption will be higher than double value size.
++    ASSERT_LE(operation_tracker_consumption + log_cache_consumption, kValueSize * 2)
++        << DumpMemTrackers();
++    if (std::chrono::steady_clock::time_point() == deadline) { // operation did not finish yet
++      if (future.wait_for(kWaitInterval) == std::future_status::ready) {
++        LOG(INFO) << "Value written";
++        deadline = std::chrono::steady_clock::now() + 3s;
++        ASSERT_OK(future.get());
++        ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, op->response().status());
++      }
++    } else if (deadline < std::chrono::steady_clock::now() || tracked_by_log_cache) {
++      break;
++    } else {
++      std::this_thread::sleep_for(kWaitInterval);
++    }
++  }
++
++  ASSERT_TRUE(tracked_by_tablets);
++  ASSERT_TRUE(tracked_by_log_cache);
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/consensus/consensus.cc b/src/yb/consensus/consensus.cc
+index 534822680e..857e5ef57e 100644
+--- a/src/yb/consensus/consensus.cc
++++ b/src/yb/consensus/consensus.cc
+@@ -64,9 +64,10 @@ ConsensusRound::ConsensusRound(Consensus* consensus,
+   DCHECK_NOTNULL(replicate_msg_.get());
+ }
+ 
+-void ConsensusRound::NotifyReplicationFinished(const Status& status, int64_t leader_term) {
++void ConsensusRound::NotifyReplicationFinished(
++    const Status& status, int64_t leader_term, OpIds* applied_op_ids) {
+   if (PREDICT_FALSE(replicated_cb_ == nullptr)) return;
+-  replicated_cb_(status, leader_term);
++  replicated_cb_(status, leader_term, applied_op_ids);
+ }
+ 
+ Status ConsensusRound::CheckBoundTerm(int64_t current_term) const {
+diff --git a/src/yb/consensus/consensus.h b/src/yb/consensus/consensus.h
+index 79761983e4..ede4e7675b 100644
+--- a/src/yb/consensus/consensus.h
++++ b/src/yb/consensus/consensus.h
+@@ -88,7 +88,9 @@ class ReplicaOperationFactory;
+ 
+ typedef int64_t ConsensusTerm;
+ 
+-typedef std::function<void(const Status& status, int64_t leader_term)> ConsensusReplicatedCallback;
++typedef std::function<void(
++    const Status& status, int64_t leader_term, OpIds* applied_op_ids)>
++        ConsensusReplicatedCallback;
+ 
+ // After completing bootstrap, some of the results need to be plumbed through
+ // into the consensus implementation.
+@@ -520,7 +522,8 @@ class ConsensusRound : public RefCountedThreadSafe<ConsensusRound> {
+   }
+ 
+   // If a continuation was set, notifies it that the round has been replicated.
+-  void NotifyReplicationFinished(const Status& status, int64_t leader_term);
++  void NotifyReplicationFinished(
++      const Status& status, int64_t leader_term, OpIds* applied_op_ids);
+ 
+   // Binds this round such that it may not be eventually executed in any term
+   // other than 'term'.
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index f3c89c6798..e88d8b144c 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -1264,5 +1264,9 @@ size_t PeerMessageQueue::EvictLogCache(size_t bytes_to_evict) {
+   return log_cache_.EvictThroughOp(std::numeric_limits<int64_t>::max(), bytes_to_evict);
+ }
+ 
++void PeerMessageQueue::TrackOperationsMemory(const OpIds& op_ids) {
++  log_cache_.TrackOperationsMemory(op_ids);
++}
++
+ }  // namespace consensus
+ }  // namespace yb
+diff --git a/src/yb/consensus/consensus_queue.h b/src/yb/consensus/consensus_queue.h
+index a96031f54b..2a255c1b73 100644
+--- a/src/yb/consensus/consensus_queue.h
++++ b/src/yb/consensus/consensus_queue.h
+@@ -319,6 +319,9 @@ class PeerMessageQueue {
+   size_t LogCacheSize();
+   size_t EvictLogCache(size_t bytes_to_evict);
+ 
++  // Start memory tracking of following operations in case they are still present in our caches.
++  void TrackOperationsMemory(const OpIds& op_ids);
++
+  private:
+   FRIEND_TEST(ConsensusQueueTest, TestQueueAdvancesCommittedIndex);
+   FRIEND_TEST(ConsensusQueueTest, TestReadReplicatedMessagesForCDC);
+diff --git a/src/yb/consensus/log_cache-test.cc b/src/yb/consensus/log_cache-test.cc
+index ad8e37f80c..e0c49f60b8 100644
+--- a/src/yb/consensus/log_cache-test.cc
++++ b/src/yb/consensus/log_cache-test.cc
+@@ -133,6 +133,8 @@ class LogCacheTest : public YBTest {
+       RETURN_NOT_OK(cache_->AppendOperations(
+           msgs, yb::OpId() /* committed_op_id */, RestartSafeCoarseMonoClock().Now(),
+           Bind(&FatalOnError)));
++      cache_->TrackOperationsMemory({yb::OpId::FromPB(msgs[0]->id())});
++      std::this_thread::sleep_for(100ms);
+     }
+     return Status::OK();
+   }
+diff --git a/src/yb/consensus/log_cache.cc b/src/yb/consensus/log_cache.cc
+index 13114908d2..17be34f9b7 100644
+--- a/src/yb/consensus/log_cache.cc
++++ b/src/yb/consensus/log_cache.cc
+@@ -70,6 +70,9 @@ DEFINE_int32(global_log_cache_size_limit_mb, 1024,
+              "caching log entries across all tablets is kept under this threshold.");
+ TAG_FLAG(global_log_cache_size_limit_mb, advanced);
+ 
++DEFINE_test_flag(bool, TEST_log_cache_skip_eviction, false,
++                 "Don't evict log entries in tests.");
++
+ using strings::Substitute;
+ 
+ namespace yb {
+@@ -172,29 +175,6 @@ Result<LogCache::PrepareAppendResult> LogCache::PrepareAppendOperations(const Re
+     }
+   }
+ 
+-  // Try to consume the memory. If it can't be consumed, we may need to evict.
+-  if (!tracker_->TryConsume(result.mem_required)) {
+-    int spare = tracker_->SpareCapacity();
+-    int need_to_free = result.mem_required - spare;
+-    VLOG_WITH_PREFIX_UNLOCKED(1)
+-        << "Memory limit would be exceeded trying to append "
+-        << HumanReadableNumBytes::ToString(result.mem_required)
+-        << " to log cache (available="
+-        << HumanReadableNumBytes::ToString(spare)
+-        << "): attempting to evict some operations...";
+-
+-    // TODO: we should also try to evict from other tablets - probably better to evict really old
+-    // ops from another tablet than evict recent ops from this one.
+-    EvictSomeUnlocked(min_pinned_op_index_, need_to_free);
+-
+-    // Force consuming, so that we don't refuse appending data. We might blow past our limit a
+-    // little bit (as much as the number of tablets times the amount of in-flight data in the log),
+-    // but until implementing the above TODO, it's difficult to solve this issue.
+-    tracker_->Consume(result.mem_required);
+-
+-    result.borrowed_memory = parent_tracker_->LimitExceeded();
+-  }
+-
+   for (auto& e : entries_to_insert) {
+     auto index = e.msg->id().index();
+     EmplaceOrDie(&cache_, index, std::move(e));
+@@ -210,26 +190,24 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs, const yb::OpId& com
+   PrepareAppendResult prepare_result;
+   if (!msgs.empty()) {
+     prepare_result = VERIFY_RESULT(PrepareAppendOperations(msgs));
+-    metrics_.log_cache_size->IncrementBy(prepare_result.mem_required);
+-    metrics_.log_cache_num_ops->IncrementBy(msgs.size());
+   }
+ 
+   Status log_status = log_->AsyncAppendReplicates(
+     msgs, committed_op_id, batch_mono_time,
+-    Bind(&LogCache::LogCallback, Unretained(this), prepare_result.last_idx_in_batch,
+-         prepare_result.borrowed_memory, callback));
++    Bind(&LogCache::LogCallback, Unretained(this), prepare_result.last_idx_in_batch, callback));
+ 
+   if (!log_status.ok()) {
+-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Couldn't append to log: " << log_status.ToString();
+-    tracker_->Release(prepare_result.mem_required);
++    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Couldn't append to log: " << log_status;
+     return log_status;
+   }
+ 
++  metrics_.log_cache_size->IncrementBy(prepare_result.mem_required);
++  metrics_.log_cache_num_ops->IncrementBy(msgs.size());
++
+   return Status::OK();
+ }
+ 
+ void LogCache::LogCallback(int64_t last_idx_in_batch,
+-                           bool borrowed_memory,
+                            const StatusCallback& user_callback,
+                            const Status& log_status) {
+   if (log_status.ok()) {
+@@ -238,15 +216,6 @@ void LogCache::LogCallback(int64_t last_idx_in_batch,
+       VLOG_WITH_PREFIX_UNLOCKED(1) << "Updating pinned index to " << (last_idx_in_batch + 1);
+       min_pinned_op_index_ = last_idx_in_batch + 1;
+     }
+-
+-    // If we went over the global limit in order to log this batch, evict some to get back down
+-    // under the limit.
+-    if (borrowed_memory) {
+-      int64_t spare_capacity = parent_tracker_->SpareCapacity();
+-      if (spare_capacity < 0) {
+-        EvictSomeUnlocked(min_pinned_op_index_, -spare_capacity);
+-      }
+-    }
+   }
+   user_callback.Run(log_status);
+ }
+@@ -399,6 +368,10 @@ size_t LogCache::EvictSomeUnlocked(int64_t stop_after_index, int64_t bytes_to_ev
+                       << " or " << HumanReadableNumBytes::ToString(bytes_to_evict)
+                       << ": before state: " << ToStringUnlocked();
+ 
++  if (ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_log_cache_skip_eviction)) {
++    return 0;
++  }
++
+   int64_t bytes_evicted = 0;
+   for (auto iter = cache_.begin(); iter != cache_.end();) {
+     const CacheEntry& entry = iter->second;
+@@ -415,13 +388,6 @@ size_t LogCache::EvictSomeUnlocked(int64_t stop_after_index, int64_t bytes_to_ev
+       break;
+     }
+ 
+-    if (!msg.unique()) {
+-      VLOG_WITH_PREFIX_UNLOCKED(2) << "Evicting cache: cannot remove " << msg->id()
+-                                   << " because it is in-use by a peer.";
+-      ++iter;
+-      continue;
+-    }
+-
+     VLOG_WITH_PREFIX_UNLOCKED(2) << "Evicting cache. Removing: " << msg->id();
+     AccountForMessageRemovalUnlocked(entry);
+     bytes_evicted += entry.mem_usage;
+@@ -437,7 +403,9 @@ size_t LogCache::EvictSomeUnlocked(int64_t stop_after_index, int64_t bytes_to_ev
+ }
+ 
+ void LogCache::AccountForMessageRemovalUnlocked(const CacheEntry& entry) {
+-  tracker_->Release(entry.mem_usage);
++  if (entry.tracked) {
++    tracker_->Release(entry.mem_usage);
++  }
+   metrics_.log_cache_size->DecrementBy(entry.mem_usage);
+   metrics_.log_cache_num_ops->Decrement();
+ }
+@@ -517,6 +485,45 @@ void LogCache::DumpToHtml(std::ostream& out) const {
+   out << "</table>";
+ }
+ 
++void LogCache::TrackOperationsMemory(const OpIds& op_ids) {
++  if (op_ids.empty()) {
++    return;
++  }
++
++  std::lock_guard<simple_spinlock> lock(lock_);
++
++  int mem_required = 0;
++  for (const auto& op_id : op_ids) {
++    auto it = cache_.find(op_id.index);
++    if (it != cache_.end() && it->second.msg->id().term() == op_id.term) {
++      mem_required += it->second.mem_usage;
++      it->second.tracked = true;
++    }
++  }
++
++  if (mem_required == 0) {
++    return;
++  }
++
++  // Try to consume the memory. If it can't be consumed, we may need to evict.
++  if (!tracker_->TryConsume(mem_required)) {
++    int spare = tracker_->SpareCapacity();
++    int need_to_free = mem_required - spare;
++    VLOG_WITH_PREFIX_UNLOCKED(1)
++        << "Memory limit would be exceeded trying to append "
++        << HumanReadableNumBytes::ToString(mem_required)
++        << " to log cache (available="
++        << HumanReadableNumBytes::ToString(spare)
++        << "): attempting to evict some operations...";
++
++    tracker_->Consume(mem_required);
++
++    // TODO: we should also try to evict from other tablets - probably better to evict really old
++    // ops from another tablet than evict recent ops from this one.
++    EvictSomeUnlocked(min_pinned_op_index_, need_to_free);
++  }
++}
++
+ #define INSTANTIATE_METRIC(x) \
+   x.Instantiate(metric_entity, 0)
+ LogCache::Metrics::Metrics(const scoped_refptr<MetricEntity>& metric_entity)
+diff --git a/src/yb/consensus/log_cache.h b/src/yb/consensus/log_cache.h
+index 889261b4ba..220429dc29 100644
+--- a/src/yb/consensus/log_cache.h
++++ b/src/yb/consensus/log_cache.h
+@@ -164,6 +164,9 @@ class LogCache {
+   // Returns another bad Status if the log index fails to load (eg. due to an IO error).
+   CHECKED_STATUS LookupOpId(int64_t op_index, OpId* op_id) const;
+ 
++  // Start memory tracking of following operations in case they are still present in cache.
++  void TrackOperationsMemory(const OpIds& op_ids);
++
+  private:
+   FRIEND_TEST(LogCacheTest, TestAppendAndGetMessages);
+   FRIEND_TEST(LogCacheTest, TestGlobalMemoryLimit);
+@@ -176,6 +179,9 @@ class LogCache {
+     // The cached value of msg->SpaceUsedLong(). This method is expensive
+     // to compute, so we compute it only once upon insertion.
+     int64_t mem_usage;
++
++    // Did we start memory tracking for this entry.
++    bool tracked = false;
+   };
+ 
+   // Try to evict the oldest operations from the queue, stopping either when
+@@ -195,7 +201,6 @@ class LogCache {
+   std::string LogPrefixUnlocked() const;
+ 
+   void LogCallback(int64_t last_idx_in_batch,
+-                   bool borrowed_memory,
+                    const StatusCallback& user_callback,
+                    const Status& log_status);
+ 
+@@ -204,8 +209,6 @@ class LogCache {
+     int64_t mem_required = 0;
+     // Last idx in batch of provided operations.
+     int64_t last_idx_in_batch = -1;
+-    // true if we exceeded mem tracker limit while preparing provided operations.
+-    bool borrowed_memory = false;
+   };
+ 
+   Result<PrepareAppendResult> PrepareAppendOperations(const ReplicateMsgs& msgs);
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 62afd8a5f9..9909d4d35f 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -314,12 +314,14 @@ RaftConsensus::RaftConsensus(
+         MonoDelta::FromSeconds(FLAGS_follower_reject_update_consensus_requests_seconds);
+   }
+ 
+-  state_.reset(new ReplicaState(options,
+-                                peer_uuid,
+-                                std::move(cmeta),
+-                                DCHECK_NOTNULL(operation_factory),
+-                                this,
+-                                retryable_requests));
++  state_ = std::make_unique<ReplicaState>(
++      options,
++      peer_uuid,
++      std::move(cmeta),
++      DCHECK_NOTNULL(operation_factory),
++      this,
++      retryable_requests,
++      std::bind(&PeerMessageQueue::TrackOperationsMemory, queue_.get(), _1));
+ 
+   peer_manager_->SetConsensus(this);
+ }
+@@ -2963,5 +2965,9 @@ RetryableRequestsCounts RaftConsensus::TEST_CountRetryableRequests() {
+   return state_->TEST_CountRetryableRequests();
+ }
+ 
++void RaftConsensus::TrackOperationMemory(const yb::OpId& op_id) {
++  queue_->TrackOperationsMemory({op_id});
++}
++
+ }  // namespace consensus
+ }  // namespace yb
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index a176186bf2..1ec680b192 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -252,6 +252,9 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+   CHECKED_STATUS ReadReplicatedMessagesForCDC(const OpId& from, ReplicateMsgs* msgs,
+                                               bool* have_more_messages) override;
+ 
++  // Start memory tracking of following operation in case it is still present in our caches.
++  void TrackOperationMemory(const yb::OpId& op_id);
++
+  protected:
+   // Trigger that a non-Operation ConsensusRound has finished replication.
+   // If the replication was successful, an status will be OK. Otherwise, it
+@@ -610,7 +613,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+   // The queue of messages that must be sent to peers.
+   gscoped_ptr<PeerMessageQueue> queue_;
+ 
+-  gscoped_ptr<ReplicaState> state_;
++  std::unique_ptr<ReplicaState> state_;
+ 
+   Random rng_;
+ 
+diff --git a/src/yb/consensus/raft_consensus_quorum-test.cc b/src/yb/consensus/raft_consensus_quorum-test.cc
+index e36b43040c..c207279c5c 100644
+--- a/src/yb/consensus/raft_consensus_quorum-test.cc
++++ b/src/yb/consensus/raft_consensus_quorum-test.cc
+@@ -259,7 +259,8 @@ class RaftConsensusQuorumTest : public YBTest {
+ 
+     // Use a latch in place of a Transaction callback.
+     gscoped_ptr<Synchronizer> sync(new Synchronizer());
+-    *round = peer->NewRound(std::move(msg), [sync = sync.get()](const Status& status, int64_t) {
++    *round = peer->NewRound(std::move(msg),
++        [sync = sync.get()](const Status& status, int64_t, OpIds*) {
+       sync->StatusCB(status);
+     });
+     InsertOrDie(&syncs_, round->get(), sync.release());
+diff --git a/src/yb/consensus/replica_state-test.cc b/src/yb/consensus/replica_state-test.cc
+index da56aec776..ef7077b783 100644
+--- a/src/yb/consensus/replica_state-test.cc
++++ b/src/yb/consensus/replica_state-test.cc
+@@ -72,7 +72,8 @@ class RaftConsensusStateTest : public YBTest {
+                                         config_, kMinimumTerm, &cmeta));
+     state_.reset(new ReplicaState(ConsensusOptions(), fs_manager_.uuid(), std::move(cmeta),
+                                   operation_factory_.get(), nullptr /* safe_op_id_waiter */,
+-                                  nullptr /* retryable_requests */));
++                                  nullptr /* retryable_requests */,
++                                  [](const OpIds&) {} /* applied_ops_tracker */));
+ 
+     // Start up the ReplicaState.
+     ReplicaState::UniqueLock lock;
+diff --git a/src/yb/consensus/replica_state.cc b/src/yb/consensus/replica_state.cc
+index c72b316efc..f9083e19cb 100644
+--- a/src/yb/consensus/replica_state.cc
++++ b/src/yb/consensus/replica_state.cc
+@@ -74,12 +74,14 @@ ReplicaState::ReplicaState(ConsensusOptions options, string peer_uuid,
+                            std::unique_ptr<ConsensusMetadata> cmeta,
+                            ReplicaOperationFactory* operation_factory,
+                            SafeOpIdWaiter* safe_op_id_waiter,
+-                           RetryableRequests* retryable_requests)
++                           RetryableRequests* retryable_requests,
++                           std::function<void(const OpIds&)> applied_ops_tracker)
+     : options_(std::move(options)),
+       peer_uuid_(std::move(peer_uuid)),
+       cmeta_(std::move(cmeta)),
+       operation_factory_(operation_factory),
+-      safe_op_id_waiter_(safe_op_id_waiter) {
++      safe_op_id_waiter_(safe_op_id_waiter),
++      applied_ops_tracker_(std::move(applied_ops_tracker)) {
+   CHECK(cmeta_) << "ConsensusMeta passed as NULL";
+   if (retryable_requests) {
+     retryable_requests_ = std::move(*retryable_requests);
+@@ -521,7 +523,8 @@ Status ReplicaState::CancelPendingOperations() {
+         LOG_WITH_PREFIX(INFO) << "Aborting operation because of shutdown: "
+                               << round->replicate_msg()->ShortDebugString();
+       }
+-      NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm);
++      NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm,
++                                        nullptr /* applied_op_ids */);
+     }
+   }
+   return Status::OK();
+@@ -590,7 +593,8 @@ Status ReplicaState::AbortOpsAfterUnlocked(int64_t new_preceding_idx) {
+     const scoped_refptr<ConsensusRound>& round = *it;
+     LOG_WITH_PREFIX(INFO) << "Aborting uncommitted operation due to leader change: "
+                           << round->replicate_msg()->id();
+-    NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm);
++    NotifyReplicationFinishedUnlocked(round, abort_status, yb::OpId::kUnknownTerm,
++                                      nullptr /* applied_op_ids */);
+   }
+   // Clear entries from pending operations.
+   pending_operations_.erase(preceding_op_iter, pending_operations_.end());
+@@ -811,6 +815,9 @@ Status ReplicaState::ApplyPendingOperationsUnlocked(
+   }
+   auto leader_term = GetLeaderStateUnlocked().term;
+ 
++  OpIds applied_op_ids;
++  applied_op_ids.reserve(committed_op_id.index - prev_id.index);
++
+   while (!pending_operations_.empty()) {
+     auto round = pending_operations_.front();
+     auto current_id = yb::OpId::FromPB(round->id());
+@@ -847,11 +854,13 @@ Status ReplicaState::ApplyPendingOperationsUnlocked(
+     }
+ 
+     prev_id = current_id;
+-    NotifyReplicationFinishedUnlocked(round, Status::OK(), leader_term);
++    NotifyReplicationFinishedUnlocked(round, Status::OK(), leader_term, &applied_op_ids);
+   }
+ 
+   SetLastCommittedIndexUnlocked(prev_id);
+ 
++  applied_ops_tracker_(applied_op_ids);
++
+   return Status::OK();
+ }
+ 
+@@ -1228,8 +1237,9 @@ yb::OpId ReplicaState::MinRetryableRequestOpId() {
+ }
+ 
+ void ReplicaState::NotifyReplicationFinishedUnlocked(
+-    const ConsensusRoundPtr& round, const Status& status, int64_t leader_term) {
+-  round->NotifyReplicationFinished(status, leader_term);
++    const ConsensusRoundPtr& round, const Status& status, int64_t leader_term,
++    OpIds* applied_op_ids) {
++  round->NotifyReplicationFinished(status, leader_term, applied_op_ids);
+ 
+   retryable_requests_.ReplicationFinished(*round->replicate_msg(), status, leader_term);
+ }
+diff --git a/src/yb/consensus/replica_state.h b/src/yb/consensus/replica_state.h
+index 9d4421442c..738c016067 100644
+--- a/src/yb/consensus/replica_state.h
++++ b/src/yb/consensus/replica_state.h
+@@ -117,7 +117,8 @@ class ReplicaState {
+                std::unique_ptr<ConsensusMetadata> cmeta,
+                ReplicaOperationFactory* operation_factory,
+                SafeOpIdWaiter* safe_op_id_waiter,
+-               RetryableRequests* retryable_requests);
++               RetryableRequests* retryable_requests,
++               std::function<void(const OpIds&)> applied_ops_tracker);
+ 
+   ~ReplicaState();
+ 
+@@ -424,7 +425,8 @@ class ReplicaState {
+   void ApplyConfigChangeUnlocked(const ConsensusRoundPtr& round);
+ 
+   void NotifyReplicationFinishedUnlocked(
+-      const ConsensusRoundPtr& round, const Status& status, int64_t leader_term);
++      const ConsensusRoundPtr& round, const Status& status, int64_t leader_term,
++      OpIds* applied_op_ids);
+ 
+   consensus::LeaderState RefreshLeaderStateCacheUnlocked(
+       CoarseTimePoint* now) const ATTRIBUTE_NONNULL(2);
+@@ -510,6 +512,8 @@ class ReplicaState {
+   // after the new leader successful election.
+   bool leader_no_op_committed_ = false;
+ 
++  std::function<void(const OpIds&)> applied_ops_tracker_;
++
+   struct LeaderStateCache {
+     static constexpr size_t kStatusBits = 3;
+     static_assert(kLeaderStatusMapSize <= (1 << kStatusBits),
+diff --git a/src/yb/consensus/retryable_requests.cc b/src/yb/consensus/retryable_requests.cc
+index 0539aca642..c163958983 100644
+--- a/src/yb/consensus/retryable_requests.cc
++++ b/src/yb/consensus/retryable_requests.cc
+@@ -227,7 +227,8 @@ class RetryableRequests::Impl {
+ 
+     if (data.request_id() < client_retryable_requests.min_running_request_id) {
+       round->NotifyReplicationFinished(
+-          STATUS(Expired, "Request id is below than min running"), round->bound_term());
++          STATUS(Expired, "Request id is below than min running"), round->bound_term(),
++          nullptr /* applied_op_ids */);
+       return false;
+     }
+ 
+@@ -235,7 +236,8 @@ class RetryableRequests::Impl {
+     auto it = replicated_indexed_by_last_id.lower_bound(data.request_id());
+     if (it != replicated_indexed_by_last_id.end() && it->first_id <= data.request_id()) {
+       round->NotifyReplicationFinished(
+-          STATUS(AlreadyPresent, "Duplicate request"), round->bound_term());
++          STATUS(AlreadyPresent, "Duplicate request"), round->bound_term(),
++          nullptr /* applied_op_ids */);
+       return false;
+     }
+ 
+@@ -318,7 +320,8 @@ class RetryableRequests::Impl {
+     static Status duplicate_write_status = STATUS(AlreadyPresent, "Duplicate request");
+     auto status_for_duplicate = status.ok() ? duplicate_write_status : status;
+     for (const auto& duplicate : running_it->duplicate_rounds) {
+-      duplicate->NotifyReplicationFinished(status_for_duplicate, leader_term);
++      duplicate->NotifyReplicationFinished(status_for_duplicate, leader_term,
++                                           nullptr /* applied_op_ids */);
+     }
+     auto entry_time = running_it->time;
+     running_indexed_by_request_id.erase(running_it);
+diff --git a/src/yb/tablet/operations/operation_driver.cc b/src/yb/tablet/operations/operation_driver.cc
+index a4a3295b89..75434cec5c 100644
+--- a/src/yb/tablet/operations/operation_driver.cc
++++ b/src/yb/tablet/operations/operation_driver.cc
+@@ -90,6 +90,7 @@ OperationDriver::OperationDriver(OperationTracker *operation_tracker,
+   if (Trace::CurrentTrace()) {
+     Trace::CurrentTrace()->AddChildTrace(trace_.get());
+   }
++  DCHECK(op_id_copy_.is_lock_free());
+ }
+ 
+ Status OperationDriver::Init(std::unique_ptr<Operation>* operation, int64_t term) {
+@@ -98,10 +99,8 @@ Status OperationDriver::Init(std::unique_ptr<Operation>* operation, int64_t term
+   }
+ 
+   if (term == OpId::kUnknownTerm) {
+-    std::lock_guard<simple_spinlock> lock(opid_lock_);
+     if (operation_) {
+-      op_id_copy_ = operation_->state()->op_id();
+-      DCHECK(op_id_copy_.IsInitialized());
++      op_id_copy_.store(yb::OpId::FromPB(operation_->state()->op_id()), std::memory_order_release);
+     }
+     replication_state_ = REPLICATING;
+   } else {
+@@ -110,7 +109,7 @@ Status OperationDriver::Init(std::unique_ptr<Operation>* operation, int64_t term
+       consensus::ReplicateMsgPtr replicate_msg = operation_->NewReplicateMsg();
+       mutable_state()->set_consensus_round(
+         consensus_->NewRound(std::move(replicate_msg),
+-                             std::bind(&OperationDriver::ReplicationFinished, this, _1, _2)));
++                             std::bind(&OperationDriver::ReplicationFinished, this, _1, _2, _3)));
+       mutable_state()->consensus_round()->BindToTerm(term);
+       mutable_state()->consensus_round()->SetAppendCallback(this);
+     }
+@@ -124,9 +123,8 @@ Status OperationDriver::Init(std::unique_ptr<Operation>* operation, int64_t term
+   return result;
+ }
+ 
+-consensus::OpId OperationDriver::GetOpId() {
+-  std::lock_guard<simple_spinlock> lock(opid_lock_);
+-  return op_id_copy_;
++yb::OpId OperationDriver::GetOpId() {
++  return op_id_copy_.load(std::memory_order_acquire);
+ }
+ 
+ const OperationState* OperationDriver::state() const {
+@@ -201,12 +199,14 @@ void OperationDriver::PrepareAndStartTask() {
+ bool OperationDriver::StartOperation() {
+   if (operation_) {
+     operation_->Start();
++    std::lock_guard<simple_spinlock> lock(lock_);
++    op_id_copy_.store(yb::OpId::FromPB(operation_->state()->op_id()), std::memory_order_release);
+   }
+   if (propagated_safe_time_) {
+     mvcc_->SetPropagatedSafeTimeOnFollower(propagated_safe_time_);
+   }
+   if (!operation_) {
+-    operation_tracker_->Release(this);
++    operation_tracker_->Release(this, nullptr /* applied_op_ids */);
+     return false;
+   }
+   return true;
+@@ -282,7 +282,7 @@ Status OperationDriver::PrepareAndStart() {
+     {
+       // We can move on to apply.  Note that ApplyOperation() will handle the error status in the
+       // REPLICATION_FAILED case.
+-      return ApplyOperation(yb::OpId::kUnknownTerm);
++      return ApplyOperation(yb::OpId::kUnknownTerm, nullptr /* applied_op_ids */);
+     }
+   }
+   FATAL_INVALID_ENUM_VALUE(ReplicationState, repl_state_copy);
+@@ -330,7 +330,7 @@ void OperationDriver::HandleFailure(Status status) {
+       VLOG_WITH_PREFIX(1) << "Operation " << ToString() << " failed prior to "
+           "replication success: " << status;
+       operation_->Aborted(status);
+-      operation_tracker_->Release(this);
++      operation_tracker_->Release(this, nullptr /* applied_op_ids */);
+       return;
+     }
+ 
+@@ -343,20 +343,11 @@ void OperationDriver::HandleFailure(Status status) {
+   }
+ }
+ 
+-void OperationDriver::ReplicationFinished(const Status& status, int64_t leader_term) {
+-  consensus::OpId op_id_local;
+-  {
+-    std::lock_guard<simple_spinlock> op_id_lock(opid_lock_);
+-    // TODO: it's a bit silly that we have three copies of the opid:
+-    // one here, one in ConsensusRound, and one in OperationState.
+-
+-    op_id_copy_ = DCHECK_NOTNULL(mutable_state()->consensus_round())->id();
+-    DCHECK(!status.ok() || op_id_copy_.IsInitialized());
+-    // We can't update mutable_state()->mutable_op_id() here, because it is guarded by a different
+-    // lock. Instead, we save it in a local variable and write it to the other location when
+-    // holding the other lock.
+-    op_id_local = op_id_copy_;
+-  }
++void OperationDriver::ReplicationFinished(
++    const Status& status, int64_t leader_term, OpIds* applied_op_ids) {
++  auto op_id_local = DCHECK_NOTNULL(mutable_state()->consensus_round())->id();
++  DCHECK(!status.ok() || op_id_local.IsInitialized());
++  op_id_copy_.store(yb::OpId::FromPB(op_id_local), std::memory_order_release);
+ 
+   PrepareState prepare_state_copy;
+   {
+@@ -379,7 +370,7 @@ void OperationDriver::ReplicationFinished(const Status& status, int64_t leader_t
+   if (prepare_state_copy == PREPARED) {
+     // We likely need to do cleanup if this fails so for now just
+     // CHECK_OK
+-    CHECK_OK(ApplyOperation(leader_term));
++    CHECK_OK(ApplyOperation(leader_term, applied_op_ids));
+   }
+ }
+ 
+@@ -403,13 +394,14 @@ void OperationDriver::Abort(const Status& status) {
+   }
+ }
+ 
+-Status OperationDriver::ApplyOperation(int64_t leader_term) {
++Status OperationDriver::ApplyOperation(
++    int64_t leader_term, OpIds* applied_op_ids) {
+   {
+     std::unique_lock<simple_spinlock> lock(lock_);
+     DCHECK_EQ(prepare_state_, PREPARED);
+     if (operation_status_.ok()) {
+       DCHECK_EQ(replication_state_, REPLICATED);
+-      order_verifier_->CheckApply(op_id_copy_.index(),
++      order_verifier_->CheckApply(op_id_copy_.load(std::memory_order_relaxed).index,
+                                   prepare_physical_hybrid_time_);
+     } else {
+       DCHECK_EQ(replication_state_, REPLICATION_FAILED);
+@@ -424,11 +416,11 @@ Status OperationDriver::ApplyOperation(int64_t leader_term) {
+ 
+   // RocksDB-backed tables require that we apply changes in the same order they appear in the Raft
+   // log.
+-  ApplyTask(leader_term);
++  ApplyTask(leader_term, applied_op_ids);
+   return Status::OK();
+ }
+ 
+-void OperationDriver::ApplyTask(int64_t leader_term) {
++void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {
+   TRACE_EVENT_FLOW_END0("operation", "ApplyTask", this);
+   ADOPT_TRACE(trace());
+ 
+@@ -446,7 +438,7 @@ void OperationDriver::ApplyTask(int64_t leader_term) {
+ 
+   {
+     CHECK_OK(operation_->Replicated(leader_term));
+-    operation_tracker_->Release(this);
++    operation_tracker_->Release(this, applied_op_ids);
+   }
+ }
+ 
+@@ -507,5 +499,16 @@ std::string OperationDriver::LogPrefix() const {
+                              ts_string);
+ }
+ 
++int64_t OperationDriver::SpaceUsed() {
++  if (!operation_) {
++    return 0;
++  }
++  auto consensus_round = operation_->state()->consensus_round();
++  if (consensus_round) {
++    return consensus_round->replicate_msg()->SpaceUsedLong();
++  }
++  return state()->request()->SpaceUsedLong();
++}
++
+ }  // namespace tablet
+ }  // namespace yb
+diff --git a/src/yb/tablet/operations/operation_driver.h b/src/yb/tablet/operations/operation_driver.h
+index 901730991e..d1b2e3aa51 100644
+--- a/src/yb/tablet/operations/operation_driver.h
++++ b/src/yb/tablet/operations/operation_driver.h
+@@ -40,6 +40,7 @@
+ #include "yb/gutil/walltime.h"
+ #include "yb/tablet/operations/operation.h"
+ #include "yb/util/lockfree.h"
++#include "yb/util/opid.h"
+ #include "yb/util/status.h"
+ #include "yb/util/trace.h"
+ 
+@@ -126,7 +127,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+   // Returns the OpId of the operation being executed or an uninitialized
+   // OpId if none has been assigned. Returns a copy and thus should not
+   // be used in tight loops.
+-  consensus::OpId GetOpId();
++  yb::OpId GetOpId();
+ 
+   // Submits the operation for execution.
+   // The returned status acknowledges any error on the submission process.
+@@ -145,7 +146,8 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+   // If status is anything different from OK() we don't proceed with the apply.
+   //
+   // see comment in the interface for an important TODO.
+-  void ReplicationFinished(const Status& status, int64_t leader_term);
++  void ReplicationFinished(
++      const Status& status, int64_t leader_term, OpIds* applied_op_ids);
+ 
+   std::string ToString() const;
+ 
+@@ -201,9 +203,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+     mvcc_ = mvcc;
+   }
+ 
+-  int64_t SpaceUsed() {
+-    return operation_ ? state()->request()->SpaceUsed() : 0;
+-  }
++  int64_t SpaceUsed();
+ 
+  private:
+   friend class RefCountedThreadSafe<OperationDriver>;
+@@ -235,11 +235,11 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+   bool StartOperation();
+ 
+   // Performs status checks and calls ApplyTask.
+-  CHECKED_STATUS ApplyOperation(int64_t leader_term);
++  CHECKED_STATUS ApplyOperation(int64_t leader_term, OpIds* applied_op_ids);
+ 
+   // Calls Operation::Apply() followed by Consensus::Commit() with the
+   // results from the Apply().
+-  void ApplyTask(int64_t leader_term);
++  void ApplyTask(int64_t leader_term, OpIds* applied_op_ids);
+ 
+   // Returns the mutable state of the operation being executed by
+   // this driver.
+@@ -265,13 +265,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+   // receives one from Consensus and uninitialized until then.
+   // TODO(todd): we have three separate copies of this now -- in OperationState,
+   // CommitMsg, and here... we should be able to consolidate!
+-  consensus::OpId op_id_copy_;
+-
+-  // Lock that protects access to the driver's copy of the op_id, specifically.
+-  // GetOpId() is the only method expected to be called by threads outside
+-  // of the control of the driver, so we use a special lock to control access
+-  // otherwise callers would block for a long time for long running operations.
+-  mutable simple_spinlock opid_lock_;
++  std::atomic<yb::OpId> op_id_copy_{yb::OpId::Invalid()};
+ 
+   // The operation to be executed by this driver.
+   std::unique_ptr<Operation> operation_;
+diff --git a/src/yb/tablet/operations/operation_tracker.cc b/src/yb/tablet/operations/operation_tracker.cc
+index 4c93a8e672..6f24c78f41 100644
+--- a/src/yb/tablet/operations/operation_tracker.cc
++++ b/src/yb/tablet/operations/operation_tracker.cc
+@@ -119,11 +119,8 @@ OperationTracker::Metrics::Metrics(const scoped_refptr<MetricEntity>& entity)
+ #undef GINIT
+ #undef MINIT
+ 
+-OperationTracker::State::State()
+-  : memory_footprint(0) {
+-}
+-
+-OperationTracker::OperationTracker() {
++OperationTracker::OperationTracker(const std::string& log_prefix)
++    : log_prefix_(log_prefix) {
+ }
+ 
+ OperationTracker::~OperationTracker() {
+@@ -187,24 +184,34 @@ void OperationTracker::DecrementCounters(const OperationDriver& driver) const {
+   metrics_->operations_inflight[index]->Decrement();
+ }
+ 
+-void OperationTracker::Release(OperationDriver* driver) {
++void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {
+   DecrementCounters(*driver);
+ 
+   State st;
++  yb::OpId op_id = driver->GetOpId();
++  OperationType operation_type = driver->operation_type();
+   {
+     // Remove the operation from the map, retaining the state for use
+     // below.
+     std::lock_guard<simple_spinlock> l(lock_);
+     st = FindOrDie(pending_operations_, driver);
+     if (PREDICT_FALSE(pending_operations_.erase(driver) != 1)) {
+-      LOG(FATAL) << "Could not remove pending operation from map: "
++      LOG_WITH_PREFIX(FATAL) << "Could not remove pending operation from map: "
+           << driver->ToStringUnlocked();
+     }
+   }
+ 
+-  if (mem_tracker_) {
++  if (mem_tracker_ && st.memory_footprint) {
+     mem_tracker_->Release(st.memory_footprint);
+   }
++
++  if (operation_type != OperationType::kEmpty) {
++    if (applied_op_ids) {
++      applied_op_ids->push_back(op_id);
++    } else if (post_tracker_) {
++      post_tracker_(op_id);
++    }
++  }
+ }
+ 
+ std::vector<scoped_refptr<OperationDriver>> OperationTracker::GetPendingOperations() const {
+@@ -249,15 +256,16 @@ Status OperationTracker::WaitForAllToFinish(const MonoDelta& timeout) const {
+     }
+     int64_t waited_ms = diff.ToMilliseconds();
+     if (waited_ms / complain_ms > num_complaints) {
+-      LOG(WARNING) << Substitute("OperationTracker waiting for $0 outstanding operations to"
+-                                 " complete now for $1 ms", operations.size(), waited_ms);
++      LOG_WITH_PREFIX(WARNING)
++          << Substitute("OperationTracker waiting for $0 outstanding operations to"
++                        " complete now for $1 ms", operations.size(), waited_ms);
+       num_complaints++;
+     }
+     wait_time = std::min(wait_time * 5 / 4, 1000000);
+ 
+-    LOG(INFO) << "Dumping currently running operations: ";
++    LOG_WITH_PREFIX(INFO) << "Dumping currently running operations: ";
+     for (scoped_refptr<OperationDriver> driver : operations) {
+-      LOG(INFO) << driver->ToString();
++      LOG_WITH_PREFIX(INFO) << driver->ToString();
+     }
+     SleepFor(MonoDelta::FromMicroseconds(wait_time));
+   }
+diff --git a/src/yb/tablet/operations/operation_tracker.h b/src/yb/tablet/operations/operation_tracker.h
+index 8d99f76cc2..672dd0e39b 100644
+--- a/src/yb/tablet/operations/operation_tracker.h
++++ b/src/yb/tablet/operations/operation_tracker.h
+@@ -42,6 +42,7 @@
+ #include "yb/gutil/ref_counted.h"
+ #include "yb/tablet/operations/operation.h"
+ #include "yb/util/locks.h"
++#include "yb/util/opid.h"
+ 
+ namespace yb {
+ 
+@@ -59,7 +60,7 @@ class OperationDriver;
+ // It will remove itself by calling Release().
+ class OperationTracker {
+  public:
+-  OperationTracker();
++  explicit OperationTracker(const std::string& log_prefix);
+   ~OperationTracker();
+ 
+   // Adds a operation to the set of tracked operations.
+@@ -70,7 +71,7 @@ class OperationTracker {
+ 
+   // Removes the operation from the pending list.
+   // Also triggers the deletion of the Operation object, if its refcount == 0.
+-  void Release(OperationDriver* driver);
++  void Release(OperationDriver* driver, OpIds* applied_op_ids);
+ 
+   // Populates list of currently-running operations into 'pending_out' vector.
+   std::vector<scoped_refptr<OperationDriver>> GetPendingOperations() const;
+@@ -84,6 +85,17 @@ class OperationTracker {
+   void StartInstrumentation(const scoped_refptr<MetricEntity>& metric_entity);
+   void StartMemoryTracking(const std::shared_ptr<MemTracker>& parent_mem_tracker);
+ 
++  // Post tracker in called when operation tracker finishes tracking memory for corresponding op id.
++  // So post tracker could start tracking this memory in case it is still keeping memory for this
++  // op id.
++  void SetPostTracker(std::function<void(const OpId&)> post_tracker) {
++    post_tracker_ = std::move(post_tracker);
++  }
++
++  const std::string& LogPrefix() const {
++    return log_prefix_;
++  }
++
+  private:
+   struct Metrics {
+     explicit Metrics(const scoped_refptr<MetricEntity>& entity);
+@@ -100,14 +112,14 @@ class OperationTracker {
+   // Decrements relevant metric counters.
+   void DecrementCounters(const OperationDriver& driver) const;
+ 
++  const std::string log_prefix_;
++
+   mutable simple_spinlock lock_;
+ 
+   // Per-operation state that is tracked along with the operation itself.
+   struct State {
+-    State();
+-
+     // Approximate memory footprint of the operation.
+-    int64_t memory_footprint;
++    int64_t memory_footprint = 0;
+   };
+ 
+   // Protected by 'lock_'.
+@@ -122,6 +134,8 @@ class OperationTracker {
+ 
+   std::shared_ptr<MemTracker> mem_tracker_;
+ 
++  std::function<void(const OpId&)> post_tracker_;
++
+   DISALLOW_COPY_AND_ASSIGN(OperationTracker);
+ };
+ 
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index c550ee11bd..d9be81a0ed 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -149,6 +149,7 @@ TabletPeer::TabletPeer(
+     tablet_id_(meta->raft_group_id()),
+     local_peer_pb_(local_peer_pb),
+     state_(RaftGroupStatePB::NOT_STARTED),
++    operation_tracker_(Format("T $0 P $1: ", tablet_id_, permanent_uuid)),
+     status_listener_(new TabletStatusListener(meta)),
+     clock_(clock),
+     log_anchor_registry_(new LogAnchorRegistry()),
+@@ -265,6 +266,8 @@ Status TabletPeer::InitTabletPeer(const shared_ptr<TabletClass> &tablet,
+       return HybridTime(lease_micros, /* logical */ 0);
+     };
+     tablet_->SetHybridTimeLeaseProvider(ht_lease_provider);
++    operation_tracker_.SetPostTracker(
++        std::bind(&RaftConsensus::TrackOperationMemory, consensus_.get(), _1));
+ 
+     auto* mvcc_manager = tablet_->mvcc_manager();
+     consensus_->SetPropagatedSafeTimeProvider([mvcc_manager, ht_lease_provider] {
+@@ -674,7 +677,7 @@ void TabletPeer::GetInFlightOperations(Operation::TraceType trace_type,
+     }
+ 
+     consensus::OperationStatusPB status_pb;
+-    status_pb.mutable_op_id()->CopyFrom(driver->GetOpId());
++    driver->GetOpId().ToPB(status_pb.mutable_op_id());
+     status_pb.set_operation_type(MapOperationTypeToPB(op_type));
+     status_pb.set_description(driver->ToString());
+     int64_t running_for_micros =
+@@ -713,11 +716,11 @@ Result<int64_t> TabletPeer::GetEarliestNeededLogIndex() const {
+ 
+   // Next, interrogate the OperationTracker.
+   for (const auto& driver : operation_tracker_.GetPendingOperations()) {
+-    OpId tx_op_id = driver->GetOpId();
++    auto tx_op_id = driver->GetOpId();
+     // A operation which doesn't have an opid hasn't been submitted for replication yet and
+     // thus has no need to anchor the log.
+-    if (tx_op_id.IsInitialized()) {
+-      min_index = std::min(min_index, tx_op_id.index());
++    if (tx_op_id != yb::OpId::Invalid()) {
++      min_index = std::min(min_index, tx_op_id.index);
+     }
+   }
+ 
+@@ -860,7 +863,7 @@ Status TabletPeer::StartReplicaOperation(
+ 
+   // Unretained is required to avoid a refcount cycle.
+   state->consensus_round()->SetConsensusReplicatedCallback(
+-      std::bind(&OperationDriver::ReplicationFinished, driver.get(), _1, _2));
++      std::bind(&OperationDriver::ReplicationFinished, driver.get(), _1, _2, _3));
+ 
+   if (propagated_safe_time) {
+     driver->SetPropagatedSafeTime(propagated_safe_time, tablet_->mvcc_manager());
+diff --git a/src/yb/util/opid.h b/src/yb/util/opid.h
+index c661f56dc2..536d0e1811 100644
+--- a/src/yb/util/opid.h
++++ b/src/yb/util/opid.h
+@@ -17,6 +17,7 @@
+ 
+ #include <cstdint>
+ #include <iosfwd>
++#include <vector>
+ 
+ namespace yb {
+ 
+@@ -106,6 +107,8 @@ struct OpIdHash {
+   }
+ };
+ 
++typedef std::vector<OpId> OpIds;
++
+ } // namespace yb
+ 
+ #endif // YB_UTIL_OPID_H

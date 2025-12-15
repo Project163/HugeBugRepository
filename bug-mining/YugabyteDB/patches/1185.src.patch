@@ -1,0 +1,335 @@
+diff --git a/src/postgres/src/backend/utils/adt/regexp.c b/src/postgres/src/backend/utils/adt/regexp.c
+index 9758c60e79..d5de38f423 100644
+--- a/src/postgres/src/backend/utils/adt/regexp.c
++++ b/src/postgres/src/backend/utils/adt/regexp.c
+@@ -38,6 +38,10 @@
+ #include "utils/memutils.h"
+ #include "utils/varlena.h"
+ 
++/* YB includes. */
++#include "yb/yql/pggate/ybc_pg_typedefs.h"
++#include "yb/yql/pggate/ybc_pggate.h"
++
+ #define PG_GETARG_TEXT_PP_IF_EXISTS(_n) \
+ 	(PG_NARGS() > (_n) ? PG_GETARG_TEXT_PP(_n) : NULL)
+ 
+@@ -106,9 +110,57 @@ typedef struct cached_re_str
+ 	regex_t		cre_re;			/* the compiled regular expression */
+ } cached_re_str;
+ 
+-static int	num_res = 0;		/* # of cached re's */
+-static cached_re_str re_array[MAX_CACHED_RES];	/* cached re's */
++/*
++ * YB: A single static cache works in Postgres, but is not safe in a
++ * multi-threaded environment when we pushdown regex filters to the tserver.
++ * The following infrastructure is necessary to create a thread local cache
++ * for regex compilation.
++ */
++typedef struct YbReCacheInfo
++{
++	int *num;
++	cached_re_str *array;
++} YbReCacheInfo;
+ 
++static void YbFreeRe(cached_re_str *re)
++{
++	pg_regfree(&re->cre_re);
++	free(re->cre_pat);
++}
++
++static void
++YbFreeReCache(YBCPgThreadLocalRegexpCache *cache)
++{
++	Assert(cache && cache->array);
++	cached_re_str *re = cache->array;
++	for (cached_re_str *re_end = re + cache->num; re != re_end; ++re)
++		YbFreeRe(re);
++}
++
++static YbReCacheInfo
++YbGetReCacheInfo()
++{
++	if (IsMultiThreadedMode())
++	{
++		YBCPgThreadLocalRegexpCache* cache = YBCPgGetThreadLocalRegexpCache();
++		if (!cache)
++		{
++			cache = YBCPgInitThreadLocalRegexpCache(
++				sizeof(cached_re_str) * MAX_CACHED_RES,
++				&YbFreeReCache);
++			Assert(cache && cache->array);
++		}
++
++		return (YbReCacheInfo){
++			.num = &cache->num,
++			.array = (cached_re_str *) cache->array};
++	}
++
++	static int	num_res = 0;		/* # of cached re's */
++	static cached_re_str re_array[MAX_CACHED_RES];	/* cached re's */
++
++	return (YbReCacheInfo) {.num = &num_res, .array = re_array};
++}
+ 
+ /* Local functions */
+ static regexp_matches_ctx *setup_regexp_matches(text *orig_str, text *pattern,
+@@ -145,12 +197,16 @@ RE_compile_and_cache(text *text_re, int cflags, Oid collation)
+ 	cached_re_str re_temp;
+ 	char		errMsg[100];
+ 
++	YbReCacheInfo yb_re_cache_info = YbGetReCacheInfo();
++	int *num_res = yb_re_cache_info.num;
++	cached_re_str *re_array = yb_re_cache_info.array;
++
+ 	/*
+ 	 * Look for a match among previously compiled REs.  Since the data
+ 	 * structure is self-organizing with most-used entries at the front, our
+ 	 * search strategy can just be to scan from the front.
+ 	 */
+-	for (i = 0; i < num_res; i++)
++	for (i = 0; i < *num_res; i++)
+ 	{
+ 		if (re_array[i].cre_pat_len == text_re_len &&
+ 			re_array[i].cre_flags == cflags &&
+@@ -231,19 +287,18 @@ RE_compile_and_cache(text *text_re, int cflags, Oid collation)
+ 	 * Okay, we have a valid new item in re_temp; insert it into the storage
+ 	 * array.  Discard last entry if needed.
+ 	 */
+-	if (num_res >= MAX_CACHED_RES)
++	if (*num_res >= MAX_CACHED_RES)
+ 	{
+-		--num_res;
+-		Assert(num_res < MAX_CACHED_RES);
+-		pg_regfree(&re_array[num_res].cre_re);
+-		free(re_array[num_res].cre_pat);
++		--*num_res;
++		Assert(*num_res < MAX_CACHED_RES);
++		YbFreeRe(&re_array[*num_res]);
+ 	}
+ 
+-	if (num_res > 0)
+-		memmove(&re_array[1], &re_array[0], num_res * sizeof(cached_re_str));
++	if (*num_res > 0)
++		memmove(&re_array[1], &re_array[0], *num_res * sizeof(cached_re_str));
+ 
+ 	re_array[0] = re_temp;
+-	num_res++;
++	(*num_res)++;
+ 
+ 	return &re_array[0].cre_re;
+ }
+diff --git a/src/yb/yql/pggate/pggate_thread_local_vars.cc b/src/yb/yql/pggate/pggate_thread_local_vars.cc
+index 2bf57ddf42..d66efa2a3e 100644
+--- a/src/yb/yql/pggate/pggate_thread_local_vars.cc
++++ b/src/yb/yql/pggate/pggate_thread_local_vars.cc
+@@ -15,18 +15,41 @@
+ #include "yb/yql/pggate/pggate_thread_local_vars.h"
+ 
+ #include <stddef.h>
++#include <optional>
++#include <vector>
+ 
+-namespace yb {
+-namespace pggate {
++#include "yb/yql/pggate/ybc_pg_typedefs.h"
++#include "yb/util/logging.h"
++
++class CachedRegexpHolder {
++ public:
++  CachedRegexpHolder(size_t buffer_size,
++                     YBCPgThreadLocalRegexpCacheCleanup cleanup)
++      : buffer_(buffer_size, 0), cleanup_(cleanup), cache_{.num = 0, .array = buffer_.data()} {}
++
++  ~CachedRegexpHolder() {
++    cleanup_(&cache_);
++  }
++
++  PgThreadLocalRegexpCache& cache() { return cache_; }
++
++ private:
++  std::vector<char> buffer_;
++  const YBCPgThreadLocalRegexpCacheCleanup cleanup_;
++  PgThreadLocalRegexpCache cache_ = {};
++};
++
++namespace yb::pggate {
+ 
+ /*
+  * This code does not need to know anything about the value internals.
+  * TODO we could use opaque types instead of void* for additional type safety.
+  */
+-thread_local void* thread_local_memory_context_ = NULL;
+-thread_local void* pg_strtok_ptr = NULL;
+-thread_local void* jump_buffer = NULL;
+-thread_local void* err_status = NULL;
++thread_local void* thread_local_memory_context_ = nullptr;
++thread_local void* pg_strtok_ptr = nullptr;
++thread_local void* jump_buffer = nullptr;
++thread_local void* err_status = nullptr;
++thread_local std::optional<CachedRegexpHolder> re_cache;
+ 
+ //-----------------------------------------------------------------------------
+ // Memory context.
+@@ -43,9 +66,9 @@ void* PgGetThreadLocalCurrentMemoryContext() {
+ }
+ 
+ void PgResetCurrentMemCtxThreadLocalVars() {
+-  pg_strtok_ptr = NULL;
+-  jump_buffer = NULL;
+-  err_status = NULL;
++  pg_strtok_ptr = nullptr;
++  jump_buffer = nullptr;
++  err_status = nullptr;
+ }
+ 
+ //-----------------------------------------------------------------------------
+@@ -84,5 +107,15 @@ void PgSetThreadLocalStrTokPtr(char *new_pg_strtok_ptr) {
+   pg_strtok_ptr = new_pg_strtok_ptr;
+ }
+ 
+-}  // namespace pggate
+-}  // namespace yb
++YBCPgThreadLocalRegexpCache* PgGetThreadLocalRegexpCache() {
++  return re_cache ? &re_cache->cache() : nullptr;
++}
++
++YBCPgThreadLocalRegexpCache* PgInitThreadLocalRegexpCache(
++    size_t buffer_size, YBCPgThreadLocalRegexpCacheCleanup cleanup) {
++  DCHECK(!re_cache);
++  re_cache.emplace(buffer_size, cleanup);
++  return &re_cache->cache();
++}
++
++}  // namespace yb::pggate
+diff --git a/src/yb/yql/pggate/pggate_thread_local_vars.h b/src/yb/yql/pggate/pggate_thread_local_vars.h
+index 5249bb599b..98d5db810a 100644
+--- a/src/yb/yql/pggate/pggate_thread_local_vars.h
++++ b/src/yb/yql/pggate/pggate_thread_local_vars.h
+@@ -21,10 +21,8 @@
+ 
+ #pragma once
+ 
+-
+-
+-namespace yb {
+-namespace pggate {
++#include "yb/yql/pggate/ybc_pg_typedefs.h"
++namespace yb::pggate {
+ 
+ //-----------------------------------------------------------------------------
+ // Memory context.
+@@ -69,5 +67,12 @@ void *PgGetThreadLocalErrStatus();
+ void* PgGetThreadLocalStrTokPtr();
+ void PgSetThreadLocalStrTokPtr(char *new_pg_strtok_ptr);
+ 
+-} // namespace pggate
+-} // namespace yb
++/*
++ * CachedRegexpHolder (from regex/regex.c)
++ * These are used to cache the compiled regexes
++ */
++YBCPgThreadLocalRegexpCache* PgGetThreadLocalRegexpCache();
++YBCPgThreadLocalRegexpCache* PgInitThreadLocalRegexpCache(
++    size_t buffer_size, YBCPgThreadLocalRegexpCacheCleanup cleanup);
++
++} // namespace yb::pggate
+diff --git a/src/yb/yql/pggate/ybc_pg_typedefs.h b/src/yb/yql/pggate/ybc_pg_typedefs.h
+index f9847b28f5..ef4e91cc7d 100644
+--- a/src/yb/yql/pggate/ybc_pg_typedefs.h
++++ b/src/yb/yql/pggate/ybc_pg_typedefs.h
+@@ -797,6 +797,14 @@ typedef struct YbCloneInfo {
+   const char* tgt_owner;
+ } YbCloneInfo;
+ 
++// A thread-safe way to cache compiled regexes.
++typedef struct PgThreadLocalRegexpCache {
++  int num;
++  void* array;
++} YBCPgThreadLocalRegexpCache;
++
++typedef void (*YBCPgThreadLocalRegexpCacheCleanup)(YBCPgThreadLocalRegexpCache*);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif  // __cplusplus
+diff --git a/src/yb/yql/pggate/ybc_pggate.cc b/src/yb/yql/pggate/ybc_pggate.cc
+index c7f4aa3a20..9a247072f2 100644
+--- a/src/yb/yql/pggate/ybc_pggate.cc
++++ b/src/yb/yql/pggate/ybc_pggate.cc
+@@ -2088,6 +2088,15 @@ void YBCPgSetThreadLocalStrTokPtr(char *new_pg_strtok_ptr) {
+   PgSetThreadLocalStrTokPtr(new_pg_strtok_ptr);
+ }
+ 
++YBCPgThreadLocalRegexpCache* YBCPgGetThreadLocalRegexpCache() {
++  return PgGetThreadLocalRegexpCache();
++}
++
++YBCPgThreadLocalRegexpCache* YBCPgInitThreadLocalRegexpCache(
++    size_t buffer_size, YBCPgThreadLocalRegexpCacheCleanup cleanup) {
++  return PgInitThreadLocalRegexpCache(buffer_size, cleanup);
++}
++
+ void* YBCPgSetThreadLocalJumpBuffer(void* new_buffer) {
+   return PgSetThreadLocalJumpBuffer(new_buffer);
+ }
+diff --git a/src/yb/yql/pggate/ybc_pggate.h b/src/yb/yql/pggate/ybc_pggate.h
+index 084a20f946..b46c2341af 100644
+--- a/src/yb/yql/pggate/ybc_pggate.h
++++ b/src/yb/yql/pggate/ybc_pggate.h
+@@ -802,6 +802,11 @@ void* YBCPgSetThreadLocalErrStatus(void* new_status);
+ 
+ void* YBCPgGetThreadLocalErrStatus();
+ 
++YBCPgThreadLocalRegexpCache* YBCPgGetThreadLocalRegexpCache();
++
++YBCPgThreadLocalRegexpCache* YBCPgInitThreadLocalRegexpCache(
++    size_t buffer_size, YBCPgThreadLocalRegexpCacheCleanup cleanup);
++
+ void YBCPgResetCatalogReadTime();
+ 
+ YBCStatus YBCNewGetLockStatusDataSRF(YBCPgFunction *handle);
+diff --git a/src/yb/yql/pgwrapper/pg_mini-test.cc b/src/yb/yql/pgwrapper/pg_mini-test.cc
+index d22d03bfd0..be127b9255 100644
+--- a/src/yb/yql/pgwrapper/pg_mini-test.cc
++++ b/src/yb/yql/pgwrapper/pg_mini-test.cc
+@@ -2416,6 +2416,40 @@ TEST_F_EX(PgMiniTest, DISABLED_ReadsDuringRBS, PgMiniStreamCompressionTest) {
+   thread_holder.Stop();
+ }
+ 
++TEST_F_EX(PgMiniTest, RegexPushdown, PgMiniTestSingleNode) {
++  // Create (a, aa, aaa, b, bb, bbb, ..., z, zz, zzz) rows.
++  const int kMaxRepeats = 3;
++  std::stringstream str;
++  auto first = true;
++  for (char c = 'a'; c <= 'z'; ++c) {
++    for (size_t repeats = 1; repeats <= kMaxRepeats; ++repeats) {
++      if (!first) {
++        str << ", ";
++      } else {
++        first = false;
++      }
++
++      str << "('";
++      for (size_t i = 0; i < repeats; ++i)
++        str << c;
++      str << "')";
++    }
++  }
++  const auto values = str.str();
++
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.ExecuteFormat(
++      "CREATE TABLE test_texticregex (t TEXT, PRIMARY KEY(t ASC)) SPLIT AT VALUES($0)", values));
++  ASSERT_OK(conn.ExecuteFormat("INSERT INTO test_texticregex VALUES $0", values));
++
++  for (size_t i = 0; i < 10; ++i) {
++    const auto count = ASSERT_RESULT(conn.FetchRow<PGUint64>(
++        "SELECT COUNT(*) FROM test_texticregex WHERE texticregexeq(t, t)"));
++    ASSERT_EQ(count, ('z' - 'a' + 1) * kMaxRepeats);
++  }
++}
++
++
+ Status MockAbortFailure(
+     const yb::tserver::PgFinishTransactionRequestPB* req,
+     yb::tserver::PgFinishTransactionResponsePB* resp, yb::rpc::RpcContext* context) {

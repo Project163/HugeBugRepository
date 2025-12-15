@@ -1,0 +1,184 @@
+diff --git a/RELEASE.rst b/RELEASE.rst
+index b713656c51..ce880b949b 100644
+--- a/RELEASE.rst
++++ b/RELEASE.rst
+@@ -94,6 +94,8 @@ pandas 0.8.2
+     from earlier version of pandas (#1757)
+   - Handle non-float64 dtypes in fast DataFrame.corr/cov code paths (#1761)
+   - Fix DatetimeIndex.isin to function properly (#1763)
++  - Fix conversion of array of tz-aware datetime.datetime to DatetimeIndex with
++    right time zone (#1777)
+ 
+ pandas 0.8.1
+ ============
+diff --git a/pandas/core/index.py b/pandas/core/index.py
+index 08af7932ce..3fb68fa9e8 100644
+--- a/pandas/core/index.py
++++ b/pandas/core/index.py
+@@ -3,13 +3,11 @@
+ from datetime import time
+ 
+ from itertools import izip
+-import weakref
+ 
+ import numpy as np
+ 
+ from pandas.core.common import ndtake
+ from pandas.util.decorators import cache_readonly
+-from pandas.util import py3compat
+ import pandas.core.common as com
+ import pandas.lib as lib
+ import pandas._algos as _algos
+diff --git a/pandas/src/datetime.pyx b/pandas/src/datetime.pyx
+index 9788ee6826..b6e0b9eb4c 100644
+--- a/pandas/src/datetime.pyx
++++ b/pandas/src/datetime.pyx
+@@ -567,6 +567,12 @@ cpdef convert_to_tsobject(object ts, object tz=None):
+ cdef inline bint _is_utc(object tz):
+     return tz is UTC or isinstance(tz, _du_utc)
+ 
++cdef inline object _get_zone(object tz):
++    if _is_utc(tz):
++        return 'UTC'
++    else:
++        return tz.zone
++
+ cdef int64_t _NS_LOWER_BOUND = -9223285636854775809LL
+ cdef int64_t _NS_UPPER_BOUND = -9223372036854775807LL
+ 
+@@ -648,6 +654,42 @@ cdef inline _string_to_dts(object val, pandas_datetimestruct* dts):
+     if result == -1:
+         raise ValueError('Unable to parse %s' % str(val))
+ 
++def datetime_to_datetime64(ndarray[object] values):
++    cdef:
++        Py_ssize_t i, n = len(values)
++        object val, inferred_tz = None
++        ndarray[int64_t] iresult
++        pandas_datetimestruct dts
++        _TSObject _ts
++
++    result = np.empty(n, dtype='M8[ns]')
++    iresult = result.view('i8')
++    for i in range(n):
++        val = values[i]
++        if util._checknull(val):
++            iresult[i] = iNaT
++        elif PyDateTime_Check(val):
++            if val.tzinfo is not None:
++                if inferred_tz is not None:
++                    if _get_zone(val.tzinfo) != inferred_tz:
++                        raise ValueError('Array must be all same time zone')
++                else:
++                    inferred_tz = _get_zone(val.tzinfo)
++
++                _ts = convert_to_tsobject(val)
++                iresult[i] = _ts.value
++                _check_dts_bounds(iresult[i], &_ts.dts)
++            else:
++                if inferred_tz is not None:
++                    raise ValueError('Cannot mix tz-aware with tz-naive values')
++                iresult[i] = _pydatetime_to_dts(val, &dts)
++                _check_dts_bounds(iresult[i], &dts)
++        else:
++            raise TypeError('Unrecognized value type: %s' % type(val))
++
++    return result, inferred_tz
++
++
+ def array_to_datetime(ndarray[object] values, raise_=False, dayfirst=False,
+                       format=None, utc=None):
+     cdef:
+diff --git a/pandas/tseries/index.py b/pandas/tseries/index.py
+index 497f7c75c4..f20c527c96 100644
+--- a/pandas/tseries/index.py
++++ b/pandas/tseries/index.py
+@@ -197,7 +197,11 @@ class DatetimeIndex(Int64Index):
+             subarr = _str_to_dt_array(data, offset)
+         elif issubclass(data.dtype.type, np.datetime64):
+             if isinstance(data, DatetimeIndex):
++                if tz is None:
++                    tz = data.tz
++
+                 subarr = data.values
++
+                 if offset is None:
+                     offset = data.offset
+                     verify_integrity = False
+diff --git a/pandas/tseries/tests/test_timezones.py b/pandas/tseries/tests/test_timezones.py
+index 22065fcc57..1adcb571c7 100644
+--- a/pandas/tseries/tests/test_timezones.py
++++ b/pandas/tseries/tests/test_timezones.py
+@@ -361,8 +361,8 @@ class TestTimeZoneSupport(unittest.TestCase):
+                  datetime(2000, 1, 3)]
+ 
+         dates_aware = [tz.localize(x) for x in dates]
+-
+-        self.assertRaises(Exception, to_datetime, dates_aware)
++        result = to_datetime(dates_aware)
++        self.assert_(result.tz.zone == 'US/Eastern')
+ 
+         converted = to_datetime(dates_aware, utc=True)
+         ex_vals = [Timestamp(x).value for x in dates_aware]
+@@ -418,6 +418,12 @@ class TestTimeZoneSupport(unittest.TestCase):
+         index.hour
+         index[0]
+ 
++    def test_tzaware_datetime_to_index(self):
++        d = [datetime(2012, 8, 19, tzinfo=pytz.timezone('US/Eastern'))]
++
++        index = DatetimeIndex(d)
++        self.assert_(index.tz.zone == 'US/Eastern')
++
+ class TestTimeZones(unittest.TestCase):
+ 
+     def setUp(self):
+diff --git a/pandas/tseries/tools.py b/pandas/tseries/tools.py
+index 57330ac99e..cac52b6f58 100644
+--- a/pandas/tseries/tools.py
++++ b/pandas/tseries/tools.py
+@@ -62,25 +62,34 @@ def to_datetime(arg, errors='ignore', dayfirst=False, utc=None, box=True):
+     """
+     from pandas.core.series import Series
+     from pandas.tseries.index import DatetimeIndex
++
++    def _convert_f(arg):
++        arg = com._ensure_object(arg)
++
++        try:
++            result = lib.array_to_datetime(arg, raise_=errors == 'raise',
++                                           utc=utc, dayfirst=dayfirst)
++            if com.is_datetime64_dtype(result) and box:
++                result = DatetimeIndex(result, tz='utc' if utc else None)
++            return result
++        except ValueError, e:
++            try:
++                values, tz = lib.datetime_to_datetime64(arg)
++                return DatetimeIndex(values, tz=tz)
++            except (ValueError, TypeError):
++                raise e
++
+     if arg is None:
+         return arg
+     elif isinstance(arg, datetime):
+         return arg
+     elif isinstance(arg, Series):
+-        values = lib.array_to_datetime(com._ensure_object(arg.values),
+-                                       raise_=errors == 'raise',
+-                                       utc=utc,
+-                                       dayfirst=dayfirst)
++        values = _convert_f(arg.values)
+         return Series(values, index=arg.index, name=arg.name)
+     elif isinstance(arg, (np.ndarray, list)):
+         if isinstance(arg, list):
+             arg = np.array(arg, dtype='O')
+-        result = lib.array_to_datetime(com._ensure_object(arg),
+-                                       raise_=errors == 'raise',
+-                                       utc=utc,
+-                                       dayfirst=dayfirst)
+-        if com.is_datetime64_dtype(result) and box:
+-            result = DatetimeIndex(result, tz='utc' if utc else None)
++        result = _convert_f(arg)
+         return result
+     try:
+         if not arg:

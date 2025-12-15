@@ -1,0 +1,249 @@
+diff --git a/doc/build/changelog/changelog_11.rst b/doc/build/changelog/changelog_11.rst
+index e06ae6a60..ef52c4bbe 100644
+--- a/doc/build/changelog/changelog_11.rst
++++ b/doc/build/changelog/changelog_11.rst
+@@ -21,6 +21,21 @@
+ .. changelog::
+     :version: 1.1.0b1
+ 
++    .. change::
++        :tags: bug, orm
++        :tickets: 3677
++
++        Fixed bug where a newly inserted instance that is rolled back
++        would still potentially cause persistence conflicts on the next
++        transaction, because the instance would not be checked that it
++        was expired.   This fix will resolve a large class of cases that
++        erronously cause the "New instance with identity X conflicts with
++        persistent instance Y" error.
++
++        .. seealso::
++
++            :ref:`change_3677`
++
+     .. change::
+         :tags: bug, orm
+         :tickets: 3662
+diff --git a/doc/build/changelog/migration_11.rst b/doc/build/changelog/migration_11.rst
+index 6c6febd08..cbf213d44 100644
+--- a/doc/build/changelog/migration_11.rst
++++ b/doc/build/changelog/migration_11.rst
+@@ -290,6 +290,98 @@ time on the outside of the subquery.
+ 
+ :ticket:`3582`
+ 
++.. _change_3677:
++
++Erroneous "new instance X conflicts with persistent instance Y" flush errors fixed
++----------------------------------------------------------------------------------
++
++The :meth:`.Session.rollback` method is responsible for removing objects
++that were INSERTed into the database, e.g. moved from pending to persistent,
++within that now rolled-back transaction.   Objects that make this state
++change are tracked in a weak-referencing collection, and if an object is
++garbage collected from that collection, the :class:`.Session` no longer worries
++about it (it would otherwise not scale for operations that insert many new
++objects within a transaction).  However, an issue arises if the application
++re-loads that same garbage-collected row within the transaction, before the
++rollback occurs; if a strong reference to this object remains into the next
++transaction, the fact that this object was not inserted and should be
++removed would be lost, and the flush would incorrectly raise an error::
++
++    from sqlalchemy import Column, create_engine
++    from sqlalchemy.orm import Session
++    from sqlalchemy.ext.declarative import declarative_base
++
++    Base = declarative_base()
++
++    class A(Base):
++        __tablename__ = 'a'
++        id = Column(Integer, primary_key=True)
++
++    e = create_engine("sqlite://", echo=True)
++    Base.metadata.create_all(e)
++
++    s = Session(e)
++
++    # persist an object
++    s.add(A(id=1))
++    s.flush()
++
++    # rollback buffer loses reference to A
++
++    # load it again, rollback buffer knows nothing
++    # about it
++    a1 = s.query(A).first()
++
++    # roll back the transaction; all state is expired but the
++    # "a1" reference remains
++    s.rollback()
++
++    # previous "a1" conflicts with the new one because we aren't
++    # checking that it never got committed
++    s.add(A(id=1))
++    s.commit()
++
++The above program would raise::
++
++    FlushError: New instance <User at 0x7f0287eca4d0> with identity key
++    (<class 'test.orm.test_transaction.User'>, ('u1',)) conflicts
++    with persistent instance <User at 0x7f02889c70d0>
++
++The bug is that when the above exception is raised, the unit of work
++is operating upon the original object assuming it's a live row, when in
++fact the object is expired and upon testing reveals that it's gone.  The
++fix tests this condition now, so in the SQL log we see:
++
++.. sourcecode:: sql
++
++    BEGIN (implicit)
++
++    INSERT INTO a (id) VALUES (?)
++    (1,)
++
++    SELECT a.id AS a_id FROM a LIMIT ? OFFSET ?
++    (1, 0)
++
++    ROLLBACK
++
++    BEGIN (implicit)
++
++    SELECT a.id AS a_id FROM a WHERE a.id = ?
++    (1,)
++
++    INSERT INTO a (id) VALUES (?)
++    (1,)
++
++    COMMIT
++
++Above, the unit of work now does a SELECT for the row we're about to report
++as a conflict for, sees that it doesn't exist, and proceeds normally.
++The expense of this SELECT is only incurred in the case when we would have
++erroneously raised an exception in any case.
++
++
++:ticket:`3677`
++
+ .. _change_2349:
+ 
+ passive_deletes feature for joined-inheritance mappings
+diff --git a/lib/sqlalchemy/orm/persistence.py b/lib/sqlalchemy/orm/persistence.py
+index b9a1f9df9..a5e0d9d95 100644
+--- a/lib/sqlalchemy/orm/persistence.py
++++ b/lib/sqlalchemy/orm/persistence.py
+@@ -295,22 +295,24 @@ def _organize_states_for_save(base_mapper, states, uowtransaction):
+             instance = \
+                 uowtransaction.session.identity_map[instance_key]
+             existing = attributes.instance_state(instance)
+-            if not uowtransaction.is_deleted(existing):
+-                raise orm_exc.FlushError(
+-                    "New instance %s with identity key %s conflicts "
+-                    "with persistent instance %s" %
+-                    (state_str(state), instance_key,
+-                     state_str(existing)))
+-
+-            base_mapper._log_debug(
+-                "detected row switch for identity %s.  "
+-                "will update %s, remove %s from "
+-                "transaction", instance_key,
+-                state_str(state), state_str(existing))
+-
+-            # remove the "delete" flag from the existing element
+-            uowtransaction.remove_state_actions(existing)
+-            row_switch = existing
++
++            if not uowtransaction.was_already_deleted(existing):
++                if not uowtransaction.is_deleted(existing):
++                    raise orm_exc.FlushError(
++                        "New instance %s with identity key %s conflicts "
++                        "with persistent instance %s" %
++                        (state_str(state), instance_key,
++                         state_str(existing)))
++
++                base_mapper._log_debug(
++                    "detected row switch for identity %s.  "
++                    "will update %s, remove %s from "
++                    "transaction", instance_key,
++                    state_str(state), state_str(existing))
++
++                # remove the "delete" flag from the existing element
++                uowtransaction.remove_state_actions(existing)
++                row_switch = existing
+ 
+         if (has_identity or row_switch) and mapper.version_id_col is not None:
+             update_version_id = mapper._get_committed_state_attr_by_column(
+diff --git a/lib/sqlalchemy/orm/unitofwork.py b/lib/sqlalchemy/orm/unitofwork.py
+index 8b4ae64bb..f3e39d9b5 100644
+--- a/lib/sqlalchemy/orm/unitofwork.py
++++ b/lib/sqlalchemy/orm/unitofwork.py
+@@ -16,6 +16,7 @@ organizes them in order of dependency, and executes.
+ from .. import util, event
+ from ..util import topological
+ from . import attributes, persistence, util as orm_util
++from . import exc as orm_exc
+ import itertools
+ 
+ 
+@@ -155,6 +156,18 @@ class UOWTransaction(object):
+     def has_work(self):
+         return bool(self.states)
+ 
++    def was_already_deleted(self, state):
++        """return true if the given state is expired and was deleted
++        previously.
++        """
++        if state.expired:
++            try:
++                state._load_expired(state, attributes.PASSIVE_OFF)
++            except orm_exc.ObjectDeletedError:
++                self.session._remove_newly_deleted([state])
++                return True
++        return False
++
+     def is_deleted(self, state):
+         """return true if the given state is marked as deleted
+         within this uowtransaction."""
+diff --git a/test/orm/test_transaction.py b/test/orm/test_transaction.py
+index c7b3315d9..c1662c9d1 100644
+--- a/test/orm/test_transaction.py
++++ b/test/orm/test_transaction.py
+@@ -9,7 +9,7 @@ from sqlalchemy.orm import (
+     relationship, attributes)
+ from sqlalchemy.testing.util import gc_collect
+ from test.orm._fixtures import FixtureTest
+-
++from sqlalchemy import inspect
+ 
+ class SessionTransactionTest(FixtureTest):
+     run_inserts = None
+@@ -1518,6 +1518,30 @@ class NaturalPKRollbackTest(fixtures.MappedTest):
+ 
+         session.rollback()
+ 
++    def test_reloaded_deleted_checked_for_expiry(self):
++        """test issue #3677"""
++        users, User = self.tables.users, self.classes.User
++
++        mapper(User, users)
++
++        u1 = User(name='u1')
++
++        s = Session()
++        s.add(u1)
++        s.flush()
++        del u1
++        gc_collect()
++
++        u1 = s.query(User).first()  # noqa
++
++        s.rollback()
++
++        u2 = User(name='u1')
++        s.add(u2)
++        s.commit()
++
++        assert inspect(u2).persistent
++
+     def test_key_replaced_by_update(self):
+         users, User = self.tables.users, self.classes.User
+ 

@@ -1,0 +1,152 @@
+diff --git a/src/postgres/src/backend/utils/misc/guc.c b/src/postgres/src/backend/utils/misc/guc.c
+index 49189058a5..a21eb19b1d 100644
+--- a/src/postgres/src/backend/utils/misc/guc.c
++++ b/src/postgres/src/backend/utils/misc/guc.c
+@@ -3068,6 +3068,21 @@ static struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"yb_disable_catalog_version_check", PGC_SUSET, CUSTOM_OPTIONS,
++			gettext_noop("Disable checking that read requests from "
++			"this pg backend have the latest catalog version."),
++			gettext_noop("User should set this variable with caution. It is "
++			"under active development and is not recommended for production "
++			"clusters. Currently, it is used by ysql_dump to read pg catalog "
++			"as of time."),
++			GUC_NOT_IN_SAMPLE
++		},
++		&yb_disable_catalog_version_check,
++		false,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"yb_enable_advisory_locks", PGC_SIGHUP, LOCK_MANAGEMENT,
+ 			gettext_noop("Enable advisory lock feature"),
+diff --git a/src/postgres/src/backend/utils/misc/pg_yb_utils.c b/src/postgres/src/backend/utils/misc/pg_yb_utils.c
+index b5cdbe2ce3..4177c0ab6b 100644
+--- a/src/postgres/src/backend/utils/misc/pg_yb_utils.c
++++ b/src/postgres/src/backend/utils/misc/pg_yb_utils.c
+@@ -1623,6 +1623,8 @@ bool yb_enable_inplace_index_update = true;
+ bool yb_enable_advisory_locks = false;
+ bool yb_ignore_freeze_with_copy = true;
+ bool yb_enable_docdb_vector_type = false;
++bool yb_disable_catalog_version_check = false;
++
+ 
+ YBUpdateOptimizationOptions yb_update_optimization_options = {
+ 	.has_infra = true,
+@@ -4968,8 +4970,17 @@ assign_yb_read_time(const char *newval, void *extra)
+ 	unsigned long long value_ull;
+ 	bool is_ht_unit;
+ 	parse_yb_read_time(newval, &value_ull, &is_ht_unit);
++	/*
++	 * Don't refresh the sys caches in case the read time value didn't change.
++	 */
++	bool needs_syscaches_refresh = (yb_read_time != value_ull);
+ 	yb_read_time = value_ull;
+ 	yb_is_read_time_ht = is_ht_unit;
++
++	/* Clear and reload system catalog caches, including all callbacks. */
++	if (needs_syscaches_refresh)
++		YbResetCatalogCacheVersion();
++
+ 	if (!am_walsender)
+ 	{
+ 		ereport(NOTICE,
+@@ -5202,6 +5213,13 @@ YbSetMetricsCaptureType(YbcPgMetricsCaptureType metrics_capture)
+ void
+ YbSetCatalogCacheVersion(YbcPgStatement handle, uint64_t version)
+ {
++	/* 
++	 * Skip setting catalog version which skips catalog version check at
++	 * tserver. Used in time-traveling queries as they might read old data
++	 * with old catalog version.
++	 */
++	if (yb_disable_catalog_version_check)
++		return;
+ 	HandleYBStatus(YBIsDBCatalogVersionMode()
+ 		? YBCPgSetDBCatalogCacheVersion(handle, MyDatabaseId, version)
+ 		: YBCPgSetCatalogCacheVersion(handle, version));
+diff --git a/src/postgres/src/bin/pg_dump/pg_dump.c b/src/postgres/src/bin/pg_dump/pg_dump.c
+index f03b282eb7..1ff4069921 100644
+--- a/src/postgres/src/bin/pg_dump/pg_dump.c
++++ b/src/postgres/src/bin/pg_dump/pg_dump.c
+@@ -1315,6 +1315,15 @@ setup_connection(Archive *AH, const char *dumpencoding,
+ 		appendPQExpBuffer(query, "SET yb_read_time To %s", dopt->yb_read_time);
+ 		ExecuteSqlStatement(AH, query->data);
+ 		destroyPQExpBuffer(query);
++		/*
++		 * Disable catalog version check for read requests in case of
++		 * time-traveling queries, as queries in this session might read old data
++		 * with old catalog version.
++		 */
++		query = createPQExpBuffer();
++		appendPQExpBuffer(query, "SET yb_disable_catalog_version_check To True");
++		ExecuteSqlStatement(AH, query->data);
++		destroyPQExpBuffer(query);
+ 	}
+ 	/*
+ 	 * Initialize prepared-query state to "nothing prepared".  We do this here
+diff --git a/src/postgres/src/include/pg_yb_utils.h b/src/postgres/src/include/pg_yb_utils.h
+index ba8da2802b..2e60053a09 100644
+--- a/src/postgres/src/include/pg_yb_utils.h
++++ b/src/postgres/src/include/pg_yb_utils.h
+@@ -597,6 +597,7 @@ extern bool yb_enable_nop_alter_role_optimization;
+  * Compatibility option to ignore FREEZE with COPY FROM.
+  */
+ extern bool yb_ignore_freeze_with_copy;
++extern bool yb_disable_catalog_version_check;
+ 
+ //------------------------------------------------------------------------------
+ // GUC variables needed by YB via their YB pointers.
+diff --git a/src/yb/tools/yb-admin-snapshot-schedule-test.cc b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+index 7632ac47de..9e9f4e9d61 100644
+--- a/src/yb/tools/yb-admin-snapshot-schedule-test.cc
++++ b/src/yb/tools/yb-admin-snapshot-schedule-test.cc
+@@ -1804,6 +1804,44 @@ TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam, PgsqlRenameCol
+   ASSERT_OK(conn.Execute("INSERT INTO test_table(key, value) VALUES (2, 'new_value')"));
+ }
+ 
++TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam, PgsqlRenameColumnWithIndex) {
++  auto schedule_id = ASSERT_RESULT(PreparePgWithColocatedParam());
++  auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));
++
++  ASSERT_OK(
++      conn.Execute("CREATE TABLE test_table (key INT PRIMARY KEY, value TEXT);"
++                   "INSERT INTO test_table VALUES (1, 'before');"
++                   "CREATE INDEX test_table_idx ON test_table (value)"));
++
++  const auto time = ASSERT_RESULT(GetCurrentTime());
++  LOG(INFO) << "Time to restore back: " << time;
++
++  LOG(INFO) << "Alter table 'test_table' -> Rename 'value' column to 'value2'";
++  ASSERT_OK(conn.Execute("ALTER TABLE test_table RENAME COLUMN value TO value2"));
++  const std::string query = "SELECT value FROM test_table";
++  ASSERT_NOK_STR_CONTAINS(conn.FetchRow<std::string>(query), "does not exist");
++
++  auto select_res = ASSERT_RESULT(conn.FetchRow<std::string>("SELECT value2 FROM test_table"));
++  ASSERT_EQ(select_res, "before");
++
++  ASSERT_OK(RestoreSnapshotSchedule(schedule_id, time));
++  conn = ASSERT_RESULT(ConnectToRestoredDb());
++
++  LOG(INFO) << "Select data from table after restore";
++  // There might be a transient period when we get stale data before
++  // the new catalog version gets propagated to all tservers via heartbeats.
++  ASSERT_OK(WaitForSelectQueryToMatchExpectation(query, "before", &conn));
++
++  LOG(INFO) << "Insert data to table after restore";
++  ASSERT_NOK_STR_CONTAINS(
++      conn.Execute("INSERT INTO test_table(key, value2) VALUES (2, 'new_value')"),
++      "does not exist");
++  const auto is_index_scan =
++      ASSERT_RESULT(conn.HasIndexScan("SELECT * FROM test_table where value = 'before'"));
++  ASSERT_TRUE(is_index_scan);
++  ASSERT_OK(conn.Execute("INSERT INTO test_table(key, value) VALUES (2, 'new_value')"));
++}
++
+ TEST_P(YbAdminSnapshotScheduleTestWithYsqlColocationRestoreParam, PgsqlSetDefault) {
+   auto schedule_id = ASSERT_RESULT(PreparePgWithColocatedParam());
+   auto conn = ASSERT_RESULT(PgConnect(client::kTableName.namespace_name()));

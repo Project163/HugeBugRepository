@@ -1,0 +1,151 @@
+diff --git a/doc/source/whatsnew/v0.20.0.txt b/doc/source/whatsnew/v0.20.0.txt
+index 50161b5b7e..f3d60fa8cc 100644
+--- a/doc/source/whatsnew/v0.20.0.txt
++++ b/doc/source/whatsnew/v0.20.0.txt
+@@ -440,3 +440,5 @@ Bug Fixes
+ 
+ - Bug in ``Series.dt.round`` inconsistent behaviour on NAT's with different arguments (:issue:`14940`)
+ - Bug in ``.read_json()`` for Python 2 where ``lines=True`` and contents contain non-ascii unicode characters (:issue:`15132`)
++
++- Bug in ``pd.read_csv()`` with ``float_precision='round_trip'`` which caused a segfault when a text entry is parsed (:issue:`15140`)
+diff --git a/pandas/io/tests/parser/c_parser_only.py b/pandas/io/tests/parser/c_parser_only.py
+index c6ef68fcac..6df3c513fa 100644
+--- a/pandas/io/tests/parser/c_parser_only.py
++++ b/pandas/io/tests/parser/c_parser_only.py
+@@ -388,3 +388,10 @@ No,No,No"""
+         df = self.read_csv(StringIO(test_input), sep='\t', nrows=1010)
+ 
+         self.assertTrue(df.size == 1010 * 10)
++
++    def test_float_precision_round_trip_with_text(self):
++        # gh-15140 - This should not segfault on Python 2.7+
++        df = self.read_csv(StringIO('a'),
++                           float_precision='round_trip',
++                           header=None)
++        tm.assert_frame_equal(df, DataFrame({0: ['a']}))
+diff --git a/pandas/parser.pyx b/pandas/parser.pyx
+index bd793c98ee..b6e5ad0d73 100644
+--- a/pandas/parser.pyx
++++ b/pandas/parser.pyx
+@@ -181,7 +181,11 @@ cdef extern from "parser/tokenizer.h":
+         PyObject *skipfunc
+         int64_t skip_first_N_rows
+         int skipfooter
+-        double (*converter)(const char *, char **, char, char, char, int) nogil
++        # pick one, depending on whether the converter requires GIL
++        double (*double_converter_nogil)(const char *, char **,
++                                         char, char, char, int) nogil
++        double (*double_converter_withgil)(const char *, char **,
++                                           char, char, char, int)
+ 
+         #  error handling
+         char *warn_msg
+@@ -482,11 +486,14 @@ cdef class TextReader:
+ 
+         self.verbose = verbose
+         self.low_memory = low_memory
+-        self.parser.converter = xstrtod
++        self.parser.double_converter_nogil = xstrtod
++        self.parser.double_converter_withgil = NULL
+         if float_precision == 'high':
+-            self.parser.converter = precise_xstrtod
+-        elif float_precision == 'round_trip':
+-            self.parser.converter = round_trip
++            self.parser.double_converter_nogil = precise_xstrtod
++            self.parser.double_converter_withgil = NULL
++        elif float_precision == 'round_trip':  # avoid gh-15140
++            self.parser.double_converter_nogil = NULL
++            self.parser.double_converter_withgil = round_trip
+ 
+         # encoding
+         if encoding is not None:
+@@ -1699,8 +1706,19 @@ cdef _try_double(parser_t *parser, int col, int line_start, int line_end,
+     result = np.empty(lines, dtype=np.float64)
+     data = <double *> result.data
+     na_fset = kset_float64_from_list(na_flist)
+-    with nogil:
+-        error = _try_double_nogil(parser, col, line_start, line_end,
++    if parser.double_converter_nogil != NULL:  # if it can run without the GIL
++        with nogil:
++            error = _try_double_nogil(parser, parser.double_converter_nogil,
++                                      col, line_start, line_end,
++                                      na_filter, na_hashset, use_na_flist,
++                                      na_fset, NA, data, &na_count)
++    else:
++        assert parser.double_converter_withgil != NULL
++        error = _try_double_nogil(parser,
++                                  <double (*)(const char *, char **,
++                                              char, char, char, int)
++                                  nogil>parser.double_converter_withgil,
++                                  col, line_start, line_end,
+                                   na_filter, na_hashset, use_na_flist,
+                                   na_fset, NA, data, &na_count)
+     kh_destroy_float64(na_fset)
+@@ -1708,8 +1726,11 @@ cdef _try_double(parser_t *parser, int col, int line_start, int line_end,
+         return None, None
+     return result, na_count
+ 
+-cdef inline int _try_double_nogil(parser_t *parser, int col,
+-                                  int line_start, int line_end,
++cdef inline int _try_double_nogil(parser_t *parser,
++                                  double (*double_converter)(
++                                      const char *, char **, char,
++                                      char, char, int) nogil,
++                                  int col, int line_start, int line_end,
+                                   bint na_filter, kh_str_t *na_hashset,
+                                   bint use_na_flist,
+                                   const kh_float64_t *na_flist,
+@@ -1739,7 +1760,7 @@ cdef inline int _try_double_nogil(parser_t *parser, int col,
+                 na_count[0] += 1
+                 data[0] = NA
+             else:
+-                data[0] = parser.converter(word, &p_end, parser.decimal,
++                data[0] = double_converter(word, &p_end, parser.decimal,
+                                            parser.sci, parser.thousands, 1)
+                 if errno != 0 or p_end[0] or p_end == word:
+                     if (strcasecmp(word, cinf) == 0 or
+@@ -1760,7 +1781,7 @@ cdef inline int _try_double_nogil(parser_t *parser, int col,
+     else:
+         for i in range(lines):
+             COLITER_NEXT(it, word)
+-            data[0] = parser.converter(word, &p_end, parser.decimal,
++            data[0] = double_converter(word, &p_end, parser.decimal,
+                                        parser.sci, parser.thousands, 1)
+             if errno != 0 or p_end[0] or p_end == word:
+                 if (strcasecmp(word, cinf) == 0 or
+diff --git a/pandas/src/parser/tokenizer.c b/pandas/src/parser/tokenizer.c
+index 87e17fe5fb..7cddefd40c 100644
+--- a/pandas/src/parser/tokenizer.c
++++ b/pandas/src/parser/tokenizer.c
+@@ -1773,11 +1773,9 @@ double precise_xstrtod(const char *str, char **endptr, char decimal, char sci,
+ 
+ double round_trip(const char *p, char **q, char decimal, char sci, char tsep,
+                   int skip_trailing) {
+-#if PY_VERSION_HEX >= 0x02070000
+-    return PyOS_string_to_double(p, q, 0);
+-#else
+-    return strtod(p, q);
+-#endif
++    double r = PyOS_string_to_double(p, q, 0);
++    PyErr_Clear();
++    return r;
+ }
+ 
+ // End of xstrtod code
+diff --git a/pandas/src/parser/tokenizer.h b/pandas/src/parser/tokenizer.h
+index e7271cabb0..6c1bc630ab 100644
+--- a/pandas/src/parser/tokenizer.h
++++ b/pandas/src/parser/tokenizer.h
+@@ -201,7 +201,11 @@ typedef struct parser_t {
+     PyObject *skipfunc;
+     int64_t skip_first_N_rows;
+     int skip_footer;
+-    double (*converter)(const char *, char **, char, char, char, int);
++    // pick one, depending on whether the converter requires GIL
++    double (*double_converter_nogil)(const char *, char **,
++                                     char, char, char, int);
++    double (*double_converter_withgil)(const char *, char **,
++                                       char, char, char, int);
+ 
+     // error handling
+     char *warn_msg;

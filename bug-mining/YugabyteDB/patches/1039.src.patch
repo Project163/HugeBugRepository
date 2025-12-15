@@ -1,0 +1,399 @@
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index 46ca4c57b7..cc6e290b45 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -312,6 +312,10 @@ DEFINE_test_flag(bool, catalog_manager_simulate_system_table_create_failure, fal
+                  "persisted in syscatalog, but the tablet information is not yet persisted and "
+                  "there is a failure.");
+ 
++DEFINE_test_flag(bool, fail_table_creation_at_preparing_state, false,
++                 "This is only used in tests to simulate a failure that occurs when a table in "
++                 "process of creation is still in PREPARING state.");
++
+ DEFINE_test_flag(bool, pause_before_send_hinted_election, false,
+                  "Inside StartElectionIfReady, pause before sending request for hinted election");
+ 
+@@ -4271,6 +4275,11 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
+   }
+ 
+   DVLOG(3) << __PRETTY_FUNCTION__ << " Done.";
++
++  if (FLAGS_TEST_fail_table_creation_at_preparing_state) {
++    return STATUS(IllegalState, "Failing table creation at PREPARING state");
++  }
++
+   return Status::OK();
+ }
+ 
+@@ -6029,7 +6038,6 @@ Status CatalogManager::DeleteTable(
+   if (req->ysql_ddl_rollback_enabled() && req->has_transaction() &&
+       table->GetTableType() == PGSQL_TABLE_TYPE) {
+     bool ysql_txn_verifier_state_present = false;
+-    bool table_created_by_same_transaction = false;
+     auto l = table->LockForWrite();
+     if (l->has_ysql_ddl_txn_verifier_state()) {
+       DCHECK(!l->pb_transaction_id().empty());
+@@ -6043,37 +6051,34 @@ Status CatalogManager::DeleteTable(
+       // This DROP operation is part of a DDL transaction that has already made changes
+       // to this table.
+       ysql_txn_verifier_state_present = true;
+-      // If this table is being dropped in the same transaction where it was being created, then
+-      // it can be dropped without waiting for the transaction to end. This is because this table
+-      // will be dropped anyway whether this transaction commits or aborts.
+-      table_created_by_same_transaction = l->is_being_created_by_ysql_ddl_txn();
+-    }
+-
+-    // If this table has not been created in the same transaction that is dropping it, mark this
+-    // table for deletion upon successful commit of this transaction.
+-    if (!table_created_by_same_transaction) {
+-      // Setup a background task. It monitors the YSQL transaction. If it commits, the task drops
+-      // the table. Otherwise it removes the deletion marker in the ysql_ddl_txn_verifier_state.
+-      TransactionMetadata txn;
+-      auto& pb = l.mutable_data()->pb;
+-      if (!ysql_txn_verifier_state_present) {
+-        pb.mutable_transaction()->CopyFrom(req->transaction());
+-        txn = VERIFY_RESULT(TransactionMetadata::FromPB(req->transaction()));
+-        RSTATUS_DCHECK(!txn.status_tablet.empty(), Corruption, "Given incomplete Transaction");
+-        pb.add_ysql_ddl_txn_verifier_state();
+-      }
+-      DCHECK_EQ(pb.ysql_ddl_txn_verifier_state_size(), 1);
+-      pb.mutable_ysql_ddl_txn_verifier_state(0)->set_contains_drop_table_op(true);
+-      // Upsert to sys_catalog.
+-      RETURN_NOT_OK(sys_catalog_->Upsert(epoch, table));
+-      // Update the in-memory state.
+-      TRACE("Committing in-memory state as part of DeleteTable operation");
+-      l.Commit();
+-      if (!ysql_txn_verifier_state_present) {
+-        ScheduleYsqlTxnVerification(table, txn, epoch);
+-      }
+-      return Status::OK();
+     }
++
++    // Setup a background task. It monitors the YSQL transaction. If it commits, the task drops
++    // the table. Otherwise it removes the deletion marker in the ysql_ddl_txn_verifier_state.
++    // Note that we could ideally drop this table right now if it was created in the same
++    // transaction, as we are sure that this table will be dropped whether the transaction commits
++    // or aborts. However, in cases where a table could be deleted and re-created multiple times in
++    // an alter operation, that would abort the DDL transaction operating on it. Hence we do not
++    // perform the actual deletion until commit.
++    TransactionMetadata txn;
++    auto& pb = l.mutable_data()->pb;
++    if (!ysql_txn_verifier_state_present) {
++      pb.mutable_transaction()->CopyFrom(req->transaction());
++      txn = VERIFY_RESULT(TransactionMetadata::FromPB(req->transaction()));
++      RSTATUS_DCHECK(!txn.status_tablet.empty(), Corruption, "Given incomplete Transaction");
++      pb.add_ysql_ddl_txn_verifier_state();
++    }
++    DCHECK_EQ(pb.ysql_ddl_txn_verifier_state_size(), 1);
++    pb.mutable_ysql_ddl_txn_verifier_state(0)->set_contains_drop_table_op(true);
++    // Upsert to sys_catalog.
++    RETURN_NOT_OK(sys_catalog_->Upsert(epoch, table));
++    // Update the in-memory state.
++    TRACE("Committing in-memory state as part of DeleteTable operation");
++    l.Commit();
++    if (!ysql_txn_verifier_state_present) {
++      ScheduleYsqlTxnVerification(table, txn, epoch);
++    }
++    return Status::OK();
+   }
+ 
+   return DeleteTableInternal(req, resp, rpc, epoch);
+diff --git a/src/yb/master/ysql_ddl_handler.cc b/src/yb/master/ysql_ddl_handler.cc
+index a942519d6c..ee4112936d 100644
+--- a/src/yb/master/ysql_ddl_handler.cc
++++ b/src/yb/master/ysql_ddl_handler.cc
+@@ -208,8 +208,7 @@ Status CatalogManager::YsqlDdlTxnCompleteCallbackInternal(
+ 
+   auto& metadata = l.mutable_data()->pb;
+ 
+-  SCHECK(metadata.state() == SysTablesEntryPB::RUNNING ||
+-         metadata.state() == SysTablesEntryPB::ALTERING, Aborted,
++  SCHECK(l->is_running(), Aborted,
+          "Unexpected table state ($0), abandoning DDL rollback for $1",
+          SysTablesEntryPB_State_Name(metadata.state()), table->ToString());
+ 
+diff --git a/src/yb/master/ysql_transaction_ddl.cc b/src/yb/master/ysql_transaction_ddl.cc
+index 714ad93796..ac4074c26b 100644
+--- a/src/yb/master/ysql_transaction_ddl.cc
++++ b/src/yb/master/ysql_transaction_ddl.cc
+@@ -323,7 +323,18 @@ Status YsqlTransactionDdl::PgSchemaCheckerWithReadTime(
+   auto oid_col_id = VERIFY_RESULT(read_data.ColumnByName("oid")).rep();
+   auto relname_col_id = VERIFY_RESULT(read_data.ColumnByName(name_col)).rep();
+   dockv::ReaderProjection projection;
+-  projection.Init(read_data.schema(), {oid_col_id, relname_col_id});
++
++  PgOid relfilenode_oid = kPgInvalidOid;
++  ColumnIdRep relfilenode_col = kInvalidColumnId.rep();
++  if (table->matview_pg_table_id().empty()) {
++    projection.Init(read_data.schema(), {oid_col_id, relname_col_id});
++  } else {
++    relfilenode_oid = oid;
++    oid = VERIFY_RESULT(GetPgsqlTableOid(table->matview_pg_table_id()));
++    relfilenode_col = VERIFY_RESULT(read_data.ColumnByName("relfilenode")).rep();
++    projection.Init(read_data.schema(), {oid_col_id, relname_col_id, relfilenode_col});
++  }
++
+   RequestScope request_scope;
+   auto iter =
+       VERIFY_RESULT(GetPgCatalogTableScanIterator(read_data, oid, projection, &request_scope));
+@@ -335,10 +346,26 @@ Status YsqlTransactionDdl::PgSchemaCheckerWithReadTime(
+     return STATUS_FORMAT(Aborted, "Not performing transaction verification for table $0 as it no "
+                          "longer has any transaction verification state", table->ToString());
+   }
++
++  qlexpr::QLTableRow row;
++  bool table_found = false;
++
++  if (VERIFY_RESULT(iter->FetchNext(&row))) {
++    // One row found in pg_class matching the oid. If this is not a matview, then we have found this
++    // table in pg catalog. But if this table is a matview, we should also check whether the
++    // relfilenode exists.
++    table_found = true;
++    if (relfilenode_oid != kPgInvalidOid) {
++      const auto& relfilenode = row.GetValue(relfilenode_col);
++      if (relfilenode->uint32_value() != relfilenode_oid) {
++        table_found = false;
++      }
++    }
++  }
++
+   // Table not found in pg_class. This can only happen in two cases: Table creation failed,
+   // or a table deletion went through successfully.
+-  qlexpr::QLTableRow row;
+-  if (!VERIFY_RESULT(iter->FetchNext(&row))) {
++  if (!table_found) {
+     *read_restart_ht = VERIFY_RESULT(iter->RestartReadHt());
+     if (l->is_being_deleted_by_ysql_ddl_txn()) {
+       *result = true;
+@@ -350,12 +377,12 @@ Status YsqlTransactionDdl::PgSchemaCheckerWithReadTime(
+     return Status::OK();
+   }
+ 
++  // Table present in PG catalog.
+   *read_restart_ht = VERIFY_RESULT(iter->RestartReadHt());
+-  // Table found in pg_class.
++
+   if (l->is_being_deleted_by_ysql_ddl_txn()) {
+     LOG(INFO) << "Ysql Drop transaction for " << table->ToString()
+-              << " detected to have failed as table found "
+-              << "in PG catalog";
++              << " detected to have failed as table found in PG catalog";
+     *result = false;
+     return Status::OK();
+   }
+@@ -422,7 +449,12 @@ bool YsqlTransactionDdl::MatchPgDocDBSchemaColumns(
+ 
+   const string& fail_msg = "Schema mismatch for table " + table->ToString() + " with schema "
+                           + schema.ToString() + " and PG catalog schema " + PrintPgCols(pg_cols);
+-  const std::vector<ColumnSchema>& columns = schema.columns();
++  std::vector<ColumnSchema> columns = schema.columns();
++  // Sort the columns based on the "order" field. This corresponds to PG attnum field. The pg
++  // columns will also be sorted on attnum, so the comparison will be easier.
++  sort(columns.begin(), columns.end(), [](const auto& lhs, const auto& rhs) {
++    return lhs.order() < rhs.order();
++  });
+ 
+   size_t pg_idx = 0;
+   for (const auto& col : columns) {
+diff --git a/src/yb/yql/pgwrapper/pg_ddl_atomicity-test.cc b/src/yb/yql/pgwrapper/pg_ddl_atomicity-test.cc
+index b2fe9e7055..bcd40a1fa3 100644
+--- a/src/yb/yql/pgwrapper/pg_ddl_atomicity-test.cc
++++ b/src/yb/yql/pgwrapper/pg_ddl_atomicity-test.cc
+@@ -253,6 +253,89 @@ TEST_F(PgDdlAtomicitySanityTest, BasicTest) {
+   ASSERT_OK(VerifyRowsAfterDdlSuccess(&conn, num_rows));
+ }
+ 
++TEST_F(PgDdlAtomicitySanityTest, CreateFailureRollback) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnMasters(
++      "TEST_fail_table_creation_at_preparing_state", "true"));
++  ASSERT_NOK(conn.Execute(CreateTableStmt(kCreateTable)));
++  VerifyTableNotExists(client.get(), kDatabase, kCreateTable, 20);
++}
++
++TEST_F(PgDdlAtomicitySanityTest, TestMultiRewriteAlterTable) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++
++  // First create a table with some data.
++  const string table_name = "test_table";
++  ASSERT_OK(conn.Execute(CreateTableStmt(table_name)));
++  const int num_rows = 5;
++  for (int i = 0; i < num_rows; ++i) {
++    ASSERT_OK(conn.ExecuteFormat(
++        "INSERT INTO $0 VALUES ($1, 'value$1', 1.1)", table_name, i));
++  }
++
++  // Test failure of alter statement with multiple subcommands.
++  ASSERT_OK(conn.TestFailDdl("ALTER TABLE test_table ALTER COLUMN key TYPE text USING key::text,"
++      " ALTER COLUMN num TYPE text USING num::text"));
++  VerifyTableNotExists(client.get(), "yugabyte", table_name + "_temp_old", 10);
++  VerifyTableExists(client.get(), "yugabyte", table_name, 20);
++  ASSERT_OK(VerifySchema(client.get(), "yugabyte", table_name, {"key", "value", "num"}));
++
++  // Verify that the data and schema is intact.
++  PGResultPtr res = ASSERT_RESULT(conn.FetchFormat("SELECT * FROM $0", table_name));
++  ASSERT_EQ(PQntuples(res.get()), num_rows);
++  ASSERT_OK(conn.ExecuteFormat(
++      "INSERT INTO $0 VALUES (11, 'value11', 11.11)", table_name));
++
++  // Verify successful execution of the above alter commands.
++  ASSERT_OK(conn.Execute("ALTER TABLE test_table ALTER COLUMN key TYPE text USING key::text,"
++      " ALTER COLUMN num TYPE text USING num::text"));
++  ASSERT_OK(VerifySchema(client.get(), "yugabyte", table_name, {"key", "value", "num"}));
++  ASSERT_OK(conn.ExecuteFormat(
++      "INSERT INTO $0 VALUES ('keytext', 'value$1', '2.231')", table_name));
++
++  PGResultPtr res_after_ddl = ASSERT_RESULT(conn.FetchFormat("SELECT * FROM $0", table_name));
++  // We added two new rows.
++  ASSERT_EQ(PQntuples(res_after_ddl.get()), num_rows + 2);
++}
++
++TEST_F(PgDdlAtomicitySanityTest, TestChangedPkColOrder) {
++  auto conn = ASSERT_RESULT(Connect());
++  auto client = ASSERT_RESULT(cluster_->CreateClient());
++  ASSERT_OK(cluster_->SetFlagOnTServers("report_ysql_ddl_txn_status_to_master", "false"));
++
++  // First create a table with some data.
++  const string table_name = "test_table";
++  ASSERT_OK(conn.TestFailDdl(Format("CREATE TABLE $0 (key int, value text, value2 float, "
++      "PRIMARY KEY(value2, key))", table_name)));
++  VerifyTableNotExists(client.get(), "yugabyte", table_name, 10);
++
++  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (key int, value text, value2 float, "
++      "PRIMARY KEY(value2, key))", table_name));
++  VerifyTableExists(client.get(), "yugabyte", table_name, 10);
++
++  // Verify Alter Table with switched PK order.
++  const string alter_test = "alter_test";
++  ASSERT_OK(conn.ExecuteFormat("CREATE TABLE $0 (key INT, value TEXT, value2 float)", alter_test));
++
++  // Verify failure case.
++  ASSERT_OK(conn.TestFailDdl(Format("ALTER TABLE $0 ADD PRIMARY KEY(value, key)", alter_test)));
++  VerifyTableNotExists(client.get(), "yugabyte", alter_test + "_temp_old", 20);
++  VerifyTableExists(client.get(), "yugabyte", alter_test, 10);
++  // Insert duplicate rows.
++  ASSERT_OK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 'value1', 1.1), (1, 'value1', 1.1)",
++                               alter_test));
++  ASSERT_OK(conn.ExecuteFormat("DELETE FROM $0 WHERE key = 1", alter_test));
++
++  // Verify success case.
++  ASSERT_OK(conn.Execute(Format("ALTER TABLE $0 ADD PRIMARY KEY(value, key)", alter_test)));
++  VerifyTableNotExists(client.get(), "yugabyte", alter_test + "_temp_old", 20);
++  VerifyTableExists(client.get(), "yugabyte", alter_test, 10);
++  ASSERT_NOK(conn.ExecuteFormat("INSERT INTO $0 VALUES (1, 'value1', 1.1), (1, 'value1', 1.1)",
++                                alter_test));
++}
++
+ TEST_F(PgDdlAtomicitySanityTest, IndexRollback) {
+   auto conn = ASSERT_RESULT(Connect());
+   auto client = ASSERT_RESULT(cluster_->CreateClient());
+@@ -1208,28 +1291,82 @@ TEST_F(PgDdlAtomicitySnapshotTest, DdlRollbackListSnapshotTest) {
+   ASSERT_OK(ListSnapshotTest(DdlErrorInjection::kTrue));
+ }
+ 
+-TEST_F(PgDdlAtomicitySanityTest, MatviewTest) {
++class PgLibPqMatviewTest: public PgDdlAtomicitySanityTest {
++ public:
++  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
++    options->extra_tserver_flags.push_back(
++      "--allowed_preview_flags_csv=ysql_ddl_rollback_enabled");
++    options->extra_tserver_flags.push_back("--ysql_ddl_rollback_enabled=true");
++  }
++ protected:
++  void MatviewTest();
++};
++
++void PgLibPqMatviewTest::MatviewTest() {
+   auto conn = ASSERT_RESULT(Connect());
++
+   ASSERT_OK(conn.ExecuteFormat("CREATE TABLE t(id int)"));
+ 
+   // Test matview creation failure.
+   auto client = ASSERT_RESULT(cluster_->CreateClient());
+-  ASSERT_OK(conn.TestFailDdl(Format("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t")));
+-
++  ASSERT_OK(conn.TestFailDdl("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t"));
+   // Verify matview creation is rolled back.
+   VerifyTableNotExists(client.get(), kDatabase, "mv", 10);
+ 
+-  // Insert some values into the table.
+-  conn = ASSERT_RESULT(Connect());
+-  ASSERT_OK(conn.ExecuteFormat("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t"));
++  // Verify successful materialized view creation.
++  const string rename_test = "rename_mv";
++  const string renamed_name = "foobar";
++  const string rename_col_test = "rename_col_mv";
++
++  // Verify alter materialized view fails.
++  ASSERT_OK(conn.ExecuteFormat("CREATE MATERIALIZED VIEW $0 AS SELECT * FROM t", rename_test));
++  ASSERT_OK(conn.ExecuteFormat("CREATE MATERIALIZED VIEW $0 AS SELECT * FROM t", rename_col_test));
++  ASSERT_OK(conn.TestFailDdl(Format("ALTER MATERIALIZED VIEW $0 RENAME TO $1",
++      rename_test, renamed_name)));
++  ASSERT_OK(conn.TestFailDdl(Format("ALTER MATERIALIZED VIEW $0 RENAME $1 TO $2", rename_col_test,
++      "id", "foobar")));
++  VerifyTableNotExists(client.get(), kDatabase, renamed_name, 10);
++  VerifyTableExists(client.get(), kDatabase, rename_test, 10);
++  ASSERT_OK(VerifySchema(client.get(), kDatabase, rename_col_test, {"ybrowid", "id"}));
++
++  // Verify alter materialized view success.
++  ASSERT_OK(conn.ExecuteFormat("ALTER MATERIALIZED VIEW $0 RENAME TO $1",
++      rename_test, renamed_name));
++  ASSERT_OK(conn.ExecuteFormat("ALTER MATERIALIZED VIEW $0 RENAME $1 TO $2", rename_col_test,
++      "id", renamed_name));
++  VerifyTableNotExists(client.get(), kDatabase, rename_test, 10);
++  VerifyTableExists(client.get(), kDatabase, renamed_name, 10);
++  ASSERT_OK(VerifySchema(client.get(), kDatabase, rename_col_test, {"ybrowid", renamed_name}));
++
++  // Verify refresh failure.
++  ASSERT_OK(conn.Execute("CREATE MATERIALIZED VIEW mv AS SELECT * FROM t"));
+   ASSERT_OK(conn.Execute("INSERT INTO t VALUES (1), (2)"));
+-
+-  // Test failed refresh matview.
+   ASSERT_OK(conn.TestFailDdl(Format("REFRESH MATERIALIZED VIEW mv")));
+   // Wait for rollback to complete.
+   SleepFor(2s);
+   auto curr_rows = ASSERT_RESULT(conn.FetchValue<int64_t>("SELECT COUNT(*) FROM mv"));
+   ASSERT_EQ(curr_rows, 0);
++
++  // Verify refresh success.
++  ASSERT_OK(conn.Execute("REFRESH MATERIALIZED VIEW mv"));
++  curr_rows = ASSERT_RESULT(conn.FetchValue<int64_t>("SELECT COUNT(*) FROM mv"));
++  ASSERT_EQ(curr_rows, 2);
++
++  // Perform another refresh to verify the case where relfilenode of both old and new table no
++  // longer matches the oid.
++  ASSERT_OK(conn.Execute("INSERT INTO t VALUES (3), (4)"));
++  ASSERT_OK(conn.Execute("REFRESH MATERIALIZED VIEW mv"));
++  curr_rows = ASSERT_RESULT(conn.FetchValue<int64_t>("SELECT COUNT(*) FROM mv"));
++  ASSERT_EQ(curr_rows, 4);
++}
++
++TEST_F(PgLibPqMatviewTest, MatviewTestWithoutPgOptimization) {
++  ASSERT_OK(cluster_->SetFlagOnTServers("report_ysql_ddl_txn_status_to_master", "false"));
++  MatviewTest();
++}
++
++TEST_F(PgLibPqMatviewTest, MatviewTest) {
++  MatviewTest();
+ }
+ 
+ class PgLibPqMatviewFailure: public PgDdlAtomicitySanityTest {
+diff --git a/src/yb/yql/pgwrapper/pg_ddl_atomicity_test_base.cc b/src/yb/yql/pgwrapper/pg_ddl_atomicity_test_base.cc
+index 8e20f60553..9f3bb85a95 100644
+--- a/src/yb/yql/pgwrapper/pg_ddl_atomicity_test_base.cc
++++ b/src/yb/yql/pgwrapper/pg_ddl_atomicity_test_base.cc
+@@ -250,9 +250,11 @@ Result<bool> PgDdlAtomicityTestBase::CheckIfSchemaMatches(client::YBClient* clie
+   RETURN_NOT_OK(sync.Wait());
+ 
+   const auto& columns = table_info->schema.columns();
++
+   if (expected_column_names.size() != columns.size()) {
+     LOG(INFO) << "Expected " << expected_column_names.size() << " columns for " << table_name
+-              << " but found " << columns.size() << " columns";
++              << " but found " << columns.size() << " columns. Table Schema: "
++              << table_info->schema.ToString();
+     return false;
+   }
+ 

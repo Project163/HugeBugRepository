@@ -1,0 +1,1024 @@
+diff --git a/src/yb/integration-tests/flush-test.cc b/src/yb/integration-tests/flush-test.cc
+index bc25db6652..ab54f0ac28 100644
+--- a/src/yb/integration-tests/flush-test.cc
++++ b/src/yb/integration-tests/flush-test.cc
+@@ -12,46 +12,123 @@
+ //
+ 
+ #include <chrono>
++#include <regex>
+ 
+ #include "yb/integration-tests/test_workload.h"
+ #include "yb/integration-tests/ts_itest-base.h"
+ #include "yb/integration-tests/mini_cluster.h"
++#include "yb/rocksdb/db/db_impl.h"
+ #include "yb/rocksdb/memory_monitor.h"
++#include "yb/rocksdb/util/testutil.h"
+ #include "yb/tablet/tablet.h"
+ #include "yb/tserver/mini_tablet_server.h"
+ #include "yb/tserver/tablet_server.h"
+ 
+ using namespace std::literals;
+ 
++DECLARE_bool(flush_rocksdb_on_shutdown);
+ DECLARE_int64(global_memstore_size_percentage);
+ DECLARE_int64(global_memstore_size_mb_max);
+ DECLARE_int32(memstore_size_mb);
++DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
++DECLARE_int32(rocksdb_max_background_flushes);
+ 
+ namespace yb {
+ namespace client {
+ class YBTableName;
+ }
++
+ namespace tserver {
+ 
++namespace {
++
++constexpr auto kWaitDelay = 10ms;
++
++class RocksDbListener : public rocksdb::test::FlushedFileCollector {
++ public:
++  void OnCompactionStarted() override {
++    ++num_compactions_started_;
++  }
++
++  int GetNumCompactionsStarted() { return num_compactions_started_; }
++
++ private:
++  std::atomic<int> num_compactions_started_;
++};
++
++Result<TabletId> GetTabletIdFromSstFilename(const std::string& filename) {
++  static std::regex re(R"#(.*/tablet-([^/]+)/\d+\.sst)#");
++  std::smatch match;
++  if (std::regex_search(filename, match, re)) {
++    return match.str(1);
++  } else {
++    return STATUS_FORMAT(InvalidArgument, "Cannot parse tablet id from SST filename: $0", filename);
++  }
++}
++
++class TabletManagerListener : public tserver::TsTabletManagerListener {
++ public:
++  void StartedFlush(const TabletId& tablet_id) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    flushed_tablets_.push_back(tablet_id);
++  }
++
++  std::vector<TabletId> GetFlushedTablets() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return flushed_tablets_;
++  }
++
++ private:
++  std::mutex mutex_;
++  std::vector<TabletId> flushed_tablets_;
++};
++
++} // namespace
++
+ class FlushITest : public YBTest {
+  public:
+   FlushITest() {}
++
+   void SetUp() override {
+-    FLAGS_memstore_size_mb = kTabletLimitMB;
++    HybridTime::TEST_SetPrettyToString(true);
++    FLAGS_memstore_size_mb = kOverServerLimitMB;
+     // Set the global memstore to kServerLimitMB.
+     FLAGS_global_memstore_size_percentage = 100;
+     FLAGS_global_memstore_size_mb_max = kServerLimitMB;
+     YBTest::SetUp();
+ 
++    rocksdb_listener_ = std::make_shared<RocksDbListener>();
++    tablet_manager_listener_ = std::make_shared<TabletManagerListener>();
++
+     // Start cluster
+     MiniClusterOptions opts;
+     opts.num_tablet_servers = 1;
+     cluster_.reset(new MiniCluster(env_.get(), opts));
+     ASSERT_OK(cluster_->Start());
+-    ASSERT_OK(cluster_->WaitForTabletServerCount(opts.num_tablet_servers));
++    // Patch tablet options inside tablet manager, will be applied to new created tablets.
++    cluster_->GetTabletManager(0)->TEST_tablet_options()->listeners.push_back(
++        rocksdb_listener_);
++    // Patch tablet options inside mini tablet server, will use for new tablet server after
++    // minicluster restart.
++    cluster_->mini_tablet_server(0)->options()->listeners.push_back(rocksdb_listener_);
++    SetupCluster();
++    SetupWorkload();
++  }
+ 
+-    // Setup workload
++  void TearDown() override {
++    workload_->StopAndJoin();
++    cluster_->Shutdown();
++    YBTest::TearDown();
++  }
++
++  void SetupCluster() {
++    cluster_->GetTabletManager(0)->TEST_listeners.push_back(tablet_manager_listener_);
++  }
++
++  void SetupWorkload(
++      const client::YBTableName& table_name = TestWorkloadOptions::kDefaultTableName) {
+     workload_.reset(new TestWorkload(cluster_.get()));
++    workload_->set_table_name(table_name);
+     workload_->set_timeout_allowed(true);
+     workload_->set_payload_bytes(kPayloadBytes);
+     workload_->set_write_batch_size(1);
+@@ -60,22 +137,14 @@ class FlushITest : public YBTest {
+     workload_->Setup();
+   }
+ 
+-  void TearDown() override {
+-    workload_->StopAndJoin();
+-    cluster_->Shutdown();
+-    YBTest::TearDown();
+-  }
+-
+  protected:
+-
+-  size_t TotalFlushes() {
+-    size_t total_flushes = 0;
+-    std::vector<std::shared_ptr<tablet::TabletPeer>> tablet_peers;
+-    cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
++  size_t TotalBytesFlushed() {
++    size_t bytes = 0;
++    auto tablet_peers = cluster_->GetTabletPeers(0);
+     for (auto& peer : tablet_peers) {
+-      total_flushes += peer->tablet()->flush_stats()->num_flushes();
++      bytes += peer->tablet()->rocksdb_statistics()->getTickerCount(rocksdb::FLUSH_WRITE_BYTES);
+     }
+-    return total_flushes;
++    return bytes;
+   }
+ 
+   size_t BytesWritten() {
+@@ -84,30 +153,224 @@ class FlushITest : public YBTest {
+ 
+   void WriteAtLeast(size_t size_bytes) {
+     workload_->Start();
+-    LOG(INFO) << "Waiting until we've written at least " << size_bytes << " bytes ...";
+-    ASSERT_OK(
+-        WaitFor([this, size_bytes] { return BytesWritten() >= size_bytes; }, 60s, "Write", 10ms));
++    AssertLoggedWaitFor(
++        [this, size_bytes] { return BytesWritten() >= size_bytes; }, 60s,
++        Format("Waiting until we've written at least $0 bytes ...", size_bytes), kWaitDelay);
+     workload_->StopAndJoin();
+     LOG(INFO) << "Wrote " << BytesWritten() << " bytes.";
+   }
+ 
+-  const size_t kTabletLimitMB = 100;
+-  const size_t kServerLimitMB = 10;
++  client::YBTableName GetTableName(int i) {
++    auto table_name = TestWorkloadOptions::kDefaultTableName;
++    table_name.set_table_name(Format("$0_$1", table_name.table_name(), i));
++    return table_name;
++  }
++
++  int NumTotalRunningCompactions() {
++    int compactions = 0;
++    for (auto& peer : cluster_->GetTabletPeers(0)) {
++      auto* db = pointer_cast<rocksdb::DBImpl*>(peer->tablet()->TEST_db());
++      if (db) {
++        compactions += db->TEST_NumTotalRunningCompactions();
++      }
++    }
++    return compactions;
++  }
++
++  int NumRunningFlushes() {
++    int compactions = 0;
++    for (auto& peer : cluster_->GetTabletPeers(0)) {
++      auto* db = pointer_cast<rocksdb::DBImpl*>(peer->tablet()->TEST_db());
++      if (db) {
++        compactions += db->TEST_NumRunningFlushes();
++      }
++    }
++    return compactions;
++  }
++
++  void WriteUntilCompaction() {
++    int num_compactions_started = rocksdb_listener_->GetNumCompactionsStarted();
++    workload_->Start();
++    AssertLoggedWaitFor(
++        [this, num_compactions_started] {
++          return rocksdb_listener_->GetNumCompactionsStarted() > num_compactions_started;
++        }, 60s, "Waiting until we've written to start compaction ...", kWaitDelay);
++    workload_->StopAndJoin();
++    LOG(INFO) << "Wrote " << BytesWritten() << " bytes.";
++    AssertLoggedWaitFor(
++        [this] { return NumTotalRunningCompactions() == 0 && NumRunningFlushes() == 0; }, 60s,
++        "Waiting until compactions and flushes are done ...", kWaitDelay);
++  }
++
++  void AddTabletsWithNonEmptyMemTable(std::unordered_map<TabletId, int>* tablets, int order) {
++    for (auto& peer : cluster_->GetTabletPeers(0)) {
++      const auto tablet_id = peer->tablet_id();
++      if (tablets->count(tablet_id) == 0) {
++        auto* db = pointer_cast<rocksdb::DBImpl*>(peer->tablet()->TEST_db());
++        if (db) {
++          auto* cf = pointer_cast<rocksdb::ColumnFamilyHandleImpl*>(db->DefaultColumnFamily());
++          if (cf->cfd()->mem()->num_entries() > 0) {
++            tablets->insert(std::make_pair(tablet_id, order));
++          }
++        }
++      }
++    }
++  }
++
++  MemoryMonitor* memory_monitor() {
++    return cluster_->GetTabletManager(0)->memory_monitor();
++  }
++
++  size_t GetRocksDbMemoryUsage() {
++    return memory_monitor()->memory_usage();
++  }
++
++  void DumpMemoryUsage() {
++    auto* server = cluster_->mini_tablet_server(0)->server();
++    LOG(INFO) << server->mem_tracker()->FindChild("Tablets")->LogUsage("MEM ");
++    LOG(INFO) << "rocksdb memory usage: " << GetRocksDbMemoryUsage();
++  }
++
++  void TestFlushPicksOldestInactiveTabletAfterCompaction(bool with_restart);
++
++  const size_t kServerLimitMB = 2;
++  // Used to set memstore limit to value higher than server limit, so flushes are only being
++  // triggered by memory monitor which we want to test.
++  const size_t kOverServerLimitMB = kServerLimitMB * 10;
+   const size_t kNumTablets = 3;
+-  const size_t kPayloadBytes = 8 * 1024; // 8KB
++  const size_t kPayloadBytes = 8_KB;
+   std::unique_ptr<MiniCluster> cluster_;
+   std::unique_ptr<TestWorkload> workload_;
++  std::shared_ptr<RocksDbListener> rocksdb_listener_;
++  std::shared_ptr<TabletManagerListener> tablet_manager_listener_;
+ };
+ 
+ TEST_F(FlushITest, TestFlushHappens) {
+-  const size_t total_flushes_before = TotalFlushes();
+-  WriteAtLeast((kServerLimitMB << 20) + 1);
++  const size_t flushed_before_writes = TotalBytesFlushed();
++  WriteAtLeast((kServerLimitMB * 1_MB) + 1);
+   ASSERT_OK(WaitFor(
+-      [this, total_flushes_before] { return TotalFlushes() > total_flushes_before; },
++      [this, flushed_before_writes] {
++        return TotalBytesFlushed() > flushed_before_writes; },
+       60s, "Flush", 10ms));
+-  const size_t flushes_since_write = TotalFlushes() - total_flushes_before;
+-  LOG(INFO) << "Flushed " << flushes_since_write << " times.";
+-  ASSERT_GT(flushes_since_write, 0);
++  const size_t flushed_after_writes = TotalBytesFlushed() - flushed_before_writes;
++  LOG(INFO) << "Flushed " << flushed_after_writes << " bytes.";
++  ASSERT_GT(flushed_after_writes, 0);
++}
++
++void FlushITest::TestFlushPicksOldestInactiveTabletAfterCompaction(bool with_restart) {
++  // Trigger compaction early.
++  FLAGS_rocksdb_level0_file_num_compaction_trigger = 2;
++
++  // Set memstore limit to 1/nth of server limit so we can cause memory usage with enough
++  // granularity.
++  FLAGS_memstore_size_mb = kServerLimitMB / 5;
++  std::unordered_map<TabletId, int> inactive_tablets_to_flush;
++  // Write to tables until compaction started and until we occupy 50% of kServerLimitMB by
++  // memtables.
++  int tables = 1; // First empty table is created by test setup.
++  while (GetRocksDbMemoryUsage() < kServerLimitMB * 1_MB / 2) {
++    SetupWorkload(GetTableName(tables));
++    WriteUntilCompaction();
++    AddTabletsWithNonEmptyMemTable(&inactive_tablets_to_flush, tables);
++    tables++;
++  }
++
++  LOG(INFO) << "Tablets to flush: " << inactive_tablets_to_flush.size();
++
++  std::unordered_set<TabletId> inactive_tablets;
++  for (auto& peer : cluster_->GetTabletPeers(0)) {
++    inactive_tablets.insert(peer->tablet_id());
++  }
++
++  DumpMemoryUsage();
++
++  if (with_restart) {
++    // We want to restore memtables from log on restart to test how memory monitor based flush
++    // works after restart.
++    FLAGS_flush_rocksdb_on_shutdown = false;
++    LOG(INFO) << "Restarting cluster ...";
++    ASSERT_OK(cluster_->RestartSync());
++    LOG(INFO) << "Cluster has been restarted";
++    SetupCluster();
++    DumpMemoryUsage();
++  }
++
++  rocksdb_listener_->Clear();
++
++  FLAGS_memstore_size_mb = kOverServerLimitMB;
++  SetupWorkload(GetTableName(tables));
++  tables++;
++  WriteAtLeast((kServerLimitMB * 1_MB) + 1);
++
++  DumpMemoryUsage();
++
++  AssertLoggedWaitFor(
++      [this] { return !memory_monitor()->Exceeded(); }, 30s,
++      "Waiting until memory is freed by flushes...", kWaitDelay);
++
++  LOG(INFO) << "Tables: " << tables;
++
++  ERROR_NOT_OK(
++      LoggedWaitFor(
++          [this, &inactive_tablets_to_flush] {
++            const auto flushed_tablets = tablet_manager_listener_->GetFlushedTablets().size();
++            YB_LOG_EVERY_N_SECS(INFO, 5) << "Flushed tablets: " << flushed_tablets;
++            return flushed_tablets >= inactive_tablets_to_flush.size();
++          }, 30s,
++          "Waiting until flush started for all inactive tablets with non-empty memtable ...",
++          kWaitDelay),
++      "Flush wasn't started for some inactive tablets with non-empty memtable");
++
++  auto flushed_tablets = tablet_manager_listener_->GetFlushedTablets();
++  LOG(INFO) << "Flushed tablets: " << flushed_tablets.size();
++
++  {
++    std::unordered_set<TabletId> flushed_tablets_not_completed(
++        flushed_tablets.begin(), flushed_tablets.end());
++    ERROR_NOT_OK(
++        LoggedWaitFor(
++            [&] {
++              for (const auto& filename : rocksdb_listener_->GetAndClearFlushedFiles()) {
++                const auto tablet_id = CHECK_RESULT(GetTabletIdFromSstFilename(filename));
++                flushed_tablets_not_completed.erase(tablet_id);
++              }
++              return flushed_tablets_not_completed.size() == 0;
++            }, 30s, "Waiting for flushes to complete ...", kWaitDelay),
++        "Some flushes weren't completed");
++    ASSERT_EQ(flushed_tablets_not_completed.size(), 0) << "Flush wasn't completed for tablets: "
++        << yb::ToString(flushed_tablets_not_completed);
++  }
++
++  int current_order = 0;
++  for (const auto& tablet_id : flushed_tablets) {
++    auto iter = inactive_tablets_to_flush.find(tablet_id);
++    if (iter != inactive_tablets_to_flush.end()) {
++      const auto expected_flush_order = iter->second;
++      inactive_tablets_to_flush.erase(iter);
++      LOG(INFO) << "Checking tablet " << tablet_id << " expected order: " << expected_flush_order;
++      ASSERT_GE(expected_flush_order, current_order) << "Tablet was flushed not in order: "
++                                                      << tablet_id;
++      current_order = std::max(current_order, expected_flush_order);
++    } else {
++      ASSERT_EQ(inactive_tablets.count(tablet_id), 0)
++          << "Flushed inactive tablet with empty memstore: " << tablet_id;
++      ASSERT_EQ(inactive_tablets_to_flush.size(), 0)
++          << "Tablet " << tablet_id << " from active table was flushed before inactive tablets "
++                                       "with non-empty memtable: "
++          << yb::ToString(inactive_tablets_to_flush);
++    }
++  }
++  ASSERT_EQ(inactive_tablets_to_flush.size(), 0) << "Some inactive tables with non-empty memtable "
++                                                    "were not flushed: "
++                                                 << yb::ToString(inactive_tablets_to_flush);
++}
++
++TEST_F(FlushITest, TestFlushPicksOldestInactiveTabletAfterCompaction) {
++  TestFlushPicksOldestInactiveTabletAfterCompaction(false /* with_restart */);
++}
++
++TEST_F(FlushITest, TestFlushPicksOldestInactiveTabletAfterCompactionWithRestart) {
++  TestFlushPicksOldestInactiveTabletAfterCompaction(true /* with_restart */);
+ }
+ 
+ } // namespace tserver
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index c8ceff4b33..15f6a34e13 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -401,8 +401,12 @@ string MiniCluster::GetTabletServerFsRoot(int idx) {
+   return JoinPathSegments(fs_root_, Substitute("ts-$0-root", idx));
+ }
+ 
++tserver::TSTabletManager* MiniCluster::GetTabletManager(int idx) {
++  return mini_tablet_server(idx)->server()->tablet_manager();
++}
++
+ std::vector<std::shared_ptr<tablet::TabletPeer>> MiniCluster::GetTabletPeers(int idx) {
+-  return mini_tablet_server(idx)->server()->tablet_manager()->GetTabletPeers();
++  return GetTabletManager(idx)->GetTabletPeers();
+ }
+ 
+ Status MiniCluster::WaitForReplicaCount(const string& tablet_id,
+@@ -538,9 +542,7 @@ std::vector<server::SkewedClockDeltaChanger> SkewClocks(
+ 
+ void StepDownAllTablets(MiniCluster* cluster) {
+   for (int i = 0; i != cluster->num_tablet_servers(); ++i) {
+-    std::vector<tablet::TabletPeerPtr> peers;
+-    cluster->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers(&peers);
+-    for (const auto& peer : peers) {
++    for (const auto& peer : cluster->GetTabletPeers(i)) {
+       consensus::LeaderStepDownRequestPB req;
+       req.set_tablet_id(peer->tablet_id());
+       consensus::LeaderStepDownResponsePB resp;
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 206e0c3ebf..e20c0ffbfc 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -68,6 +68,7 @@ class TabletPeer;
+ 
+ namespace tserver {
+ class MiniTabletServer;
++class TSTabletManager;
+ }
+ 
+ struct MiniClusterOptions {
+@@ -175,6 +176,8 @@ class MiniCluster : public MiniClusterBase {
+ 
+   std::vector<std::shared_ptr<tablet::TabletPeer>> GetTabletPeers(int idx);
+ 
++  tserver::TSTabletManager* GetTabletManager(int idx);
++
+   // Wait for the given tablet to have 'expected_count' replicas
+   // reported on the master. Returns the locations in '*locations'.
+   // Requires that the master has started;
+diff --git a/src/yb/rocksdb/db.h b/src/yb/rocksdb/db.h
+index 0f41c69361..e911b7d7cc 100644
+--- a/src/yb/rocksdb/db.h
++++ b/src/yb/rocksdb/db.h
+@@ -813,6 +813,8 @@ class DB {
+ 
+   virtual FlushAbility GetFlushAbility() { return FlushAbility::kHasNewData; }
+ 
++  virtual UserFrontierPtr GetMutableMemTableSmallestFrontier() { return nullptr; }
++
+   // Obtains the meta data of the specified column family of the DB.
+   // STATUS(NotFound, "") will be returned if the current DB does not have
+   // any column family match the specified name.
+diff --git a/src/yb/rocksdb/db/compact_files_test.cc b/src/yb/rocksdb/db/compact_files_test.cc
+index 1cc448e674..d515248314 100644
+--- a/src/yb/rocksdb/db/compact_files_test.cc
++++ b/src/yb/rocksdb/db/compact_files_test.cc
+@@ -30,6 +30,7 @@
+ #include "yb/util/string_util.h"
+ #include "yb/rocksdb/util/sync_point.h"
+ #include "yb/rocksdb/util/testharness.h"
++#include "yb/rocksdb/util/testutil.h"
+ 
+ namespace rocksdb {
+ 
+@@ -44,32 +45,6 @@ class CompactFilesTest : public testing::Test {
+   Env* env_;
+ };
+ 
+-// A class which remembers the name of each flushed file.
+-class FlushedFileCollector : public EventListener {
+- public:
+-  FlushedFileCollector() {}
+-  ~FlushedFileCollector() {}
+-
+-  virtual void OnFlushCompleted(
+-      DB* db, const FlushJobInfo& info) override {
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    flushed_files_.push_back(info.file_path);
+-  }
+-
+-  std::vector<std::string> GetFlushedFiles() {
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    std::vector<std::string> result;
+-    for (auto fname : flushed_files_) {
+-      result.push_back(fname);
+-    }
+-    return result;
+-  }
+-
+- private:
+-  std::vector<std::string> flushed_files_;
+-  std::mutex mutex_;
+-};
+-
+ TEST_F(CompactFilesTest, ObsoleteFiles) {
+   Options options;
+   // to trigger compaction more easily
+@@ -85,7 +60,7 @@ TEST_F(CompactFilesTest, ObsoleteFiles) {
+   options.compression = kNoCompression;
+ 
+   // Add listener
+-  FlushedFileCollector* collector = new FlushedFileCollector();
++  auto* collector = new test::FlushedFileCollector();
+   options.listeners.emplace_back(collector);
+ 
+   DB* db = nullptr;
+@@ -119,7 +94,7 @@ TEST_F(CompactFilesTest, CapturingPendingFiles) {
+   options.delete_obsolete_files_period_micros = 0;
+ 
+   // Add listener.
+-  FlushedFileCollector* collector = new FlushedFileCollector();
++  auto* collector = new test::FlushedFileCollector();
+   options.listeners.emplace_back(collector);
+ 
+   DB* db = nullptr;
+diff --git a/src/yb/rocksdb/db/compaction_job.cc b/src/yb/rocksdb/db/compaction_job.cc
+index eab7c04e60..f00e71f050 100644
+--- a/src/yb/rocksdb/db/compaction_job.cc
++++ b/src/yb/rocksdb/db/compaction_job.cc
+@@ -484,6 +484,9 @@ Result<FileNumbersHolder> CompactionJob::Run() {
+   TEST_SYNC_POINT("CompactionJob::Run():Start");
+   log_buffer_->FlushBufferToLog();
+   LogCompaction();
++  for (auto listener : db_options_.listeners) {
++    listener->OnCompactionStarted();
++  }
+ 
+   const size_t num_threads = compact_->sub_compact_states.size();
+   assert(num_threads > 0);
+diff --git a/src/yb/rocksdb/db/db_impl.cc b/src/yb/rocksdb/db/db_impl.cc
+index 28577cfb46..db90bc3205 100644
+--- a/src/yb/rocksdb/db/db_impl.cc
++++ b/src/yb/rocksdb/db/db_impl.cc
+@@ -2901,10 +2901,10 @@ ColumnFamilyData* DBImpl::PopFirstFromFlushQueue() {
+ }
+ 
+ void DBImpl::SchedulePendingFlush(ColumnFamilyData* cfd) {
+-  for (auto listener : db_options_.listeners) {
+-    listener->OnFlushScheduled(this);
+-  }
+   if (!cfd->pending_flush() && cfd->imm()->IsFlushPending()) {
++    for (auto listener : db_options_.listeners) {
++      listener->OnFlushScheduled(this);
++    }
+     if (db_options_.compaction_thread_pool) {
+       ++bg_flush_scheduled_;
+       cfd->Ref();
+@@ -5657,6 +5657,19 @@ UserFrontierPtr DBImpl::GetFlushedFrontier() {
+   return accumulated;
+ }
+ 
++UserFrontierPtr DBImpl::GetMutableMemTableSmallestFrontier() {
++  InstrumentedMutexLock l(&mutex_);
++  UserFrontierPtr accumulated;
++  for (auto cfd : *versions_->GetColumnFamilySet()) {
++    const auto* mem = cfd->mem();
++    if (!cfd->IsDropped() && !mem->IsEmpty()) {
++      UserFrontier::Update(
++          mem->GetSmallestFrontierLocked().get(), UpdateUserValueType::kSmallest, &accumulated);
++    }
++  }
++  return accumulated;
++}
++
+ Status DBImpl::ApplyVersionEdit(VersionEdit* edit) {
+   auto cfd = versions_->GetColumnFamilySet()->GetDefault();
+   InstrumentedMutexLock lock(&mutex_);
+diff --git a/src/yb/rocksdb/db/db_impl.h b/src/yb/rocksdb/db/db_impl.h
+index 7e093de5ec..6d3fb75731 100644
+--- a/src/yb/rocksdb/db/db_impl.h
++++ b/src/yb/rocksdb/db/db_impl.h
+@@ -223,6 +223,8 @@ class DBImpl : public DB {
+ 
+   FlushAbility GetFlushAbility() override;
+ 
++  UserFrontierPtr GetMutableMemTableSmallestFrontier() override;
++
+   // Obtains the meta data of the specified column family of the DB.
+   // STATUS(NotFound, "") will be returned if the current DB does not have
+   // any column family match the specified name.
+@@ -315,7 +317,6 @@ class DBImpl : public DB {
+   InternalIterator* NewInternalIterator(
+       Arena* arena, ColumnFamilyHandle* column_family = nullptr);
+ 
+-#ifndef NDEBUG
+   // Extra methods (for testing) that are not in the public DB interface
+   // Implemented in db_impl_debug.cc
+ 
+@@ -382,8 +383,6 @@ class DBImpl : public DB {
+ 
+   WriteController& TEST_write_controler() { return write_controller_; }
+ 
+-#endif  // NDEBUG
+-
+   // Return maximum background compaction alowed to be scheduled based on
+   // compaction status.
+   int BGCompactionsAllowed() const;
+diff --git a/src/yb/rocksdb/db/db_impl_debug.cc b/src/yb/rocksdb/db/db_impl_debug.cc
+index 66a5bed4f6..f17f035e1c 100644
+--- a/src/yb/rocksdb/db/db_impl_debug.cc
++++ b/src/yb/rocksdb/db/db_impl_debug.cc
+@@ -21,8 +21,6 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file. See the AUTHORS file for names of contributors.
+ 
+-#ifndef NDEBUG
+-
+ #include "yb/rocksdb/db/db_impl.h"
+ #include "yb/rocksdb/util/thread_status_updater.h"
+ 
+@@ -188,4 +186,3 @@ Status DBImpl::TEST_GetAllImmutableCFOptions(
+ }
+ 
+ }  // namespace rocksdb
+-#endif  // NDEBUG
+diff --git a/src/yb/rocksdb/db/memtable.h b/src/yb/rocksdb/db/memtable.h
+index 82ec626f9e..eb0191804f 100644
+--- a/src/yb/rocksdb/db/memtable.h
++++ b/src/yb/rocksdb/db/memtable.h
+@@ -342,12 +342,19 @@ class MemTable {
+   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
+ 
+   void UpdateFrontiers(const UserFrontiers& value) {
++    std::lock_guard<SpinMutex> l(frontiers_mutex_);
+     if (frontiers_) {
+       frontiers_->MergeFrontiers(value);
+     } else {
+       frontiers_ = value.Clone();
+     }
+   }
++
++  UserFrontierPtr GetSmallestFrontierLocked() const {
++    std::lock_guard<SpinMutex> l(frontiers_mutex_);
++    return frontiers_->Smallest().Clone();
++  }
++
+   const UserFrontiers* Frontiers() const { return frontiers_.get(); }
+ 
+   std::string ToString() const;
+@@ -405,6 +412,7 @@ class MemTable {
+ 
+   Env* env_;
+ 
++  mutable SpinMutex frontiers_mutex_;
+   std::unique_ptr<UserFrontiers> frontiers_;
+ 
+   // Returns a heuristic flush decision
+diff --git a/src/yb/rocksdb/listener.h b/src/yb/rocksdb/listener.h
+index f64c57225c..780a03ed44 100644
+--- a/src/yb/rocksdb/listener.h
++++ b/src/yb/rocksdb/listener.h
+@@ -16,8 +16,8 @@
+ // or implied.  See the License for the specific language governing permissions and limitations
+ // under the License.
+ //
+-#ifndef ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H
+-#define ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H
++#ifndef YB_ROCKSDB_LISTENER_H
++#define YB_ROCKSDB_LISTENER_H
+ 
+ #pragma once
+ 
+@@ -213,6 +213,9 @@ class EventListener {
+   // returned value.
+   virtual void OnTableFileDeleted(const TableFileDeletionInfo& /*info*/) {}
+ 
++  // A call-back function for RocksDB which will be called whenever a compaction has been started.
++  virtual void OnCompactionStarted() {}
++
+   // A call-back function for RocksDB which will be called whenever
+   // a registered RocksDB compacts a file. The default implementation
+   // is a no-op.
+@@ -254,4 +257,4 @@ class EventListener {
+ 
+ }  // namespace rocksdb
+ 
+-#endif // ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H
++#endif // YB_ROCKSDB_LISTENER_H
+diff --git a/src/yb/rocksdb/util/testutil.h b/src/yb/rocksdb/util/testutil.h
+index 0e7aa9b22a..aa1b01eb1c 100644
+--- a/src/yb/rocksdb/util/testutil.h
++++ b/src/yb/rocksdb/util/testutil.h
+@@ -750,6 +750,48 @@ class TestUserFrontiers : public rocksdb::UserFrontiersBase<TestUserFrontier> {
+   }
+ };
+ 
++// A class which remembers the name of each flushed file.
++class FlushedFileCollector : public EventListener {
++ public:
++  virtual void OnFlushCompleted(DB* db, const FlushJobInfo& info) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    flushed_file_infos_.push_back(info);
++  }
++
++  std::vector<std::string> GetFlushedFiles() {
++    std::vector<std::string> flushed_files;
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (const auto& info : flushed_file_infos_) {
++      flushed_files.push_back(info.file_path);
++    }
++    return flushed_files;
++  }
++
++  std::vector<std::string> GetAndClearFlushedFiles() {
++    std::vector<std::string> flushed_files;
++    std::lock_guard<std::mutex> lock(mutex_);
++    for (const auto& info : flushed_file_infos_) {
++      flushed_files.push_back(info.file_path);
++    }
++    flushed_file_infos_.clear();
++    return flushed_files;
++  }
++
++  std::vector<FlushJobInfo> GetFlushedFileInfos() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return flushed_file_infos_;
++  }
++
++  void Clear() {
++    std::lock_guard<std::mutex> lock(mutex_);
++    flushed_file_infos_.clear();
++  }
++
++ private:
++  std::vector<FlushJobInfo> flushed_file_infos_;
++  std::mutex mutex_;
++};
++
+ }  // namespace test
+ }  // namespace rocksdb
+ 
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index ca01303816..aad6ec3aa6 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -399,9 +399,6 @@ Tablet::Tablet(
+         transaction_coordinator_context,
+         metrics_->expired_transactions.get());
+   }
+-
+-  flush_stats_ = make_shared<TabletFlushStats>();
+-  tablet_options_.listeners.emplace_back(flush_stats_);
+ }
+ 
+ Tablet::~Tablet() {
+@@ -820,7 +817,6 @@ void Tablet::WriteBatch(const rocksdb::UserFrontiers* frontiers,
+   rocksdb::WriteOptions write_options;
+   InitRocksDBWriteOptions(&write_options);
+ 
+-  flush_stats_->AboutToWriteToDb(hybrid_time);
+   auto rocksdb_write_status = dest_db->Write(write_options, write_batch);
+   if (!rocksdb_write_status.ok()) {
+     LOG_WITH_PREFIX(FATAL) << "Failed to write a batch with " << write_batch->Count()
+@@ -1709,6 +1705,22 @@ Result<HybridTime> Tablet::MaxPersistentHybridTime() const {
+   return result;
+ }
+ 
++HybridTime Tablet::OldestMutableMemtableWriteHybridTime() const {
++  HybridTime result = HybridTime::kMax;
++  for (auto* db : { regular_db_.get(), intents_db_.get() }) {
++    if (db) {
++      auto mem_frontier = db->GetMutableMemTableSmallestFrontier();
++      if (mem_frontier) {
++        const auto hybrid_time =
++            static_cast<const docdb::ConsensusFrontier&>(*mem_frontier).hybrid_time();
++        result = std::min(result, hybrid_time);
++      }
++    }
++  }
++  return result;
++}
++
++
+ Status Tablet::DebugDump(vector<string> *lines) {
+   switch (table_type_) {
+     case TableType::PGSQL_TABLE_TYPE: FALLTHROUGH_INTENDED;
+diff --git a/src/yb/tablet/tablet.h b/src/yb/tablet/tablet.h
+index 0bb9d941a0..8e94558999 100644
+--- a/src/yb/tablet/tablet.h
++++ b/src/yb/tablet/tablet.h
+@@ -126,38 +126,6 @@ using docdb::LockBatch;
+ 
+ YB_STRONGLY_TYPED_BOOL(IncludeIntents);
+ 
+-class TabletFlushStats : public rocksdb::EventListener {
+- public:
+-
+-  void OnFlushScheduled(rocksdb::DB* db) override {
+-    oldest_write_in_memstore_.store(std::numeric_limits<uint64_t>::max(),
+-                                    std::memory_order_release);
+-    num_flushes_++;
+-  }
+-
+-  void AboutToWriteToDb(HybridTime hybrid_time) {
+-    // Atomically do oldest_write_in_memstore_ = min(oldest_write_in_memstore_, hybrid_time)
+-    uint64_t curr_val = hybrid_time.ToUint64();
+-    uint64_t prev_val = oldest_write_in_memstore_.load(std::memory_order_acquire);
+-    while (curr_val < prev_val &&
+-           !oldest_write_in_memstore_.compare_exchange_weak(prev_val, curr_val)) {}
+-  }
+-
+-  // Return the hybrid time of the oldest write in the memstore, or HybridTime::kMax if empty
+-  HybridTime oldest_write_in_memstore() const {
+-    return HybridTime(oldest_write_in_memstore_.load(std::memory_order_acquire));
+-  }
+-
+-  // Number of flushes scheduled. Updated atomically before scheduling.
+-  size_t num_flushes() {
+-    return num_flushes_.load(std::memory_order_acquire);
+-  }
+-
+- private:
+-  std::atomic<size_t> num_flushes_{0};
+-  std::atomic<uint64_t> oldest_write_in_memstore_{std::numeric_limits<uint64_t>::max()};
+-};
+-
+ YB_DEFINE_ENUM(FlushMode, (kSync)(kAsync));
+ 
+ enum class FlushFlags {
+@@ -436,6 +404,10 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
+   // Returns the maximum persistent hybrid_time across all SSTables in RocksDB.
+   Result<HybridTime> MaxPersistentHybridTime() const;
+ 
++  // Returns oldest mutable memtable write hybrid time in RocksDB or HybridTime::kMax if memtable
++  // is empty.
++  HybridTime OldestMutableMemtableWriteHybridTime() const;
++
+   // Returns the location of the last rocksdb checkpoint. Used for tests only.
+   std::string TEST_LastRocksDBCheckpointDir() { return last_rocksdb_checkpoint_dir_; }
+ 
+@@ -452,9 +424,6 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
+   // earlier than that will be rejected.
+   HybridTime UpdateHistoryCutoff(HybridTime proposed_cutoff);
+ 
+-  // The HybridTime of the oldest write that is still not scheduled to be flushed in RocksDB.
+-  TabletFlushStats* flush_stats() const { return flush_stats_.get(); }
+-
+   const scoped_refptr<server::Clock> &clock() const {
+     return clock_;
+   }
+@@ -720,10 +689,6 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
+ 
+   std::atomic<int64_t> last_committed_write_index_{0};
+ 
+-  // Remembers he HybridTime of the oldest write that is still not scheduled to
+-  // be flushed in RocksDB.
+-  std::shared_ptr<TabletFlushStats> flush_stats_;
+-
+   HybridTimeLeaseProvider ht_lease_provider_;
+ 
+  private:
+diff --git a/src/yb/tserver/tablet_server_options.h b/src/yb/tserver/tablet_server_options.h
+index bfa97998e7..019c11b43c 100644
+--- a/src/yb/tserver/tablet_server_options.h
++++ b/src/yb/tserver/tablet_server_options.h
+@@ -35,6 +35,7 @@
+ #include <vector>
+ 
+ #include "yb/server/server_base_options.h"
++#include "yb/rocksdb/listener.h"
+ 
+ namespace yb {
+ namespace tserver {
+@@ -51,6 +52,8 @@ class TabletServerOptions : public yb::server::ServerBaseOptions {
+ 
+   static const char* kServerType;
+ 
++  std::vector<std::shared_ptr<rocksdb::EventListener>> listeners;
++
+  private:
+   explicit TabletServerOptions(server::MasterAddressesPtr master_addresses);
+ 
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index c7b212e5fb..596aa5ca54 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -262,19 +262,27 @@ void TSTabletManager::MaybeFlushTablet() {
+   int iteration = 0;
+   while (memory_monitor()->Exceeded() ||
+          (iteration++ == 0 && FLAGS_pretend_memory_exceeded_enforce_flush)) {
++    YB_LOG_EVERY_N_SECS(INFO, 5) << Format("Memstore global limit of $0 bytes reached, looking for "
++                                           "tablet to flush", memory_monitor()->limit());
+     TabletPeerPtr tablet_to_flush = TabletToFlush();
+     // TODO(bojanserafimov): If tablet_to_flush flushes now because of other reasons,
+     // we will schedule a second flush, which will unnecessarily stall writes for a short time. This
+     // will not happen often, but should be fixed.
+     if (tablet_to_flush) {
++      LOG(INFO) << Format(
++          "Flushing tablet $0 with oldest memstore write at $1", tablet_to_flush->tablet_id(),
++          tablet_to_flush->tablet()->OldestMutableMemtableWriteHybridTime());
+       WARN_NOT_OK(tablet_to_flush->tablet()->Flush(tablet::FlushMode::kAsync),
+           Substitute("Flush failed on $0", tablet_to_flush->tablet_id()));
++      for (auto listener : TEST_listeners) {
++        listener->StartedFlush(tablet_to_flush->tablet_id());
++      }
+     }
+   }
+ }
+ 
+-// Return the tablet with the oldest write in memstore, or nullptr if all
+-// tablet memstores are empty or about to flush.
++// Return the tablet with the oldest write in memstore, or nullptr if all tablet memstores are
++// empty or about to flush.
+ TabletPeerPtr TSTabletManager::TabletToFlush() {
+   boost::shared_lock<RWMutex> lock(lock_); // For using the tablet map
+   HybridTime oldest_write_in_memstores = HybridTime::kMax;
+@@ -282,9 +290,9 @@ TabletPeerPtr TSTabletManager::TabletToFlush() {
+   for (const TabletMap::value_type& entry : tablet_map_) {
+     const auto tablet = entry.second->shared_tablet();
+     if (tablet) {
+-      const HybridTime oldest_write_in_memstore = tablet->flush_stats()->oldest_write_in_memstore();
+-      if (oldest_write_in_memstore < oldest_write_in_memstores) {
+-        oldest_write_in_memstores = oldest_write_in_memstore;
++      const auto ht = tablet->OldestMutableMemtableWriteHybridTime();
++      if (ht < oldest_write_in_memstores) {
++        oldest_write_in_memstores = ht;
+         tablet_to_flush = entry.second;
+       }
+     }
+@@ -403,6 +411,7 @@ Status TSTabletManager::Init() {
+ 
+   tablet_options_.env = server_->GetEnv();
+   tablet_options_.rocksdb_env = server_->GetRocksDBEnv();
++  tablet_options_.listeners = server_->options().listeners;
+ 
+   // Start the threadpool we'll use to open tablets.
+   // This has to be done in Init() instead of the constructor, since the
+diff --git a/src/yb/tserver/ts_tablet_manager.h b/src/yb/tserver/ts_tablet_manager.h
+index ce3ecf1c52..edcb1514f0 100644
+--- a/src/yb/tserver/ts_tablet_manager.h
++++ b/src/yb/tserver/ts_tablet_manager.h
+@@ -83,7 +83,11 @@ class TabletReportPB;
+ 
+ namespace tserver {
+ class TabletServer;
+-class TSMemoryMonitorListener;
++class TsTabletManagerListener {
++ public:
++  virtual ~TsTabletManagerListener() {}
++  virtual void StartedFlush(const TabletId& tablet_id) {}
++};
+ 
+ using rocksdb::MemoryMonitor;
+ 
+@@ -297,6 +301,10 @@ class TSTabletManager : public tserver::TabletPeerLookupIf {
+   // Flush some tablet if the memstore memory limit is exceeded
+   void MaybeFlushTablet();
+ 
++  tablet::TabletOptions* TEST_tablet_options() { return &tablet_options_; }
++
++  std::vector<std::shared_ptr<TsTabletManagerListener>> TEST_listeners;
++
+  private:
+   FRIEND_TEST(TsTabletManagerTest, TestPersistBlocks);
+ 
+diff --git a/src/yb/util/status.h b/src/yb/util/status.h
+index 1ea39d24bd..f01414ed5f 100644
+--- a/src/yb/util/status.h
++++ b/src/yb/util/status.h
+@@ -96,6 +96,14 @@
+     } \
+   } while (0);
+ 
++// Emit a error if 'to_call' returns a bad status.
++#define ERROR_NOT_OK(to_call, error_prefix) do { \
++    ::yb::Status _s = (to_call); \
++    if (PREDICT_FALSE(!_s.ok())) { \
++      YB_LOG(ERROR) << (error_prefix) << ": " << _s.ToString();  \
++    } \
++  } while (0);
++
+ // Log the given status and return immediately.
+ #define YB_LOG_AND_RETURN(level, status) do { \
+     ::yb::Status _s = (status); \
+diff --git a/src/yb/util/test_util.cc b/src/yb/util/test_util.cc
+index 57515c7c0e..783e1ccf63 100644
+--- a/src/yb/util/test_util.cc
++++ b/src/yb/util/test_util.cc
+@@ -310,6 +310,19 @@ void AssertLoggedWaitFor(
+   LOG(INFO) << description << " - DONE";
+ }
+ 
++Status LoggedWaitFor(
++    std::function<Result<bool>()> condition,
++    MonoDelta timeout,
++    const string& description,
++    MonoDelta initial_delay,
++    double delay_multiplier,
++    MonoDelta max_delay) {
++  LOG(INFO) << description;
++  auto status = WaitFor(condition, timeout, description, initial_delay);
++  LOG(INFO) << description << " - completed: " << yb::ToString(status);
++  return status;
++}
++
+ string GetToolPath(const string& tool_name) {
+   string exe;
+   CHECK_OK(Env::Default()->GetExecutablePath(&exe));
+diff --git a/src/yb/util/test_util.h b/src/yb/util/test_util.h
+index 9387653f40..609a44ea6b 100644
+--- a/src/yb/util/test_util.h
++++ b/src/yb/util/test_util.h
+@@ -212,6 +212,14 @@ void AssertLoggedWaitFor(
+     double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
+     MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
+ 
++CHECKED_STATUS LoggedWaitFor(
++    std::function<Result<bool>()> condition,
++    MonoDelta timeout,
++    const string& description,
++    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
++    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
++    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
++
+ // Return the path of a yb-tool.
+ std::string GetToolPath(const std::string& tool_name);
+ 

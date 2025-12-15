@@ -1,0 +1,332 @@
+diff --git a/src/yb/rpc/messenger.cc b/src/yb/rpc/messenger.cc
+index ee5fdca29c..343a0e17b7 100644
+--- a/src/yb/rpc/messenger.cc
++++ b/src/yb/rpc/messenger.cc
+@@ -96,6 +96,10 @@ DEFINE_NON_RUNTIME_int32(rpc_workers_limit, 1024, "Workers limit for rpc server"
+ 
+ DEFINE_UNKNOWN_int32(socket_receive_buffer_size, 0, "Socket receive buffer size, 0 to use default");
+ 
++DEFINE_test_flag(
++    int32, rpc_reactor_index_for_init_failure_simulation,
++    -1, "Index of reactor in Messenger to simulate failure of Reactor::Init method");
++
+ namespace yb {
+ namespace rpc {
+ 
+@@ -146,10 +150,10 @@ Result<std::unique_ptr<Messenger>> MessengerBuilder::Build() {
+   if (!connection_context_factory_) {
+     UseDefaultConnectionContextFactory();
+   }
+-  std::unique_ptr<Messenger> messenger(new Messenger(*this));
+-  RETURN_NOT_OK(messenger->Init());
++  std::unique_ptr<Messenger, MessengerShutdownDeleter> messenger(new Messenger(*this));
++  RETURN_NOT_OK(messenger->Init(*this));
+ 
+-  return messenger;
++  return std::unique_ptr<Messenger>(messenger.release());
+ }
+ 
+ MessengerBuilder &MessengerBuilder::AddStreamFactory(
+@@ -568,9 +572,6 @@ Messenger::Messenger(const MessengerBuilder &bld)
+   creation_stack_trace_.Collect(/* skip_frames */ 1);
+ #endif
+   VLOG(1) << "Messenger constructor for " << this << " called at:\n" << GetStackTrace();
+-  for (int i = 0; i < bld.num_reactors_; i++) {
+-    reactors_.emplace_back(std::make_unique<Reactor>(this, i, bld));
+-  }
+   // Make sure skip buffer is allocated before we hit memory limit and try to use it.
+   GetGlobalSkipBuffer();
+ }
+@@ -604,12 +605,16 @@ Reactor* Messenger::RemoteToReactor(const Endpoint& remote, uint32_t idx) {
+   return reactors_[reactor_idx].get();
+ }
+ 
+-Status Messenger::Init() {
+-  Status status;
+-  for (const auto& r : reactors_) {
+-    RETURN_NOT_OK(r->Init());
++Status Messenger::Init(const MessengerBuilder &bld) {
++  reactors_.reserve(bld.num_reactors_);
++  for (int i = 0; i < bld.num_reactors_; ++i) {
++    auto reactor = std::make_unique<Reactor>(this, i, bld);
++    if (PREDICT_FALSE(FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation == i)) {
++      return STATUS(InternalError, "Reactor::Init simulated error");
++    }
++    RETURN_NOT_OK(reactor->Init());
++    reactors_.push_back(std::move(reactor));
+   }
+-
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/rpc/messenger.h b/src/yb/rpc/messenger.h
+index 3d993dddb8..894a5dd5a8 100644
+--- a/src/yb/rpc/messenger.h
++++ b/src/yb/rpc/messenger.h
+@@ -307,7 +307,7 @@ class Messenger : public ProxyContext {
+   explicit Messenger(const MessengerBuilder &bld);
+ 
+   Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0);
+-  Status Init();
++  Status Init(const MessengerBuilder &bld);
+ 
+   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
+   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
+diff --git a/src/yb/rpc/reactor-test.cc b/src/yb/rpc/reactor-test.cc
+index 3790c37f00..f1dbbf74ac 100644
+--- a/src/yb/rpc/reactor-test.cc
++++ b/src/yb/rpc/reactor-test.cc
+@@ -42,6 +42,8 @@ using std::shared_ptr;
+ using namespace std::literals;
+ using namespace std::placeholders;
+ 
++DECLARE_int32(TEST_rpc_reactor_index_for_init_failure_simulation);
++
+ namespace yb {
+ namespace rpc {
+ 
+@@ -82,6 +84,16 @@ class ReactorTest : public RpcTestBase {
+   CountDownLatch latch_;
+ };
+ 
++TEST_F_EX(ReactorTest, MessengerInitFailure, YBTest) {
++  MessengerBuilder builder("test-msgr");
++  // Test Reactor::Init failure in very first Messenger's reactor
++  FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation = 0;
++  ASSERT_NOK(builder.Build());
++  // Test Reactor::Init failure in second Messenger's reactor
++  FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation = 1;
++  ASSERT_NOK(builder.Build());
++}
++
+ TEST_F(ReactorTest, TestFunctionIsCalled) {
+   auto task_id = messenger_->ScheduleOnReactor(
+       std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()), 0s,
+diff --git a/src/yb/rpc/reactor.cc b/src/yb/rpc/reactor.cc
+index 98103846cf..2a5d326f50 100644
+--- a/src/yb/rpc/reactor.cc
++++ b/src/yb/rpc/reactor.cc
+@@ -161,8 +161,11 @@ Reactor::~Reactor() {
+ }
+ 
+ Status Reactor::Init() {
+-  DCHECK(thread_.get() == nullptr) << "Already started";
+   DVLOG_WITH_PREFIX(6) << "Called Reactor::Init()";
++  auto old_state = ReactorState::kIdle;
++  SCHECK(
++      state_.compare_exchange_strong(old_state, ReactorState::kRunning, std::memory_order_acq_rel),
++      IllegalState, "Already started");
+   // Register to get async notifications in our epoll loop.
+   async_.set(loop_);
+   async_.set<Reactor, &Reactor::AsyncHandler>(this);
+@@ -182,7 +185,7 @@ Status Reactor::Init() {
+ }
+ 
+ void Reactor::Shutdown() {
+-  ReactorState old_state = ReactorState::kRunning;
++  auto old_state = ReactorState::kRunning;
+   do {
+     if (state_.compare_exchange_weak(old_state,
+                                      ReactorState::kClosing,
+@@ -190,7 +193,7 @@ void Reactor::Shutdown() {
+       VLOG_WITH_PREFIX(1) << "shutting down Reactor thread.";
+       WakeThread();
+     }
+-  } while (!HasReactorStartedClosing(old_state));
++  } while (old_state == ReactorState::kRunning);
+ 
+   // Another thread already switched the state to closing before us.
+ }
+@@ -202,8 +205,7 @@ void Reactor::ShutdownConnection(const ConnectionPtr& conn) {
+   conn->Shutdown(ServiceUnavailableError());
+   if (!conn->context().Idle()) {
+     VLOG_WITH_PREFIX(1) << "connection is not idle: " << conn->ToString();
+-    std::weak_ptr<Connection> weak_conn(conn);
+-    conn->context().ListenIdle([this, weak_conn]() {
++    conn->context().ListenIdle([this, weak_conn = std::weak_ptr(conn)]() {
+       DCHECK(IsCurrentThreadOrStartedClosing());
+       auto conn = weak_conn.lock();
+       if (conn) {
+@@ -488,8 +490,7 @@ bool Reactor::IsCurrentThread() const {
+ }
+ 
+ bool Reactor::IsCurrentThreadOrStartedClosing() const {
+-  return thread_.get() == yb::Thread::current_thread() ||
+-         HasReactorStartedClosing(state_.load(std::memory_order_acquire));
++  return IsCurrentThread() || HasReactorStartedClosing(state());
+ }
+ 
+ void Reactor::RunThread() {
+@@ -543,7 +544,7 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
+     return Status::OK();
+   }
+ 
+-  if (HasReactorStartedClosing(state_.load(std::memory_order_acquire))) {
++  if (state() != ReactorState::kRunning) {
+     return ServiceUnavailableError();
+   }
+ 
+@@ -942,14 +943,14 @@ bool Reactor::ScheduleReactorTask(ReactorTaskPtr task, bool schedule_even_closin
+     // Even though state_ is atomic, we still need to take the lock to make sure state_
+     // and pending_tasks_mtx_ are being modified in a consistent way.
+     std::unique_lock<simple_spinlock> pending_lock(pending_tasks_mtx_);
+-    auto state = state_.load(std::memory_order_acquire);
+-    bool failure = schedule_even_closing ? state == ReactorState::kClosed
+-                                         : HasReactorStartedClosing(state);
++    auto current_state = state();
++    bool failure = schedule_even_closing ? current_state == ReactorState::kClosed
++                                         : current_state != ReactorState::kRunning;
+     if (failure) {
+       return false;
+     }
+     was_empty = pending_tasks_.empty();
+-    pending_tasks_.emplace_back(std::move(task));
++    pending_tasks_.push_back(std::move(task));
+   }
+   if (was_empty) {
+     WakeThread();
+@@ -963,7 +964,7 @@ bool Reactor::DrainTaskQueueAndCheckIfClosing() {
+ 
+   std::lock_guard<simple_spinlock> lock(pending_tasks_mtx_);
+   async_handler_tasks_.swap(pending_tasks_);
+-  return HasReactorStartedClosing(state_.load(std::memory_order_acquire));
++  return HasReactorStartedClosing(state());
+ }
+ 
+ // Task to call an arbitrary function within the reactor thread.
+diff --git a/src/yb/rpc/reactor.h b/src/yb/rpc/reactor.h
+index 7d0e4eb6b8..b7f39e9072 100644
+--- a/src/yb/rpc/reactor.h
++++ b/src/yb/rpc/reactor.h
+@@ -287,7 +287,7 @@ class DelayedTask : public ReactorTask {
+ 
+ typedef std::vector<ReactorTaskPtr> ReactorTasks;
+ 
+-YB_DEFINE_ENUM(ReactorState, (kRunning)(kClosing)(kClosed));
++YB_DEFINE_ENUM(ReactorState, (kIdle)(kRunning)(kClosing)(kClosed));
+ 
+ class Reactor {
+  public:
+@@ -389,15 +389,15 @@ class Reactor {
+     return ScheduleReactorTask(MakeFunctorReactorTask(f, source_location));
+   }
+ 
+-  ReactorState state() {
+-    return state_.load(std::memory_order_acquire);
+-  }
+-
+  private:
+   friend class Connection;
+   friend class AssignOutboundCallTask;
+   friend class DelayedTask;
+ 
++  ReactorState state() const {
++    return state_.load(std::memory_order_acquire);
++  }
++
+   // Run the main event loop of the reactor.
+   void RunThread();
+ 
+@@ -452,7 +452,7 @@ class Reactor {
+ 
+   // Reactor status, mostly used when shutting down. Guarded by pending_tasks_mtx_, but also read
+   // without a lock for sanity checking.
+-  std::atomic<ReactorState> state_{ReactorState::kRunning};
++  std::atomic<ReactorState> state_{ReactorState::kIdle};
+ 
+   // This mutex is used to make sure that multiple threads that end up running Abort() in case the
+   // reactor has already shut down will not have data races accessing data that is normally only
+diff --git a/src/yb/rpc/rpc_test_util.cc b/src/yb/rpc/rpc_test_util.cc
+index 74c62685c6..95c57e30d1 100644
+--- a/src/yb/rpc/rpc_test_util.cc
++++ b/src/yb/rpc/rpc_test_util.cc
+@@ -13,19 +13,12 @@
+ 
+ #include "yb/rpc/rpc_test_util.h"
+ 
+-#include "yb/rpc/messenger.h"
+-
+ namespace yb {
+ namespace rpc {
+ 
+-void MessengerShutdownDeleter::operator()(Messenger* messenger) const {
+-  messenger->Shutdown();
+-  delete messenger;
+-}
+-
+ AutoShutdownMessengerHolder CreateAutoShutdownMessengerHolder(
+     std::unique_ptr<Messenger>&& messenger) {
+-  return AutoShutdownMessengerHolder(std::move(messenger).release());
++  return AutoShutdownMessengerHolder(messenger.release());
+ }
+ 
+ } // namespace rpc
+diff --git a/src/yb/rpc/rpc_test_util.h b/src/yb/rpc/rpc_test_util.h
+index 07728916f6..8636fbb3de 100644
+--- a/src/yb/rpc/rpc_test_util.h
++++ b/src/yb/rpc/rpc_test_util.h
+@@ -13,15 +13,13 @@
+ 
+ #pragma once
+ 
+-#include "yb/rpc/rpc_fwd.h"
++#include <memory>
++
++#include "yb/rpc/rpc_util.h"
+ 
+ namespace yb {
+ namespace rpc {
+ 
+-struct MessengerShutdownDeleter {
+-  void operator()(Messenger* messenger) const;
+-};
+-
+ using AutoShutdownMessengerHolder = std::unique_ptr<Messenger, MessengerShutdownDeleter>;
+ 
+ AutoShutdownMessengerHolder CreateAutoShutdownMessengerHolder(
+diff --git a/src/yb/rpc/rpc_util.cc b/src/yb/rpc/rpc_util.cc
+index ffd1b57c23..12772627ec 100644
+--- a/src/yb/rpc/rpc_util.cc
++++ b/src/yb/rpc/rpc_util.cc
+@@ -13,11 +13,18 @@
+ 
+ #include "yb/rpc/rpc_util.h"
+ 
++#include "yb/rpc/messenger.h"
++
+ #include "yb/util/size_literals.h"
+ 
+ namespace yb {
+ namespace rpc {
+ 
++void MessengerShutdownDeleter::operator()(Messenger* messenger) const {
++  messenger->Shutdown();
++  delete messenger;
++}
++
+ Slice GetGlobalSkipBuffer() {
+ #if (!defined(THREAD_SANITIZER))
+   // It is OK to write concurrently into this buffer, since we use it for skipping data in case of
+diff --git a/src/yb/rpc/rpc_util.h b/src/yb/rpc/rpc_util.h
+index ddd569140c..0e54824ea0 100644
+--- a/src/yb/rpc/rpc_util.h
++++ b/src/yb/rpc/rpc_util.h
+@@ -15,13 +15,17 @@
+ 
+ #pragma once
+ 
+-#include <memory>
++#include "yb/rpc/rpc_fwd.h"
+ 
+ #include "yb/util/slice.h"
+ 
+ namespace yb {
+ namespace rpc {
+ 
++struct MessengerShutdownDeleter {
++  void operator()(Messenger* messenger) const;
++};
++
+ // Returns slice pointing to global buffer for reading data which we want to ignore, for example in
+ // case of hitting memory limit.
+ Slice GetGlobalSkipBuffer();

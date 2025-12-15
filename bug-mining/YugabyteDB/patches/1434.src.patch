@@ -1,0 +1,125 @@
+diff --git a/src/postgres/src/backend/access/transam/xact.c b/src/postgres/src/backend/access/transam/xact.c
+index b96518b337..9314e1deb0 100644
+--- a/src/postgres/src/backend/access/transam/xact.c
++++ b/src/postgres/src/backend/access/transam/xact.c
+@@ -2124,12 +2124,19 @@ YBGetEffectivePggateIsolationLevel()
+ 	return mapped_pg_isolation_level;
+ }
+ 
++static TimestampTz
++ToUnixEpochUs(TimestampTz pg_timestamp)
++{
++	return pg_timestamp +
++		((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY * USECS_PER_SEC);
++}
++
+ static YbcPgInitTransactionData
+ YBBuildInitTransactionData()
+ {
+ 	return (YbcPgInitTransactionData)
+ 	{
+-		.xact_start_timestamp = xactStartTimestamp,
++		.xact_start_timestamp = ToUnixEpochUs(xactStartTimestamp),
+ 			.xact_read_only = XactReadOnly,
+ 			.xact_deferrable = XactDeferrable,
+ 			.enable_tracing = YBEnableTracing(),
+@@ -2146,7 +2153,7 @@ YBRunWithInitTransactionData(YbcStatus (*Callback) (const YbcPgInitTransactionDa
+ 	{
+ 		const YbcPgInitTransactionData data =
+ 		{
+-			.xact_start_timestamp = xactStartTimestamp,
++			.xact_start_timestamp = ToUnixEpochUs(xactStartTimestamp),
+ 			.xact_read_only = XactReadOnly,
+ 			.xact_deferrable = XactDeferrable,
+ 			.enable_tracing = YBEnableTracing(),
+diff --git a/src/yb/client/transaction.cc b/src/yb/client/transaction.cc
+index 98b7811f0e..006069f98c 100644
+--- a/src/yb/client/transaction.cc
++++ b/src/yb/client/transaction.cc
+@@ -1298,9 +1298,8 @@ class YBTransaction::Impl final : public internal::TxnBatcherIf {
+     } else {
+       metadata_.start_time = read_point_.Now();
+     }
+-    // TODO(wait-queues): Consider using metadata_.pg_txn_start_us here for consistency with
+-    // wait queues. https://github.com/yugabyte/yugabyte-db/issues/20976
+-    SetStartTimeIfNecessary();
++    // Time when the BEGIN statement was executed.
++    start_.store(metadata_.pg_txn_start_us, std::memory_order_release);
+   }
+ 
+   void SetReadTimeIfNeeded(bool do_it) {
+diff --git a/src/yb/tserver/pg_client_session.cc b/src/yb/tserver/pg_client_session.cc
+index b0745a31e7..6135ef595b 100644
+--- a/src/yb/tserver/pg_client_session.cc
++++ b/src/yb/tserver/pg_client_session.cc
+@@ -3013,10 +3013,12 @@ class PgClientSession::Impl {
+       txn = transaction_provider_.Take<kSessionKind>(deadline);
+       txn->SetLogPrefixTag(kTxnLogPrefixTag, id_);
+       txn->InitPgSessionRequestVersion();
++      // Set the start time before initializing the transaction to allow start time to be
++      // propagated to txn coordinator.
++      RETURN_NOT_OK(txn->SetPgTxnStart(MonoTime::Now().ToUint64()));
+       // Isolation level doesn't matter but we need to set it for conflict resolution to not treat
+       // it as a single shard/fast-path transaction.
+       RETURN_NOT_OK(txn->Init(IsolationLevel::READ_COMMITTED));
+-      RETURN_NOT_OK(txn->SetPgTxnStart(MonoTime::Now().ToUint64()));
+       session_data.session->SetTransaction(txn);
+     }
+     return session_data;
+diff --git a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+index 3f93d6307b..bb50a5bf78 100644
+--- a/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
++++ b/src/yb/yql/pgwrapper/pg_wait_on_conflict-test.cc
+@@ -1085,6 +1085,52 @@ TEST_F(
+       status_future.get().ToString(), "could not serialize access due to concurrent update");
+ }
+ 
++class PgWaitQueuesTestWithObjectLocking : public PgWaitQueuesTest {
++ protected:
++  void InitFlags() override {
++    PgWaitQueuesTest::InitFlags();
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_object_locking_for_table_locks) = true;
++  }
++};
++
++TEST_F(
++    PgWaitQueuesTestWithObjectLocking, YB_DISABLE_TEST_IN_TSAN(TestDeadlockDetectionAbort)) {
++  // Test verifies that the deadlock detector correctly identifies and aborts session 2 when:
++  // - Session 1 updates row 1, then blocks on row 2
++  // - Session 2 updates row 2, then blocks on row 1
++  // This creates a deadlock cycle that should be detected and resolved by aborting session 2.
++  auto conn1 = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn1.Execute(
++      "CREATE TABLE t_123 (id INT PRIMARY KEY, balance INT)"));
++  ASSERT_OK(conn1.Execute(
++      "INSERT INTO t_123 (id, balance) VALUES (1, 1000), (2, 2000)"));
++  ASSERT_OK(conn1.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++
++  auto conn2 = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn2.Execute("BEGIN ISOLATION LEVEL REPEATABLE READ"));
++
++  ASSERT_OK(conn1.Execute("UPDATE t_123 SET balance = balance - 100 WHERE id = 1"));
++  ASSERT_OK(conn2.Execute("UPDATE t_123 SET balance = balance - 200 WHERE id = 2"));
++  std::this_thread::sleep_for(2us * FLAGS_transaction_heartbeat_usec * kTimeMultiplier);
++  auto status_future = ASSERT_RESULT(
++      ExpectBlockedAsync(&conn1, "UPDATE t_123 SET balance = balance + 200 WHERE id = 2"));
++  // Session 2: Try to update row 1 (blocks on session 1's lock, creating a deadlock)
++  // This should trigger deadlock detection and abort session 2
++  auto conn2_status = conn2.Execute("UPDATE t_123 SET balance = balance + 100 WHERE id = 1");
++  ASSERT_NOK(conn2_status);
++  ASSERT_STR_CONTAINS(conn2_status.ToUserMessage(true /*include_code*/), "Deadlock");
++
++  // After session 2 is aborted, session 1's blocked operation should complete successfully
++  ASSERT_OK(status_future.get());
++  ASSERT_OK(conn1.CommitTransaction());
++
++  // Verify final state: only session 1's changes are applied
++  auto result = ASSERT_RESULT(conn1.FetchRow<int>("SELECT balance FROM t_123 WHERE id = 1"));
++  ASSERT_EQ(result, 900);
++  result = ASSERT_RESULT(conn1.FetchRow<int>("SELECT balance FROM t_123 WHERE id = 2"));
++  ASSERT_EQ(result, 2200);
++}
++
+ void PgWaitQueuesTest::TestParallelUpdatesDetectDeadlock() const {
+   // Tests that wait-for dependencies of a distributed waiter txn waiting at different tablets, and
+   // possibly different tablet servers, are not overwritten at the deadlock detector.

@@ -1,0 +1,276 @@
+diff --git a/models/issues/issue.go b/models/issues/issue.go
+index 564a9fb835..5d52f0dd5d 100644
+--- a/models/issues/issue.go
++++ b/models/issues/issue.go
+@@ -17,6 +17,7 @@ import (
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	"code.gitea.io/gitea/modules/container"
+ 	"code.gitea.io/gitea/modules/log"
++	"code.gitea.io/gitea/modules/optional"
+ 	"code.gitea.io/gitea/modules/setting"
+ 	api "code.gitea.io/gitea/modules/structs"
+ 	"code.gitea.io/gitea/modules/timeutil"
+@@ -501,6 +502,45 @@ func GetIssueByIndex(ctx context.Context, repoID, index int64) (*Issue, error) {
+ 	return issue, nil
+ }
+ 
++func isPullToCond(isPull optional.Option[bool]) builder.Cond {
++	if isPull.Has() {
++		return builder.Eq{"is_pull": isPull.Value()}
++	}
++	return builder.NewCond()
++}
++
++func FindLatestUpdatedIssues(ctx context.Context, repoID int64, isPull optional.Option[bool], pageSize int) (IssueList, error) {
++	issues := make([]*Issue, 0, pageSize)
++	err := db.GetEngine(ctx).Where("repo_id = ?", repoID).
++		And(isPullToCond(isPull)).
++		OrderBy("updated_unix DESC").
++		Limit(pageSize).
++		Find(&issues)
++	return issues, err
++}
++
++func FindIssuesSuggestionByKeyword(ctx context.Context, repoID int64, keyword string, isPull optional.Option[bool], excludedID int64, pageSize int) (IssueList, error) {
++	cond := builder.NewCond()
++	if excludedID > 0 {
++		cond = cond.And(builder.Neq{"`id`": excludedID})
++	}
++
++	// It seems that GitHub searches both title and content (maybe sorting by the search engine's ranking system?)
++	// The first PR (https://github.com/go-gitea/gitea/pull/32327) uses "search indexer" to search "name(title) +  content"
++	// But it seems that searching "content" (especially LIKE by DB engine) generates worse (unusable) results.
++	// So now (https://github.com/go-gitea/gitea/pull/33538) it only searches "name(title)", leave the improvements to the future.
++	cond = cond.And(db.BuildCaseInsensitiveLike("`name`", keyword))
++
++	issues := make([]*Issue, 0, pageSize)
++	err := db.GetEngine(ctx).Where("repo_id = ?", repoID).
++		And(isPullToCond(isPull)).
++		And(cond).
++		OrderBy("updated_unix DESC, `index` DESC").
++		Limit(pageSize).
++		Find(&issues)
++	return issues, err
++}
++
+ // GetIssueWithAttrsByIndex returns issue by index in a repository.
+ func GetIssueWithAttrsByIndex(ctx context.Context, repoID, index int64) (*Issue, error) {
+ 	issue, err := GetIssueByIndex(ctx, repoID, index)
+diff --git a/routers/web/repo/issue_suggestions.go b/routers/web/repo/issue_suggestions.go
+index 46e9f339a5..9ef3942504 100644
+--- a/routers/web/repo/issue_suggestions.go
++++ b/routers/web/repo/issue_suggestions.go
+@@ -6,13 +6,10 @@ package repo
+ import (
+ 	"net/http"
+ 
+-	"code.gitea.io/gitea/models/db"
+-	issues_model "code.gitea.io/gitea/models/issues"
+ 	"code.gitea.io/gitea/models/unit"
+-	issue_indexer "code.gitea.io/gitea/modules/indexer/issues"
+ 	"code.gitea.io/gitea/modules/optional"
+-	"code.gitea.io/gitea/modules/structs"
+ 	"code.gitea.io/gitea/services/context"
++	issue_service "code.gitea.io/gitea/services/issue"
+ )
+ 
+ // IssueSuggestions returns a list of issue suggestions
+@@ -29,54 +26,11 @@ func IssueSuggestions(ctx *context.Context) {
+ 		isPull = optional.Some(false)
+ 	}
+ 
+-	searchOpt := &issue_indexer.SearchOptions{
+-		Paginator: &db.ListOptions{
+-			Page:     0,
+-			PageSize: 5,
+-		},
+-		Keyword:  keyword,
+-		RepoIDs:  []int64{ctx.Repo.Repository.ID},
+-		IsPull:   isPull,
+-		IsClosed: nil,
+-		SortBy:   issue_indexer.SortByUpdatedDesc,
+-	}
+-
+-	ids, _, err := issue_indexer.SearchIssues(ctx, searchOpt)
+-	if err != nil {
+-		ctx.ServerError("SearchIssues", err)
+-		return
+-	}
+-	issues, err := issues_model.GetIssuesByIDs(ctx, ids, true)
++	suggestions, err := issue_service.GetSuggestion(ctx, ctx.Repo.Repository, isPull, keyword)
+ 	if err != nil {
+-		ctx.ServerError("FindIssuesByIDs", err)
++		ctx.ServerError("GetSuggestion", err)
+ 		return
+ 	}
+ 
+-	suggestions := make([]*structs.Issue, 0, len(issues))
+-
+-	for _, issue := range issues {
+-		suggestion := &structs.Issue{
+-			ID:    issue.ID,
+-			Index: issue.Index,
+-			Title: issue.Title,
+-			State: issue.State(),
+-		}
+-
+-		if issue.IsPull {
+-			if err := issue.LoadPullRequest(ctx); err != nil {
+-				ctx.ServerError("LoadPullRequest", err)
+-				return
+-			}
+-			if issue.PullRequest != nil {
+-				suggestion.PullRequest = &structs.PullRequestMeta{
+-					HasMerged:        issue.PullRequest.HasMerged,
+-					IsWorkInProgress: issue.PullRequest.IsWorkInProgress(ctx),
+-				}
+-			}
+-		}
+-
+-		suggestions = append(suggestions, suggestion)
+-	}
+-
+ 	ctx.JSON(http.StatusOK, suggestions)
+ }
+diff --git a/services/issue/suggestion.go b/services/issue/suggestion.go
+new file mode 100644
+index 0000000000..22eddb1904
+--- /dev/null
++++ b/services/issue/suggestion.go
+@@ -0,0 +1,73 @@
++// Copyright 2025 The Gitea Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package issue
++
++import (
++	"context"
++	"strconv"
++
++	issues_model "code.gitea.io/gitea/models/issues"
++	repo_model "code.gitea.io/gitea/models/repo"
++	"code.gitea.io/gitea/modules/optional"
++	"code.gitea.io/gitea/modules/structs"
++)
++
++func GetSuggestion(ctx context.Context, repo *repo_model.Repository, isPull optional.Option[bool], keyword string) ([]*structs.Issue, error) {
++	var issues issues_model.IssueList
++	var err error
++	pageSize := 5
++	if keyword == "" {
++		issues, err = issues_model.FindLatestUpdatedIssues(ctx, repo.ID, isPull, pageSize)
++		if err != nil {
++			return nil, err
++		}
++	} else {
++		indexKeyword, _ := strconv.ParseInt(keyword, 10, 64)
++		var issueByIndex *issues_model.Issue
++		var excludedID int64
++		if indexKeyword > 0 {
++			issueByIndex, err = issues_model.GetIssueByIndex(ctx, repo.ID, indexKeyword)
++			if err != nil && !issues_model.IsErrIssueNotExist(err) {
++				return nil, err
++			}
++			if issueByIndex != nil {
++				excludedID = issueByIndex.ID
++				pageSize--
++			}
++		}
++
++		issues, err = issues_model.FindIssuesSuggestionByKeyword(ctx, repo.ID, keyword, isPull, excludedID, pageSize)
++		if err != nil {
++			return nil, err
++		}
++
++		if issueByIndex != nil {
++			issues = append([]*issues_model.Issue{issueByIndex}, issues...)
++		}
++	}
++
++	if err := issues.LoadPullRequests(ctx); err != nil {
++		return nil, err
++	}
++
++	suggestions := make([]*structs.Issue, 0, len(issues))
++	for _, issue := range issues {
++		suggestion := &structs.Issue{
++			ID:    issue.ID,
++			Index: issue.Index,
++			Title: issue.Title,
++			State: issue.State(),
++		}
++
++		if issue.IsPull && issue.PullRequest != nil {
++			suggestion.PullRequest = &structs.PullRequestMeta{
++				HasMerged:        issue.PullRequest.HasMerged,
++				IsWorkInProgress: issue.PullRequest.IsWorkInProgress(ctx),
++			}
++		}
++		suggestions = append(suggestions, suggestion)
++	}
++
++	return suggestions, nil
++}
+diff --git a/services/issue/suggestion_test.go b/services/issue/suggestion_test.go
+new file mode 100644
+index 0000000000..84cfd520ac
+--- /dev/null
++++ b/services/issue/suggestion_test.go
+@@ -0,0 +1,57 @@
++// Copyright 2025 The Gitea Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package issue
++
++import (
++	"testing"
++
++	"code.gitea.io/gitea/models/db"
++	repo_model "code.gitea.io/gitea/models/repo"
++	"code.gitea.io/gitea/models/unittest"
++	"code.gitea.io/gitea/modules/optional"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func Test_Suggestion(t *testing.T) {
++	assert.NoError(t, unittest.PrepareTestDatabase())
++
++	repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
++
++	testCases := []struct {
++		keyword         string
++		isPull          optional.Option[bool]
++		expectedIndexes []int64
++	}{
++		{
++			keyword:         "",
++			expectedIndexes: []int64{5, 1, 4, 2, 3},
++		},
++		{
++			keyword:         "1",
++			expectedIndexes: []int64{1},
++		},
++		{
++			keyword:         "issue",
++			expectedIndexes: []int64{4, 1, 2, 3},
++		},
++		{
++			keyword:         "pull",
++			expectedIndexes: []int64{5},
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.keyword, func(t *testing.T) {
++			issues, err := GetSuggestion(db.DefaultContext, repo1, testCase.isPull, testCase.keyword)
++			assert.NoError(t, err)
++
++			issueIndexes := make([]int64, 0, len(issues))
++			for _, issue := range issues {
++				issueIndexes = append(issueIndexes, issue.Index)
++			}
++			assert.EqualValues(t, testCase.expectedIndexes, issueIndexes)
++		})
++	}
++}

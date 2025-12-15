@@ -1,0 +1,475 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4dda5ea..1b43527 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,8 @@ Bug fixes:
+   `-A` and `-B` now only each partially override `-C`.
+ * [BUG #2236](https://github.com/BurntSushi/ripgrep/issues/2236):
+   Fix gitignore parsing bug where a trailing `\/` resulted in an error.
++* [BUG #2243](https://github.com/BurntSushi/ripgrep/issues/2243):
++  Fix `--sort` flag for values other than `path`.
+ * [BUG #2480](https://github.com/BurntSushi/ripgrep/issues/2480):
+   Fix bug when using inline regex flags with `-e/--regexp`.
+ * [BUG #2523](https://github.com/BurntSushi/ripgrep/issues/2523):
+diff --git a/crates/core/args.rs b/crates/core/args.rs
+index 9734775..dc4cadb 100644
+--- a/crates/core/args.rs
++++ b/crates/core/args.rs
+@@ -41,7 +41,7 @@ use crate::path_printer::{PathPrinter, PathPrinterBuilder};
+ use crate::search::{
+     PatternMatcher, Printer, SearchWorker, SearchWorkerBuilder,
+ };
+-use crate::subject::SubjectBuilder;
++use crate::subject::{Subject, SubjectBuilder};
+ use crate::Result;
+ 
+ /// The command that ripgrep should execute based on the command line
+@@ -324,6 +324,46 @@ impl Args {
+             .build())
+     }
+ 
++    /// Returns true if and only if `stat`-related sorting is required
++    pub fn needs_stat_sort(&self) -> bool {
++        return self.matches().sort_by().map_or(
++            false,
++            |sort_by| match sort_by.kind {
++                SortByKind::LastModified
++                | SortByKind::Created
++                | SortByKind::LastAccessed => sort_by.check().is_ok(),
++                _ => false,
++            },
++        );
++    }
++
++    /// Sort subjects if a sorter is specified, but only if the sort requires
++    /// stat calls. Non-stat related sorts are handled during file traversal
++    ///
++    /// This function assumes that it is known that a stat-related sort is
++    /// required, and does not check for it again.
++    ///
++    /// It is important that that precondition is fulfilled, since this function
++    /// consumes the subjects iterator, and is therefore a blocking function.
++    pub fn sort_by_stat<I>(&self, subjects: I) -> Vec<Subject>
++    where
++        I: Iterator<Item = Subject>,
++    {
++        let sorter = match self.matches().sort_by() {
++            Ok(v) => v,
++            Err(_) => return subjects.collect(),
++        };
++        use SortByKind::*;
++        let mut keyed = match sorter.kind {
++            LastModified => load_timestamps(subjects, |m| m.modified()),
++            LastAccessed => load_timestamps(subjects, |m| m.accessed()),
++            Created => load_timestamps(subjects, |m| m.created()),
++            _ => return subjects.collect(),
++        };
++        keyed.sort_by(|a, b| sort_by_option(&a.0, &b.0, sorter.reverse));
++        keyed.into_iter().map(|v| v.1).collect()
++    }
++
+     /// Return a parallel walker that may use additional threads.
+     pub fn walker_parallel(&self) -> Result<WalkParallel> {
+         Ok(self
+@@ -404,44 +444,23 @@ impl SortBy {
+         Ok(())
+     }
+ 
+-    fn configure_walk_builder(self, builder: &mut WalkBuilder) {
+-        // This isn't entirely optimal. In particular, we will wind up issuing
+-        // a stat for many files redundantly. Aside from having potentially
+-        // inconsistent results with respect to sorting, this is also slow.
+-        // We could fix this here at the expense of memory by caching stat
+-        // calls. A better fix would be to find a way to push this down into
+-        // directory traversal itself, but that's a somewhat nasty change.
++    /// Load sorters only if they are applicable at the walk stage.
++    ///
++    /// In particular, sorts that involve `stat` calls are not loaded because
++    /// the walk inherently assumes that parent directories are aware of all its
++    /// decendent properties, but `stat` does not work that way.
++    fn configure_builder_sort(self, builder: &mut WalkBuilder) {
++        use SortByKind::*;
+         match self.kind {
+-            SortByKind::None => {}
+-            SortByKind::Path => {
+-                if self.reverse {
+-                    builder.sort_by_file_name(|a, b| a.cmp(b).reverse());
+-                } else {
+-                    builder.sort_by_file_name(|a, b| a.cmp(b));
+-                }
+-            }
+-            SortByKind::LastModified => {
+-                builder.sort_by_file_path(move |a, b| {
+-                    sort_by_metadata_time(a, b, self.reverse, |md| {
+-                        md.modified()
+-                    })
+-                });
+-            }
+-            SortByKind::LastAccessed => {
+-                builder.sort_by_file_path(move |a, b| {
+-                    sort_by_metadata_time(a, b, self.reverse, |md| {
+-                        md.accessed()
+-                    })
+-                });
++            Path if self.reverse => {
++                builder.sort_by_file_name(|a, b| a.cmp(b).reverse());
+             }
+-            SortByKind::Created => {
+-                builder.sort_by_file_path(move |a, b| {
+-                    sort_by_metadata_time(a, b, self.reverse, |md| {
+-                        md.created()
+-                    })
+-                });
++            Path => {
++                builder.sort_by_file_name(|a, b| a.cmp(b));
+             }
+-        }
++            // these use `stat` calls and will be sorted in Args::sort_by_stat()
++            LastModified | LastAccessed | Created | None => {}
++        };
+     }
+ }
+ 
+@@ -876,9 +895,7 @@ impl ArgMatches {
+         if !self.no_ignore() && !self.no_ignore_dot() {
+             builder.add_custom_ignore_filename(".rgignore");
+         }
+-        let sortby = self.sort_by()?;
+-        sortby.check()?;
+-        sortby.configure_walk_builder(&mut builder);
++        self.sort_by()?.configure_builder_sort(&mut builder);
+         Ok(builder)
+     }
+ }
+@@ -1740,32 +1757,18 @@ fn u64_to_usize(arg_name: &str, value: Option<u64>) -> Result<Option<usize>> {
+     }
+ }
+ 
+-/// Builds a comparator for sorting two files according to a system time
+-/// extracted from the file's metadata.
+-///
+-/// If there was a problem extracting the metadata or if the time is not
+-/// available, then both entries compare equal.
+-fn sort_by_metadata_time<G>(
+-    p1: &Path,
+-    p2: &Path,
++/// Sorts by an optional parameter.
++//
++/// If parameter is found to be `None`, both entries compare equal.
++fn sort_by_option<T: Ord>(
++    p1: &Option<T>,
++    p2: &Option<T>,
+     reverse: bool,
+-    get_time: G,
+-) -> cmp::Ordering
+-where
+-    G: Fn(&fs::Metadata) -> io::Result<SystemTime>,
+-{
+-    let t1 = match p1.metadata().and_then(|md| get_time(&md)) {
+-        Ok(t) => t,
+-        Err(_) => return cmp::Ordering::Equal,
+-    };
+-    let t2 = match p2.metadata().and_then(|md| get_time(&md)) {
+-        Ok(t) => t,
+-        Err(_) => return cmp::Ordering::Equal,
+-    };
+-    if reverse {
+-        t1.cmp(&t2).reverse()
+-    } else {
+-        t1.cmp(&t2)
++) -> cmp::Ordering {
++    match (p1, p2, reverse) {
++        (Some(p1), Some(p2), true) => p1.cmp(&p2).reverse(),
++        (Some(p1), Some(p2), false) => p1.cmp(&p2),
++        _ => cmp::Ordering::Equal,
+     }
+ }
+ 
+@@ -1819,3 +1822,17 @@ fn current_dir() -> Result<PathBuf> {
+     )
+     .into())
+ }
++
++/// Tries to assign a timestamp to every `Subject` in the vector to help with
++/// sorting Subjects by time.
++fn load_timestamps<G>(
++    subjects: impl Iterator<Item = Subject>,
++    get_time: G,
++) -> Vec<(Option<SystemTime>, Subject)>
++where
++    G: Fn(&fs::Metadata) -> io::Result<SystemTime>,
++{
++    subjects
++        .map(|s| (s.path().metadata().and_then(|m| get_time(&m)).ok(), s))
++        .collect()
++}
+diff --git a/crates/core/main.rs b/crates/core/main.rs
+index eff4da1..45230a2 100644
+--- a/crates/core/main.rs
++++ b/crates/core/main.rs
+@@ -77,53 +77,70 @@ fn try_main(args: Args) -> Result<()> {
+ /// steps through the file list (current directory by default) and searches
+ /// each file sequentially.
+ fn search(args: &Args) -> Result<bool> {
+-    let started_at = Instant::now();
+-    let quit_after_match = args.quit_after_match()?;
+-    let subject_builder = args.subject_builder();
+-    let mut stats = args.stats()?;
+-    let mut searcher = args.search_worker(args.stdout())?;
+-    let mut matched = false;
+-    let mut searched = false;
++    /// The meat of the routine is here. This lets us call the same iteration
++    /// code over each file regardless of whether we stream over the files
++    /// as they're produced by the underlying directory traversal or whether
++    /// they've been collected and sorted (for example) first.
++    fn iter(
++        args: &Args,
++        subjects: impl Iterator<Item = Subject>,
++        started_at: std::time::Instant,
++    ) -> Result<bool> {
++        let quit_after_match = args.quit_after_match()?;
++        let mut stats = args.stats()?;
++        let mut searcher = args.search_worker(args.stdout())?;
++        let mut matched = false;
++        let mut searched = false;
+ 
+-    for result in args.walker()? {
+-        let subject = match subject_builder.build_from_result(result) {
+-            Some(subject) => subject,
+-            None => continue,
+-        };
+-        searched = true;
+-        let search_result = match searcher.search(&subject) {
+-            Ok(search_result) => search_result,
+-            Err(err) => {
++        for subject in subjects {
++            searched = true;
++            let search_result = match searcher.search(&subject) {
++                Ok(search_result) => search_result,
+                 // A broken pipe means graceful termination.
+-                if err.kind() == io::ErrorKind::BrokenPipe {
+-                    break;
++                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => break,
++                Err(err) => {
++                    err_message!("{}: {}", subject.path().display(), err);
++                    continue;
+                 }
+-                err_message!("{}: {}", subject.path().display(), err);
+-                continue;
++            };
++            matched |= search_result.has_match();
++            if let Some(ref mut stats) = stats {
++                *stats += search_result.stats().unwrap();
++            }
++            if matched && quit_after_match {
++                break;
+             }
+-        };
+-        matched = matched || search_result.has_match();
+-        if let Some(ref mut stats) = stats {
+-            *stats += search_result.stats().unwrap();
+         }
+-        if matched && quit_after_match {
+-            break;
++        if args.using_default_path() && !searched {
++            eprint_nothing_searched();
+         }
++        if let Some(ref stats) = stats {
++            let elapsed = Instant::now().duration_since(started_at);
++            // We don't care if we couldn't print this successfully.
++            let _ = searcher.print_stats(elapsed, stats);
++        }
++        Ok(matched)
+     }
+-    if args.using_default_path() && !searched {
+-        eprint_nothing_searched();
+-    }
+-    if let Some(ref stats) = stats {
+-        let elapsed = Instant::now().duration_since(started_at);
+-        // We don't care if we couldn't print this successfully.
+-        let _ = searcher.print_stats(elapsed, stats);
++
++    let started_at = Instant::now();
++    let subject_builder = args.subject_builder();
++    let subjects = args
++        .walker()?
++        .filter_map(|result| subject_builder.build_from_result(result));
++    if args.needs_stat_sort() {
++        let subjects = args.sort_by_stat(subjects).into_iter();
++        iter(args, subjects, started_at)
++    } else {
++        iter(args, subjects, started_at)
+     }
+-    Ok(matched)
+ }
+ 
+ /// The top-level entry point for multi-threaded search. The parallelism is
+ /// itself achieved by the recursive directory traversal. All we need to do is
+ /// feed it a worker for performing a search on each file.
++///
++/// Requesting a sorted output from ripgrep (such as with `--sort path`) will
++/// automatically disable parallelism and hence sorting is not handled here.
+ fn search_parallel(args: &Args) -> Result<bool> {
+     use std::sync::atomic::AtomicBool;
+     use std::sync::atomic::Ordering::SeqCst;
+@@ -214,35 +231,54 @@ fn eprint_nothing_searched() {
+ /// recursively steps through the file list (current directory by default) and
+ /// prints each path sequentially using a single thread.
+ fn files(args: &Args) -> Result<bool> {
+-    let quit_after_match = args.quit_after_match()?;
+-    let subject_builder = args.subject_builder();
+-    let mut matched = false;
+-    let mut path_printer = args.path_printer(args.stdout())?;
+-    for result in args.walker()? {
+-        let subject = match subject_builder.build_from_result(result) {
+-            Some(subject) => subject,
+-            None => continue,
+-        };
+-        matched = true;
+-        if quit_after_match {
+-            break;
+-        }
+-        if let Err(err) = path_printer.write_path(subject.path()) {
+-            // A broken pipe means graceful termination.
+-            if err.kind() == io::ErrorKind::BrokenPipe {
++    /// The meat of the routine is here. This lets us call the same iteration
++    /// code over each file regardless of whether we stream over the files
++    /// as they're produced by the underlying directory traversal or whether
++    /// they've been collected and sorted (for example) first.
++    fn iter(
++        args: &Args,
++        subjects: impl Iterator<Item = Subject>,
++    ) -> Result<bool> {
++        let quit_after_match = args.quit_after_match()?;
++        let mut matched = false;
++        let mut path_printer = args.path_printer(args.stdout())?;
++
++        for subject in subjects {
++            matched = true;
++            if quit_after_match {
+                 break;
+             }
+-            // Otherwise, we have some other error that's preventing us from
+-            // writing to stdout, so we should bubble it up.
+-            return Err(err.into());
++            if let Err(err) = path_printer.write_path(subject.path()) {
++                // A broken pipe means graceful termination.
++                if err.kind() == io::ErrorKind::BrokenPipe {
++                    break;
++                }
++                // Otherwise, we have some other error that's preventing us from
++                // writing to stdout, so we should bubble it up.
++                return Err(err.into());
++            }
+         }
++        Ok(matched)
++    }
++
++    let subject_builder = args.subject_builder();
++    let subjects = args
++        .walker()?
++        .filter_map(|result| subject_builder.build_from_result(result));
++    if args.needs_stat_sort() {
++        let subjects = args.sort_by_stat(subjects).into_iter();
++        iter(args, subjects)
++    } else {
++        iter(args, subjects)
+     }
+-    Ok(matched)
+ }
+ 
+ /// The top-level entry point for listing files without searching them. This
+ /// recursively steps through the file list (current directory by default) and
+ /// prints each path sequentially using multiple threads.
++///
++/// Requesting a sorted output from ripgrep (such as with `--sort path`) will
++/// automatically disable parallelism and hence sorting is not handled here.
+ fn files_parallel(args: &Args) -> Result<bool> {
+     use std::sync::atomic::AtomicBool;
+     use std::sync::atomic::Ordering::SeqCst;
+diff --git a/tests/feature.rs b/tests/feature.rs
+index 6d4d194..94bb62b 100644
+--- a/tests/feature.rs
++++ b/tests/feature.rs
+@@ -787,6 +787,28 @@ rgtest!(f1466_no_ignore_files, |dir: Dir, mut cmd: TestCommand| {
+     eqnice!("foo\n", cmd.arg("-u").stdout());
+ });
+ 
++// See: https://github.com/BurntSushi/ripgrep/pull/2361
++rgtest!(f2361_sort_nested_files, |dir: Dir, mut cmd: TestCommand| {
++    use std::{thread::sleep, time::Duration};
++
++    dir.create("foo", "1");
++    sleep(Duration::from_millis(100));
++    dir.create_dir("dir");
++    sleep(Duration::from_millis(100));
++    dir.create(dir.path().join("dir").join("bar"), "1");
++
++    cmd.arg("--sort").arg("accessed").arg("--files");
++    eqnice!("foo\ndir/bar\n", cmd.stdout());
++
++    dir.create("foo", "2");
++    sleep(Duration::from_millis(100));
++    dir.create(dir.path().join("dir").join("bar"), "2");
++    sleep(Duration::from_millis(100));
++
++    cmd.arg("--sort").arg("accessed").arg("--files");
++    eqnice!("foo\ndir/bar\n", cmd.stdout());
++});
++
+ // See: https://github.com/BurntSushi/ripgrep/issues/1404
+ rgtest!(f1404_nothing_searched_warning, |dir: Dir, mut cmd: TestCommand| {
+     dir.create(".ignore", "ignored-dir/**");
+diff --git a/tests/misc.rs b/tests/misc.rs
+index c892da5..40f900d 100644
+--- a/tests/misc.rs
++++ b/tests/misc.rs
+@@ -1065,3 +1065,48 @@ rgtest!(type_list, |_: Dir, mut cmd: TestCommand| {
+     // This can change over time, so just make sure we print something.
+     assert!(!cmd.stdout().is_empty());
+ });
++
++// The following series of tests seeks to test all permutations of ripgrep's
++// sorted queries.
++//
++// They all rely on this setup function, which sets up this particular file
++// structure with a particular creation order:
++//  ├── a             # 1
++//  ├── b             # 4
++//  └── dir           # 2
++//     ├── c          # 3
++//     └── d          # 5
++//
++// This order is important when sorting them by system time-stamps.
++fn sort_setup(dir: Dir) {
++    use std::{thread::sleep, time::Duration};
++
++    let sub_dir = dir.path().join("dir");
++    dir.create("a", "test");
++    sleep(Duration::from_millis(100));
++    dir.create_dir(&sub_dir);
++    sleep(Duration::from_millis(100));
++    dir.create(sub_dir.join("c"), "test");
++    sleep(Duration::from_millis(100));
++    dir.create("b", "test");
++    sleep(Duration::from_millis(100));
++    dir.create(sub_dir.join("d"), "test");
++}
++
++rgtest!(sort_files, |dir: Dir, mut cmd: TestCommand| {
++    sort_setup(dir);
++    let expected = "a:test\nb:test\ndir/c:test\ndir/d:test\n";
++    eqnice!(expected, cmd.args(["--sort", "path", "test"]).stdout());
++});
++
++rgtest!(sort_accessed, |dir: Dir, mut cmd: TestCommand| {
++    sort_setup(dir);
++    let expected = "a:test\ndir/c:test\nb:test\ndir/d:test\n";
++    eqnice!(expected, cmd.args(["--sort", "accessed", "test"]).stdout());
++});
++
++rgtest!(sortr_accessed, |dir: Dir, mut cmd: TestCommand| {
++    sort_setup(dir);
++    let expected = "dir/d:test\nb:test\ndir/c:test\na:test\n";
++    eqnice!(expected, cmd.args(["--sortr", "accessed", "test"]).stdout());
++});

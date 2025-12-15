@@ -1,0 +1,1936 @@
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index bbaf77bdb5..9dda67199a 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -20,6 +20,7 @@
+ #include "yb/client/table_handle.h"
+ #include "yb/client/transaction.h"
+ 
++#include "yb/consensus/log_reader.h"
+ #include "yb/consensus/raft_consensus.h"
+ #include "yb/consensus/replica_state.h"
+ #include "yb/consensus/retryable_requests.h"
+@@ -55,6 +56,11 @@ DECLARE_int32(rocksdb_level0_slowdown_writes_trigger);
+ DECLARE_int32(rocksdb_universal_compaction_min_merge_width);
+ DECLARE_int32(rocksdb_universal_compaction_size_ratio);
+ DECLARE_int64(db_write_buffer_size);
++DECLARE_uint64(log_segment_size_bytes);
++DECLARE_int32(log_min_seconds_to_retain);
++DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
++DECLARE_int64(db_write_buffer_size);
++DECLARE_int32(log_cache_size_limit_mb);
+ 
+ using namespace std::literals;
+ 
+@@ -174,6 +180,10 @@ class QLStressTest : public QLDmlTestBase {
+ 
+   bool CheckRetryableRequestsCounts(size_t* total_entries, size_t* total_leaders);
+ 
++  void AddWriter(
++      std::string value_prefix, std::atomic<int>* key, TestThreadHolder* thread_holder,
++      const std::chrono::nanoseconds& sleep_duration = std::chrono::nanoseconds());
++
+   TableHandle table_;
+ 
+   int checkpoint_index_ = 0;
+@@ -587,18 +597,11 @@ void QLStressTest::VerifyFlushedFrontiers() {
+ }
+ 
+ TEST_F_EX(QLStressTest, FlushCompact, QLStressTestSingleTablet) {
++  std::atomic<int> key;
++
+   TestThreadHolder thread_holder;
+ 
+-  thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag()] {
+-    CDSAttacher attacher;
+-    auto session = NewSession();
+-    int key = 0;
+-    std::string value = "value_";
+-    while (!stop.load(std::memory_order_acquire)) {
+-      ASSERT_OK(WriteRow(session, key, value + std::to_string(key)));
+-      ++key;
+-    }
+-  });
++  AddWriter("value_", &key, &thread_holder);
+ 
+   auto start_time = MonoTime::Now();
+   const auto kTimeout = MonoDelta::FromSeconds(60);
+@@ -627,22 +630,9 @@ TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingl
+   tablet::TabletPeer* leader_peer = nullptr;
+   std::atomic<int> key(0);
+   {
+-    std::atomic<bool> stop(false);
++    TestThreadHolder thread_holder;
+ 
+-    std::thread writer([this, &stop, &key] {
+-      CDSAttacher attacher;
+-      auto session = NewSession();
+-      std::string value_prefix = "value_";
+-      while (!stop.load(std::memory_order_acquire)) {
+-        ASSERT_OK(WriteRow(session, key, value_prefix + std::to_string(key)));
+-        ++key;
+-      }
+-    });
+-
+-    BOOST_SCOPE_EXIT(&stop, &writer) {
+-      stop.store(true);
+-      writer.join();
+-    } BOOST_SCOPE_EXIT_END;
++    AddWriter("value_", &key, &thread_holder);
+ 
+     tserver::MiniTabletServer* leader = nullptr;
+     for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
+@@ -673,7 +663,8 @@ TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingl
+     ASSERT_GE(pre_restore_op_id.index, pre_isolate_op_id.index);
+     ASSERT_LE(pre_restore_op_id.index, pre_isolate_op_id.index + 10);
+     leader->SetIsolated(false);
+-    std::this_thread::sleep_for(5s * yb::kTimeMultiplier);
++
++    thread_holder.WaitAndStop(5s * yb::kTimeMultiplier);
+   }
+ 
+   ASSERT_OK(WaitFor([leader_peer, &key] {
+@@ -695,16 +686,7 @@ TEST_F_EX(QLStressTest, SlowUpdateConsensus, QLStressTestSingleTablet) {
+   down_cast<consensus::RaftConsensus*>(peers[0]->consensus())->TEST_DelayUpdate(20s);
+ 
+   TestThreadHolder thread_holder;
+-  thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag(), &key] {
+-    CDSAttacher attacher;
+-    auto session = NewSession();
+-    std::string value_prefix = std::string(100_KB, 'X');
+-    while (!stop.load(std::memory_order_acquire)) {
+-      ASSERT_OK(WriteRow(session, key, value_prefix + std::to_string(key)));
+-      std::this_thread::sleep_for(100ms);
+-      ++key;
+-    }
+-  });
++  AddWriter(std::string(100_KB, 'X'), &key, &thread_holder, 100ms);
+ 
+   thread_holder.WaitAndStop(30s);
+ 
+@@ -733,20 +715,30 @@ class QLStressTestDelayWrite : public QLStressTestSingleTablet {
+   }
+ };
+ 
++void QLStressTest::AddWriter(
++    std::string value_prefix, std::atomic<int>* key, TestThreadHolder* thread_holder,
++    const std::chrono::nanoseconds& sleep_duration) {
++  thread_holder->AddThreadFunctor([this, &stop = thread_holder->stop_flag(), key, sleep_duration,
++                                   value_prefix = std::move(value_prefix)] {
++    auto session = NewSession();
++    while (!stop.load(std::memory_order_acquire)) {
++      auto new_key = *key + 1;
++      ASSERT_OK(WriteRow(session, new_key, value_prefix + std::to_string(new_key)));
++      if (sleep_duration.count() > 0) {
++        std::this_thread::sleep_for(sleep_duration);
++      }
++      ++*key;
++    }
++  });
++}
++
+ TEST_F_EX(QLStressTest, DelayWrite, QLStressTestDelayWrite) {
+   std::atomic<int> key(0);
+ 
+   const std::string value_prefix = std::string(1_KB, 'X');
+ 
+   TestThreadHolder thread_holder;
+-  thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag(), &key, &value_prefix] {
+-    auto session = NewSession();
+-    while (!stop.load(std::memory_order_acquire)) {
+-      auto new_key = key + 1;
+-      ASSERT_OK(WriteRow(session, new_key, value_prefix + std::to_string(new_key)));
+-      ++key;
+-    }
+-  });
++  AddWriter(value_prefix, &key, &thread_holder);
+ 
+   thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag(), &key, &value_prefix] {
+     auto session = NewSession();
+@@ -786,5 +778,72 @@ TEST_F_EX(QLStressTest, DelayWrite, QLStressTestDelayWrite) {
+   }, 30s, "Waiting tablets to sync up"));
+ }
+ 
++class QLStressTestLongRemoteBootstrap : public QLStressTestSingleTablet {
++ public:
++  void SetUp() override {
++    FLAGS_log_cache_size_limit_mb = 1;
++    FLAGS_log_segment_size_bytes = 96_KB;
++    QLStressTestSingleTablet::SetUp();
++  }
++};
++
++TEST_F_EX(QLStressTest, LongRemoteBootstrap, QLStressTestLongRemoteBootstrap) {
++  FLAGS_log_min_seconds_to_retain = 1;
++  FLAGS_remote_bootstrap_rate_limit_bytes_per_sec = 1_MB;
++
++  cluster_->mini_tablet_server(0)->Shutdown();
++
++  ASSERT_OK(WaitFor([this] {
++    auto leaders = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
++    if (leaders.empty()) {
++      return false;
++    }
++    LOG(INFO) << "Tablet id: " << leaders.front()->tablet_id();
++    return true;
++  }, 30s, "Leader elected"));
++
++  std::atomic<int> key(0);
++
++  TestThreadHolder thread_holder;
++  constexpr size_t kValueSize = 32_KB;
++  AddWriter(std::string(kValueSize, 'X'), &key, &thread_holder, 100ms);
++
++  std::this_thread::sleep_for(20s); // Wait some time to have logs.
++
++  ASSERT_OK(WaitFor([this]() -> Result<bool> {
++    RETURN_NOT_OK(cluster_->CleanTabletLogs());
++    auto leaders = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
++    if (leaders.empty()) {
++      return false;
++    }
++
++    RETURN_NOT_OK(leaders.front()->tablet()->Flush(tablet::FlushMode::kSync));
++    RETURN_NOT_OK(leaders.front()->RunLogGC());
++
++    // Check that first log was garbage collected, so remote bootstrap will be required.
++    consensus::ReplicateMsgs replicates;
++    return !leaders.front()->log()->GetLogReader()->ReadReplicatesInRange(
++        100, 101, 0, &replicates).ok();
++  }, 30s, "Logs cleaned"));
++
++  LOG(INFO) << "Bring replica back, keys written: " << key.load(std::memory_order_acquire);
++  ASSERT_OK(cluster_->mini_tablet_server(0)->Start());
++
++  thread_holder.AddThreadFunctor([this, &stop = thread_holder.stop_flag()] {
++    while (!stop.load(std::memory_order_acquire)) {
++      ASSERT_OK(cluster_->FlushTablets());
++      ASSERT_OK(cluster_->CleanTabletLogs());
++      std::this_thread::sleep_for(100ms);
++    }
++  });
++
++  ASSERT_OK(WaitAllReplicasHaveIndex(cluster_.get(), key.load(std::memory_order_acquire), 40s));
++  LOG(INFO) << "All replicas ready";
++
++  // Write some more values and check that replica still in touch.
++  std::this_thread::sleep_for(5s);
++  ASSERT_OK(WaitAllReplicasHaveIndex(cluster_.get(), key.load(std::memory_order_acquire), 1s));
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/consensus/consensus_peers.cc b/src/yb/consensus/consensus_peers.cc
+index aebbffc8b3..d3b09c3533 100644
+--- a/src/yb/consensus/consensus_peers.cc
++++ b/src/yb/consensus/consensus_peers.cc
+@@ -238,7 +238,8 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
+       status = queue_->GetRemoteBootstrapRequestForPeer(peer_pb_.permanent_uuid(), &rb_request_);
+     }
+     if (!status.ok()) {
+-      LOG_WITH_PREFIX(WARNING) << "Unable to generate remote bootstrap request for peer: " << s;
++      LOG_WITH_PREFIX(WARNING) << "Unable to generate remote bootstrap request for peer: "
++                               << status;
+       return;
+     }
+ 
+diff --git a/src/yb/consensus/log.cc b/src/yb/consensus/log.cc
+index fc5a9c4562..6d69ede341 100644
+--- a/src/yb/consensus/log.cc
++++ b/src/yb/consensus/log.cc
+@@ -966,6 +966,15 @@ Status Log::Close() {
+   }
+ }
+ 
++scoped_refptr<ReadableLogSegment> Log::GetSegmentBySequenceNumber(int64_t seq) const {
++  boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
++  if (!reader_) {
++    return nullptr;
++  }
++
++  return reader_->GetSegmentBySequenceNumber(seq);
++}
++
+ Status Log::DeleteOnDiskData(Env* env,
+                              const string& tablet_id,
+                              const string& tablet_wal_path,
+@@ -1105,6 +1114,11 @@ Status Log::CreatePlaceholderSegment(const WritableFileOptions& opts,
+   return Status::OK();
+ }
+ 
++uint64_t Log::active_segment_sequence_number() const {
++  boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
++  return active_segment_sequence_number_;
++}
++
+ Status Log::TEST_SubmitFuncToAppendToken(const std::function<void()>& func) {
+   return appender_->TEST_SubmitFunc(func);
+ }
+diff --git a/src/yb/consensus/log.h b/src/yb/consensus/log.h
+index 364b6d306a..c6fc272e2f 100644
+--- a/src/yb/consensus/log.h
++++ b/src/yb/consensus/log.h
+@@ -240,6 +240,10 @@ class Log : public RefCountedThreadSafe<Log> {
+   // On timeout returns default constructed OpId.
+   yb::OpId WaitForSafeOpIdToApply(const yb::OpId& op_id, MonoDelta duration = MonoDelta());
+ 
++  // Return a readable segment with the given sequence number, or NULL if it
++  // cannot be found (e.g. if it has already been GCed).
++  scoped_refptr<ReadableLogSegment> GetSegmentBySequenceNumber(int64_t seq) const;
++
+   void TEST_SetSleepDuration(const std::chrono::nanoseconds& duration) {
+     sleep_duration_.store(duration, std::memory_order_release);
+   }
+@@ -248,6 +252,8 @@ class Log : public RefCountedThreadSafe<Log> {
+     all_op_ids_safe_ = value;
+   }
+ 
++  uint64_t active_segment_sequence_number() const;
++
+   CHECKED_STATUS TEST_SubmitFuncToAppendToken(const std::function<void()>& func);
+ 
+   const std::string& LogPrefix() const {
+diff --git a/src/yb/consensus/log_anchor_registry-test.cc b/src/yb/consensus/log_anchor_registry-test.cc
+index cd008605d9..8581c1c63d 100644
+--- a/src/yb/consensus/log_anchor_registry-test.cc
++++ b/src/yb/consensus/log_anchor_registry-test.cc
+@@ -58,7 +58,7 @@ TEST_F(LogAnchorRegistryTest, TestUpdateRegistration) {
+   reg->Register(kInitialIndex, test_name, &anchor);
+   ASSERT_TRUE(anchor.is_registered);
+   ASSERT_TRUE(anchor.when_registered.Initialized());
+-  ASSERT_OK(reg->UpdateRegistration(kInitialIndex + 1, test_name, &anchor));
++  ASSERT_OK(reg->UpdateRegistration(kInitialIndex + 1, &anchor));
+   ASSERT_OK(reg->Unregister(&anchor));
+ }
+ 
+@@ -67,8 +67,8 @@ TEST_F(LogAnchorRegistryTest, TestDuplicateInserts) {
+   scoped_refptr<LogAnchorRegistry> reg(new LogAnchorRegistry());
+ 
+   // Register a bunch of anchors at log index 1.
+-  const int num_anchors = 10;
+-  LogAnchor anchors[num_anchors];
++  constexpr int kNumAnchors = 10;
++  LogAnchor anchors[kNumAnchors];
+   for (auto& anchor : anchors) {
+     reg->Register(1, test_name, &anchor);
+   }
+diff --git a/src/yb/consensus/log_anchor_registry.cc b/src/yb/consensus/log_anchor_registry.cc
+index de56ae0446..c2319b70dd 100644
+--- a/src/yb/consensus/log_anchor_registry.cc
++++ b/src/yb/consensus/log_anchor_registry.cc
+@@ -63,12 +63,11 @@ void LogAnchorRegistry::Register(int64_t log_index,
+ }
+ 
+ Status LogAnchorRegistry::UpdateRegistration(int64_t log_index,
+-                                             const std::string& owner,
+                                              LogAnchor* anchor) {
+   std::lock_guard<simple_spinlock> l(lock_);
+   RETURN_NOT_OK_PREPEND(UnregisterUnlocked(anchor),
+                         "Unable to swap registration, anchor not registered")
+-  RegisterUnlocked(log_index, owner, anchor);
++  RegisterUnlocked(log_index, std::string(), anchor);
+   return Status::OK();
+ }
+ 
+@@ -124,7 +123,9 @@ void LogAnchorRegistry::RegisterUnlocked(int64_t log_index,
+   DCHECK(!anchor->is_registered);
+ 
+   anchor->log_index = log_index;
+-  anchor->owner.assign(owner);
++  if (!owner.empty()) { // Keep existing owner during registration update.
++    anchor->owner = owner;
++  }
+   anchor->is_registered = true;
+   anchor->when_registered = MonoTime::Now();
+   AnchorMultiMap::value_type value(log_index, anchor);
+@@ -176,7 +177,7 @@ void MinLogIndexAnchorer::AnchorIfMinimum(int64_t log_index) {
+     registry_->Register(minimum_log_index_, owner_, &anchor_);
+   } else if (log_index < minimum_log_index_) {
+     minimum_log_index_ = log_index;
+-    CHECK_OK(registry_->UpdateRegistration(minimum_log_index_, owner_, &anchor_));
++    CHECK_OK(registry_->UpdateRegistration(minimum_log_index_, &anchor_));
+   }
+ }
+ 
+diff --git a/src/yb/consensus/log_anchor_registry.h b/src/yb/consensus/log_anchor_registry.h
+index 4fbb2e0c1e..a7c31d83c4 100644
+--- a/src/yb/consensus/log_anchor_registry.h
++++ b/src/yb/consensus/log_anchor_registry.h
+@@ -29,8 +29,8 @@
+ // or implied.  See the License for the specific language governing permissions and limitations
+ // under the License.
+ //
+-#ifndef YB_CONSENSUS_LOG_ANCHOR_REGISTRY_
+-#define YB_CONSENSUS_LOG_ANCHOR_REGISTRY_
++#ifndef YB_CONSENSUS_LOG_ANCHOR_REGISTRY_H
++#define YB_CONSENSUS_LOG_ANCHOR_REGISTRY_H
+ 
+ #include <map>
+ #include <string>
+@@ -67,9 +67,7 @@ class LogAnchorRegistry : public RefCountedThreadSafe<LogAnchorRegistry> {
+   // Before: anchor must be registered with some log index.
+   // After: anchor is now registered using index 'log_index'.
+   // See Register().
+-  CHECKED_STATUS UpdateRegistration(int64_t log_index,
+-                            const std::string& owner,
+-                            LogAnchor* anchor);
++  CHECKED_STATUS UpdateRegistration(int64_t log_index, LogAnchor* anchor);
+ 
+   // Release the anchor on a log index.
+   // Note: anchor must be the original pointer passed to Register().
+@@ -173,4 +171,4 @@ class MinLogIndexAnchorer {
+ } // namespace log
+ } // namespace yb
+ 
+-#endif // YB_CONSENSUS_LOG_ANCHOR_REGISTRY_
++#endif // YB_CONSENSUS_LOG_ANCHOR_REGISTRY_H
+diff --git a/src/yb/consensus/log_cache.cc b/src/yb/consensus/log_cache.cc
+index ef0709ff62..59cc805a10 100644
+--- a/src/yb/consensus/log_cache.cc
++++ b/src/yb/consensus/log_cache.cc
+@@ -173,11 +173,12 @@ Result<LogCache::PrepareAppendResult> LogCache::PrepareAppendOperations(const Re
+   if (!tracker_->TryConsume(result.mem_required)) {
+     int spare = tracker_->SpareCapacity();
+     int need_to_free = result.mem_required - spare;
+-    VLOG_WITH_PREFIX_UNLOCKED(1) << "Memory limit would be exceeded trying to append "
+-                        << HumanReadableNumBytes::ToString(result.mem_required)
+-                        << " to log cache (available="
+-                        << HumanReadableNumBytes::ToString(spare)
+-                        << "): attempting to evict some operations...";
++    VLOG_WITH_PREFIX_UNLOCKED(1)
++        << "Memory limit would be exceeded trying to append "
++        << HumanReadableNumBytes::ToString(result.mem_required)
++        << " to log cache (available="
++        << HumanReadableNumBytes::ToString(spare)
++        << "): attempting to evict some operations...";
+ 
+     // TODO: we should also try to evict from other tablets - probably better to evict really old
+     // ops from another tablet than evict recent ops from this one.
+@@ -340,8 +341,8 @@ Status LogCache::ReadOps(int64_t after_op_index,
+             next_index, up_to, remaining_space, &raw_replicate_ptrs),
+         Substitute("Failed to read ops $0..$1", next_index, up_to));
+       l.lock();
+-      LOG_WITH_PREFIX_UNLOCKED(INFO) << "Successfully read " << raw_replicate_ptrs.size() << " ops "
+-                            << "from disk.";
++      LOG_WITH_PREFIX_UNLOCKED(INFO)
++          << "Successfully read " << raw_replicate_ptrs.size() << " ops from disk.";
+ 
+       for (auto& msg : raw_replicate_ptrs) {
+         CHECK_EQ(next_index, msg->id().index());
+diff --git a/src/yb/consensus/log_reader.cc b/src/yb/consensus/log_reader.cc
+index 620477a6c0..e736efef28 100644
+--- a/src/yb/consensus/log_reader.cc
++++ b/src/yb/consensus/log_reader.cc
+@@ -129,33 +129,34 @@ Status LogReader::Init(const string& tablet_wal_path) {
+   }
+ 
+   VLOG_WITH_PREFIX(1) << "Parsing segments from path: " << tablet_wal_path;
+-  // list existing segment files
+-  vector<string> log_files;
+ 
+-  RETURN_NOT_OK_PREPEND(env_->GetChildren(tablet_wal_path, &log_files),
++  std::vector<string> files_from_log_directory;
++  RETURN_NOT_OK_PREPEND(env_->GetChildren(tablet_wal_path, &files_from_log_directory),
+                         "Unable to read children from path");
+ 
+   SegmentSequence read_segments;
+ 
+-  // build a log segment from each file
+-  for (const string &log_file : log_files) {
+-    if (HasPrefixString(log_file, FsManager::kWalFileNamePrefix)) {
+-      string fqp = JoinPathSegments(tablet_wal_path, log_file);
+-      scoped_refptr<ReadableLogSegment> segment;
+-      RETURN_NOT_OK_PREPEND(ReadableLogSegment::Open(env_, fqp, &segment),
+-                            "Unable to open readable log segment");
+-      DCHECK(segment);
+-      CHECK(segment->IsInitialized()) << "Uninitialized segment at: " << segment->path();
+-
+-      if (!segment->HasFooter()) {
+-        LOG_WITH_PREFIX(WARNING)
+-            << "Log segment " << fqp << " was likely left in-progress "
+-               "after a previous crash. Will try to rebuild footer by scanning data.";
+-        RETURN_NOT_OK(segment->RebuildFooterByScanning());
+-      }
++  // Build a log segment from log files, ignoring non log files.
++  for (const string &potential_log_file : files_from_log_directory) {
++    if (!IsLogFileName(potential_log_file)) {
++      continue;
++    }
++
++    string fqp = JoinPathSegments(tablet_wal_path, potential_log_file);
++    scoped_refptr<ReadableLogSegment> segment;
++    RETURN_NOT_OK_PREPEND(ReadableLogSegment::Open(env_, fqp, &segment),
++                          Format("Unable to open readable log segment: $0", fqp));
++    DCHECK(segment);
++    CHECK(segment->IsInitialized()) << "Uninitialized segment at: " << segment->path();
+ 
+-      read_segments.push_back(segment);
++    if (!segment->HasFooter()) {
++      LOG_WITH_PREFIX(WARNING)
++          << "Log segment " << fqp << " was likely left in-progress "
++             "after a previous crash. Will try to rebuild footer by scanning data.";
++      RETURN_NOT_OK(segment->RebuildFooterByScanning());
+     }
++
++    read_segments.push_back(segment);
+   }
+ 
+   // Sort the segments by sequence number.
+@@ -405,17 +406,18 @@ Status LogReader::TrimSegmentsUpToAndIncluding(int64_t segment_sequence_number)
+   std::lock_guard<simple_spinlock> lock(lock_);
+   CHECK_EQ(state_, kLogReaderReading);
+   auto iter = segments_.begin();
+-  int num_deleted_segments = 0;
++  std::vector<int64_t> deleted_segments;
+ 
+   while (iter != segments_.end()) {
+-    if ((*iter)->header().sequence_number() <= segment_sequence_number) {
+-      iter = segments_.erase(iter);
+-      num_deleted_segments++;
+-      continue;
++    auto current_seq_no = (*iter)->header().sequence_number();
++    if (current_seq_no > segment_sequence_number) {
++      break;
+     }
+-    break;
++    deleted_segments.push_back(current_seq_no);
++    iter = segments_.erase(iter);
+   }
+-  LOG_WITH_PREFIX(INFO) << "Removed " << num_deleted_segments << " log segments from log reader";
++  LOG_WITH_PREFIX(INFO) << "Removed log segment sequence numbers from log reader: "
++                        << yb::ToString(deleted_segments);
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index a00cc9b54a..c8ceff4b33 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -585,10 +585,14 @@ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+ 
+   for (int i = 0; i != cluster->num_tablet_servers(); ++i) {
+     auto server = cluster->mini_tablet_server(i)->server();
++    if (!server) { // Server is shut down.
++      continue;
++    }
+     auto peers = server->tablet_manager()->GetTabletPeers();
+     for (const auto& peer : peers) {
+       WARN_NOT_OK(
+-          WaitFor([peer] { return peer->consensus() != nullptr; }, 5s, "Waiting peer ready"),
++          WaitFor([peer] { return peer->consensus() != nullptr; }, 5s,
++          Format("Waiting peer T $0 P $1 ready", peer->tablet_id(), peer->permanent_uuid())),
+           "List tablet peers failure");
+       if (filter(peer)) {
+         result.push_back(peer);
+@@ -638,4 +642,34 @@ std::thread RestartsThread(
+   });
+ }
+ 
++Status WaitAllReplicasReady(MiniCluster* cluster, MonoDelta timeout) {
++  return WaitFor([cluster] {
++    std::unordered_set<std::string> tablet_ids;
++    auto peers = ListTabletPeers(cluster, ListPeersFilter::kAll);
++    for (const auto& peer : peers) {
++      if (peer->state() != tablet::RaftGroupStatePB::RUNNING) {
++        return false;
++      }
++      tablet_ids.insert(peer->tablet_id());
++    }
++    auto replication_factor = cluster->num_tablet_servers();
++    return tablet_ids.size() * replication_factor == peers.size();
++  }, timeout, "Wait all replicas to be ready");
++}
++
++Status WaitAllReplicasHaveIndex(MiniCluster* cluster, int64_t index, MonoDelta timeout) {
++  return WaitFor([cluster, index] {
++    std::unordered_set<std::string> tablet_ids;
++    auto peers = ListTabletPeers(cluster, ListPeersFilter::kAll);
++    for (const auto& peer : peers) {
++      if (peer->GetLatestLogEntryOpId().index < index) {
++        return false;
++      }
++      tablet_ids.insert(peer->tablet_id());
++    }
++    auto replication_factor = cluster->num_tablet_servers();
++    return tablet_ids.size() * replication_factor == peers.size();
++  }, timeout, "Wait for all replicas to have a specific Raft index");
++}
++
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index f8860d657d..206e0c3ebf 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -256,6 +256,14 @@ CHECKED_STATUS StepDown(
+     tablet::TabletPeerPtr leader, const std::string& new_leader_uuid,
+     ForceStepDown force_step_down);
+ 
++// Waits until all tablet peers of the specified cluster are in the Running state.
++// And total number of those peers equals to the number of tablet servers for each known tablet.
++CHECKED_STATUS WaitAllReplicasReady(MiniCluster* cluster, MonoDelta timeout);
++
++// Waits until all tablet peers of specified cluster have the specified index in their log.
++// And total number of those peers equals to the number of tablet servers for each known tablet.
++CHECKED_STATUS WaitAllReplicasHaveIndex(MiniCluster* cluster, int64_t index, MonoDelta timeout);
++
+ std::thread RestartsThread(
+     MiniCluster* cluster, CoarseDuration interval, std::atomic<bool>* stop_flag);
+ 
+diff --git a/src/yb/rocksdb/db/db_impl.cc b/src/yb/rocksdb/db/db_impl.cc
+index 0ebecaaed1..921e1d0671 100644
+--- a/src/yb/rocksdb/db/db_impl.cc
++++ b/src/yb/rocksdb/db/db_impl.cc
+@@ -5828,8 +5828,6 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
+   }
+ 
+   if (s.ok()) {
+-    RLOG(InfoLogLevel::INFO_LEVEL, impl->db_options_.info_log, "DB pointer %p",
+-        impl);
+     LogFlush(impl->db_options_.info_log);
+     if (!persist_options_status.ok()) {
+       if (db_options.fail_if_options_file_error) {
+diff --git a/src/yb/tserver/remote_bootstrap.proto b/src/yb/tserver/remote_bootstrap.proto
+index 60379ea526..a9edccb240 100644
+--- a/src/yb/tserver/remote_bootstrap.proto
++++ b/src/yb/tserver/remote_bootstrap.proto
+@@ -58,6 +58,8 @@ service RemoteBootstrapService {
+   // End a remote bootstrap session, allow server to release resources.
+   rpc EndRemoteBootstrapSession(EndRemoteBootstrapSessionRequestPB)
+       returns (EndRemoteBootstrapSessionResponsePB);
++
++  rpc RemoveSession(RemoveSessionRequestPB) returns (RemoveSessionResponsePB);
+ }
+ 
+ // Remote bootstrap-specific errors use this protobuf.
+@@ -128,7 +130,10 @@ message BeginRemoteBootstrapSessionResponsePB {
+ 
+   // Identifiers for the WAL segments available for download.
+   // Each WAL segment is keyed by its sequence number.
+-  repeated uint64 wal_segment_seqnos = 4;
++  repeated uint64 DEPRECATED_wal_segment_seqnos = 4;
++
++  // Sequence number of first WAL segment available for download.
++  optional uint64 first_wal_segment_seqno = 6;
+ 
+   // A snapshot of the committed Consensus state at the time that the
+   // remote bootstrap session was started.
+@@ -218,7 +223,19 @@ message EndRemoteBootstrapSessionRequestPB {
+   // Client-provided error message. The server will log this error so that an
+   // admin can identify when bad things are happening with remote bootstrap.
+   optional AppStatusPB error = 3;
++
++  // True if we should not remove session on this request, and it will be removed by upcoming
++  // RemoveRemoteBootstrapSession.
++  optional bool keep_session = 4 [default = false];
+ }
+ 
+ message EndRemoteBootstrapSessionResponsePB {
++  optional bool session_kept = 1 [default = false];
++}
++
++message RemoveSessionRequestPB {
++  optional bytes session_id = 1;
++}
++
++message RemoveSessionResponsePB {
+ }
+diff --git a/src/yb/tserver/remote_bootstrap_client.cc b/src/yb/tserver/remote_bootstrap_client.cc
+index 5bbe798b9b..67d7d6a1a0 100644
+--- a/src/yb/tserver/remote_bootstrap_client.cc
++++ b/src/yb/tserver/remote_bootstrap_client.cc
+@@ -32,6 +32,8 @@
+ 
+ #include "yb/tserver/remote_bootstrap_client.h"
+ 
++#include <boost/scope_exit.hpp>
++
+ #include <gflags/gflags.h>
+ #include <glog/logging.h>
+ 
+@@ -146,6 +148,34 @@ using tablet::RaftGroupReplicaSuperBlockPB;
+ constexpr int kBytesReservedForMessageHeaders = 16384;
+ std::atomic<int32_t> RemoteBootstrapClient::n_started_(0);
+ 
++
++namespace {
++
++// Decode the remote error into a human-readable Status object.
++CHECKED_STATUS ExtractRemoteError(
++    const rpc::ErrorStatusPB& remote_error, const Status& original_status) {
++  if (!remote_error.HasExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext)) {
++    return original_status;
++  }
++
++  const RemoteBootstrapErrorPB& error =
++      remote_error.GetExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext);
++  LOG(INFO) << "ExtractRemoteError: " << error.ShortDebugString();
++  return StatusFromPB(error.status()).CloneAndPrepend(
++      "Received error code " + RemoteBootstrapErrorPB::Code_Name(error.code()) +
++          " from remote service");
++}
++
++// Enhance a RemoteError Status message with additional details from the remote.
++CHECKED_STATUS UnwindRemoteError(const Status& status, const rpc::RpcController& controller) {
++  if (!status.IsRemoteError()) {
++    return status;
++  }
++  return ExtractRemoteError(*controller.error_response(), status);
++}
++
++} // namespace
++
+ RemoteBootstrapClient::RemoteBootstrapClient(std::string tablet_id,
+                                              FsManager* fs_manager,
+                                              string client_permanent_uuid)
+@@ -160,7 +190,8 @@ RemoteBootstrapClient::RemoteBootstrapClient(std::string tablet_id,
+       status_listener_(nullptr),
+       session_idle_timeout_millis_(0),
+       start_time_micros_(0),
+-      succeeded_(false) {}
++      succeeded_(false),
++      log_prefix_(Format("T $0 P$ 1: Remote bootstrap client: ", tablet_id_, permanent_uuid_)) {}
+ 
+ RemoteBootstrapClient::~RemoteBootstrapClient() {
+   // Note: Ending the remote bootstrap session releases anchors on the remote.
+@@ -169,12 +200,13 @@ RemoteBootstrapClient::~RemoteBootstrapClient() {
+   if (!succeeded_) {
+     LOG_WITH_PREFIX(INFO) << "Closing remote bootstrap session " << session_id_
+                           << " in RemoteBootstrapClient destructor.";
+-    WARN_NOT_OK(EndRemoteSession(), "Unable to close remote bootstrap session " + session_id_);
++    WARN_NOT_OK(EndRemoteSession(),
++                LogPrefix() + "Unable to close remote bootstrap session " + session_id_);
+   }
+   if (started_) {
+     auto old_count = n_started_.fetch_sub(1, std::memory_order_acq_rel);
+     if (old_count < 1) {
+-      LOG(DFATAL) << "Invalid number of remote bootstrap sessions: " << old_count;
++      LOG_WITH_PREFIX(DFATAL) << "Invalid number of remote bootstrap sessions: " << old_count;
+     }
+   }
+ }
+@@ -262,6 +294,11 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
+   auto* kv_store = resp.mutable_superblock()->mutable_kv_store();
+   LOG_WITH_PREFIX(INFO) << "RocksDB files: " << yb::ToString(kv_store->rocksdb_files());
+   LOG_WITH_PREFIX(INFO) << "Snapshot files: " << yb::ToString(kv_store->snapshot_files());
++  if (first_wal_seqno_) {
++    LOG_WITH_PREFIX(INFO) << "First WAL segment: " << first_wal_seqno_;
++  } else {
++    LOG_WITH_PREFIX(INFO) << "Log files: " << yb::ToString(resp.deprecated_wal_segment_seqnos());
++  }
+ 
+   const TableId table_id = resp.superblock().primary_table_id();
+   const tablet::TableInfoPB* table_ptr = nullptr;
+@@ -290,7 +327,13 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
+   superblock_->clear_wal_dir();
+ 
+   superblock_->set_tablet_data_state(tablet::TABLET_DATA_COPYING);
+-  wal_seqnos_.assign(resp.wal_segment_seqnos().begin(), resp.wal_segment_seqnos().end());
++  wal_seqnos_.assign(resp.deprecated_wal_segment_seqnos().begin(),
++                     resp.deprecated_wal_segment_seqnos().end());
++  if (resp.has_first_wal_segment_seqno()) {
++    first_wal_seqno_ = resp.first_wal_segment_seqno();
++  } else {
++    first_wal_seqno_ = 0;
++  }
+   remote_committed_cstate_.reset(resp.release_initial_committed_cstate());
+ 
+   Schema schema;
+@@ -398,7 +441,7 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
+   started_ = true;
+   auto old_count = n_started_.fetch_add(1, std::memory_order_acq_rel);
+   if (old_count < 0) {
+-    LOG(DFATAL) << "Invalid number of remote bootstrap sessions: " << old_count;
++    LOG_WITH_PREFIX(DFATAL) << "Invalid number of remote bootstrap sessions: " << old_count;
+     n_started_ = 0;
+   }
+ 
+@@ -456,6 +499,7 @@ Status RemoteBootstrapClient::Finish() {
+ 
+   RETURN_NOT_OK_PREPEND(EndRemoteSession(), "Error closing remote bootstrap session " +
+                         session_id_);
++
+   return Status::OK();
+ }
+ 
+@@ -495,29 +539,6 @@ Status RemoteBootstrapClient::VerifyChangeRoleSucceeded(
+                            committed_config.ShortDebugString()));
+ }
+ 
+-// Decode the remote error into a human-readable Status object.
+-Status RemoteBootstrapClient::ExtractRemoteError(const rpc::ErrorStatusPB& remote_error) {
+-  if (PREDICT_TRUE(remote_error.HasExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext))) {
+-    const RemoteBootstrapErrorPB& error =
+-        remote_error.GetExtension(RemoteBootstrapErrorPB::remote_bootstrap_error_ext);
+-    return StatusFromPB(error.status()).CloneAndPrepend("Received error code " +
+-              RemoteBootstrapErrorPB::Code_Name(error.code()) + " from remote service");
+-  } else {
+-    return STATUS(InvalidArgument, "Unable to decode remote bootstrap RPC error message",
+-                                   remote_error.ShortDebugString());
+-  }
+-}
+-
+-// Enhance a RemoteError Status message with additional details from the remote.
+-Status RemoteBootstrapClient::UnwindRemoteError(const Status& status,
+-                                                const rpc::RpcController& controller) {
+-  if (!status.IsRemoteError()) {
+-    return status;
+-  }
+-  Status extension_status = ExtractRemoteError(*controller.error_response());
+-  return status.CloneAndAppend(extension_status.ToString());
+-}
+-
+ void RemoteBootstrapClient::UpdateStatusMessage(const string& message) {
+   if (status_listener_ != nullptr) {
+     status_listener_->StatusMessage("RemoteBootstrap: " + message);
+@@ -530,18 +551,18 @@ Status RemoteBootstrapClient::EndRemoteSession() {
+   }
+ 
+   rpc::RpcController controller;
+-  controller.set_timeout(MonoDelta::FromMilliseconds(
+-        FLAGS_remote_bootstrap_begin_session_timeout_ms));
++  controller.set_timeout(MonoDelta::FromSeconds(FLAGS_remote_bootstrap_end_session_timeout_sec));
+ 
+   EndRemoteBootstrapSessionRequestPB req;
+   req.set_session_id(session_id_);
+   req.set_is_success(succeeded_);
++  req.set_keep_session(true);
+   EndRemoteBootstrapSessionResponsePB resp;
+ 
+   LOG_WITH_PREFIX(INFO) << "Ending remote bootstrap session " << session_id_;
+-  controller.set_timeout(MonoDelta::FromSeconds(FLAGS_remote_bootstrap_end_session_timeout_sec));
+   auto status = proxy_->EndRemoteBootstrapSession(req, &resp, &controller);
+   if (status.ok()) {
++    remove_required_ = resp.session_kept();
+     LOG_WITH_PREFIX(INFO) << "Remote bootstrap session " << session_id_ << " ended successfully";
+     return Status::OK();
+   }
+@@ -559,6 +580,29 @@ Status RemoteBootstrapClient::EndRemoteSession() {
+                                            session_id_));
+ }
+ 
++Status RemoteBootstrapClient::Remove() {
++  if (!remove_required_) {
++    return Status::OK();
++  }
++
++  rpc::RpcController controller;
++  controller.set_timeout(MonoDelta::FromSeconds(FLAGS_remote_bootstrap_end_session_timeout_sec));
++
++  RemoveSessionRequestPB req;
++  req.set_session_id(session_id_);
++  RemoveSessionResponsePB resp;
++
++  LOG_WITH_PREFIX(INFO) << "Removing remote bootstrap session " << session_id_;
++  const auto status = proxy_->RemoveSession(req, &resp, &controller);
++  if (status.ok()) {
++    LOG_WITH_PREFIX(INFO) << "Remote bootstrap session " << session_id_ << " removed successfully";
++    return Status::OK();
++  }
++
++  return UnwindRemoteError(status, controller).CloneAndPrepend(
++      Format("Failure removing remote bootstrap session $0", session_id_));
++}
++
+ Status RemoteBootstrapClient::DownloadWALs() {
+   CHECK(started_);
+ 
+@@ -585,14 +629,43 @@ Status RemoteBootstrapClient::DownloadWALs() {
+                         Substitute("Failed to sync WAL table directory $0", wal_table_top_dir));
+ 
+   // Download the WAL segments.
+-  int num_segments = wal_seqnos_.size();
+-  LOG_WITH_PREFIX(INFO) << "Starting download of " << num_segments << " WAL segments...";
+   uint64_t counter = 0;
+-  for (uint64_t seg_seqno : wal_seqnos_) {
+-    UpdateStatusMessage(Substitute("Downloading WAL segment with seq. number $0 ($1/$2)",
+-                                   seg_seqno, counter + 1, num_segments));
+-    RETURN_NOT_OK(DownloadWAL(seg_seqno));
+-    ++counter;
++  if (first_wal_seqno_) {
++    LOG_WITH_PREFIX(INFO) << "Starting download of WAL segments starting from sequence number "
++                          << first_wal_seqno_;
++    for (;;) {
++      uint64_t segment_seqno = first_wal_seqno_ + counter;
++      UpdateStatusMessage(
++          Format("Downloading WAL segment with seq. number $0 (#$1 in this session)",
++                 segment_seqno, counter + 1));
++      auto download_status = DownloadWAL(segment_seqno);
++      if (!download_status.ok()) {
++        std::string message_suffix;
++        if (counter > 0) {
++          message_suffix = Format(", downloaded segments in range: $0..$1",
++                                      first_wal_seqno_, segment_seqno - 1);
++        } else {
++          message_suffix = ", no segments were downloaded";
++        }
++        if (download_status.IsNotFound()) {
++          LOG_WITH_PREFIX(INFO) << "Stopped downloading WAL segments" << message_suffix;
++          break;
++        }
++        LOG_WITH_PREFIX(WARNING) << "Downloading WAL segments failed: "
++                                 << download_status << message_suffix;
++        return download_status;
++      }
++      ++counter;
++    }
++  } else {
++    int num_segments = wal_seqnos_.size();
++    LOG_WITH_PREFIX(INFO) << "Starting download of " << num_segments << " WAL segments...";
++    for (uint64_t seg_seqno : wal_seqnos_) {
++      UpdateStatusMessage(Substitute("Downloading WAL segment with seq. number $0 ($1/$2)",
++                                     seg_seqno, counter + 1, num_segments));
++      RETURN_NOT_OK(DownloadWAL(seg_seqno));
++      ++counter;
++    }
+   }
+ 
+   if (FLAGS_bytes_remote_bootstrap_durable_write_mb != 0) {
+@@ -670,15 +743,16 @@ Status RemoteBootstrapClient::DownloadRocksDBFiles() {
+     auto start = MonoTime::Now();
+     RETURN_NOT_OK(DownloadFile(file_pb, rocksdb_dir, &data_id));
+     auto elapsed = MonoTime::Now().GetDeltaSince(start);
+-    LOG(INFO) << "Downloaded file " << file_pb.name() << " of size " << file_pb.size_bytes()
+-              << " in " << elapsed.ToSeconds() << " seconds";
++    LOG_WITH_PREFIX(INFO)
++        << "Downloaded file " << file_pb.name() << " of size " << file_pb.size_bytes()
++        << " in " << elapsed.ToSeconds() << " seconds";
+   }
+ 
+   // To avoid adding new file type to remote bootstrap we move intents as subdir of regular DB.
+   auto intents_tmp_dir = JoinPathSegments(rocksdb_dir, tablet::kIntentsSubdir);
+   if (fs_manager_->env()->FileExists(intents_tmp_dir)) {
+     auto intents_dir = rocksdb_dir + tablet::kIntentsDBSuffix;
+-    LOG(INFO) << "Moving intents DB: " << intents_tmp_dir << " => " << intents_dir;
++    LOG_WITH_PREFIX(INFO) << "Moving intents DB: " << intents_tmp_dir << " => " << intents_dir;
+     RETURN_NOT_OK(fs_manager_->env()->RenameFile(intents_tmp_dir, intents_dir));
+   }
+   if (FLAGS_bytes_remote_bootstrap_durable_write_mb != 0) {
+@@ -696,21 +770,32 @@ Status RemoteBootstrapClient::DownloadWAL(uint64_t wal_segment_seqno) {
+   data_id.set_type(DataIdPB::LOG_SEGMENT);
+   data_id.set_wal_segment_seqno(wal_segment_seqno);
+   const string dest_path = fs_manager_->GetWalSegmentFileName(meta_->wal_dir(), wal_segment_seqno);
++  const auto temp_dest_path = dest_path + ".tmp";
++  bool ok = false;
++  BOOST_SCOPE_EXIT(this_, &temp_dest_path, &ok) {
++    if (!ok) {
++      WARN_NOT_OK(this_->fs_manager_->env()->DeleteFile(temp_dest_path),
++                  "Failed to delete temporary WAL segment");
++    }
++  } BOOST_SCOPE_EXIT_END;
+ 
+   WritableFileOptions opts;
+   opts.sync_on_close = true;
+   gscoped_ptr<WritableFile> writer;
+-  RETURN_NOT_OK_PREPEND(fs_manager_->env()->NewWritableFile(opts, dest_path, &writer),
++  RETURN_NOT_OK_PREPEND(fs_manager_->env()->NewWritableFile(opts, temp_dest_path, &writer),
+                         "Unable to open file for writing");
+ 
+   auto start = MonoTime::Now();
+   RETURN_NOT_OK_PREPEND(DownloadFile(data_id, writer.get()),
+                         Substitute("Unable to download WAL segment with seq. number $0",
+                                    wal_segment_seqno));
++  RETURN_NOT_OK(fs_manager_->env()->RenameFile(temp_dest_path, dest_path));
+   auto elapsed = MonoTime::Now().GetDeltaSince(start);
+   LOG_WITH_PREFIX(INFO) << "Downloaded WAL segment with seq. number " << wal_segment_seqno
+                         << " of size " << writer->Size() << " in " << elapsed.ToSeconds()
+                         << " seconds";
++  ok = true;
++
+   return Status::OK();
+ }
+ 
+@@ -798,8 +883,8 @@ Status RemoteBootstrapClient::DownloadFile(const DataIdPB& data_id,
+ 
+     // Write the data.
+     RETURN_NOT_OK(appendable->Append(resp.chunk().data()));
+-    VLOG(3) << "resp size: " << resp.ByteSize()
+-            << ", chunk size: " << resp.chunk().data().size();
++    VLOG_WITH_PREFIX(3)
++        << "resp size: " << resp.ByteSize() << ", chunk size: " << resp.chunk().data().size();
+ 
+     if (offset + resp.chunk().data().size() == resp.chunk().total_data_length()) {
+       done = true;
+@@ -814,7 +899,7 @@ Status RemoteBootstrapClient::DownloadFile(const DataIdPB& data_id,
+     }
+   }
+ 
+-  VLOG(2) << "Transmission rate: " << rate_limiter->GetRate();
++  VLOG_WITH_PREFIX(2) << "Transmission rate: " << rate_limiter->GetRate();
+ 
+   return Status::OK();
+ }
+@@ -836,9 +921,5 @@ Status RemoteBootstrapClient::VerifyData(uint64_t offset, const DataChunkPB& chu
+   return Status::OK();
+ }
+ 
+-string RemoteBootstrapClient::LogPrefix() {
+-  return Substitute("T $0 P $1: Remote bootstrap client: ", tablet_id_, permanent_uuid_);
+-}
+-
+ } // namespace tserver
+ } // namespace yb
+diff --git a/src/yb/tserver/remote_bootstrap_client.h b/src/yb/tserver/remote_bootstrap_client.h
+index 111272787f..986d05bd9d 100644
+--- a/src/yb/tserver/remote_bootstrap_client.h
++++ b/src/yb/tserver/remote_bootstrap_client.h
+@@ -131,24 +131,17 @@ class RemoteBootstrapClient {
+   CHECKED_STATUS VerifyChangeRoleSucceeded(
+       const std::shared_ptr<consensus::Consensus>& shared_consensus);
+ 
++  // Removes session at server.
++  CHECKED_STATUS Remove();
++
+  protected:
+   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestBeginEndSession);
+   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestDownloadRocksDBFiles);
+ 
+-  // Extract the embedded Status message from the given ErrorStatusPB.
+-  // The given ErrorStatusPB must extend RemoteBootstrapErrorPB.
+-  static CHECKED_STATUS ExtractRemoteError(const rpc::ErrorStatusPB& remote_error);
+-
+-  static CHECKED_STATUS UnwindRemoteError(const Status& status,
+-                                          const rpc::RpcController& controller);
+-
+   // Update the bootstrap StatusListener with a message.
+   // The string "RemoteBootstrap: " will be prepended to each message.
+   void UpdateStatusMessage(const std::string& message);
+ 
+-  // End the remote bootstrap session.
+-  CHECKED_STATUS EndRemoteSession();
+-
+   // Download all WAL files sequentially.
+   CHECKED_STATUS DownloadWALs();
+ 
+@@ -180,8 +173,13 @@ class RemoteBootstrapClient {
+   CHECKED_STATUS DownloadFile(
+       const tablet::FilePB& file_pb, const std::string& dir, DataIdPB* data_id);
+ 
++  // End the remote bootstrap session.
++  CHECKED_STATUS EndRemoteSession();
++
+   // Return standard log prefix.
+-  std::string LogPrefix();
++  const std::string& LogPrefix() const {
++    return log_prefix_;
++  }
+ 
+   // Set-once members.
+   const std::string tablet_id_;
+@@ -200,6 +198,8 @@ class RemoteBootstrapClient {
+   // Session-specific data items.
+   bool replace_tombstoned_tablet_;
+ 
++  bool remove_required_ = false;
++
+   // Local tablet metadata file.
+   scoped_refptr<tablet::RaftGroupMetadata> meta_;
+ 
+@@ -216,12 +216,17 @@ class RemoteBootstrapClient {
+   gscoped_ptr<consensus::ConsensusStatePB> remote_committed_cstate_;
+   std::vector<uint64_t> wal_seqnos_;
+ 
++  // First available WAL segment.
++  uint64_t first_wal_seqno_ = 0;
++
+   int64_t start_time_micros_;
+ 
+   // We track whether this session succeeded and send this information as part of the
+   // EndRemoteBootstrapSessionRequestPB request.
+   bool succeeded_;
+ 
++  const std::string log_prefix_;
++
+  private:
+   std::unordered_map<uint64_t, std::string> inode2file_;
+ 
+diff --git a/src/yb/tserver/remote_bootstrap_service-test.cc b/src/yb/tserver/remote_bootstrap_service-test.cc
+index 3825f7147c..d1fb54aa3a 100644
+--- a/src/yb/tserver/remote_bootstrap_service-test.cc
++++ b/src/yb/tserver/remote_bootstrap_service-test.cc
+@@ -102,7 +102,7 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
+       string* session_id,
+       tablet::RaftGroupReplicaSuperBlockPB* superblock = nullptr,
+       uint64_t* idle_timeout_millis = nullptr,
+-      vector<uint64_t>* sequence_numbers = nullptr) {
++      uint64_t* first_sequence_number = nullptr) {
+     BeginRemoteBootstrapSessionResponsePB resp;
+     RpcController controller;
+     RETURN_NOT_OK(DoBeginRemoteBootstrapSession(GetTabletId(), GetLocalUUID(), &resp, &controller));
+@@ -113,8 +113,8 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
+     if (idle_timeout_millis) {
+       *idle_timeout_millis = resp.session_idle_timeout_millis();
+     }
+-    if (sequence_numbers) {
+-      sequence_numbers->assign(resp.wal_segment_seqnos().begin(), resp.wal_segment_seqnos().end());
++    if (first_sequence_number) {
++      *first_sequence_number = resp.first_wal_segment_seqno();
+     }
+     return Status::OK();
+   }
+@@ -209,17 +209,16 @@ TEST_F(RemoteBootstrapServiceTest, TestSimpleBeginEndSession) {
+   string session_id;
+   tablet::RaftGroupReplicaSuperBlockPB superblock;
+   uint64_t idle_timeout_millis;
+-  vector<uint64_t> segment_seqnos;
++  uint64_t first_segment_seqno;
+   ASSERT_OK(DoBeginValidRemoteBootstrapSession(&session_id,
+                                                &superblock,
+                                                &idle_timeout_millis,
+-                                               &segment_seqnos));
++                                               &first_segment_seqno));
+   // Basic validation of returned params.
+   ASSERT_FALSE(session_id.empty());
+   ASSERT_EQ(FLAGS_remote_bootstrap_idle_timeout_ms, idle_timeout_millis);
+   ASSERT_TRUE(superblock.IsInitialized());
+-  // We should have number of segments = number of rolls + 1 (due to the active segment).
+-  ASSERT_EQ(kNumLogRolls + 1, segment_seqnos.size());
++  ASSERT_EQ(1, first_segment_seqno);
+ 
+   EndRemoteBootstrapSessionResponsePB resp;
+   RpcController controller;
+@@ -337,21 +336,20 @@ TEST_F(RemoteBootstrapServiceTest, TestFetchLog) {
+   string session_id;
+   tablet::RaftGroupReplicaSuperBlockPB superblock;
+   uint64_t idle_timeout_millis;
+-  vector<uint64_t> segment_seqnos;
++  uint64_t segment_seqno;
+   ASSERT_OK(DoBeginValidRemoteBootstrapSession(&session_id,
+                                                &superblock,
+                                                &idle_timeout_millis,
+-                                               &segment_seqnos));
++                                               &segment_seqno));
+ 
+-  ASSERT_EQ(kNumLogRolls + 1, segment_seqnos.size());
+-  uint64_t seg_seqno = *segment_seqnos.begin();
++  ASSERT_EQ(1, segment_seqno);
+ 
+   // Fetch the remote data.
+   FetchDataResponsePB resp;
+   RpcController controller;
+   DataIdPB data_id;
+   data_id.set_type(DataIdPB::LOG_SEGMENT);
+-  data_id.set_wal_segment_seqno(seg_seqno);
++  data_id.set_wal_segment_seqno(segment_seqno);
+   ASSERT_OK(DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller));
+ 
+   // Fetch the local data.
+@@ -361,8 +359,8 @@ TEST_F(RemoteBootstrapServiceTest, TestFetchLog) {
+   uint64_t first_seg_seqno = (*local_segments.begin())->header().sequence_number();
+ 
+ 
+-  ASSERT_EQ(seg_seqno, first_seg_seqno)
+-      << "Expected equal sequence numbers: " << seg_seqno
++  ASSERT_EQ(segment_seqno, first_seg_seqno)
++      << "Expected equal sequence numbers: " << segment_seqno
+       << " and " << first_seg_seqno;
+   const scoped_refptr<ReadableLogSegment>& segment = local_segments[0];
+   faststring scratch;
+diff --git a/src/yb/tserver/remote_bootstrap_service.cc b/src/yb/tserver/remote_bootstrap_service.cc
+index 8f8e14b920..f59db487b1 100644
+--- a/src/yb/tserver/remote_bootstrap_service.cc
++++ b/src/yb/tserver/remote_bootstrap_service.cc
+@@ -52,6 +52,8 @@
+ #include "yb/util/fault_injection.h"
+ #include "yb/util/flag_tags.h"
+ 
++using namespace std::literals;
++
+ // Note, this macro assumes the existence of a local var named 'context'.
+ #define RPC_RETURN_APP_ERROR(app_err, message, s) \
+   do { \
+@@ -156,8 +158,9 @@ void RemoteBootstrapServiceImpl::BeginRemoteBootstrapSession(
+ 
+   scoped_refptr<RemoteBootstrapSessionClass> session;
+   {
+-    std::lock_guard<simple_spinlock> l(sessions_lock_);
+-    if (!FindCopy(sessions_, session_id, &session)) {
++    std::lock_guard<std::mutex> l(sessions_mutex_);
++    auto it = sessions_.find(session_id);
++    if (it == sessions_.end()) {
+       LOG(INFO) << "Beginning new remote bootstrap session on tablet " << tablet_id
+                 << " from peer " << requestor_uuid << " at " << context.requestor_string()
+                 << ": session id = " << session_id;
+@@ -167,13 +170,14 @@ void RemoteBootstrapServiceImpl::BeginRemoteBootstrapSession(
+                         RemoteBootstrapErrorPB::UNKNOWN_ERROR,
+                         Substitute("Error initializing remote bootstrap session for tablet $0",
+                                    tablet_id));
+-      InsertOrDie(&sessions_, session_id, session);
++      it = sessions_.emplace(session_id, SessionData{session, CoarseTimePoint()}).first;
+       auto new_nsessions = nsessions_.fetch_add(1, std::memory_order_acq_rel) + 1;
+       if (new_nsessions != sessions_.size()) {
+         LOG(DFATAL) << "nsessions_ " << new_nsessions
+                     << " !=  number of sessions " << sessions_.size();
+       }
+     } else {
++      session = it->second.session;
+       LOG(INFO) << "Re-initializing existing remote bootstrap session on tablet " << tablet_id
+                 << " from peer " << requestor_uuid << " at " << context.requestor_string()
+                 << ": session id = " << session_id;
+@@ -182,7 +186,7 @@ void RemoteBootstrapServiceImpl::BeginRemoteBootstrapSession(
+                         Substitute("Error initializing remote bootstrap session for tablet $0",
+                                    tablet_id));
+     }
+-    ResetSessionExpirationUnlocked(session_id);
++    it->second.ResetExpiration();
+   }
+ 
+   resp->set_session_id(session_id);
+@@ -190,8 +194,13 @@ void RemoteBootstrapServiceImpl::BeginRemoteBootstrapSession(
+   resp->mutable_superblock()->CopyFrom(session->tablet_superblock());
+   resp->mutable_initial_committed_cstate()->CopyFrom(session->initial_committed_cstate());
+ 
+-  for (const scoped_refptr<log::ReadableLogSegment>& segment : session->log_segments()) {
+-    resp->add_wal_segment_seqnos(segment->header().sequence_number());
++  auto const& log_segments = session->log_segments();
++  resp->mutable_deprecated_wal_segment_seqnos()->Reserve(log_segments.size());
++  for (const scoped_refptr<log::ReadableLogSegment>& segment : log_segments) {
++    resp->add_deprecated_wal_segment_seqnos(segment->header().sequence_number());
++  }
++  if (!log_segments.empty()) {
++    resp->set_first_wal_segment_seqno(log_segments.front()->header().sequence_number());
+   }
+ 
+   context.RespondSuccess();
+@@ -201,27 +210,18 @@ void RemoteBootstrapServiceImpl::CheckSessionActive(
+         const CheckRemoteBootstrapSessionActiveRequestPB* req,
+         CheckRemoteBootstrapSessionActiveResponsePB* resp,
+         rpc::RpcContext context) {
+-  const string& session_id = req->session_id();
+-
+   // Look up and validate remote bootstrap session.
+-  scoped_refptr<RemoteBootstrapSessionClass> session;
+-  std::lock_guard<simple_spinlock> l(sessions_lock_);
+-  RemoteBootstrapErrorPB::Code app_error;
+-  Status status = FindSessionUnlocked(session_id, &app_error, &session);
+-  if (status.ok()) {
++  std::lock_guard<std::mutex> l(sessions_mutex_);
++  auto it = sessions_.find(req->session_id());
++  if (it != sessions_.end()) {
+     if (req->keepalive()) {
+-      ResetSessionExpirationUnlocked(session_id);
++      it->second.ResetExpiration();
+     }
+     resp->set_session_is_active(true);
+     context.RespondSuccess();
+-    return;
+-  } else if (app_error == RemoteBootstrapErrorPB::NO_SESSION) {
++  } else {
+     resp->set_session_is_active(false);
+     context.RespondSuccess();
+-    return;
+-  } else {
+-    RPC_RETURN_NOT_OK(status, app_error,
+-                      Substitute("Error trying to check whether session $0 is active", session_id));
+   }
+ }
+ 
+@@ -271,11 +271,15 @@ void RemoteBootstrapServiceImpl::FetchData(const FetchDataRequestPB* req,
+   // Look up and validate remote bootstrap session.
+   scoped_refptr<RemoteBootstrapSessionClass> session;
+   {
+-    std::lock_guard<simple_spinlock> l(sessions_lock_);
+-    RemoteBootstrapErrorPB::Code app_error;
+-    RPC_RETURN_NOT_OK(FindSessionUnlocked(session_id, &app_error, &session),
+-                      app_error, "No such session");
+-    ResetSessionExpirationUnlocked(session_id);
++    std::lock_guard<std::mutex> l(sessions_mutex_);
++    auto it = sessions_.find(session_id);
++    if (it == sessions_.end()) {
++      RPC_RETURN_APP_ERROR(
++          RemoteBootstrapErrorPB::NO_SESSION, "No such session",
++          STATUS_FORMAT(NotFound, "Fetch data for unknown sessions id: $0", session_id));
++    }
++    it->second.ResetExpiration();
++    session = it->second.session;
+   }
+ 
+   session->EnsureRateLimiterIsInitialized();
+@@ -314,45 +318,66 @@ void RemoteBootstrapServiceImpl::EndRemoteBootstrapSession(
+         EndRemoteBootstrapSessionResponsePB* resp,
+         rpc::RpcContext context) {
+   {
+-    std::lock_guard<simple_spinlock> l(sessions_lock_);
++    std::lock_guard<std::mutex> l(sessions_mutex_);
+     RemoteBootstrapErrorPB::Code app_error;
+-    RPC_RETURN_NOT_OK(DoEndRemoteBootstrapSessionUnlocked(req->session_id(), req->is_success(),
+-                                                          &app_error),
++    RPC_RETURN_NOT_OK(DoEndRemoteBootstrapSession(
++                          req->session_id(), req->is_success(), &app_error),
+                       app_error, "No such session");
+     LOG(INFO) << "Request end of remote bootstrap session " << req->session_id()
+               << " received from " << context.requestor_string();
++
++    if (!req->keep_session()) {
++      RemoveSession(req->session_id());
++    } else {
++      resp->set_session_kept(true);
++    }
++  }
++  context.RespondSuccess();
++}
++
++void RemoteBootstrapServiceImpl::RemoveSession(
++        const RemoveSessionRequestPB* req,
++        RemoveSessionResponsePB* resp,
++        rpc::RpcContext context) {
++  {
++    std::lock_guard<std::mutex> l(sessions_mutex_);
++    RemoveSession(req->session_id());
+   }
+   context.RespondSuccess();
+ }
+ 
++void RemoteBootstrapServiceImpl::RemoveSession(const std::string& session_id) {
++  // Remove the session from the map.
++  // It will get destroyed once there are no outstanding refs.
++  auto it = sessions_.find(session_id);
++  if (it == sessions_.end()) {
++    LOG(WARNING) << "Attempt to remove session with unknown id: " << session_id;
++    return;
++  }
++  LOG(INFO) << "Removing remote bootstrap session " << session_id << " on tablet "
++            << session_id << " with peer " << it->second.session->requestor_uuid();
++  sessions_.erase(it);
++  nsessions_.fetch_sub(1, std::memory_order_acq_rel);
++}
++
+ void RemoteBootstrapServiceImpl::Shutdown() {
+   shutdown_latch_.CountDown();
+   session_expiration_thread_->Join();
+ 
++  std::lock_guard<std::mutex> lock(sessions_mutex_);
+   // Destroy all remote bootstrap sessions.
+-  vector<string> session_ids;
+-  for (const MonoTimeMap::value_type& entry : session_expirations_) {
++  std::vector<string> session_ids;
++  session_ids.reserve(sessions_.size());
++  for (const auto& entry : sessions_) {
+     session_ids.push_back(entry.first);
+   }
+   for (const string& session_id : session_ids) {
+     LOG(INFO) << "Destroying remote bootstrap session " << session_id << " due to service shutdown";
+     RemoteBootstrapErrorPB::Code app_error;
+-    CHECK_OK(DoEndRemoteBootstrapSessionUnlocked(session_id, false, &app_error));
++    CHECK_OK(DoEndRemoteBootstrapSession(session_id, false, &app_error));
+   }
+ }
+ 
+-Status RemoteBootstrapServiceImpl::FindSessionUnlocked(
+-        const string& session_id,
+-        RemoteBootstrapErrorPB::Code* app_error,
+-        scoped_refptr<RemoteBootstrapSessionClass>* session) const {
+-  if (!FindCopy(sessions_, session_id, session)) {
+-    *app_error = RemoteBootstrapErrorPB::NO_SESSION;
+-    return STATUS(NotFound,
+-        Substitute("Remote bootstrap session with Session ID \"$0\" not found", session_id));
+-  }
+-  return Status::OK();
+-}
+-
+ Status RemoteBootstrapServiceImpl::ValidateFetchRequestDataId(
+         const DataIdPB& data_id,
+         RemoteBootstrapErrorPB::Code* app_error,
+@@ -393,18 +418,20 @@ Status RemoteBootstrapServiceImpl::ValidateSnapshotFetchRequestDataId(
+   return STATUS(InvalidArgument, "Type SNAPSHOT_FILE not supported", data_id.ShortDebugString());
+ }
+ 
+-void RemoteBootstrapServiceImpl::ResetSessionExpirationUnlocked(const std::string& session_id) {
+-  MonoTime expiration(MonoTime::Now());
+-  expiration.AddDelta(MonoDelta::FromMilliseconds(FLAGS_remote_bootstrap_idle_timeout_ms));
+-  InsertOrUpdate(&session_expirations_, session_id, expiration);
++void RemoteBootstrapServiceImpl::SessionData::ResetExpiration() {
++  expiration = CoarseMonoClock::now() + FLAGS_remote_bootstrap_idle_timeout_ms * 1ms;
+ }
+ 
+-Status RemoteBootstrapServiceImpl::DoEndRemoteBootstrapSessionUnlocked(
++Status RemoteBootstrapServiceImpl::DoEndRemoteBootstrapSession(
+         const std::string& session_id,
+         bool session_succeeded,
+         RemoteBootstrapErrorPB::Code* app_error) {
+-  scoped_refptr<RemoteBootstrapSessionClass> session;
+-  RETURN_NOT_OK(FindSessionUnlocked(session_id, app_error, &session));
++  auto it = sessions_.find(session_id);
++  if (it == sessions_.end()) {
++    *app_error = RemoteBootstrapErrorPB::NO_SESSION;
++    return STATUS_FORMAT(NotFound, "End of unknown session id: $0", session_id);
++  }
++  auto session = it->second.session;
+ 
+   if (session_succeeded || session->Succeeded()) {
+     session->SetSuccess();
+@@ -435,7 +462,7 @@ Status RemoteBootstrapServiceImpl::DoEndRemoteBootstrapSessionUnlocked(
+       LOG(WARNING) << "ChangeRole failed for bootstrap session " << session_id
+                    << ", error : " << status;
+       if (!status.IsLeaderHasNoLease() || MonoTime::Now() >= deadline) {
+-        ResetSessionExpirationUnlocked(session_id);
++        it->second.ResetExpiration();
+         return Status::OK();
+       }
+     }
+@@ -445,35 +472,26 @@ Status RemoteBootstrapServiceImpl::DoEndRemoteBootstrapSessionUnlocked(
+                << session_succeeded;
+   }
+ 
+-  // Remove the session from the map.
+-  // It will get destroyed once there are no outstanding refs.
+-  LOG(INFO) << "Ending remote bootstrap session " << session_id << " on tablet "
+-            << session->tablet_id() << " with peer " << session->requestor_uuid();
+-  CHECK_EQ(1, sessions_.erase(session_id));
+-  nsessions_.fetch_sub(1, std::memory_order_acq_rel);
+-  CHECK_EQ(1, session_expirations_.erase(session_id));
+-
+   return Status::OK();
+ }
+ 
+ void RemoteBootstrapServiceImpl::EndExpiredSessions() {
+   do {
+-    std::lock_guard<simple_spinlock> l(sessions_lock_);
+-    MonoTime now = MonoTime::Now();
+-
+-    vector<string> expired_session_ids;
+-    for (const MonoTimeMap::value_type& entry : session_expirations_) {
+-      const string& session_id = entry.first;
+-      const MonoTime& expiration = entry.second;
+-      if (expiration.ComesBefore(now)) {
+-        expired_session_ids.push_back(session_id);
++    std::lock_guard<std::mutex> l(sessions_mutex_);
++    auto now = CoarseMonoClock::Now();
++
++    std::vector<string> expired_session_ids;
++    for (const auto& entry : sessions_) {
++      if (entry.second.expiration < now) {
++        expired_session_ids.push_back(entry.first);
+       }
+     }
+     for (const string& session_id : expired_session_ids) {
+       LOG(INFO) << "Remote bootstrap session " << session_id
+                 << " has expired. Terminating session.";
+       RemoteBootstrapErrorPB::Code app_error;
+-      CHECK_OK(DoEndRemoteBootstrapSessionUnlocked(session_id, false, &app_error));
++      CHECK_OK(DoEndRemoteBootstrapSession(session_id, false, &app_error));
++      RemoveSession(session_id);
+     }
+   } while (!shutdown_latch_.WaitFor(MonoDelta::FromMilliseconds(
+                                     FLAGS_remote_bootstrap_timeout_poll_period_ms)));
+diff --git a/src/yb/tserver/remote_bootstrap_service.h b/src/yb/tserver/remote_bootstrap_service.h
+index f3e8c4c4f1..8db5b592e8 100644
+--- a/src/yb/tserver/remote_bootstrap_service.h
++++ b/src/yb/tserver/remote_bootstrap_service.h
+@@ -63,23 +63,29 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
+                              TabletPeerLookupIf* tablet_peer_lookup,
+                              const scoped_refptr<MetricEntity>& metric_entity);
+ 
+-  virtual void BeginRemoteBootstrapSession(const BeginRemoteBootstrapSessionRequestPB* req,
+-                                           BeginRemoteBootstrapSessionResponsePB* resp,
+-                                           rpc::RpcContext context) override;
++  void BeginRemoteBootstrapSession(const BeginRemoteBootstrapSessionRequestPB* req,
++                                   BeginRemoteBootstrapSessionResponsePB* resp,
++                                   rpc::RpcContext context) override;
+ 
+-  virtual void CheckSessionActive(const CheckRemoteBootstrapSessionActiveRequestPB* req,
+-                                  CheckRemoteBootstrapSessionActiveResponsePB* resp,
+-                                  rpc::RpcContext context) override;
++  void CheckSessionActive(const CheckRemoteBootstrapSessionActiveRequestPB* req,
++                          CheckRemoteBootstrapSessionActiveResponsePB* resp,
++                          rpc::RpcContext context) override;
+ 
+-  virtual void FetchData(const FetchDataRequestPB* req,
+-                         FetchDataResponsePB* resp,
+-                         rpc::RpcContext context) override;
++  void FetchData(const FetchDataRequestPB* req,
++                 FetchDataResponsePB* resp,
++                 rpc::RpcContext context) override;
+ 
+-  virtual void EndRemoteBootstrapSession(const EndRemoteBootstrapSessionRequestPB* req,
+-                                         EndRemoteBootstrapSessionResponsePB* resp,
+-                                         rpc::RpcContext context) override;
++  void EndRemoteBootstrapSession(const EndRemoteBootstrapSessionRequestPB* req,
++                                 EndRemoteBootstrapSessionResponsePB* resp,
++                                 rpc::RpcContext context) override;
+ 
+-  virtual void Shutdown() override;
++
++  void RemoveSession(
++          const RemoveSessionRequestPB* req,
++          RemoveSessionResponsePB* resp,
++          rpc::RpcContext context) override;
++
++  void Shutdown() override;
+ 
+  protected:
+   typedef YB_EDITION_NS_PREFIX RemoteBootstrapSession RemoteBootstrapSessionClass;
+@@ -92,14 +98,14 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
+   virtual CHECKED_STATUS ValidateSnapshotFetchRequestDataId(const DataIdPB& data_id) const;
+ 
+  private:
+-  typedef std::unordered_map<std::string, scoped_refptr<RemoteBootstrapSessionClass>> SessionMap;
+-  typedef std::unordered_map<std::string, MonoTime> MonoTimeMap;
++  struct SessionData {
++    scoped_refptr<RemoteBootstrapSessionClass> session;
++    CoarseTimePoint expiration;
+ 
+-  // Look up session in session map.
+-  CHECKED_STATUS FindSessionUnlocked(
+-      const std::string& session_id,
+-      RemoteBootstrapErrorPB::Code* app_error,
+-      scoped_refptr<RemoteBootstrapSessionClass>* session) const;
++    void ResetExpiration();
++  };
++
++  typedef std::unordered_map<std::string, SessionData> SessionMap;
+ 
+   // Validate the data identifier in a FetchData request.
+   CHECKED_STATUS ValidateFetchRequestDataId(
+@@ -107,13 +113,13 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
+       RemoteBootstrapErrorPB::Code* app_error,
+       const scoped_refptr<RemoteBootstrapSessionClass>& session) const;
+ 
+-  // Take note of session activity; Re-update the session timeout deadline.
+-  void ResetSessionExpirationUnlocked(const std::string& session_id);
+-
+   // Destroy the specified remote bootstrap session.
+-  CHECKED_STATUS DoEndRemoteBootstrapSessionUnlocked(const std::string& session_id,
+-                                                     bool session_suceeded,
+-                                                     RemoteBootstrapErrorPB::Code* app_error);
++  CHECKED_STATUS DoEndRemoteBootstrapSession(
++      const std::string& session_id,
++      bool session_suceeded,
++      RemoteBootstrapErrorPB::Code* app_error)  EXCLUSIVE_LOCKS_REQUIRED(sessions_mutex_);
++
++  void RemoveSession(const std::string& session_id) EXCLUSIVE_LOCKS_REQUIRED(sessions_mutex_);
+ 
+   // The timeout thread periodically checks whether sessions are expired and
+   // removes them from the map.
+@@ -123,10 +129,9 @@ class RemoteBootstrapServiceImpl : public RemoteBootstrapServiceIf {
+   TabletPeerLookupIf* tablet_peer_lookup_;
+ 
+   // Protects sessions_ and session_expirations_ maps.
+-  mutable simple_spinlock sessions_lock_;
+-  SessionMap sessions_;
+-  std::atomic<int32> nsessions_ = {0};
+-  MonoTimeMap session_expirations_;
++  mutable std::mutex sessions_mutex_;
++  SessionMap sessions_ GUARDED_BY(sessions_mutex_);
++  std::atomic<int32> nsessions_ GUARDED_BY(sessions_mutex_) = {0};
+ 
+   // Session expiration thread.
+   // TODO: this is a hack, replace with some kind of timer impl. See KUDU-286.
+diff --git a/src/yb/tserver/remote_bootstrap_session.cc b/src/yb/tserver/remote_bootstrap_session.cc
+index 52d1518e44..9d6ad52464 100644
+--- a/src/yb/tserver/remote_bootstrap_session.cc
++++ b/src/yb/tserver/remote_bootstrap_session.cc
+@@ -96,7 +96,7 @@ RemoteBootstrapSession::~RemoteBootstrapSession() {
+ }
+ 
+ Status RemoteBootstrapSession::ChangeRole() {
+-  CHECK(succeeded_);
++  CHECK(Succeeded());
+ 
+   shared_ptr<consensus::Consensus> consensus = tablet_peer_->shared_consensus();
+   // This check fixes an issue with test TestDeleteTabletDuringRemoteBootstrap in which a tablet is
+@@ -207,11 +207,9 @@ Result<google::protobuf::RepeatedPtrField<tablet::FilePB>> ListFiles(const std::
+ 
+ Status RemoteBootstrapSession::Init() {
+   // Take locks to support re-initialization of the same session.
+-  boost::lock_guard<simple_spinlock> l(session_lock_);
++  std::lock_guard<std::mutex> lock(mutex_);
+   RETURN_NOT_OK(UnregisterAnchorIfNeededUnlocked());
+ 
+-  logs_.clear();
+-
+   const string& tablet_id = tablet_peer_->tablet_id();
+ 
+   // Prevent log GC while we grab log segments and Tablet metadata.
+@@ -259,16 +257,8 @@ Status RemoteBootstrapSession::Init() {
+   // The Log doesn't add the active segment to the log reader's list until
+   // a header has been written to it (but it will not have a footer).
+   RETURN_NOT_OK(tablet_peer_->log()->GetSegmentsSnapshot(&log_segments_));
+-  for (const scoped_refptr<ReadableLogSegment>& segment : log_segments_) {
+-    RETURN_NOT_OK(OpenLogSegmentUnlocked(segment->header().sequence_number()));
+-  }
+-  LOG(INFO) << "Got snapshot of " << log_segments_.size() << " log segments";
+-
+-  // Look up the committed consensus state.
+-  // We do this after snapshotting the log for YB table types to avoid a scenario where the latest
+-  // entry in the log has a term higher than the term stored in the consensus metadata, which
+-  // will result in a CHECK failure on RaftConsensus init.
+-  RETURN_NOT_OK(SetInitialCommittedState());
++  log_anchor_index_ = log_segments_.empty() || !log_segments_.front()->HasFooter()
++      ? last_logged_opid.index : log_segments_.front()->footer().min_replicate_index();
+ 
+   // Re-anchor on the highest OpId that was in the log right before we
+   // snapshotted the log segments. This helps ensure that we don't end up in a
+@@ -276,7 +266,13 @@ Status RemoteBootstrapSession::Init() {
+   // leader's log when remote bootstrap is slow. The remote controls when
+   // this anchor is released by ending the remote bootstrap session.
+   RETURN_NOT_OK(tablet_peer_->log_anchor_registry()->UpdateRegistration(
+-      last_logged_opid.index, anchor_owner_token, &log_anchor_));
++      log_anchor_index_, &log_anchor_));
++
++  // Look up the committed consensus state.
++  // We do this after snapshotting the log for YB table types to avoid a scenario where the latest
++  // entry in the log has a term higher than the term stored in the consensus metadata, which
++  // will result in a CHECK failure on RaftConsensus init.
++  RETURN_NOT_OK(SetInitialCommittedState());
+ 
+   start_time_ = MonoTime::Now();
+ 
+@@ -339,16 +335,15 @@ static Status GetResponseDataSize(int64_t total_size,
+   return Status::OK();
+ }
+ 
++namespace {
++
+ // Read a chunk of a file into a buffer.
+ // data_name provides a string for the block/log to be used in error messages.
+-template <class Info>
+-static Status ReadFileChunkToBuf(const Info* info,
+-                                 uint64_t offset, int64_t client_maxlen,
+-                                 const string& data_name,
+-                                 string* data, int64_t* file_size,
+-                                 RemoteBootstrapErrorPB::Code* error_code) {
++Status ReadFileChunkToBuf(RandomAccessFile* file, int64_t file_size,
++                          uint64_t offset, int64_t client_maxlen, const string& data_name,
++                          string* data, RemoteBootstrapErrorPB::Code* error_code) {
+   int64_t response_data_size = 0;
+-  RETURN_NOT_OK_PREPEND(GetResponseDataSize(info->size, offset, client_maxlen, error_code,
++  RETURN_NOT_OK_PREPEND(GetResponseDataSize(file_size, offset, client_maxlen, error_code,
+                                             &response_data_size),
+                         Substitute("Error reading $0", data_name));
+ 
+@@ -361,7 +356,7 @@ static Status ReadFileChunkToBuf(const Info* info,
+   data->resize(response_data_size);
+   uint8_t* buf = reinterpret_cast<uint8_t*>(const_cast<char*>(data->data()));
+   Slice slice;
+-  Status s = info->ReadFully(offset, response_data_size, &slice, buf);
++  Status s = env_util::ReadFully(file, offset, response_data_size, &slice, buf);
+   if (PREDICT_FALSE(!s.ok())) {
+     s = s.CloneAndPrepend(
+         Substitute("Unable to read existing file for $0", data_name));
+@@ -378,19 +373,39 @@ static Status ReadFileChunkToBuf(const Info* info,
+   TRACE("Remote bootstrap: $0: $1 total bytes read. Total time elapsed: $2",
+         data_name, response_data_size, chunk_timer.elapsed().ToString());
+ 
+-  *file_size = info->size;
+   return Status::OK();
+ }
+ 
++} // namespace
++
++// Caches file size and holds a shared_ptr reference to a RandomAccessFile.
++// Assumes that the file underlying the RandomAccessFile is immutable.
++struct ImmutableRandomAccessFileInfo {
++  std::shared_ptr<RandomAccessFile> readable;
++  int64_t size = 0;
++  uint64_t segment_seqno = 0;
++
++  ImmutableRandomAccessFileInfo(std::shared_ptr<RandomAccessFile> readable,
++                                int64_t size)
++      : readable(std::move(readable)), size(size) {}
++};
++
+ Status RemoteBootstrapSession::GetLogSegmentPiece(uint64_t segment_seqno,
+                                                   uint64_t offset, int64_t client_maxlen,
+                                                   std::string* data, int64_t* block_file_size,
+                                                   RemoteBootstrapErrorPB::Code* error_code) {
+-  ImmutableRandomAccessFileInfo* file_info;
+-  RETURN_NOT_OK(FindLogSegment(segment_seqno, &file_info, error_code));
+-  RETURN_NOT_OK(ReadFileChunkToBuf(file_info, offset, client_maxlen,
+-                                   Substitute("log segment $0", segment_seqno),
+-                                   data, block_file_size, error_code));
++  std::shared_ptr<RandomAccessFile> file;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (opened_log_segment_seqno_ != segment_seqno) {
++      RETURN_NOT_OK(OpenLogSegment(segment_seqno, error_code));
++    }
++    *block_file_size = opened_log_segment_file_size_;
++    file = opened_log_segment_file_;
++  }
++  RETURN_NOT_OK(ReadFileChunkToBuf(
++      file.get(), *block_file_size, offset, client_maxlen,
++      Substitute("log segment $0", segment_seqno), data, error_code));
+ 
+   // Note: We do not eagerly close log segment files, since we share ownership
+   // of the LogSegment objects with the Log itself.
+@@ -406,8 +421,8 @@ Status RemoteBootstrapSession::GetRocksDBFilePiece(const std::string file_name,
+       checkpoint_dir_, file_name, offset, client_maxlen, data, log_file_size, error_code);
+ }
+ 
+-Status RemoteBootstrapSession::GetFilePiece(const std::string path,
+-                                            const std::string file_name,
++Status RemoteBootstrapSession::GetFilePiece(const std::string& path,
++                                            const std::string& file_name,
+                                             uint64_t offset, int64_t client_maxlen,
+                                             std::string* data, int64_t* block_file_size,
+                                             RemoteBootstrapErrorPB::Code* error_code) {
+@@ -419,22 +434,17 @@ Status RemoteBootstrapSession::GetFilePiece(const std::string path,
+   }
+ 
+   gscoped_ptr<RandomAccessFile> readable_file;
+-  shared_ptr<RandomAccessFile> readable_file_shared_ptr;
+ 
+   RETURN_NOT_OK(fs_manager_->env()->NewRandomAccessFile(file_path, &readable_file));
+ 
+-  uint64 file_size = VERIFY_RESULT(readable_file->Size());
++  *block_file_size = VERIFY_RESULT(readable_file->Size());
+   auto inode = VERIFY_RESULT(readable_file->INode());
+-  VLOG(2) << "Reading RocksDB file. File path: " << file_path << ", file size: " << file_size
++  VLOG(2) << "Reading RocksDB file. File path: " << file_path << ", file size: " << *block_file_size
+           << ", inode: " << inode;
+ 
+-  readable_file_shared_ptr.reset(readable_file.release());
+-
+-  std::unique_ptr<ImmutableRandomAccessFileInfo> file_info(
+-      new ImmutableRandomAccessFileInfo(readable_file_shared_ptr, file_size));
+-  RETURN_NOT_OK(ReadFileChunkToBuf(file_info.get(), offset, client_maxlen,
++  RETURN_NOT_OK(ReadFileChunkToBuf(readable_file.get(), *block_file_size, offset, client_maxlen,
+                                    Substitute("rocksdb file $0", file_name),
+-                                   data, block_file_size, error_code));
++                                   data, error_code));
+ 
+   return Status::OK();
+ }
+@@ -459,44 +469,38 @@ static Status AddImmutableFileToMap(Collection* const cache,
+   return Status::OK();
+ }
+ 
+-Status RemoteBootstrapSession::OpenLogSegmentUnlocked(uint64_t segment_seqno) {
+-  DCHECK(session_lock_.is_locked());
+-
+-  scoped_refptr<log::ReadableLogSegment> log_segment;
+-  int position = -1;
+-  if (!log_segments_.empty()) {
+-    position = segment_seqno - log_segments_[0]->header().sequence_number();
++Status RemoteBootstrapSession::OpenLogSegment(
++    uint64_t segment_seqno, RemoteBootstrapErrorPB::Code* error_code) {
++  auto active_seqno = tablet_peer_->log()->active_segment_sequence_number();
++  auto log_segment = tablet_peer_->log()->GetSegmentBySequenceNumber(segment_seqno);
++  // Usually active log segment is extended, while sent of the wire. So we cannot send next segment,
++  // Otherwise entries at end of previously active log segment could be missing.
++  if (opened_log_segment_active_) {
++    *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;
++    return STATUS_FORMAT(NotFound, "Already sent active log segment, don't send $0", segment_seqno);
+   }
+-  if (position < 0 || position >= log_segments_.size()) {
+-    return STATUS(NotFound, Substitute("Segment with sequence number $0 not found",
+-                                       segment_seqno));
++  if (!log_segment) {
++    *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;
++    return STATUS_FORMAT(NotFound, "Log segment $0 not found", segment_seqno);
+   }
+-  log_segment = log_segments_[position];
+-  CHECK_EQ(log_segment->header().sequence_number(), segment_seqno);
+-
+-  uint64_t size = log_segment->readable_up_to() + log_segment->get_header_size();
+-  Status s = AddImmutableFileToMap(
+-      &logs_, segment_seqno, log_segment->readable_file_checkpoint(), size);
+-  if (!s.ok()) {
+-    s = s.CloneAndPrepend(
+-            Substitute("Error accessing data for log segment with seqno $0",
+-                       segment_seqno));
+-    LOG(INFO) << s.ToString();
++  opened_log_segment_file_size_ = log_segment->readable_up_to() + log_segment->get_header_size();
++  opened_log_segment_seqno_ = segment_seqno;
++  opened_log_segment_file_ = log_segment->readable_file_checkpoint();
++  opened_log_segment_active_ = active_seqno == segment_seqno;
++
++  if (log_segment->HasFooter() &&
++      log_segment->footer().min_replicate_index() > log_anchor_index_) {
++    log_anchor_index_ = log_segment->footer().min_replicate_index();
++
++    // Update log anchor, since we don't need older logs anymore.
++    auto status = tablet_peer_->log_anchor_registry()->UpdateRegistration(
++        log_anchor_index_, &log_anchor_);
++    if (!status.ok()) {
++      *error_code = RemoteBootstrapErrorPB::UNKNOWN_ERROR;
++      return status;
++    }
+   }
+-  return s;
+-}
+ 
+-Status RemoteBootstrapSession::FindLogSegment(uint64_t segment_seqno,
+-                                              ImmutableRandomAccessFileInfo** file_info,
+-                                              RemoteBootstrapErrorPB::Code* error_code) {
+-  boost::lock_guard<simple_spinlock> l(session_lock_);
+-  auto it = logs_.find(segment_seqno);
+-  if (it == logs_.end()) {
+-    *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;
+-    return STATUS(NotFound, Substitute("Segment with sequence number $0 not found",
+-                                       segment_seqno));
+-  }
+-  *file_info = it->second.get();
+   return Status::OK();
+ }
+ 
+@@ -505,11 +509,12 @@ Status RemoteBootstrapSession::UnregisterAnchorIfNeededUnlocked() {
+ }
+ 
+ void RemoteBootstrapSession::SetSuccess() {
+-  boost::lock_guard<simple_spinlock> l(session_lock_);
++  std::lock_guard<std::mutex> lock(mutex_);
+   succeeded_ = true;
+ }
+ 
+ bool RemoteBootstrapSession::Succeeded() {
++  std::lock_guard<std::mutex> lock(mutex_);
+   return succeeded_;
+ }
+ 
+diff --git a/src/yb/tserver/remote_bootstrap_session.h b/src/yb/tserver/remote_bootstrap_session.h
+index 4ed11ce511..945331612e 100644
+--- a/src/yb/tserver/remote_bootstrap_session.h
++++ b/src/yb/tserver/remote_bootstrap_session.h
+@@ -62,21 +62,6 @@ namespace tserver {
+ 
+ class TabletPeerLookupIf;
+ 
+-// Caches file size and holds a shared_ptr reference to a RandomAccessFile.
+-// Assumes that the file underlying the RandomAccessFile is immutable.
+-struct ImmutableRandomAccessFileInfo {
+-  std::shared_ptr<RandomAccessFile> readable;
+-  int64_t size;
+-
+-  ImmutableRandomAccessFileInfo(std::shared_ptr<RandomAccessFile> readable,
+-                                int64_t size)
+-      : readable(std::move(readable)), size(size) {}
+-
+-  CHECKED_STATUS ReadFully(uint64_t offset, int64_t size, Slice* data, uint8_t* scratch) const {
+-    return env_util::ReadFully(readable.get(), offset, size, data, scratch);
+-  }
+-};
+-
+ // A potential Learner must establish a RemoteBootstrapSession with the leader in order
+ // to fetch the needed superblock, blocks, and log segments.
+ // This class is refcounted to make it easy to remove it from the session map
+@@ -122,7 +107,7 @@ class RemoteBootstrapSession : public RefCountedThreadSafe<RemoteBootstrapSessio
+   // The behavior and params are very similar to GetLogSegmentPiece(), but this one
+   // is only for sending rocksdb files.
+   CHECKED_STATUS GetFilePiece(
+-      const std::string path, const std::string file_name, uint64_t offset, int64_t client_maxlen,
++      const std::string& path, const std::string& file_name, uint64_t offset, int64_t client_maxlen,
+       std::string* data, int64_t* log_file_size, RemoteBootstrapErrorPB::Code* error_code);
+ 
+   MonoTime start_time() { return start_time_; }
+@@ -156,17 +141,11 @@ class RemoteBootstrapSession : public RefCountedThreadSafe<RemoteBootstrapSessio
+   FRIEND_TEST(RemoteBootstrapRocksDBTest, CheckSuperBlockHasRocksDBFields);
+   FRIEND_TEST(RemoteBootstrapRocksDBTest, CheckSuperBlockHasSnapshotFields);
+ 
+-  typedef std::unordered_map<uint64_t, std::unique_ptr<ImmutableRandomAccessFileInfo>> LogMap;
+-
+   virtual ~RemoteBootstrapSession();
+ 
+   // Snapshot the log segment's length and put it into segment map.
+-  CHECKED_STATUS OpenLogSegmentUnlocked(uint64_t segment_seqno);
+-
+-  // Look up log segment in cache or log segment map.
+-  CHECKED_STATUS FindLogSegment(uint64_t segment_seqno,
+-                        ImmutableRandomAccessFileInfo** file_info,
+-                        RemoteBootstrapErrorPB::Code* error_code);
++  CHECKED_STATUS OpenLogSegment(uint64_t segment_seqno, RemoteBootstrapErrorPB::Code* error_code)
++      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+ 
+   // Unregister log anchor, if it's registered.
+   CHECKED_STATUS UnregisterAnchorIfNeededUnlocked();
+@@ -179,9 +158,12 @@ class RemoteBootstrapSession : public RefCountedThreadSafe<RemoteBootstrapSessio
+   const std::string requestor_uuid_;
+   FsManager* const fs_manager_;
+ 
+-  mutable simple_spinlock session_lock_;
++  mutable std::mutex mutex_;
+ 
+-  LogMap logs_;     // Protected by session_lock_.
++  std::shared_ptr<RandomAccessFile> opened_log_segment_file_ GUARDED_BY(mutex_);
++  int64_t opened_log_segment_file_size_ GUARDED_BY(mutex_) = -1;
++  uint64_t opened_log_segment_seqno_ GUARDED_BY(mutex_) = 0;
++  bool opened_log_segment_active_ GUARDED_BY(mutex_) = false;
+ 
+   tablet::RaftGroupReplicaSuperBlockPB tablet_superblock_;
+ 
+@@ -192,10 +174,11 @@ class RemoteBootstrapSession : public RefCountedThreadSafe<RemoteBootstrapSessio
+   log::SegmentSequence log_segments_;
+ 
+   log::LogAnchor log_anchor_;
++  int64_t log_anchor_index_ GUARDED_BY(mutex_) = 0;
+ 
+   // We need to know whether this ended succesfully before changing the peer's member type from
+   // PRE_VOTER to VOTER.
+-  bool succeeded_;
++  bool succeeded_ GUARDED_BY(mutex_) = false;
+ 
+   // Directory where the checkpoint files are stored for this session (only for rocksdb).
+   std::string checkpoint_dir_;
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index 47853ccde7..c7b212e5fb 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -79,6 +79,7 @@
+ #include "yb/tserver/tablet_server.h"
+ 
+ #include "yb/util/background_task.h"
++#include "yb/util/debug/long_operation_tracker.h"
+ #include "yb/util/debug/trace_event.h"
+ #include "yb/util/env.h"
+ #include "yb/util/env_util.h"
+@@ -656,6 +657,8 @@ Status HandleReplacingStaleTablet(
+ }
+ 
+ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB& req) {
++  LongOperationTracker tracker("StartRemoteBootstrap", 5s);
++
+   const string& tablet_id = req.tablet_id();
+   const string& bootstrap_peer_uuid = req.bootstrap_peer_uuid();
+   HostPort bootstrap_peer_addr = HostPortFromPB(DesiredHostPort(
+@@ -762,7 +765,7 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+                                             tablet_peer,
+                                             meta,
+                                             fs_manager_->uuid(),
+-                                            "Remote bootstrap: Failure calling OpenTablet()",
++                                            "Remote bootstrap: OpenTablet() failed",
+                                             this);
+ 
+   auto status = rb_client->VerifyChangeRoleSucceeded(tablet_peer->shared_consensus());
+@@ -776,6 +779,8 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+     LOG(INFO) << kLogPrefix << "Remote bootstrap for tablet ended successfully";
+   }
+ 
++  WARN_NOT_OK(rb_client->Remove(), "Remove remote bootstrap sessions failed");
++
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/yql/redis/redisserver/redisserver-test.cc b/src/yb/yql/redis/redisserver/redisserver-test.cc
+index 34fab3e65d..ed4ed8009d 100644
+--- a/src/yb/yql/redis/redisserver/redisserver-test.cc
++++ b/src/yb/yql/redis/redisserver/redisserver-test.cc
+@@ -714,19 +714,17 @@ class TestRedisService : public RedisTableTestBase {
+   std::vector<uint8_t> resp_;
+   boost::optional<rpc::IoThreadPool> io_thread_pool_;
+   std::shared_ptr<RedisClient> test_client_;
+-  boost::optional<google::FlagSaver> flag_saver_;
+ };
+ 
+ void TestRedisService::SetUp() {
++  FLAGS_redis_service_yb_client_timeout_millis = kDefaultTimeoutMs;
+   if (IsTsan()) {
+-    flag_saver_.emplace();
+     FLAGS_redis_max_value_size = 1_MB;
+     FLAGS_rpc_max_message_size = FLAGS_redis_max_value_size * 4 - 1;
+     FLAGS_redis_max_command_size = FLAGS_rpc_max_message_size - 2_KB;
+     FLAGS_consensus_max_batch_size_bytes = FLAGS_rpc_max_message_size - 2_KB;
+   } else {
+ #ifndef NDEBUG
+-    flag_saver_.emplace();
+     FLAGS_redis_max_value_size = 32_MB;
+     FLAGS_rpc_max_message_size = FLAGS_redis_max_value_size * 4 - 1;
+     FLAGS_redis_max_command_size = FLAGS_rpc_max_message_size - 2_KB;
+@@ -813,8 +811,6 @@ void TestRedisService::TearDown() {
+   CloseRedisClient();
+   StopServer();
+   RedisTableTestBase::TearDown();
+-
+-  flag_saver_.reset();
+ }
+ 
+ Status TestRedisService::Send(const std::string& cmd) {

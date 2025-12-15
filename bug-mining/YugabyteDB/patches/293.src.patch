@@ -1,0 +1,163 @@
+diff --git a/src/yb/consensus/log.cc b/src/yb/consensus/log.cc
+index 0adc7995dd..62d3b73450 100644
+--- a/src/yb/consensus/log.cc
++++ b/src/yb/consensus/log.cc
+@@ -367,7 +367,6 @@ Log::Log(LogOptions options, string log_path,
+       tablet_wal_path_(std::move(tablet_wal_path)),
+       schema_(schema),
+       schema_version_(schema_version),
+-      active_segment_sequence_number_(0),
+       log_state_(kLogInitialized),
+       max_segment_size_(options_.segment_size_bytes),
+       appender_(new Appender(this, append_thread_pool)),
+@@ -409,6 +408,7 @@ Status Log::Init() {
+     vector<scoped_refptr<ReadableLogSegment> > segments;
+     RETURN_NOT_OK(reader_->GetSegmentsSnapshot(&segments));
+     active_segment_sequence_number_ = segments.back()->header().sequence_number();
++    LOG_WITH_PREFIX(INFO) << "Opened existing logs. Last segment is " << segments.back()->path();
+   }
+ 
+   if (durable_wal_write_) {
+@@ -837,6 +837,8 @@ yb::OpId Log::WaitForSafeOpIdToApply(const yb::OpId& min_allowed, MonoDelta dura
+       if (duration) {
+         return yb::OpId();
+       }
++      // TODO(bogdan): If the log is closed at this point, consider refactoring to return status
++      // and fail cleanly.
+       LOG_WITH_PREFIX(DFATAL) << "Long wait for safe op id: " << min_allowed
+                               << ", passed: " << (CoarseMonoClock::Now() - start);
+     }
+@@ -1156,7 +1158,6 @@ Status Log::CreatePlaceholderSegment(const WritableFileOptions& opts,
+ }
+ 
+ uint64_t Log::active_segment_sequence_number() const {
+-  SharedLock<rw_spinlock> read_lock(state_lock_.get_lock());
+   return active_segment_sequence_number_;
+ }
+ 
+diff --git a/src/yb/consensus/log.h b/src/yb/consensus/log.h
+index 476afc5a07..aec147ec02 100644
+--- a/src/yb/consensus/log.h
++++ b/src/yb/consensus/log.h
+@@ -381,7 +381,7 @@ class Log : public RefCountedThreadSafe<Log> {
+   gscoped_ptr<WritableLogSegment> active_segment_;
+ 
+   // The current (active) segment sequence number.
+-  uint64_t active_segment_sequence_number_;
++  std::atomic<uint64_t> active_segment_sequence_number_ = {0};
+ 
+   // The writable file for the next allocated segment
+   std::shared_ptr<WritableFile> next_segment_file_;
+diff --git a/src/yb/master/async_rpc_tasks.cc b/src/yb/master/async_rpc_tasks.cc
+index ebd5536a76..492d5ab146 100644
+--- a/src/yb/master/async_rpc_tasks.cc
++++ b/src/yb/master/async_rpc_tasks.cc
+@@ -123,6 +123,9 @@ Status RetryingTSRpcTask::Run() {
+     UnregisterAsyncTask();  // May delete this.
+     return STATUS(IllegalState, "Unable to run task because it has been aborted");
+   }
++  // TODO(bogdan): There is a race between scheduling and running and can cause this to fail.
++  // Should look into removing the kScheduling state, if not needed, and simplifying the state
++  // transitions!
+   DCHECK(task_state == MonitoredTaskState::kWaiting) << "State: " << ToString(task_state);
+ 
+   const Status s = ResetTSProxy();
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index ff07c216f7..8d889163fa 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -5145,11 +5145,6 @@ void CatalogManager::SendAddServerRequest(
+   Status status = task->Run();
+   WARN_NOT_OK(status, Substitute("Failed to send AddServer of tserver $0 to tablet $1",
+                                  change_config_ts_uuid, tablet.get()->ToString()));
+-
+-  // Need to print this after Run() because that's where it picks the TS which description()
+-  // needs.
+-  if (status.ok())
+-    LOG(INFO) << "Started AddServer task: " << task->description();
+ }
+ 
+ void CatalogManager::GetPendingServerTasksUnlocked(const TableId &table_uuid,
+diff --git a/src/yb/rpc/thread_pool.cc b/src/yb/rpc/thread_pool.cc
+index ce9bb3a12a..1186185a62 100644
+--- a/src/yb/rpc/thread_pool.cc
++++ b/src/yb/rpc/thread_pool.cc
+@@ -181,13 +181,14 @@ class ThreadPool::Impl {
+     }
+     bool added = share_.task_queue.push(task);
+     DCHECK(added); // BasketQueue always succeed.
+-    --adding_;
+     Worker* worker = nullptr;
+     while (share_.waiting_workers.pop(worker)) {
+       if (worker->Notify()) {
++        --adding_;
+         return true;
+       }
+     }
++    --adding_;
+ 
+     // We increment created_workers_ every time, the first max_worker increments would produce
+     // a new worker. And after that, we will just increment it doing nothing after that.
+@@ -221,13 +222,13 @@ class ThreadPool::Impl {
+         worker->Stop();
+       }
+     }
+-    workers_.clear();
+     // Shutdown is quite rare situation otherwise enqueue is quite frequent.
+     // Because of this we use "atomic lock" in enqueue and busy wait in shutdown.
+     // So we could process enqueue quickly, and stuck in shutdown for sometime.
+-    while(adding_ != 0) {
++    while (adding_ != 0) {
+       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+     }
++    workers_.clear();
+     ThreadPoolTask* task = nullptr;
+     while (share_.task_queue.pop(task)) {
+       task->Done(shutdown_status_);
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index f91fd2bedc..bbe9e0569c 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -356,8 +356,11 @@ const consensus::RaftConfigPB TabletPeer::RaftConfig() const {
+ bool TabletPeer::StartShutdown() {
+   LOG_WITH_PREFIX(INFO) << "Initiating TabletPeer shutdown";
+ 
+-  if (tablet_) {
+-    tablet_->SetShutdownRequestedFlag();
++  {
++    std::lock_guard<decltype(lock_)> lock(lock_);
++    if (tablet_) {
++      tablet_->SetShutdownRequestedFlag();
++    }
+   }
+ 
+   {
+@@ -381,8 +384,11 @@ bool TabletPeer::StartShutdown() {
+   // indirectly end up calling into the log, which we are about to shut down.
+   UnregisterMaintenanceOps();
+ 
+-  if (consensus_) {
+-    consensus_->Shutdown();
++  {
++    std::lock_guard<decltype(lock_)> lock(lock_);
++    if (consensus_) {
++      consensus_->Shutdown();
++    }
+   }
+ 
+   return true;
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index fafcc716bb..84f9bddd23 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -894,6 +894,10 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
+   // to check what happens when this server receives raft consensus requests since at this point,
+   // this tablet server could be a voter (if the ChangeRole request in Finish succeeded and its
+   // initial role was PRE_VOTER).
++  //
++  // TODO(bogdan): This leads to a bunch of startup / shutdown race conditions, as this call is not
++  // executed on the thread pool, like the other OpenTablet calls, so on shutdown, it could be
++  // running initialization code for TabletPeer, Raft, Log, etc, which exposes some of these races.
+   OpenTablet(meta, nullptr);
+ 
+   // If OpenTablet fails, tablet_peer->error() will be set.

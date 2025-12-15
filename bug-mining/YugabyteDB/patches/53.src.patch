@@ -1,0 +1,235 @@
+diff --git a/java/yb-jedis-tests/src/test/java/com/yugabyte/jedis/TestReadFromFollowers.java b/java/yb-jedis-tests/src/test/java/com/yugabyte/jedis/TestReadFromFollowers.java
+index f970624dd5..c559535ef5 100644
+--- a/java/yb-jedis-tests/src/test/java/com/yugabyte/jedis/TestReadFromFollowers.java
++++ b/java/yb-jedis-tests/src/test/java/com/yugabyte/jedis/TestReadFromFollowers.java
+@@ -12,6 +12,7 @@
+ //
+ package com.yugabyte.jedis;
+ 
++import com.google.common.net.HostAndPort;
+ import com.google.protobuf.ByteString;
+ import org.apache.commons.text.RandomStringGenerator;
+ import org.junit.Test;
+@@ -23,6 +24,9 @@ import org.yb.Common;
+ import org.yb.YBParameterizedTestRunner;
+ import org.yb.client.*;
+ import org.yb.master.Master;
++import org.yb.minicluster.MiniYBCluster;
++import org.yb.minicluster.MiniYBDaemon;
++
+ import redis.clients.jedis.Jedis;
+ import redis.clients.jedis.YBJedis;
+ import redis.clients.util.JedisClusterCRC16;
+@@ -33,6 +37,7 @@ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.List;
++import java.util.Map;
+ 
+ import static junit.framework.TestCase.*;
+ 
+@@ -83,6 +88,10 @@ public class TestReadFromFollowers extends BaseJedisTest {
+     assertEquals(Common.PartitionSchemaPB.HashSchema.REDIS_HASH_SCHEMA,
+         tableSchema.getPartitionSchema().getHashSchema());
+ 
++    setUpJedisClient();
++  }
++
++  public void setUpJedisClient() throws Exception {
+     // Setup the Jedis client.
+     List<InetSocketAddress> redisContactPoints = miniCluster.getRedisContactPoints();
+ 
+@@ -431,4 +440,96 @@ public class TestReadFromFollowers extends BaseJedisTest {
+       }
+     }
+   }
++
++  @Test
++  public void testRestartDuringFollowerRead() throws Exception {
++    testRestartDuringFollowerReadWithValueSize(10);
++  }
++
++  @Test
++  public void testRestartDuringFollowerReadWithFlushes() throws Exception {
++    testRestartDuringFollowerReadWithValueSize(10240);
++  }
++
++  public void testRestartDuringFollowerReadWithValueSize(int valSize) throws Exception {
++    assertNull(miniCluster);
++
++    // We don't want the tablets to move while we are testing.
++    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
++
++    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=false";
++    List<List<String>> tserverArgs = new ArrayList<List<String>>();
++    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
++    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
++    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
++
++    createMiniCluster(3, masterArgs, tserverArgs);
++
++    // Setup the Jedis client.
++    setUpJedis();
++
++    char[] arr = new char[valSize];
++    Arrays.fill(arr, 'v');
++    String val = new String(arr);
++
++    for (int i = 0; i < 200; i++) {
++      String s = "key-" + i;
++      LOG.info("Inserting key {}", s);
++      assertEquals("OK", jedis_client.set(s, val));
++    }
++    LOG.info("Done loading the data");
++    for (int i = 0; i < 200; i++) {
++      String s = "key-" + i;
++      LOG.info("Reading key {}", s);
++      String value = jedis_client.get(s);
++
++      while (value == null || !value.equals(val)) {
++        // We hope that all the followers have caught up to the updates by now. In case they aren't
++        // we may loop here.
++        LOG.error(String.format("Unexpected: Invalid value %s returned for key %s", value, s));
++
++        value = jedis_client.get(s);
++      }
++    }
++    LOG.info("Done reading the data before restart");
++
++    miniCluster.restart();
++    setUpJedisClient();
++
++    LOG.info("Restarted after loading the data");
++    int missingValues = 0;
++    StringBuilder missing = new StringBuilder();
++    for (int i = 0; i < 200; i++) {
++      String s = "key-" + i;
++      LOG.info("Reading key {}", s);
++      String value;
++      try {
++        value = jedis_client.get(s);
++      } catch (Exception e) {
++        LOG.error("Caught exception while trying to read key " + s, e);
++        i--;  // Retry the same key.
++        continue;
++      }
++      if (value == null || !value.equals(val)) {
++        // If we were able to read the value before the restart, we should be able to
++        // read it after the restart as well. Failure here shall be considered a test failure.
++        LOG.error(String.format("Invalid value %s returned for key %s", value, s));
++        missingValues++;
++        missing.append(s);
++        missing.append(", ");
++      } else {
++        LOG.debug("Read value as expected. After restart.");
++      }
++    }
++    // We may expect upto 1 missing edit/key-value for each tablet.
++    // TODO: Reset this to 0, when we start persisting noops related to commit index advancement.
++    int kMissingAllowed = 24;
++    if (missingValues > kMissingAllowed) {
++      fail(String.format("Missed %d values : %s", missingValues, missing.toString()));
++    } else if (missingValues > 0) {
++      LOG.info(String.format("[OK for now] Missed %d values : %s",
++               missingValues, missing.toString()));
++    }
++    LOG.info("Done reading after restart.");
++  }
+ }
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 346eaeb4bd..54f9694811 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -1454,6 +1454,24 @@ Result<DocDbOpIds> Tablet::MaxPersistentOpId() const {
+   return result;
+ }
+ 
++Result<HybridTime> Tablet::MaxPersistentHybridTime() const {
++  ScopedPendingOperation scoped_read_operation(&pending_op_counter_);
++  RETURN_NOT_OK(scoped_read_operation);
++
++  HybridTime result = HybridTime::kMin;
++  auto temp = regular_db_->GetFlushedFrontier();
++  if (temp) {
++    result.MakeAtLeast(down_cast<docdb::ConsensusFrontier*>(temp.get())->hybrid_time());
++  }
++  if (intents_db_) {
++    temp = intents_db_->GetFlushedFrontier();
++    if (temp) {
++      result.MakeAtLeast(down_cast<docdb::ConsensusFrontier*>(temp.get())->hybrid_time());
++    }
++  }
++  return result;
++}
++
+ Status Tablet::DebugDump(vector<string> *lines) {
+   switch (table_type_) {
+     case TableType::PGSQL_TABLE_TYPE: FALLTHROUGH_INTENDED;
+diff --git a/src/yb/tablet/tablet.h b/src/yb/tablet/tablet.h
+index de78482d29..c06009d4a6 100644
+--- a/src/yb/tablet/tablet.h
++++ b/src/yb/tablet/tablet.h
+@@ -409,6 +409,9 @@ class Tablet : public AbstractTablet, public TransactionIntentApplier {
+   // First for regular records and second for intents.
+   Result<DocDbOpIds> MaxPersistentOpId() const;
+ 
++  // Returns the maximum persistent hybrid_time across all SSTables in RocksDB.
++  Result<HybridTime> MaxPersistentHybridTime() const;
++
+   // Returns the location of the last rocksdb checkpoint. Used for tests only.
+   std::string GetLastRocksDBCheckpointDirForTest() { return last_rocksdb_checkpoint_dir_; }
+ 
+diff --git a/src/yb/tablet/tablet_bootstrap.cc b/src/yb/tablet/tablet_bootstrap.cc
+index a6866ceb45..afab58f375 100644
+--- a/src/yb/tablet/tablet_bootstrap.cc
++++ b/src/yb/tablet/tablet_bootstrap.cc
+@@ -162,7 +162,7 @@ struct ReplayState {
+   // persistent sequence number), we remember the hybrid time of that entry in this field.
+   // We guarantee that we'll either see that entry or a latter entry we know is committed into Raft
+   // during log replay. This is crucial for properly setting safe time at bootstrap.
+-  HybridTime rocksdb_last_entry_hybrid_time = HybridTime::kMin;
++  HybridTime max_committed_hybrid_time = HybridTime::kMin;
+ };
+ 
+ ReplayState::ReplayState(const consensus::OpId& regular_op_id, const consensus::OpId& intents_op_id)
+@@ -551,15 +551,6 @@ Status TabletBootstrap::HandleReplicateMessage(ReplayState* state,
+     //
+     // Also see the other place where we update state->committed_op_id in the end of this function.
+     state->UpdateCommittedOpId(replicate.id());
+-
+-    // We also update the MVCC safe time to make sure this committed entry is visible to readers
+-    // as every committed entry should be. Unlike the committed op id, though, we can't just update
+-    // the safe time here, as this entry could be overwritten by a later entry with a later term but
+-    // an earlier hybrid time (TODO: would that still be possible when we have leader leases?).
+-    // Instead, we only keep the last value of hybrid time of the entry at this index, and update
+-    // safe time based on it in the end. We do require that we keep at least one committed entry
+-    // in the log, though.
+-    state->rocksdb_last_entry_hybrid_time = HybridTime(replicate.hybrid_time());
+   }
+ 
+   // Append the replicate message to the log as is
+@@ -662,6 +653,7 @@ Status TabletBootstrap::HandleEntryPair(ReplayState* state, LogEntryPB* replicat
+           "Failed to play $0 request. ReplicateMsg: { $1 }",
+           OperationType_Name(op_type), *replicate));
+     }
++    state->max_committed_hybrid_time.MakeAtLeast(HybridTime(replicate->hybrid_time()));
+   }
+ 
+   return Status::OK();
+@@ -701,6 +693,7 @@ Status TabletBootstrap::PlaySegments(ConsensusBootstrapInfo* consensus_info) {
+   intents_op_id.set_term(flushed_op_id.intents.term);
+   intents_op_id.set_index(flushed_op_id.intents.index);
+   ReplayState state(regular_op_id, intents_op_id);
++  state.max_committed_hybrid_time = VERIFY_RESULT(tablet_->MaxPersistentHybridTime());
+ 
+   LOG_WITH_PREFIX(INFO) << "Max persistent index in RocksDB's SSTables before bootstrap: "
+                         << state.regular_stored_op_id.ShortDebugString() << "/"
+@@ -772,7 +765,7 @@ Status TabletBootstrap::PlaySegments(ConsensusBootstrapInfo* consensus_info) {
+       << "Last: " << state.prev_op_id.ShortDebugString()
+       << ", committed: " << state.committed_op_id;
+ 
+-  tablet_->mvcc_manager()->SetLastReplicated(state.rocksdb_last_entry_hybrid_time);
++  tablet_->mvcc_manager()->SetLastReplicated(state.max_committed_hybrid_time);
+   consensus_info->last_id = state.prev_op_id;
+   consensus_info->last_committed_id = state.committed_op_id;
+ 

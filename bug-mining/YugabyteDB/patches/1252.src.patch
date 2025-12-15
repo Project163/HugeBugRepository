@@ -1,0 +1,192 @@
+diff --git a/src/yb/cdc/cdc_service.cc b/src/yb/cdc/cdc_service.cc
+index 6c630a9451..faa80f7557 100644
+--- a/src/yb/cdc/cdc_service.cc
++++ b/src/yb/cdc/cdc_service.cc
+@@ -2120,6 +2120,7 @@ void CDCServiceImpl::ProcessMetricsForEmptyChildrenTablets(
+ void CDCServiceImpl::UpdateMetrics() {
+   auto tablet_checkpoints = impl_->TabletCheckpointsCopy();
+   TabletInfoToLastReplicationTimeMap cdc_state_tablets_to_last_replication_time;
++  std::unordered_set<TabletStreamInfo, TabletStreamInfo::Hash> expired_entries;
+   EmptyChildrenTabletMap empty_children_tablets;
+ 
+   Status iteration_status;
+@@ -2167,6 +2168,11 @@ void CDCServiceImpl::UpdateMetrics() {
+     bool is_leader = (tablet_peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY);
+ 
+     if (record.GetSourceType() == CDCSDK) {
++      if (entry.active_time.has_value() &&
++          CheckTabletExpiredOrNotOfInterest(tablet_info, *entry.active_time)) {
++        expired_entries.insert(tablet_info);
++        continue;
++      }
+       auto tablet_metric_result = GetCDCSDKTabletMetrics(
+           *tablet_peer.get(), tablet_info.stream_id, CreateMetricsEntityIfNotFound::kTrue,
+           record.GetReplicationSlotName());
+@@ -2280,7 +2286,8 @@ void CDCServiceImpl::UpdateMetrics() {
+   // longer replicating.
+   for (const auto& checkpoint : tablet_checkpoints) {
+     const TabletStreamInfo& tablet_info = checkpoint.producer_tablet_info;
+-    if (!cdc_state_tablets_to_last_replication_time.contains(tablet_info)) {
++    if (!cdc_state_tablets_to_last_replication_time.contains(tablet_info) ||
++        expired_entries.contains(tablet_info)) {
+       // We're no longer replicating this tablet, so set lag to 0.
+       auto tablet_peer = context_->LookupTablet(checkpoint.tablet_id());
+       if (!tablet_peer) {
+@@ -4037,6 +4044,25 @@ Status CDCServiceImpl::CheckTabletNotOfInterest(
+       producer_tablet.tablet_id);
+ }
+ 
++bool CDCServiceImpl::CheckTabletExpiredOrNotOfInterest(
++    const TabletStreamInfo& producer_tablet, int64_t last_active_time_passed) {
++  auto s = CheckStreamActive(producer_tablet, last_active_time_passed);
++  if (!s.ok()) {
++    VLOG(3) << "Tablet: " << producer_tablet.tablet_id
++            << " expired for stream: " << producer_tablet.stream_id;
++    return true;
++  }
++
++  s = CheckTabletNotOfInterest(producer_tablet, last_active_time_passed);
++  if (!s.ok()) {
++    VLOG(3) << "Tablet: " << producer_tablet.tablet_id
++            << " is not of interest for stream: " << producer_tablet.stream_id;
++    return true;
++  }
++
++  return false;
++}
++
+ Result<int64_t> CDCServiceImpl::GetLastActiveTime(
+     const TabletStreamInfo& producer_tablet, bool ignore_cache) {
+   DCHECK(producer_tablet.stream_id && !producer_tablet.tablet_id.empty());
+diff --git a/src/yb/cdc/cdc_service.h b/src/yb/cdc/cdc_service.h
+index 01f823e4cb..0ef4c68c9d 100644
+--- a/src/yb/cdc/cdc_service.h
++++ b/src/yb/cdc/cdc_service.h
+@@ -309,6 +309,9 @@ class CDCServiceImpl : public CDCServiceIf {
+       const TabletStreamInfo& producer_tablet, int64_t last_active_time_passed = 0,
+       bool deletion_check = false);
+ 
++  bool CheckTabletExpiredOrNotOfInterest(
++      const TabletStreamInfo& producer_tablet, int64_t last_active_time_passed);
++
+   Result<int64_t> GetLastActiveTime(
+       const TabletStreamInfo& producer_tablet, bool ignore_cache = false);
+ 
+diff --git a/src/yb/integration-tests/cdcsdk_ysql-test.cc b/src/yb/integration-tests/cdcsdk_ysql-test.cc
+index 1dd7b6b072..d486387651 100644
+--- a/src/yb/integration-tests/cdcsdk_ysql-test.cc
++++ b/src/yb/integration-tests/cdcsdk_ysql-test.cc
+@@ -4486,6 +4486,100 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestCDCSDKMetricsWithAddStream))
+   ASSERT_LT(current_traffic_sent_bytes, new_metrics->cdcsdk_traffic_sent->value());
+ }
+ 
++void CDCSDKYsqlTest::TestLagMetricWithConsistentSnapshotStream(bool expire_table) {
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_update_metrics_interval_ms) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_update_min_cdc_indices_interval_secs) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_state_checkpoint_update_interval_ms) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_cdc_consistent_snapshot_streams) = true;
++  ASSERT_OK(SetUpWithParams(1, 1, false));
++
++  const uint32_t num_tablets = 1;
++  const uint32_t num_tables = 2;
++  vector<string> table_suffix = {"_1", "_2"};
++
++  vector<YBTableName> table(num_tables);
++  vector<google::protobuf::RepeatedPtrField<master::TabletLocationsPB>> tablets(num_tables);
++  vector<TableId> table_id(num_tables);
++
++  // Create two tables.
++  for (uint32_t idx = 0; idx < num_tables; idx++) {
++    table[idx] = ASSERT_RESULT(
++        CreateTable(&test_cluster_, kNamespaceName, kTableName + table_suffix[idx], num_tablets));
++
++    ASSERT_OK(test_client()->GetTablets(
++        table[idx], 0, &tablets[idx],
++        /* partition_list_version =*/nullptr));
++    ASSERT_EQ(tablets[idx].size(), num_tablets);
++
++    table_id[idx] =
++        ASSERT_RESULT(GetTableId(&test_cluster_, kNamespaceName, kTableName + table_suffix[idx]));
++  }
++
++  // Creat a consistent snapshot stream.
++  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStream());
++
++  ASSERT_OK(
++      WriteRowsHelper(1, 50, &test_cluster_, true, 2, (kTableName + table_suffix[0]).c_str()));
++
++  const auto& tserver = test_cluster()->mini_tablet_server(0)->server();
++  auto cdc_service = CDCService(tserver);
++
++  ASSERT_OK(WaitFor(
++      [&]() { return cdc_service->CDCEnabled(); }, MonoDelta::FromSeconds(30), "IsCDCEnabled"));
++
++  auto change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets[0]));
++  ASSERT_GE(change_resp.cdc_sdk_proto_records_size(), 50);
++  change_resp =
++      ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets[0], &change_resp.cdc_sdk_checkpoint()));
++
++  // Since GetChanges has consumed everything, the lag should be zero.
++  for (uint32_t idx = 0; idx < num_tables; idx++) {
++    ASSERT_OK(WaitFor(
++        [&]() -> Result<bool> {
++          auto metrics = VERIFY_RESULT(
++              GetCDCSDKTabletMetrics(*cdc_service, tablets[idx][0].tablet_id(), stream_id));
++          return metrics->cdcsdk_sent_lag_micros->value() == 0;
++        },
++        MonoDelta::FromSeconds(10) * kTimeMultiplier, "Timed out waiting for lag to be = 0"));
++  }
++
++  // Insert some records in second table.
++  ASSERT_OK(
++      WriteRowsHelper(1, 50, &test_cluster_, true, 2, (kTableName + table_suffix[1]).c_str()));
++
++  // Since this table is not being polled, lag will rise up for it.
++  ASSERT_OK(WaitFor(
++      [&]() -> Result<bool> {
++        auto metrics = VERIFY_RESULT(
++            GetCDCSDKTabletMetrics(*cdc_service, tablets[1][0].tablet_id(), stream_id));
++        return metrics->cdcsdk_sent_lag_micros->value() > 0;
++      },
++      MonoDelta::FromSeconds(10) * kTimeMultiplier, "Timed out waiting for lag to be > 0"));
++
++  if (expire_table) {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_intent_retention_ms) = 0;
++  } else {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdcsdk_tablet_not_of_interest_timeout_secs) = 0;
++  }
++
++  // As the table has expired / become not of interest, its lag should go down to zero.
++  ASSERT_OK(WaitFor(
++      [&]() -> Result<bool> {
++        auto metrics = VERIFY_RESULT(
++            GetCDCSDKTabletMetrics(*cdc_service, tablets[1][0].tablet_id(), stream_id));
++        return metrics->cdcsdk_sent_lag_micros->value() == 0;
++      },
++      MonoDelta::FromSeconds(10) * kTimeMultiplier, "Timed out waiting for lag to be = 0"));
++}
++
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestLagMetricWithNotOfInterestTableAndCSStream)) {
++  TestLagMetricWithConsistentSnapshotStream(false);
++}
++
++TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestLagMetricWithExpiredTableAndCSStream)) {
++    TestLagMetricWithConsistentSnapshotStream(true);
++}
++
+ TEST_F(
+     CDCSDKYsqlTest,
+     YB_DISABLE_TEST_IN_TSAN(TestCDCSDKAddColumnsWithImplictTransactionWithoutPackedRow)) {
+diff --git a/src/yb/integration-tests/cdcsdk_ysql_test_base.h b/src/yb/integration-tests/cdcsdk_ysql_test_base.h
+index b642ee1e06..0ced571654 100644
+--- a/src/yb/integration-tests/cdcsdk_ysql_test_base.h
++++ b/src/yb/integration-tests/cdcsdk_ysql_test_base.h
+@@ -850,6 +850,8 @@ class CDCSDKYsqlTest : public CDCSDKTestBase {
+   Status GetIntentEntriesAndSSTFileCountForTablet(
+       const TabletId& tablet_id, std::unordered_map<std::string, std::pair<int64_t, int64_t>>*
+                                         initial_intents_and_intent_sst_file_count);
++
++  void TestLagMetricWithConsistentSnapshotStream(bool expire_table);
+ };
+ 
+ }  // namespace cdc

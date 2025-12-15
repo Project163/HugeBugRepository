@@ -1,0 +1,182 @@
+diff --git a/src/yb/tablet/operations/operation_driver.h b/src/yb/tablet/operations/operation_driver.h
+index 7ef01450ec..c3933239c9 100644
+--- a/src/yb/tablet/operations/operation_driver.h
++++ b/src/yb/tablet/operations/operation_driver.h
+@@ -41,6 +41,7 @@
+ #include "yb/common/common_types.pb.h"
+ 
+ #include "yb/consensus/log_fwd.h"
++#include "yb/consensus/consensus.pb.h"
+ #include "yb/consensus/consensus_round.h"
+ 
+ #include "yb/gutil/ref_counted.h"
+@@ -204,6 +205,12 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
+ 
+   int64_t SpaceUsed();
+ 
++  size_t ReplicateMsgSize() {
++    return consensus_round() && consensus_round()->replicate_msg()
++               ? consensus_round()->replicate_msg()->ByteSizeLong()
++               : 0;
++  }
++
+  private:
+   friend class RefCountedThreadSafe<OperationDriver>;
+   enum ReplicationState {
+diff --git a/src/yb/tablet/preparer.cc b/src/yb/tablet/preparer.cc
+index 1d9cce066b..d9e393a7bf 100644
+--- a/src/yb/tablet/preparer.cc
++++ b/src/yb/tablet/preparer.cc
+@@ -39,10 +39,14 @@
+ DEFINE_uint64(max_group_replicate_batch_size, 16,
+               "Maximum number of operations to submit to consensus for replication in a batch.");
+ 
++DEFINE_double(estimated_replicate_msg_size_percentage, 0.95,
++              "The estimated percentage of replicate message size in a log entry batch.");
++
+ DEFINE_test_flag(int32, preparer_batch_inject_latency_ms, 0,
+                  "Inject latency before replicating batch.");
+ 
+ DECLARE_int32(protobuf_message_total_bytes_limit);
++DECLARE_uint64(rpc_max_message_size);
+ 
+ using namespace std::literals;
+ using std::vector;
+@@ -109,6 +113,7 @@ class PreparerImpl {
+   OperationDrivers leader_side_batch_;
+   size_t leader_side_batch_size_estimate_ = 0;
+   const size_t leader_side_batch_size_limit_;
++  const size_t leader_side_single_op_size_limit_;
+ 
+   std::unique_ptr<ThreadPoolToken> tablet_prepare_pool_token_;
+ 
+@@ -120,6 +125,8 @@ class PreparerImpl {
+ 
+   void ProcessAndClearLeaderSideBatch();
+ 
++  void ProcessFailedItem(OperationDriver* item, Status status);
++
+   // A wrapper around ProcessAndClearLeaderSideBatch that assumes we are currently holding the
+   // mutex.
+ 
+@@ -130,7 +137,10 @@ class PreparerImpl {
+ PreparerImpl::PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool)
+     : consensus_(consensus),
+       // Reserve 5% for other LogEntryBatchPB fields in case of big batches.
+-      leader_side_batch_size_limit_(FLAGS_protobuf_message_total_bytes_limit * 0.95),
++      leader_side_batch_size_limit_(
++          FLAGS_protobuf_message_total_bytes_limit * FLAGS_estimated_replicate_msg_size_percentage),
++      leader_side_single_op_size_limit_(
++          FLAGS_rpc_max_message_size * FLAGS_estimated_replicate_msg_size_percentage),
+       tablet_prepare_pool_token_(tablet_prepare_pool
+                                      ->NewToken(ThreadPool::ExecutionMode::SERIAL)) {
+ }
+@@ -259,10 +269,19 @@ void PreparerImpl::ProcessItem(OperationDriver* item) {
+   const bool apply_separately = ShouldApplySeparately(operation_type);
+   const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
+ 
+-  const auto item_replicate_msg_size =
+-      item->consensus_round() && item->consensus_round()->replicate_msg()
+-          ? item->consensus_round()->replicate_msg()->ByteSizeLong()
+-          : 0;
++  const auto item_replicate_msg_size = item->ReplicateMsgSize();
++  // The item size exceeds size limit, we cannot handle it.
++  if (item_replicate_msg_size > leader_side_single_op_size_limit_) {
++    ProcessAndClearLeaderSideBatch();
++    ProcessFailedItem(
++        item,
++        STATUS_FORMAT(
++            InvalidArgument,
++            "Operation replicate msg size ($0) exceeds limit of leader side single op size ($1)",
++            item_replicate_msg_size,
++            leader_side_single_op_size_limit_));
++    return;
++  }
+   // Don't add more than the max number of operations to a batch, and also don't add
+   // operations bound to different terms, so as not to fail unrelated operations
+   // unnecessarily in case of a bound term mismatch.
+@@ -279,6 +298,16 @@ void PreparerImpl::ProcessItem(OperationDriver* item) {
+   }
+ }
+ 
++void PreparerImpl::ProcessFailedItem(OperationDriver* item, Status status) {
++  DCHECK_EQ(leader_side_batch_.size(), 0);
++  Status s = item->PrepareAndStart();
++  if (s.ok()) {
++    item->consensus_round()->NotifyReplicationFailed(status);
++  } else {
++    item->HandleFailure(s);
++  }
++}
++
+ void PreparerImpl::ProcessAndClearLeaderSideBatch() {
+   if (leader_side_batch_.empty()) {
+     return;
+diff --git a/src/yb/tablet/tablet_peer-test.cc b/src/yb/tablet/tablet_peer-test.cc
+index 1bb33a3615..e08200a977 100644
+--- a/src/yb/tablet/tablet_peer-test.cc
++++ b/src/yb/tablet/tablet_peer-test.cc
+@@ -81,6 +81,7 @@ DECLARE_int32(log_min_seconds_to_retain);
+ DECLARE_uint64(log_segment_size_bytes);
+ DECLARE_uint64(max_group_replicate_batch_size);
+ DECLARE_int32(protobuf_message_total_bytes_limit);
++DECLARE_uint64(rpc_max_message_size);
+ 
+ DECLARE_bool(quick_leader_election_on_create);
+ 
+@@ -465,12 +466,14 @@ class TabletPeerProtofBufSizeLimitTest : public TabletPeerTest {
+  public:
+   TabletPeerProtofBufSizeLimitTest() : TabletPeerTest(GetSimpleTestSchema()) {
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_protobuf_message_total_bytes_limit) = kProtobufSizeLimit;
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_max_message_size) = kMaxRpcMsgSize;
+     // Avoid unnecessary log segments rolling.
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_initial_log_segment_size_bytes) = kProtobufSizeLimit * 2;
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_segment_size_bytes) = kProtobufSizeLimit * 2;
+   }
+ 
+   static constexpr auto kProtobufSizeLimit = 10_MB;
++  static constexpr auto kMaxRpcMsgSize = kProtobufSizeLimit / 2;
+ };
+ 
+ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimitTest) {
+@@ -548,5 +551,40 @@ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimi
+   }
+ }
+ 
++TEST_F_EX(TabletPeerTest, SingleOpExceedsRpcMsgLimit, TabletPeerProtofBufSizeLimitTest) {
++  // Make sure batch of kNumOps operations is larger than kMaxRpcMsgSize to test limit overflow.
++  constexpr auto kValueSize = kMaxRpcMsgSize * 11 / 10;
++
++  ConsensusBootstrapInfo info;
++  ASSERT_OK(StartPeer(info));
++
++  std::string value(kValueSize, 'X');
++
++  WriteRequestPB req;
++  WriteResponsePB resp;
++  std::vector<std::unique_ptr<WriteQuery>> queries;
++  queries.reserve(1);
++  CountDownLatch latch(1);
++
++  auto* const tablet_peer = tablet_peer_.get();
++
++  req.set_tablet_id(tablet()->tablet_id());
++  AddTestRowInsert(1, 1, value, &req);
++  auto query = std::make_unique<WriteQuery>(
++      /* leader_term = */ 1, CoarseTimePoint::max(), tablet_peer, tablet_peer->tablet(), &resp);
++      query->set_client_request(req);
++      query->set_callback([&latch, &resp](const Status& status) {
++        if (!status.ok()) {
++        StatusToPB(status, resp.mutable_error()->mutable_status());
++      }
++      latch.CountDown();
++  });
++
++  tablet_peer->WriteAsync(std::move(query));
++  latch.Wait();
++
++  ASSERT_TRUE(resp.has_error()) << "\n Response:\n" << resp.DebugString();
++}
++
+ } // namespace tablet
+ } // namespace yb

@@ -1,0 +1,167 @@
+diff --git a/src/yb/cdc/cdc_service.cc b/src/yb/cdc/cdc_service.cc
+index 6ab71620a5..21beace0b8 100644
+--- a/src/yb/cdc/cdc_service.cc
++++ b/src/yb/cdc/cdc_service.cc
+@@ -2824,17 +2824,29 @@ Result<bool> CDCServiceImpl::CheckBeforeImageActive(
+   bool is_before_image_active = false;
+   if (FLAGS_ysql_yb_enable_replica_identity && IsReplicationSlotStream(stream_metadata)) {
+     auto replica_identity_map = stream_metadata.GetReplicaIdentities();
++    bool is_colocated_tablet = tablet_peer->tablet_metadata()->colocated();
++    bool is_sys_catalog_tablet = tablet_peer->tablet_metadata()->IsSysCatalog();
++
+     // If the tablet is colocated, we check the replica identities of all the tables residing in it.
+-    // If before image is active for any one of the tables then we should return true
+-    if (tablet_peer->tablet_metadata()->colocated()) {
++    // If the tablet is sys catalog, we check the replica identities of only tables
++    // 'pg_publication_rel' & 'pg_class' residing in it (This is because currently only these sys
++    // catalog tables are part of publication's table list).
++    // If before image is active for any such tables then we should return true.
++    if (is_colocated_tablet || is_sys_catalog_tablet) {
+       auto table_ids = tablet_peer->tablet_metadata()->GetAllColocatedTables();
+       for (auto table_id : table_ids) {
+         auto table_name = tablet_peer->tablet_metadata()->table_name(table_id);
+-        if ((boost::ends_with(table_name, kTablegroupParentTableNameSuffix) ||
++        if (is_colocated_tablet &&
++            (boost::ends_with(table_name, kTablegroupParentTableNameSuffix) ||
+              boost::ends_with(table_name, kColocationParentTableNameSuffix))) {
+           continue;
+         }
+ 
++        if (is_sys_catalog_tablet &&
++            !VERIFY_RESULT(IsStreamableCatalogTable(table_id, stream_metadata.GetNamespaceId()))) {
++          continue;
++        }
++
+         if (replica_identity_map.find(table_id) != replica_identity_map.end()) {
+           auto table_replica_identity = replica_identity_map.at(table_id);
+           if (table_replica_identity != PgReplicaIdentity::CHANGE &&
+@@ -4531,6 +4543,21 @@ bool CDCServiceImpl::IsCDCSDKSnapshotBootstrapRequest(const CDCSDKCheckpointPB&
+   return req_checkpoint.write_id() == -1 && req_checkpoint.key().empty();
+ }
+ 
++Result<std::vector<TableId>> CDCServiceImpl::GetStreamableCatalogTables(
++    const NamespaceId& namespace_id) {
++  std::vector<TableId> table_ids;
++  auto pg_database_oid = VERIFY_RESULT(GetPgsqlDatabaseOid(namespace_id));
++  table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgClassTableOid));
++  table_ids.push_back(GetPgsqlTableId(pg_database_oid, kPgPublicationRelOid));
++  return table_ids;
++}
++
++Result<bool> CDCServiceImpl::IsStreamableCatalogTable(
++    const TableId& table_id, const NamespaceId& namespace_id) {
++  auto catalog_tables = VERIFY_RESULT(GetStreamableCatalogTables(namespace_id));
++  return std::find(catalog_tables.begin(), catalog_tables.end(), table_id) != catalog_tables.end();
++}
++
+ Status CDCServiceImpl::InsertRowForColocatedTableInCDCStateTable(
+     const TabletStreamInfo& producer_tablet, const TableId& colocated_table_id,
+     const OpId& commit_op_id, const std::optional<HybridTime>& cdc_sdk_safe_time) {
+diff --git a/src/yb/cdc/cdc_service.h b/src/yb/cdc/cdc_service.h
+index fbd8002fa7..6bdbb98ac3 100644
+--- a/src/yb/cdc/cdc_service.h
++++ b/src/yb/cdc/cdc_service.h
+@@ -297,6 +297,16 @@ class CDCServiceImpl : public CDCServiceIf {
+ 
+   static bool IsCDCSDKSnapshotBootstrapRequest(const CDCSDKCheckpointPB& req_checkpoint);
+ 
++  // Returns a list of catalog tables which gets streamed. (Currently 'pg_publication_rel' &
++  // 'pg_class' are the only catalog tables which gets streamed).
++  // 'namespace_id' is the id of namespace on which stream was created.
++  static Result<std::vector<TableId>> GetStreamableCatalogTables(const NamespaceId& namespace_id);
++
++  // Returns true if the given table is one of the catalog table which gets streamed.
++  // 'namespace_id' is the id of namespace on which stream was created.
++  static Result<bool> IsStreamableCatalogTable(
++      const TableId& table_id, const NamespaceId& namespace_id);
++
+   // Sets paused producer XCluster streams.
+   void SetPausedXClusterProducerStreams(
+       const ::google::protobuf::Map<std::string, bool>& paused_producer_stream_ids,
+diff --git a/src/yb/integration-tests/cdcsdk_test_base.cc b/src/yb/integration-tests/cdcsdk_test_base.cc
+index 1b99971473..fb0a10a78c 100644
+--- a/src/yb/integration-tests/cdcsdk_test_base.cc
++++ b/src/yb/integration-tests/cdcsdk_test_base.cc
+@@ -558,7 +558,7 @@ Result<std::string> CDCSDKTestBase::HybridTimeToReadableString(uint64_t hybrid_t
+ }
+ 
+ Result<GetChangesResponsePB> CDCSDKTestBase::GetChangesFromMaster(
+-    const xrepl::StreamId& stream_id) {
++    const xrepl::StreamId& stream_id, const CDCSDKCheckpointPB* explicit_checkpoint) {
+   GetChangesRequestPB change_req;
+   GetChangesResponsePB change_resp;
+   change_req.set_stream_id(stream_id.ToString());
+@@ -570,6 +570,15 @@ Result<GetChangesResponsePB> CDCSDKTestBase::GetChangesFromMaster(
+   rpc::RpcController change_rpc;
+   change_rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_write_rpc_timeout_ms));
+ 
++  if (explicit_checkpoint != nullptr) {
++    change_req.mutable_explicit_cdc_sdk_checkpoint()->set_term(explicit_checkpoint->term());
++    change_req.mutable_explicit_cdc_sdk_checkpoint()->set_index(explicit_checkpoint->index());
++    change_req.mutable_explicit_cdc_sdk_checkpoint()->set_key(explicit_checkpoint->key());
++    change_req.mutable_explicit_cdc_sdk_checkpoint()->set_write_id(explicit_checkpoint->write_id());
++    change_req.mutable_explicit_cdc_sdk_checkpoint()->set_snapshot_time(
++        explicit_checkpoint->snapshot_time());
++  }
++
+   // Create CDC service proxy to master.
+   CDCServiceProxy master_proxy(
+       &test_client()->proxy_cache(),
+diff --git a/src/yb/integration-tests/cdcsdk_test_base.h b/src/yb/integration-tests/cdcsdk_test_base.h
+index 3e42861772..b4a1e0546a 100644
+--- a/src/yb/integration-tests/cdcsdk_test_base.h
++++ b/src/yb/integration-tests/cdcsdk_test_base.h
+@@ -258,7 +258,8 @@ class CDCSDKTestBase : public YBTest {
+ 
+   Result<std::string> HybridTimeToReadableString(uint64_t hybrid_time);
+ 
+-  Result<GetChangesResponsePB> GetChangesFromMaster(const xrepl::StreamId& stream_id);
++  Result<GetChangesResponsePB> GetChangesFromMaster(
++      const xrepl::StreamId& stream_id, const CDCSDKCheckpointPB* explicit_checkpoint = nullptr);
+ 
+  protected:
+   // Every test needs to initialize this cdc_proxy_.
+diff --git a/src/yb/integration-tests/cdcsdk_ysql-test.cc b/src/yb/integration-tests/cdcsdk_ysql-test.cc
+index 6fe3d74bef..a4db7deda3 100644
+--- a/src/yb/integration-tests/cdcsdk_ysql-test.cc
++++ b/src/yb/integration-tests/cdcsdk_ysql-test.cc
+@@ -12564,5 +12564,39 @@ TEST_F(CDCSDKYsqlTest, TestNoLossFromActiveSegmentWithApproachingDeadline) {
+   ASSERT_EQ(change_resp.cdc_sdk_proto_records_size(), 4);
+ }
+ 
++TEST_F(CDCSDKYsqlTest, TestUPAMMovesRetentionBarriersForCatalogTablet) {
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_enable_cdc_consistent_snapshot_streams) = true;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_update_min_cdc_indices_master_interval_secs) = 1;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_state_checkpoint_update_interval_ms) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdcsdk_retention_barrier_no_revision_interval_secs) = 0;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_intent_retention_ms) = 5000;
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_yb_enable_implicit_dynamic_tables_logical_replication) =
++      true;
++
++  ASSERT_OK(SetUpWithParams(
++      1 /* rf */, 1 /* num_masters */, false /* colocated */,
++      true /* cdc_populate_safepoint_record */));
++
++  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStreamWithReplicationSlot());
++
++  ASSERT_RESULT(CreateTable(&test_cluster_, kNamespaceName, kTableName, 1 /* num_tablets */));
++
++  // Call GetChanges on Master a few times to keep the stream active. The UpdatePeersAndMetrics
++  // running on master should not expire the tablet checkpoint.
++  GetChangesResponsePB change_resp;
++  const CDCSDKCheckpointPB* explicit_checkpoint = &CDCSDKCheckpointPB::default_instance();
++  for (int i = 0; i < 5; i++) {
++    change_resp = ASSERT_RESULT(GetChangesFromMaster(stream_id, explicit_checkpoint));
++    ASSERT_FALSE(change_resp.has_error());
++    explicit_checkpoint = &change_resp.cdc_sdk_checkpoint();
++
++    SleepFor(MonoDelta::FromSeconds(2));
++  }
++
++  auto tablet_peer_ptr = ASSERT_NOTNULL(test_cluster_.mini_cluster_->mini_master()->tablet_peer());
++  // Checking that UpdatePeersAndMetrics has not expired the tablet checkpoint.
++  ASSERT_NE(tablet_peer_ptr->GetLatestCheckPoint(), OpId::Max());
++}
++
+ }  // namespace cdc
+ }  // namespace yb

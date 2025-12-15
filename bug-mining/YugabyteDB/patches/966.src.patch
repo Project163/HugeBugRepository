@@ -1,0 +1,1290 @@
+diff --git a/src/yb/client/async_rpc.cc b/src/yb/client/async_rpc.cc
+index 7874cb2f72..6eb64227c4 100644
+--- a/src/yb/client/async_rpc.cc
++++ b/src/yb/client/async_rpc.cc
+@@ -569,6 +569,10 @@ WriteRpc::WriteRpc(const AsyncRpcData& data)
+   VLOG(3) << "Created batch for " << data.tablet->tablet_id() << ":\n"
+           << req_.ShortDebugString();
+ 
++  if (batcher_->GetLeaderTerm() != OpId::kUnknownTerm) {
++    req_.set_leader_term(batcher_->GetLeaderTerm());
++  }
++
+   const auto& client_id = batcher_->client_id();
+   if (!client_id.IsNil() && FLAGS_detect_duplicates_for_retryable_requests) {
+     auto temp = client_id.ToUInt64Pair();
+diff --git a/src/yb/client/batcher.cc b/src/yb/client/batcher.cc
+index 7167c4248c..103a567d33 100644
+--- a/src/yb/client/batcher.cc
++++ b/src/yb/client/batcher.cc
+@@ -117,18 +117,20 @@ const auto kGeneralErrorStatus = STATUS(IOError, Batcher::kErrorReachingOutToTSe
+ // locks are non-reentrant).
+ // ------------------------------------------------------------
+ 
+-Batcher::Batcher(YBClient* client,
+-                 const YBSessionPtr& session,
+-                 YBTransactionPtr transaction,
+-                 ConsistentReadPoint* read_point,
+-                 bool force_consistent_read)
+-  : client_(client),
+-    weak_session_(session),
+-    async_rpc_metrics_(session->async_rpc_metrics()),
+-    transaction_(std::move(transaction)),
+-    read_point_(read_point),
+-    force_consistent_read_(force_consistent_read) {
+-}
++Batcher::Batcher(
++    YBClient* client,
++    const YBSessionPtr& session,
++    YBTransactionPtr transaction,
++    ConsistentReadPoint* read_point,
++    bool force_consistent_read,
++    int64_t leader_term)
++    : client_(client),
++      weak_session_(session),
++      async_rpc_metrics_(session->async_rpc_metrics()),
++      transaction_(std::move(transaction)),
++      read_point_(read_point),
++      force_consistent_read_(force_consistent_read),
++      leader_term_(leader_term) {}
+ 
+ Batcher::~Batcher() {
+   LOG_IF_WITH_PREFIX(DFATAL, outstanding_rpcs_ != 0)
+@@ -554,8 +556,8 @@ void Batcher::ExecuteOperations(Initial initial) {
+     // Allow local calls for last group only.
+     const auto allow_local_calls =
+         allow_local_calls_in_curr_thread_ && (&group == &ops_info_.groups.back());
+-    rpcs.push_back(CreateRpc(
+-        self, group.begin->tablet.get(), group, allow_local_calls, need_consistent_read));
++    rpcs.push_back(
++        CreateRpc(self, group.begin->tablet.get(), group, allow_local_calls, need_consistent_read));
+   }
+ 
+   outstanding_rpcs_.store(rpcs.size());
+@@ -615,12 +617,12 @@ std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
+   // levels the read algorithm would differ.
+   const auto op_group = (*group.begin).yb_op->group();
+   AsyncRpcData data {
+-    .batcher = self,
+-    .tablet = tablet,
+-    .allow_local_calls_in_curr_thread = allow_local_calls_in_curr_thread,
+-    .need_consistent_read = need_consistent_read,
+-    .ops = InFlightOps(group.begin, group.end),
+-    .need_metadata = group.need_metadata
++      .batcher = self,
++      .tablet = tablet,
++      .allow_local_calls_in_curr_thread = allow_local_calls_in_curr_thread,
++      .need_consistent_read = need_consistent_read,
++      .ops = InFlightOps(group.begin, group.end),
++      .need_metadata = group.need_metadata
+   };
+ 
+   switch (op_group) {
+diff --git a/src/yb/client/batcher.h b/src/yb/client/batcher.h
+index 66ec2f1952..38656c461a 100644
+--- a/src/yb/client/batcher.h
++++ b/src/yb/client/batcher.h
+@@ -49,6 +49,7 @@
+ #include "yb/util/async_util.h"
+ #include "yb/util/atomic.h"
+ #include "yb/util/locks.h"
++#include "yb/util/opid.h"
+ #include "yb/util/status_fwd.h"
+ #include "yb/util/threadpool.h"
+ 
+@@ -149,11 +150,13 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+   // Create a new batcher associated with the given session.
+   //
+   // Creates a weak_ptr to 'session'.
+-  Batcher(YBClient* client,
+-          const YBSessionPtr& session,
+-          YBTransactionPtr transaction,
+-          ConsistentReadPoint* read_point,
+-          bool force_consistent_read);
++  Batcher(
++      YBClient* client,
++      const YBSessionPtr& session,
++      YBTransactionPtr transaction,
++      ConsistentReadPoint* read_point,
++      bool force_consistent_read,
++      int64_t leader_term_);
+   ~Batcher();
+ 
+   // Set the timeout for this batcher.
+@@ -247,6 +250,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+ 
+   std::string LogPrefix() const;
+ 
++  int64_t GetLeaderTerm() const { return leader_term_; }
++
+   // This is a status error string used when there are multiple errors that need to be fetched
+   // from the error collector.
+   static const std::string kErrorReachingOutToTServersMsg;
+@@ -349,6 +354,8 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
+   // running requests.
+   std::set<RetryableRequestId> retryable_request_ids_;
+ 
++  const int64_t leader_term_;
++
+   DISALLOW_COPY_AND_ASSIGN(Batcher);
+ };
+ 
+diff --git a/src/yb/client/session.cc b/src/yb/client/session.cc
+index 02a0e759a2..e759437182 100644
+--- a/src/yb/client/session.cc
++++ b/src/yb/client/session.cc
+@@ -134,7 +134,7 @@ namespace {
+ internal::BatcherPtr CreateBatcher(const YBSession::BatcherConfig& config) {
+   auto batcher = std::make_shared<internal::Batcher>(
+       config.client, config.session.lock(), config.transaction, config.read_point(),
+-      config.force_consistent_read);
++      config.force_consistent_read, config.leader_term);
+   batcher->SetRejectionScoreSource(config.rejection_score_source);
+   return batcher;
+ }
+diff --git a/src/yb/client/session.h b/src/yb/client/session.h
+index 74b8d9d1f0..e376f31bec 100644
+--- a/src/yb/client/session.h
++++ b/src/yb/client/session.h
+@@ -24,6 +24,7 @@
+ 
+ #include "yb/util/locks.h"
+ #include "yb/util/monotime.h"
++#include "yb/util/opid.h"
+ 
+ namespace yb {
+ 
+@@ -234,6 +235,8 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
+ 
+   void SetRejectionScoreSource(RejectionScoreSourcePtr rejection_score_source);
+ 
++  void SetLeaderTerm(int64_t leader_term) { batcher_config_.leader_term = leader_term; }
++
+   struct BatcherConfig {
+     std::weak_ptr<YBSession> session;
+     client::YBClient* client;
+@@ -242,6 +245,7 @@ class YBSession : public std::enable_shared_from_this<YBSession> {
+     bool allow_local_calls_in_curr_thread = true;
+     bool force_consistent_read = false;
+     RejectionScoreSourcePtr rejection_score_source;
++    int64_t leader_term = OpId::kUnknownTerm;
+ 
+     ConsistentReadPoint* read_point() const;
+   };
+diff --git a/src/yb/client/stateful_services/stateful_service_client_base.cc b/src/yb/client/stateful_services/stateful_service_client_base.cc
+index ed7a70f90b..bf8e7b0e2e 100644
+--- a/src/yb/client/stateful_services/stateful_service_client_base.cc
++++ b/src/yb/client/stateful_services/stateful_service_client_base.cc
+@@ -21,6 +21,7 @@
+ #include "yb/client/client-internal.h"
+ #include "yb/util/backoff_waiter.h"
+ #include "yb/util/status_format.h"
++#include "yb/util/sync_point.h"
+ 
+ DECLARE_bool(TEST_running_test);
+ DECLARE_string(certs_dir);
+@@ -121,8 +122,15 @@ Status StatefulServiceClientBase::InvokeRpcSync(
+     std::function<Status(rpc::ProxyBase*, rpc::RpcController*)>
+         rpc_func) {
+   CoarseBackoffWaiter waiter(deadline, 1s /* max_wait */, 100ms /* base_delay */);
++
++#ifndef NDEBUG
++  uint64 attempts = 0;
++#endif
+   bool first_run = true;
+   while (true) {
++#ifndef NDEBUG
++    ++attempts;
++#endif
+     if (!first_run) {
+       SCHECK(
+           waiter.Wait(), TimedOut, "RPC call to $0 timed out after $1 attempt(s)", service_name_,
+@@ -162,10 +170,19 @@ Status StatefulServiceClientBase::InvokeRpcSync(
+       }
+     }
+ 
++    TEST_SYNC_POINT_CALLBACK("StatefulServiceClientBase::InvokeRpcSync", &attempts);
+     return status;
+   }
+ }
+ 
++Status StatefulServiceClientBase::InvokeRpcSync(
++    const MonoDelta& timeout,
++    std::function<rpc::ProxyBase*(rpc::ProxyCache*, const HostPort&)> make_proxy,
++    std::function<Status(rpc::ProxyBase*, rpc::RpcController*)> rpc_func) {
++return InvokeRpcSync(
++    CoarseMonoClock::Now() + timeout, std::move(make_proxy), std::move(rpc_func));
++}
++
+ void StatefulServiceClientBase::ResetServiceLocation() {
+   std::lock_guard lock(mutex_);
+   service_hp_.reset();
+diff --git a/src/yb/client/stateful_services/stateful_service_client_base.h b/src/yb/client/stateful_services/stateful_service_client_base.h
+index 409bbed4ca..c39e029f22 100644
+--- a/src/yb/client/stateful_services/stateful_service_client_base.h
++++ b/src/yb/client/stateful_services/stateful_service_client_base.h
+@@ -34,22 +34,27 @@ class TabletServer;
+ namespace client {
+ 
+ #define STATEFUL_SERVICE_RPC(r, service, method_name) \
+-  inline Status method_name( \
+-      CoarseTimePoint deadline, \
++  template <typename T> \
++  inline Result<stateful_service::BOOST_PP_CAT(method_name, ResponsePB)> method_name( \
+       const stateful_service::BOOST_PP_CAT(method_name, RequestPB) & req, \
+-      stateful_service::BOOST_PP_CAT(method_name, ResponsePB) * resp) { \
+-    return InvokeRpcSync( \
+-        deadline, \
++      const T& deadline_or_timeout) { \
++    stateful_service::BOOST_PP_CAT(method_name, ResponsePB) resp; \
++    RETURN_NOT_OK(InvokeRpcSync( \
++        deadline_or_timeout, \
+         [](rpc::ProxyCache* cache, const HostPort& hp) { \
+           return new stateful_service::BOOST_PP_CAT(service, ServiceProxy)(cache, hp); \
+         }, \
+-        [&req, &resp, this](rpc::ProxyBase* proxy, rpc::RpcController* controller) { \
++        [&req, resp_ptr = &resp, this](rpc::ProxyBase* proxy, rpc::RpcController* controller) { \
+           auto status = static_cast<stateful_service::BOOST_PP_CAT(service, ServiceProxy)*>(proxy) \
+-                            ->method_name(req, resp, controller); \
+-          return ExtractStatus(status, *resp); \
+-        }); \
++                            ->method_name(req, resp_ptr, controller); \
++          return ExtractStatus(status, *resp_ptr); \
++        })); \
++    return resp; \
+   }
+ 
++// Creates functions with these signature:
++// Result<[RpcMethod]ResponsePB> [RpcMethod](const CoarseTimePoint&, const [RpcMethod]RequestPB&);
++// Result<[RpcMethod]ResponsePB> [RpcMethod](const MonoDelta&, const [RpcMethod]RequestPB&);
+ #define STATEFUL_SERVICE_RPCS(service, methods) \
+   BOOST_PP_SEQ_FOR_EACH(STATEFUL_SERVICE_RPC, service, methods)
+ 
+@@ -71,6 +76,11 @@ class StatefulServiceClientBase {
+       std::function<rpc::ProxyBase*(rpc::ProxyCache*, const HostPort&)> make_proxy,
+       std::function<Status(rpc::ProxyBase*, rpc::RpcController*)> rpc_func);
+ 
++  Status InvokeRpcSync(
++      const MonoDelta& timeout,
++      std::function<rpc::ProxyBase*(rpc::ProxyCache*, const HostPort&)> make_proxy,
++      std::function<Status(rpc::ProxyBase*, rpc::RpcController*)> rpc_func);
++
+  protected:
+   template <class RespClass>
+   Status ExtractStatus(const Status& rpc_status, const RespClass& resp) {
+diff --git a/src/yb/client/stateful_services/test_echo_service_client.h b/src/yb/client/stateful_services/test_echo_service_client.h
+index 70063de148..63feab6c84 100644
+--- a/src/yb/client/stateful_services/test_echo_service_client.h
++++ b/src/yb/client/stateful_services/test_echo_service_client.h
+@@ -24,7 +24,7 @@ class TestEchoServiceClient : public StatefulServiceClientBase {
+  public:
+   TestEchoServiceClient();
+ 
+-  STATEFUL_SERVICE_RPCS(TestEcho, (GetEcho));
++  STATEFUL_SERVICE_RPCS(TestEcho, (GetEcho)(GetEchoCount));
+ };
+ }  // namespace client
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 700c7002db..7aa374853c 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -995,6 +995,21 @@ tserver::MiniTabletServer* GetLeaderForTablet(MiniCluster* cluster, const std::s
+   return nullptr;
+ }
+ 
++Result<tablet::TabletPeerPtr> GetLeaderPeerForTablet(
++    MiniCluster* cluster, const std::string& tablet_id) {
++  auto leaders = ListTabletPeers(cluster, [&tablet_id](const auto& peer) {
++    auto consensus = peer->shared_consensus();
++    return tablet_id == peer->tablet_id() && consensus &&
++           consensus->GetLeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
++  });
++
++  SCHECK_EQ(
++      leaders.size(), 1, IllegalState,
++      Format("Expected exactly one leader for tablet $0", tablet_id));
++
++  return std::move(leaders[0]);
++}
++
+ Result<std::vector<tablet::TabletPeerPtr>> WaitForTableActiveTabletLeadersPeers(
+     MiniCluster* cluster, const TableId& table_id,
+     const size_t num_active_leaders, const MonoDelta timeout) {
+@@ -1041,35 +1056,35 @@ Status WaitForLeaderOfSingleTablet(
+   }, duration, description);
+ }
+ 
+-Status StepDown(
+-    tablet::TabletPeerPtr leader, const std::string& new_leader_uuid,
+-    ForceStepDown force_step_down) {
+-  consensus::LeaderStepDownRequestPB req;
+-  req.set_tablet_id(leader->tablet_id());
+-  req.set_new_leader_uuid(new_leader_uuid);
+-  if (force_step_down) {
++  Status StepDown(
++      tablet::TabletPeerPtr leader, const std::string& new_leader_uuid,
++      ForceStepDown force_step_down) {
++    consensus::LeaderStepDownRequestPB req;
++    req.set_tablet_id(leader->tablet_id());
++    req.set_new_leader_uuid(new_leader_uuid);
++    if (force_step_down) {
+     req.set_force_step_down(true);
+-  }
+-  consensus::LeaderStepDownResponsePB resp;
+-  RETURN_NOT_OK(leader->consensus()->StepDown(&req, &resp));
+-  if (resp.has_error()) {
++    }
++    consensus::LeaderStepDownResponsePB resp;
++    RETURN_NOT_OK(leader->consensus()->StepDown(&req, &resp));
++    if (resp.has_error()) {
+     return STATUS_FORMAT(RuntimeError, "Step down failed: $0", resp);
+-  }
+-  return Status::OK();
+-}
+-
+-std::thread RestartsThread(
+-    MiniCluster* cluster, CoarseDuration interval, std::atomic<bool>* stop_flag) {
+-  return std::thread([cluster, interval, stop_flag] {
+-    CDSAttacher attacher;
+-    SetFlagOnExit set_stop_on_exit(stop_flag);
+-    int it = 0;
+-    while (!stop_flag->load(std::memory_order_acquire)) {
+-      std::this_thread::sleep_for(interval);
+-      ASSERT_OK(cluster->mini_tablet_server(++it % cluster->num_tablet_servers())->Restart());
+     }
+-  });
+-}
++    return Status::OK();
++  }
++
++  std::thread RestartsThread(
++      MiniCluster* cluster, CoarseDuration interval, std::atomic<bool>* stop_flag) {
++    return std::thread([cluster, interval, stop_flag] {
++      CDSAttacher attacher;
++      SetFlagOnExit set_stop_on_exit(stop_flag);
++      int it = 0;
++      while (!stop_flag->load(std::memory_order_acquire)) {
++        std::this_thread::sleep_for(interval);
++        ASSERT_OK(cluster->mini_tablet_server(++it % cluster->num_tablet_servers())->Restart());
++      }
++    });
++  }
+ 
+ Status WaitAllReplicasReady(MiniCluster* cluster, MonoDelta timeout) {
+   return WaitAllReplicasRunning(
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 6a5f6cd131..c15248f7d0 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -308,6 +308,8 @@ std::vector<tablet::TabletPeerPtr> ListTableInactiveSplitTabletPeers(
+     MiniCluster* cluster, const TableId& table_id);
+ 
+ tserver::MiniTabletServer* GetLeaderForTablet(MiniCluster* cluster, const std::string& tablet_id);
++Result<tablet::TabletPeerPtr> GetLeaderPeerForTablet(
++    MiniCluster* cluster, const std::string& tablet_id);
+ 
+ std::vector<tablet::TabletPeerPtr> ListActiveTabletLeadersPeers(
+     MiniCluster* cluster);
+diff --git a/src/yb/integration-tests/stateful_services/stateful_service-itest.cc b/src/yb/integration-tests/stateful_services/stateful_service-itest.cc
+index c90286cb2c..c854d43236 100644
+--- a/src/yb/integration-tests/stateful_services/stateful_service-itest.cc
++++ b/src/yb/integration-tests/stateful_services/stateful_service-itest.cc
+@@ -12,31 +12,34 @@
+ //
+ 
+ #include <chrono>
++
++#include "yb/client/client-internal.h"
+ #include "yb/client/session.h"
+ #include "yb/client/stateful_services/test_echo_service_client.h"
+ #include "yb/client/table_handle.h"
+ #include "yb/client/yb_table_name.h"
+-#include "yb/client/client-internal.h"
+ #include "yb/integration-tests/cluster_itest_util.h"
+ #include "yb/integration-tests/mini_cluster.h"
+ #include "yb/integration-tests/yb_mini_cluster_test_base.h"
+ #include "yb/master/catalog_manager.h"
+-#include "yb/master/master.h"
+ #include "yb/master/master_cluster.proxy.h"
++#include "yb/master/master_defaults.h"
++#include "yb/master/master.h"
+ #include "yb/master/mini_master.h"
+-#include "yb/tablet/tablet.h"
+ #include "yb/tablet/tablet_metadata.h"
++#include "yb/tablet/tablet.h"
+ #include "yb/tserver/mini_tablet_server.h"
++#include "yb/tserver/service_util.h"
+ #include "yb/tserver/stateful_services/stateful_service_base.h"
+-#include "yb/util/backoff_waiter.h"
+-#include "yb/util/monotime.h"
+-#include "yb/master/master_defaults.h"
+ #include "yb/tserver/tablet_server.h"
+-#include "yb/tserver/service_util.h"
++#include "yb/util/monotime.h"
++#include "yb/util/sync_point.h"
++#include "yb/util/test_thread_holder.h"
+ 
+ DECLARE_int32(follower_unavailable_considered_failed_sec);
+ DECLARE_bool(TEST_echo_service_enabled);
+ DECLARE_string(vmodule);
++DECLARE_bool(TEST_combine_batcher_errors);
+ 
+ namespace yb {
+ 
+@@ -46,6 +49,7 @@ const int kNumMasterServers = 3;
+ const int kNumTServers = 3;
+ const client::YBTableName service_table_name =
+     stateful_service::GetStatefulServiceTableName(StatefulServiceKind::TEST_ECHO);
++const Status kUninitializedStatus = STATUS(IllegalState, "Uninitialized");
+ 
+ class StatefulServiceTest : public MiniClusterTestWithClient<MiniCluster> {
+  public:
+@@ -102,8 +106,6 @@ TEST_F(StatefulServiceTest, TestRemoteBootstrap) {
+   auto t_server = cluster_->mini_tablet_server(0);
+   t_server->Shutdown();
+ 
+-  SleepFor(FLAGS_follower_unavailable_considered_failed_sec * 2s);
+-
+   // Wait till the peer is removed from quorum.
+   itest::TServerDetails* leader_ts = nullptr;
+   ASSERT_OK(FindTabletLeader(ts_map, tablet_id_, kTimeout, &leader_ts));
+@@ -219,31 +221,33 @@ TEST_F(StatefulServiceTest, TestEchoService) {
+   std::shared_ptr<client::YBSession> session = client_->NewSession();
+   session->SetTimeout(kTimeout);
+ 
+-  stateful_service::GetEchoRequestPB req;
+-  stateful_service::GetEchoResponsePB resp;
++  stateful_service::GetEchoRequestPB echo_req;
++  stateful_service::GetEchoCountRequestPB count_req;
+   auto message = "Hello World!";
+-  req.set_message(message);
++  echo_req.set_message(message);
+ 
+-  ASSERT_OK(service_client->GetEcho(CoarseMonoClock::Now() + kTimeout, req, &resp));
++  auto echo_resp = ASSERT_RESULT(service_client->GetEcho(echo_req, kTimeout));
+ 
+-  ASSERT_EQ(resp.message(), "Hello World! World! World!");
+-  auto initial_node_id = resp.node_id();
++  ASSERT_EQ(echo_resp.message(), "Hello World! World! World!");
++  auto initial_node_id = echo_resp.node_id();
+ 
+   // Make sure the tablet leader is the one serving the request.
+   auto initial_leader = GetLeaderForTablet(cluster_.get(), tablet_id_);
+   auto initial_leader_uuid = initial_leader->server()->permanent_uuid();
+-  ASSERT_EQ(resp.node_id(), initial_leader_uuid);
++  ASSERT_EQ(echo_resp.node_id(), initial_leader_uuid);
+   ASSERT_OK(ValidateRowsFromServiceTable(*service_table, 1, message, initial_leader_uuid));
+ 
++  auto count_resp = ASSERT_RESULT(service_client->GetEchoCount(count_req, kTimeout));
++  ASSERT_EQ(count_resp.count(), 1);
++
+   initial_leader->Shutdown();
+ 
+-  resp.Clear();
+   message = "Hungry shark doo";
+-  req.set_message(message);
+-  ASSERT_OK(service_client->GetEcho(CoarseMonoClock::Now() + kTimeout, req, &resp));
++  echo_req.set_message(message);
++  echo_resp = ASSERT_RESULT(service_client->GetEcho(echo_req, CoarseMonoClock::Now() + kTimeout));
+ 
+-  ASSERT_EQ(resp.message(), "Hungry shark doo doo doo");
+-  ASSERT_NE(resp.node_id(), initial_leader_uuid);
++  ASSERT_EQ(echo_resp.message(), "Hungry shark doo doo doo");
++  ASSERT_NE(echo_resp.node_id(), initial_leader_uuid);
+ 
+   ASSERT_OK(WaitFor(
+       [&]() -> Result<bool> {
+@@ -257,19 +261,155 @@ TEST_F(StatefulServiceTest, TestEchoService) {
+   auto final_leader = GetLeaderForTablet(cluster_.get(), tablet_id_);
+   auto final_leader_uuid = final_leader->server()->permanent_uuid();
+   ASSERT_NE(final_leader_uuid, initial_leader_uuid);
++
+   // We cannot test ValidateRowsFromServiceTable as we dont know which leader which processed the
+   // request. Load balancer could have moved the leader before we can find it.
++  count_resp = ASSERT_RESULT(service_client->GetEchoCount(count_req, kTimeout));
++  ASSERT_EQ(count_resp.count(), 2);
+ 
+-  resp.Clear();
+   message = "Anybody there?";
+-  req.set_message(message);
+-  ASSERT_OK(service_client->GetEcho(CoarseMonoClock::Now() + kTimeout, req, &resp));
++  echo_req.set_message(message);
++  echo_resp = ASSERT_RESULT(service_client->GetEcho(echo_req, kTimeout));
+ 
+   // Make sure the new tablet leader is the one serving the request.
+-  ASSERT_EQ(resp.message(), "Anybody there? there? there?");
+-  ASSERT_EQ(resp.node_id(), final_leader_uuid);
++  ASSERT_EQ(echo_resp.message(), "Anybody there? there? there?");
++  ASSERT_EQ(echo_resp.node_id(), final_leader_uuid);
+   ASSERT_OK(ValidateRowsFromServiceTable(*service_table, 3, message, final_leader_uuid));
+ 
++  count_resp = ASSERT_RESULT(service_client->GetEchoCount(count_req, kTimeout));
++  ASSERT_EQ(count_resp.count(), 3);
++
+   ASSERT_OK(initial_leader->Start());
+ }
++
++// The below tests use SyncPoint so can only run in DEBUG mode.
++#ifndef NDEBUG
++TEST_F(StatefulServiceTest, TestLeadershipChange) {
++  // If the tablet leader changes in the middle of a RPC, but after the write then the RPC should
++  // still fail. The StatefulServiceClient should retry the RPC on the new leader such that the
++  // client is unaware of the leader change.
++  // Note: This will lead to double write in our TestEchoService. If this behavior is undesirable
++  // then the RPC should be made idempotent using things like primary keys, or persisting request
++  // ids to check for duplicates. This is the standard behavior when writing to any database. We
++  // should always be prepared to get a failure during the commit due to process crashes or network
++  // failures. We don't know if the commit succeeded or not, so we either need to read and check the
++  // committed data, or make the operation idempotent.
++
++  // This is needed for the Batcher to propagate back the errors to the caller.
++  FLAGS_TEST_combine_batcher_errors = true;
++
++  auto service_client =
++      ASSERT_RESULT(cluster_->CreateStatefulServiceClient<client::TestEchoServiceClient>());
++  auto service_table = std::make_unique<client::TableHandle>();
++  ASSERT_OK(service_table->Open(service_table_name, client_.get()));
++
++  stateful_service::GetEchoCountRequestPB count_req;
++  stateful_service::GetEchoCountResponsePB count_resp;
++  count_resp = ASSERT_RESULT(service_client->GetEchoCount(count_req, kTimeout));
++  ASSERT_EQ(count_resp.count(), 0);
++
++  yb::SyncPoint::GetInstance()->LoadDependency(
++      {{"StatefulRpcServiceBase::HandleRpcRequestWithTermCheck::AfterMethodImpl1",
++        "StatefulServiceTest::TestLeadershipChange::BeforeLeaderChange"},
++       {"StatefulServiceTest::TestLeadershipChange::AfterLeaderChange",
++        "StatefulRpcServiceBase::HandleRpcRequestWithTermCheck::AfterMethodImpl2"}});
++
++  uint64 attempts = 0;
++  yb::SyncPoint::GetInstance()->SetCallBack(
++      "StatefulServiceClientBase::InvokeRpcSync",
++      [&attempts](void* data) { attempts += *(reinterpret_cast<decltype(attempts)*>(data)); });
++
++  yb::SyncPoint::GetInstance()->EnableProcessing();
++
++  stateful_service::GetEchoRequestPB echo_req;
++
++  auto leader_peer = ASSERT_RESULT(GetLeaderPeerForTablet(cluster_.get(), tablet_id_));
++
++  const auto message = "Hello World!";
++  echo_req.set_message(message);
++  auto test_thread_holder = TestThreadHolder();
++  Result<stateful_service::GetEchoResponsePB> result = kUninitializedStatus;
++  test_thread_holder.AddThread([&service_client, &echo_req, &result]() {
++    result = service_client->GetEcho(echo_req, kTimeout);
++  });
++
++  TEST_SYNC_POINT("StatefulServiceTest::TestLeadershipChange::BeforeLeaderChange");
++  ASSERT_OK(StepDown(leader_peer, std::string() /* new_leader_uuid */, ForceStepDown::kTrue));
++  TEST_SYNC_POINT("StatefulServiceTest::TestLeadershipChange::AfterLeaderChange");
++
++  test_thread_holder.JoinAll();
++  yb::SyncPoint::GetInstance()->DisableProcessing();
++  ASSERT_OK(result);
++  ASSERT_EQ(result->message(), "Hello World! World! World!");
++
++  // We should fail at least once.
++  ASSERT_GT(attempts, 1);
++
++  // We should have logged to the table twice.
++  count_resp = ASSERT_RESULT(service_client->GetEchoCount(count_req, kTimeout));
++  ASSERT_EQ(count_resp.count(), 2);
++}
++
++TEST_F(StatefulServiceTest, TestWriteDuringLeadershipChange) {
++  // If the tablet leader changes during a write then the write and the inflight RPC should fail.
++  // The StatefulServiceClient should retry the RPC on the new leader such that the client is
++  // unaware of the leader change.
++
++  // This is needed for the Batcher to propagate back the errors to the caller.
++  FLAGS_TEST_combine_batcher_errors = true;
++
++  yb::SyncPoint::GetInstance()->LoadDependency(
++      {{"TestEchoService::RecordRequestInTable::BeforeApply1",
++        "StatefulServiceTest::TestWriteDuringLeadershipChange::BeforeLeaderChange"},
++       {"StatefulServiceTest::TestWriteDuringLeadershipChange::AfterLeaderChange",
++        "TestEchoService::RecordRequestInTable::BeforeApply2"}});
++
++  uint32 count_ok = 0, count_term_err = 0, count_err = 0;
++  yb::SyncPoint::GetInstance()->SetCallBack(
++      "TestEchoService::GetEchoImpl::RecordRequestInTable",
++      [&count_ok, &count_term_err, &count_err](void* data) {
++        Status* status = reinterpret_cast<Status*>(data);
++        if (status->ok()) {
++          ++count_ok;
++        } else if (status->message().Contains("Leader term changed")) {
++          ++count_term_err;
++        } else {
++          LOG(ERROR) << "Unexpected error: " << status->ToString();
++          ++count_err;
++        }
++      });
++  yb::SyncPoint::GetInstance()->EnableProcessing();
++
++  auto service_client =
++      ASSERT_RESULT(cluster_->CreateStatefulServiceClient<client::TestEchoServiceClient>());
++  auto service_table = std::make_unique<client::TableHandle>();
++  ASSERT_OK(service_table->Open(service_table_name, client_.get()));
++
++  stateful_service::GetEchoRequestPB echo_req;
++
++  auto leader_peer = ASSERT_RESULT(GetLeaderPeerForTablet(cluster_.get(), tablet_id_));
++
++  echo_req.set_message("Hello World!");
++  auto test_thread_holder = TestThreadHolder();
++  Result<stateful_service::GetEchoResponsePB> result = kUninitializedStatus;
++  test_thread_holder.AddThread([&service_client, &echo_req, &result]() {
++    result = service_client->GetEcho(echo_req, kTimeout);
++  });
++
++  TEST_SYNC_POINT("StatefulServiceTest::TestWriteDuringLeadershipChange::BeforeLeaderChange");
++  ASSERT_OK(StepDown(leader_peer, std::string() /* new_leader_uuid */, ForceStepDown::kTrue));
++  TEST_SYNC_POINT("StatefulServiceTest::TestWriteDuringLeadershipChange::AfterLeaderChange");
++
++  test_thread_holder.JoinAll();
++  yb::SyncPoint::GetInstance()->DisableProcessing();
++  ASSERT_OK(result);
++  ASSERT_EQ(result->message(), "Hello World! World! World!");
++
++  // We should fail due to the term change exactly once and succeed exactly once.
++  ASSERT_EQ(count_ok, 1);
++  ASSERT_EQ(count_err, 0);
++  ASSERT_EQ(count_term_err, 1);
++}
++#endif
++
+ }  // namespace yb
+diff --git a/src/yb/tserver/pg_table_mutation_count_sender.cc b/src/yb/tserver/pg_table_mutation_count_sender.cc
+index 133622189d..560601d3c2 100644
+--- a/src/yb/tserver/pg_table_mutation_count_sender.cc
++++ b/src/yb/tserver/pg_table_mutation_count_sender.cc
+@@ -84,7 +84,6 @@ Status TableMutationCountSender::DoSendMutationCounts() {
+   }
+ 
+   stateful_service::IncreaseMutationCountersRequestPB req;
+-  stateful_service::IncreaseMutationCountersResponsePB resp;
+ 
+   for (const auto& [table_id, mutation_count] : mutation_counts) {
+     auto table_mutation_count = req.add_table_mutation_counts();
+@@ -92,19 +91,19 @@ Status TableMutationCountSender::DoSendMutationCounts() {
+     table_mutation_count->set_mutation_count(mutation_count);
+   }
+ 
+-  const auto status = client_->IncreaseMutationCounters(
+-      CoarseMonoClock::Now() + FLAGS_yb_client_admin_operation_timeout_sec * 1s, req, &resp);
+-  if (!status.ok()) {
++  const auto result =
++      client_->IncreaseMutationCounters(req, FLAGS_yb_client_admin_operation_timeout_sec * 1s);
++  if (!result) {
+     // It is possible that cluster-level mutation counters were updated but the response failed for
+     // some other reason. In this case, unless we are certain that the cluster-level mutation
+     // counters weren't updated, we avoid retrying to avoid double counting (i.e., we prefer
+     // avoiding over-aggresive auto ANALYZE).
+-    if (status.IsTryAgain()) {
++    if (result.status().IsTryAgain()) {
+       for (const auto& [table_id, mutation_count] : mutation_counts) {
+         server_.GetPgNodeLevelMutationCounter().Increase(table_id, mutation_count);
+       }
+     }
+-    return status;
++    return result.status();
+   }
+ 
+   // TODO: Handle per-table errors. Same as above, retry later if we are certain that the
+diff --git a/src/yb/tserver/stateful_services/pg_auto_analyze_service.cc b/src/yb/tserver/stateful_services/pg_auto_analyze_service.cc
+index 6a925729bf..e8c6193015 100644
+--- a/src/yb/tserver/stateful_services/pg_auto_analyze_service.cc
++++ b/src/yb/tserver/stateful_services/pg_auto_analyze_service.cc
+@@ -23,9 +23,7 @@ PgAutoAnalyzeService::PgAutoAnalyzeService(
+     const std::shared_future<client::YBClient*>& client_future)
+     : StatefulRpcServiceBase(StatefulServiceKind::PG_AUTO_ANALYZE, metric_entity, client_future) {}
+ 
+-void PgAutoAnalyzeService::Activate(const int64_t leader_term) {
+-  LOG(INFO) << "PgAutoAnalyzeService activated on term: " << leader_term;
+-}
++void PgAutoAnalyzeService::Activate() { LOG(INFO) << "PgAutoAnalyzeService activated"; }
+ 
+ void PgAutoAnalyzeService::Deactivate() { LOG(INFO) << "PgAutoAnalyzeService de-activated"; }
+ 
+diff --git a/src/yb/tserver/stateful_services/pg_auto_analyze_service.h b/src/yb/tserver/stateful_services/pg_auto_analyze_service.h
+index b0e655d546..130af940dd 100644
+--- a/src/yb/tserver/stateful_services/pg_auto_analyze_service.h
++++ b/src/yb/tserver/stateful_services/pg_auto_analyze_service.h
+@@ -25,7 +25,7 @@ class PgAutoAnalyzeService : public StatefulRpcServiceBase<PgAutoAnalyzeServiceI
+       const std::shared_future<client::YBClient*>& client_future);
+ 
+  private:
+-  void Activate(const int64_t leader_term) override;
++  void Activate() override;
+   void Deactivate() override;
+   virtual Result<bool> RunPeriodicTask() override;
+ 
+diff --git a/src/yb/tserver/stateful_services/stateful_service_base.cc b/src/yb/tserver/stateful_services/stateful_service_base.cc
+index 9f01537e3b..366f67e044 100644
+--- a/src/yb/tserver/stateful_services/stateful_service_base.cc
++++ b/src/yb/tserver/stateful_services/stateful_service_base.cc
+@@ -15,6 +15,7 @@
+ 
+ #include <chrono>
+ 
++#include "yb/client/session.h"
+ #include "yb/consensus/consensus.h"
+ #include "yb/gutil/bind.h"
+ #include "yb/gutil/bind_helpers.h"
+@@ -130,34 +131,50 @@ void StatefulServiceBase::RaftConfigChangeCallback(TabletPeerPtr peer) {
+   StartPeriodicTaskIfNeeded();
+ }
+ 
++namespace {
++bool* GetThreadLocalIsActivator() {
++  BLOCK_STATIC_THREAD_LOCAL(bool, is_activation_thread, false);
++  return is_activation_thread;
++}
++
++class ScopedSetIsActivatorThread {
++ public:
++  ScopedSetIsActivatorThread() {
++    DCHECK(!*GetThreadLocalIsActivator()) << "Nested activation threads are not supported";
++    *GetThreadLocalIsActivator() = true;
++  }
++  ~ScopedSetIsActivatorThread() { *GetThreadLocalIsActivator() = false; }
++};
++}  // namespace
++
+ bool StatefulServiceBase::IsActive() const {
+-  SharedLock lock(service_state_mutex_);
+-  return leader_term_ != OpId::kUnknownTerm;
++  return !shutdown_ && (is_active_ || *GetThreadLocalIsActivator());
+ }
+ 
+-int64_t StatefulServiceBase::GetLeaderTerm() {
++Result<int64_t> StatefulServiceBase::GetLeaderTerm() {
++  SCHECK(IsActive(), ServiceUnavailable, GetServiceNotActiveErrorStr());
++
+   TabletPeerPtr tablet_peer;
+   int64_t leader_term;
+   {
+     SharedLock lock(service_state_mutex_);
+-    if (leader_term_ == OpId::kUnknownTerm) {
+-      return leader_term_;
+-    }
++
++    SCHECK(leader_term_ != OpId::kUnknownTerm, ServiceUnavailable, GetServiceNotActiveErrorStr());
+     tablet_peer = tablet_peer_;
+     leader_term = leader_term_;
+   }
+ 
+   // Make sure term and lease are still valid.
+-  if (tablet_peer->LeaderTerm() == leader_term) {
+-    return leader_term;
+-  }
++  SCHECK(
++      tablet_peer->LeaderTerm() == leader_term, ServiceUnavailable, GetServiceNotActiveErrorStr());
+ 
+-  return OpId::kUnknownTerm;
++  return leader_term;
+ }
+ 
+ void StatefulServiceBase::DoDeactivate() {
+   {
+     std::lock_guard lock(service_state_mutex_);
++    is_active_ = false;
+     if (leader_term_ == OpId::kUnknownTerm) {
+       return;
+     }
+@@ -165,6 +182,7 @@ void StatefulServiceBase::DoDeactivate() {
+   }
+ 
+   LOG(INFO) << "Deactivating " << ServiceName();
++  DrainForDeactivation();
+   Deactivate();
+ }
+ 
+@@ -202,12 +220,17 @@ void StatefulServiceBase::ActivateOrDeactivateServiceIfNeeded() {
+ 
+   if (new_leader_term != OpId::kUnknownTerm) {
+     LOG(INFO) << "Activating " << ServiceName() << " on term " << new_leader_term;
+-    Activate(new_leader_term);
++    {
++      std::lock_guard lock(service_state_mutex_);
++      leader_term_ = new_leader_term;
++      tablet_peer_ = new_tablet_peer;
++    }
+ 
+-    // Only after Activate completes we can set the leader_term_ and serve user requests.
+-    std::lock_guard lock(service_state_mutex_);
+-    leader_term_ = new_leader_term;
+-    tablet_peer_ = new_tablet_peer;
++    {
++      ScopedSetIsActivatorThread se;
++      Activate();
++    }
++    is_active_ = true;
+   }
+ }
+ 
+@@ -337,6 +360,12 @@ void StatefulServiceBase::ProcessTaskPeriodically() {
+   StartPeriodicTaskIfNeeded();
+ }
+ 
++Result<std::shared_ptr<client::YBSession>> StatefulServiceBase::GetYBSession() {
++  auto session = GetYBClient()->NewSession();
++  session->SetLeaderTerm(VERIFY_RESULT(GetLeaderTerm()));
++  return session;
++}
++
+ Result<client::TableHandle*> StatefulServiceBase::GetServiceTable() {
+   std::lock_guard l(table_handle_mutex_);
+ 
+diff --git a/src/yb/tserver/stateful_services/stateful_service_base.h b/src/yb/tserver/stateful_services/stateful_service_base.h
+index a8d9ffacab..4e54a2bfe8 100644
+--- a/src/yb/tserver/stateful_services/stateful_service_base.h
++++ b/src/yb/tserver/stateful_services/stateful_service_base.h
+@@ -23,6 +23,7 @@
+ #include "yb/tablet/metadata.pb.h"
+ #include "yb/tablet/tablet_peer.h"
+ #include "yb/util/result.h"
++#include "yb/util/sync_point.h"
+ 
+ namespace yb {
+ 
+@@ -44,8 +45,9 @@ namespace stateful_service {
+       BOOST_PP_CAT(method_name, ResponsePB) * resp); \
+   void method_name( \
+       const BOOST_PP_CAT(method_name, RequestPB) * req, \
+-      BOOST_PP_CAT(method_name, ResponsePB) * resp, rpc::RpcContext rpc) override { \
+-    HandleMessageWithTermCheck( \
++      BOOST_PP_CAT(method_name, ResponsePB) * resp, \
++      rpc::RpcContext rpc) override { \
++    HandleRpcRequestWithTermCheck( \
+         resp, &rpc, [req, resp, this]() { return BOOST_PP_CAT(method_name, Impl)(*req, resp); }); \
+   }
+ 
+@@ -69,14 +71,16 @@ class StatefulServiceBase {
+ 
+   const client::YBTableName& TableName() const { return table_name_; }
+ 
+-  bool IsActive() const EXCLUDES(service_state_mutex_);
++  bool IsActive() const;
+ 
+   void StartPeriodicTaskIfNeeded() EXCLUDES(service_state_mutex_);
+ 
+  protected:
+   // Hosting tablet peer has become a leader. RPC messages will only be processed after this
+   // function completes.
+-  virtual void Activate(const int64_t leader_term) = 0;
++  virtual void Activate() = 0;
++
++  virtual void DrainForDeactivation() = 0;
+ 
+   // Hosting tablet peer has stepped down to a follower. Release all resources acquired by the
+   // stateful services and clear in-mem data.
+@@ -91,33 +95,16 @@ class StatefulServiceBase {
+   virtual uint32 PeriodicTaskIntervalMs() const;
+ 
+   // Get the term when we last activated and make sure we still have a valid lease.
+-  int64_t GetLeaderTerm() EXCLUDES(service_state_mutex_);
++  Result<int64_t> GetLeaderTerm() EXCLUDES(service_state_mutex_);
+ 
+-  template <class ResponsePB>
+-  void HandleMessageWithTermCheck(
+-      ResponsePB* resp, rpc::RpcContext* rpc, std::function<Status()> method_impl) {
+-    // Will return a valid term only if we are active and have a valid lease.
+-    const auto term = GetLeaderTerm();
+-    Status status;
+-    if (term != OpId::kUnknownTerm) {
+-      status = method_impl();
+-    }
++  Result<std::shared_ptr<client::YBSession>> GetYBSession();
+ 
+-    // Term should still be valid after the method_impl() call.
+-    if (term == OpId::kUnknownTerm || term != GetLeaderTerm()) {
+-      status = STATUS(ServiceUnavailable, Format(ServiceName() + " is not active on this server"));
+-    }
++  Result<client::TableHandle*> GetServiceTable() EXCLUDES(table_handle_mutex_);
+ 
+-    if (!status.ok()) {
+-      resp->Clear();
+-      StatusToPB(status, resp->mutable_error());
+-    }
+-    rpc->RespondSuccess();
++  std::string GetServiceNotActiveErrorStr() {
++    return Format(ServiceName() + " is not active on this server");
+   }
+ 
+-  std::shared_ptr<client::YBSession> GetYBSession() { return GetYBClient()->NewSession(); }
+-  Result<client::TableHandle*> GetServiceTable() EXCLUDES(table_handle_mutex_);
+-
+  private:
+   void ProcessTaskPeriodically() EXCLUDES(service_state_mutex_);
+   void ActivateOrDeactivateServiceIfNeeded() EXCLUDES(service_state_mutex_);
+@@ -129,6 +116,7 @@ class StatefulServiceBase {
+   const StatefulServiceKind service_kind_;
+ 
+   std::atomic_bool shutdown_ = false;
++  std::atomic_bool is_active_ = false;
+   mutable std::shared_mutex service_state_mutex_;
+   int64_t leader_term_ GUARDED_BY(service_state_mutex_) = OpId::kUnknownTerm;
+   tablet::TabletPeerPtr tablet_peer_ GUARDED_BY(service_state_mutex_);
+@@ -164,6 +152,61 @@ class StatefulRpcServiceBase : public StatefulServiceBase, public RpcServiceIf {
+     RpcServiceIf::Shutdown();
+     StatefulServiceBase::Shutdown();
+   }
++
++ protected:
++  void DrainForDeactivation() override {
++    std::unique_lock lock(rpc_mutex_);
++    while (active_rpcs_.load(std::memory_order_acquire) > 0) {
++      if (no_rpcs_cond_.wait_for(lock, std::chrono::seconds(5)) == std::cv_status::timeout) {
++        LOG(WARNING) << "Waiting for " << active_rpcs_.load(std::memory_order_acquire)
++                     << " active RPC request(s) to finish";
++      }
++    }
++  }
++
++  template <class ResponsePB>
++  void HandleRpcRequestWithTermCheck(
++      ResponsePB* resp, rpc::RpcContext* rpc, std::function<Status()> method_impl) {
++    // Will return a valid term only if we are active and have a valid lease.
++    const auto term_result_begin = GetLeaderTerm();
++    Status status;
++    if (term_result_begin) {
++      active_rpcs_.fetch_add(1, std::memory_order_acq_rel);
++
++      status = method_impl();
++
++      if (active_rpcs_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++        no_rpcs_cond_.notify_all();
++      }
++    }
++
++    TEST_SYNC_POINT("StatefulRpcServiceBase::HandleRpcRequestWithTermCheck::AfterMethodImpl1");
++    TEST_SYNC_POINT("StatefulRpcServiceBase::HandleRpcRequestWithTermCheck::AfterMethodImpl2");
++
++    if (!term_result_begin) {
++      status = std::move(term_result_begin.status());
++    } else {
++      // Status returned by method_impl needs to be overridden if the term has
++      // changed even if it was a bad status.
++      const auto term_result_end = GetLeaderTerm();
++      if (!term_result_end) {
++        status = std::move(term_result_end.status());
++      } else if (*term_result_begin != *term_result_end) {
++        status = STATUS(ServiceUnavailable, GetServiceNotActiveErrorStr());
++      }
++    }
++
++    if (!status.ok()) {
++      resp->Clear();
++      StatusToPB(status, resp->mutable_error());
++    }
++    rpc->RespondSuccess();
++  }
++
++ private:
++  std::mutex rpc_mutex_;
++  std::condition_variable no_rpcs_cond_;
++  std::atomic_uint32_t active_rpcs_ = 0;
+ };
+ 
+ client::YBTableName GetStatefulServiceTableName(const StatefulServiceKind& service_kind);
+diff --git a/src/yb/tserver/stateful_services/test_echo_service.cc b/src/yb/tserver/stateful_services/test_echo_service.cc
+index 2ddcc296ae..49daeb79ea 100644
+--- a/src/yb/tserver/stateful_services/test_echo_service.cc
++++ b/src/yb/tserver/stateful_services/test_echo_service.cc
+@@ -15,8 +15,11 @@
+ #include "yb/client/client.h"
+ #include "yb/client/session.h"
+ #include "yb/client/yb_op.h"
++#include "yb/common/ql_value.h"
+ #include "yb/gutil/walltime.h"
+ #include "yb/master/master_defaults.h"
++#include "yb/util/status_log.h"
++#include "yb/util/sync_point.h"
+ 
+ using namespace std::chrono_literals;
+ 
+@@ -29,25 +32,76 @@ TestEchoService::TestEchoService(
+     : StatefulRpcServiceBase(StatefulServiceKind::TEST_ECHO, metric_entity, client_future),
+       node_uuid_(node_uuid) {}
+ 
+-void TestEchoService::Activate(const int64_t leader_term) {
+-  LOG(INFO) << "Test Echo service activated on term: " << leader_term;
++void TestEchoService::Activate() {
++  LOG(INFO) << "Test Echo service activated";
++  WARN_NOT_OK(ReloadEchoCountFromTable(), "Failed to record to table");
+ }
+ 
+-void TestEchoService::Deactivate() { LOG(INFO) << "Test Echo service de-activated"; }
++void TestEchoService::Deactivate() {
++  echo_count_ = 0;
++  LOG(INFO) << "Test Echo service de-activated";
++}
+ 
+ Result<bool> TestEchoService::RunPeriodicTask() {
+   LOG(INFO) << "Test Echo service Running";
+   return true;
+ }
+ 
++Status TestEchoService::RecordRequestInTable(const std::string& message) {
++  auto* table = VERIFY_RESULT(GetServiceTable());
++
++  const auto op = table->NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
++  auto* const req = op->mutable_request();
++  QLAddTimestampHashValue(req, GetCurrentTimeMicros());
++  table->AddStringColumnValue(req, master::kTestEchoNodeId, node_uuid_);
++  table->AddStringColumnValue(req, master::kTestEchoMessage, message);
++
++  auto session = VERIFY_RESULT(GetYBSession());
++  session->SetTimeout(30s);
++
++  TEST_SYNC_POINT("TestEchoService::RecordRequestInTable::BeforeApply1");
++  TEST_SYNC_POINT("TestEchoService::RecordRequestInTable::BeforeApply2");
++
++  return session->ApplyAndFlushSync(op);
++}
++
++Status TestEchoService::ReloadEchoCountFromTable() {
++  auto* table = VERIFY_RESULT(GetServiceTable());
++
++  Status table_scan_status;
++  client::TableIteratorOptions options;
++  options.error_handler = [&table_scan_status](const Status& status) {
++    table_scan_status = status;
++  };
++
++  uint32 count = 0;
++  Timestamp max_timestamp;
++  for (const auto& row : client::TableRange(*table, options)) {
++    auto timestamp = row.column(master::kTestEchoTimestampIdx).timestamp_value();
++    if (timestamp > max_timestamp) {
++      max_timestamp = timestamp;
++    }
++    count++;
++  }
++  RETURN_NOT_OK(table_scan_status);
++
++  LOG(INFO) << "Echo count: " << count << ", max timestamp: " << max_timestamp.ToFormattedString();
++  echo_count_ = count;
++
++  return Status::OK();
++}
++
+ Status TestEchoService::GetEchoImpl(const GetEchoRequestPB& req, GetEchoResponsePB* resp) {
+   std::string echo = req.message();
+ 
+-  RETURN_NOT_OK(RecordRequestInTable(echo));
++  auto status = RecordRequestInTable(echo);
++  TEST_SYNC_POINT_CALLBACK("TestEchoService::GetEchoImpl::RecordRequestInTable", &status);
++  RETURN_NOT_OK(status);
++  echo_count_++;
+ 
+   // For a string to bounce back and make an echo, there has to be a lot of latency between the
+-  // string source and the thing (wall or mountain or service) that it hits and bounces back. Since
+-  // latency in Yugabyte is very low we need to do some string manipulation instead.
++  // string source and the thing (wall or mountain or service) that it hits and bounces back.
++  // Since latency in Yugabyte is very low we need to do some string manipulation instead.
+   auto loc = echo.find_last_of(' ') + 1;
+   auto last_word = " " + echo.substr(loc, echo.size() - loc);
+   echo.append(last_word).append(last_word);
+@@ -58,18 +112,10 @@ Status TestEchoService::GetEchoImpl(const GetEchoRequestPB& req, GetEchoResponse
+   return Status::OK();
+ }
+ 
+-Status TestEchoService::RecordRequestInTable(const std::string& message) {
+-  auto* table = VERIFY_RESULT(GetServiceTable());
+-
+-  const auto op = table->NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+-  auto* const req = op->mutable_request();
+-  QLAddTimestampHashValue(req, GetCurrentTimeMicros());
+-  table->AddStringColumnValue(req, master::kTestEchoNodeId, node_uuid_);
+-  table->AddStringColumnValue(req, master::kTestEchoMessage, message);
+-
+-  std::shared_ptr<client::YBSession> session = GetYBSession();
+-  session->SetTimeout(30s);
+-  return session->TEST_ApplyAndFlush(op);
++Status TestEchoService::GetEchoCountImpl(
++    const GetEchoCountRequestPB& req, GetEchoCountResponsePB* resp) {
++  resp->set_count(echo_count_);
++  return Status::OK();
+ }
+ 
+ }  // namespace stateful_service
+diff --git a/src/yb/tserver/stateful_services/test_echo_service.h b/src/yb/tserver/stateful_services/test_echo_service.h
+index 4556e00079..38a3508fd4 100644
+--- a/src/yb/tserver/stateful_services/test_echo_service.h
++++ b/src/yb/tserver/stateful_services/test_echo_service.h
+@@ -27,15 +27,17 @@ class TestEchoService : public StatefulRpcServiceBase<TestEchoServiceIf> {
+       const std::shared_future<client::YBClient*>& client_future);
+ 
+  private:
+-  void Activate(const int64_t leader_term) override;
++  void Activate() override;
+   void Deactivate() override;
+   Result<bool> RunPeriodicTask() override;
+   Status RecordRequestInTable(const std::string& message);
++  Status ReloadEchoCountFromTable();
+ 
+-  STATEFUL_SERVICE_IMPL_METHODS((GetEcho));
++  STATEFUL_SERVICE_IMPL_METHODS((GetEcho)(GetEchoCount));
+ 
+  private:
+   const std::string node_uuid_;
++  uint32 echo_count_ = 0;
+ };
+ 
+ }  // namespace stateful_service
+diff --git a/src/yb/tserver/stateful_services/test_echo_service.proto b/src/yb/tserver/stateful_services/test_echo_service.proto
+index fe72579b47..48b0408b02 100644
+--- a/src/yb/tserver/stateful_services/test_echo_service.proto
++++ b/src/yb/tserver/stateful_services/test_echo_service.proto
+@@ -23,6 +23,7 @@ import "yb/common/wire_protocol.proto";
+ 
+ service TestEchoService {
+   rpc GetEcho(GetEchoRequestPB) returns (GetEchoResponsePB);
++  rpc GetEchoCount(GetEchoCountRequestPB) returns (GetEchoCountResponsePB);
+ }
+ 
+ message GetEchoRequestPB { string message = 1; }
+@@ -32,3 +33,10 @@ message GetEchoResponsePB {
+   string message = 2;
+   string node_id = 3;
+ }
++
++message GetEchoCountRequestPB {}
++
++message GetEchoCountResponsePB {
++  AppStatusPB error = 1;
++  int32 count = 2;
++}
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index b72a24d5f2..dc56a9292c 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -336,13 +336,15 @@ class WriteQueryCompletionCallback {
+       WriteResponsePB* response,
+       tablet::WriteQuery* query,
+       const server::ClockPtr& clock,
+-      bool trace = false)
++      bool trace,
++      bool leader_term_set_in_request)
+       : tablet_peer_(std::move(tablet_peer)),
+         context_(std::move(context)),
+         response_(response),
+         query_(query),
+         clock_(clock),
+         include_trace_(trace),
++        leader_term_set_in_request_(leader_term_set_in_request),
+         trace_(include_trace_ ? Trace::CurrentTrace() : nullptr) {}
+ 
+   void operator()(Status status) const {
+@@ -358,6 +360,12 @@ class WriteQueryCompletionCallback {
+     TRACE("Write completing with status $0", yb::ToString(status));
+ 
+     if (!status.ok()) {
++      if (leader_term_set_in_request_ && status.IsAborted() &&
++          status.message().Contains("Operation submitted in term")) {
++        // Return a permanent error since term is set the request.
++        status = STATUS_FORMAT(InvalidArgument, "Leader term changed");
++      }
++
+       LOG(INFO) << tablet_peer_->LogPrefix() << "Write failed: " << status;
+       if (include_trace_ && trace_) {
+         response_->set_trace_buffer(trace_->DumpToString(true));
+@@ -398,6 +406,7 @@ class WriteQueryCompletionCallback {
+   tablet::WriteQuery* const query_;
+   server::ClockPtr clock_;
+   const bool include_trace_;
++  const bool leader_term_set_in_request_;
+   scoped_refptr<Trace> trace_;
+ };
+ 
+@@ -1996,8 +2005,12 @@ Status TabletServiceImpl::PerformWrite(
+ 
+   auto context_ptr = std::make_shared<RpcContext>(std::move(*context));
+ 
++  const auto leader_term = req->has_leader_term() && req->leader_term() != OpId::kUnknownTerm
++                               ? req->leader_term()
++                               : tablet.leader_term;
++
+   auto query = std::make_unique<tablet::WriteQuery>(
+-      tablet.leader_term, context_ptr->GetClientDeadline(), tablet.peer.get(), tablet.tablet,
++      leader_term, context_ptr->GetClientDeadline(), tablet.peer.get(), tablet.tablet,
+       context_ptr.get(), resp);
+   query->set_client_request(*req);
+ 
+@@ -2010,7 +2023,8 @@ Status TabletServiceImpl::PerformWrite(
+   }
+ 
+   query->set_callback(WriteQueryCompletionCallback(
+-      tablet.peer, context_ptr, resp, query.get(), server_->Clock(), req->include_trace()));
++      tablet.peer, context_ptr, resp, query.get(), server_->Clock(), req->include_trace(),
++      req->has_leader_term()));
+ 
+   query->AdjustYsqlQueryTransactionality(req->pgsql_write_batch_size());
+ 
+diff --git a/src/yb/tserver/tserver.proto b/src/yb/tserver/tserver.proto
+index 89b738da97..6ef1114ca7 100644
+--- a/src/yb/tserver/tserver.proto
++++ b/src/yb/tserver/tserver.proto
+@@ -85,6 +85,8 @@ message WriteRequestPB {
+   optional fixed64 external_hybrid_time = 19;
+ 
+   optional uint64 batch_idx = 20;
++
++  optional int64 leader_term = 21;
+ }
+ 
+ message WriteResponsePB {
+diff --git a/src/yb/util/sync_point.cc b/src/yb/util/sync_point.cc
+index c6b38066d6..f36d6f298d 100644
+--- a/src/yb/util/sync_point.cc
++++ b/src/yb/util/sync_point.cc
+@@ -18,6 +18,7 @@
+ // under the License.
+ //
+ 
++#include "yb/util/logging.h"
+ #include "yb/util/sync_point.h"
+ 
+ #ifndef NDEBUG
+@@ -41,6 +42,10 @@ void SyncPoint::LoadDependency(const std::vector<Dependency>& dependencies) {
+ }
+ 
+ bool SyncPoint::PredecessorsAllCleared(const std::string& point) {
++  if (!enabled_) {
++    return true;
++  }
++
+   for (const auto& pred : predecessors_[point]) {
+     if (cleared_points_.count(pred) == 0) {
+       return false;
+@@ -68,8 +73,11 @@ void SyncPoint::EnableProcessing() {
+ }
+ 
+ void SyncPoint::DisableProcessing() {
+-  std::unique_lock lock(mutex_);
+-  enabled_ = false;
++  {
++    std::unique_lock lock(mutex_);
++    enabled_ = false;
++  }
++  cv_.notify_all();
+ }
+ 
+ void SyncPoint::ClearTrace() {
+@@ -92,8 +100,10 @@ void SyncPoint::Process(const std::string& point, void* cb_arg) {
+     cv_.notify_all();
+   }
+ 
+-  while (!PredecessorsAllCleared(point)) {
+-    cv_.wait(lock);
++  if (!PredecessorsAllCleared(point)) {
++    LOG(INFO) << "Entered SyncPoint wait: " << point;
++    cv_.wait(lock, [this, &point]() { return PredecessorsAllCleared(point); });
++    LOG(INFO) << "Leaving SyncPoint wait: " << point;
+   }
+ 
+   cleared_points_.insert(point);

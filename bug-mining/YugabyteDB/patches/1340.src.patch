@@ -1,0 +1,256 @@
+diff --git a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestYsqlMetrics.java b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestYsqlMetrics.java
+index 5b92848085..786845c79c 100644
+--- a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestYsqlMetrics.java
++++ b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestYsqlMetrics.java
+@@ -40,6 +40,10 @@ public class TestYsqlMetrics extends BasePgSQLTest {
+   @Test
+   public void testMetrics() throws Exception {
+     Statement statement = connection.createStatement();
++    // The first DDL that requires table oid allocation will build a hash table
++    // by executing a query SELECT relfilenode FROM pg_class where relfilenode >= 16384.
++    // To avoid this internal query to affect metrics, create a dummy table first.
++    statement.execute("CREATE TABLE dummy_table(id int)");
+ 
+     // DDL is non-txn.
+     // With Ysql Connection Manager, extra SET stmts are being executed which are counted under
+diff --git a/src/postgres/src/backend/catalog/catalog.c b/src/postgres/src/backend/catalog/catalog.c
+index 4fb2ec6826..f63bc9aae0 100644
+--- a/src/postgres/src/backend/catalog/catalog.c
++++ b/src/postgres/src/backend/catalog/catalog.c
+@@ -59,8 +59,10 @@
+ #include "catalog/pg_yb_role_profile.h"
+ #include "catalog/pg_yb_tablegroup.h"
+ #include "commands/defrem.h"
++#include "executor/spi.h"
+ #include "pg_yb_utils.h"
+ #include "utils/lsyscache.h"
++#include "utils/memutils.h"
+ #include "utils/syscache.h"
+ 
+ /*
+@@ -654,6 +656,96 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
+ 	return newOid;
+ }
+ 
++static HTAB *
++YbGetAllRelfilenodes()
++{
++	static HTAB *relfilenode_htab = NULL;
++
++	/* For backward compatibility and Keep unit test happy. */
++	if (!*YBCGetGFlags()->ysql_enable_pg_per_database_oid_allocator)
++		return NULL;
++
++	/*
++	 * For practical purpose, there is no need to refresh the hash table during
++	 * a session. We only need to find out existing relfilenode in pg_class
++	 * before the session starts. After a session starts, a newly allocated OID
++	 * cannot cause collision.
++	 */
++	if (relfilenode_htab)
++		return relfilenode_htab;
++
++	/*
++	 * Connect to SPI manager
++	 */
++	if (SPI_connect() != SPI_OK_CONNECT)
++		elog(ERROR, "SPI_connect failed");
++	char query[100];
++	sprintf(query, "SELECT relfilenode FROM pg_catalog.pg_class WHERE relfilenode >= %u",
++			FirstNormalObjectId);
++	SPIPlanPtr plan = SPI_prepare(query, 0, NULL);
++	if (plan == NULL)
++		elog(ERROR, "SPI_prepare failed for \"%s\"", query);
++
++	int saved_yb_fetch_row_limit = yb_fetch_row_limit;
++	bool saved_yb_is_calling_internal_function_for_ddl = yb_is_calling_internal_function_for_ddl;
++	/*
++	 * We are fetching relfilenode column, each row has only 4-bytes, let's
++	 * fetch 256K rows at a time.
++	 */
++	yb_fetch_row_limit = 1024 * 256;
++	yb_is_calling_internal_function_for_ddl = true;
++	PG_TRY();
++	{
++		int spirc = SPI_execute_plan(plan, NULL, NULL, true, 0);
++		yb_fetch_row_limit = saved_yb_fetch_row_limit;
++		yb_is_calling_internal_function_for_ddl = saved_yb_is_calling_internal_function_for_ddl;
++		if (spirc != SPI_OK_SELECT)
++			elog(ERROR, "failed to get relfilenode tuple");
++		YBC_LOG_INFO("SPI_processed = %lu", SPI_processed);
++	}
++	PG_CATCH();
++	{
++		yb_fetch_row_limit = saved_yb_fetch_row_limit;
++		yb_is_calling_internal_function_for_ddl = saved_yb_is_calling_internal_function_for_ddl;
++		PG_RE_THROW();
++	}
++	PG_END_TRY();
++
++	/* Build a hash table of all the relfilenodes in pg_class. */
++	HASHCTL		ctl;
++	ctl.keysize = sizeof(Oid);
++	ctl.entrysize = sizeof(Oid);
++	ctl.hcxt = CacheMemoryContext;
++	relfilenode_htab = hash_create("relfilenode_htab", 1024, &ctl, HASH_ELEM | HASH_BLOBS);
++	uint64		i;
++	for (i = 0; i < SPI_processed; i++)
++	{
++		bool		isnull;
++		Datum       qdata = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
++		Assert(!isnull);
++		Oid         relfilenode = DatumGetObjectId(qdata);
++		hash_search(relfilenode_htab, &relfilenode, HASH_ENTER, NULL);
++	}
++
++	/*
++	 * Disconnect from SPI manager
++	 */
++	if (SPI_finish() != SPI_OK_FINISH)
++	{
++		hash_destroy(relfilenode_htab);
++		relfilenode_htab = NULL;
++		elog(ERROR, "SPI_finish failed");
++	}
++
++	return relfilenode_htab;
++}
++
++static bool
++YbDoesRelfilenodeExist(HTAB *htab, Oid relfilenode)
++{
++	return htab && hash_search(htab, &relfilenode, HASH_FIND, NULL);
++}
++
+ /*
+  * GetNewRelFileNode
+  *		Generate a new relfilenode number that is unique within the
+@@ -675,6 +767,11 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
+ {
+ 	RelFileNodeBackend rnode;
+ 
++	HTAB *htab = NULL;
++
++	if (IsYugaByteEnabled() && relpersistence != RELPERSISTENCE_TEMP)
++		htab = YbGetAllRelfilenodes();
++
+ 	/*
+ 	 * If we ever get here during pg_upgrade, there's something wrong; all
+ 	 * relfilenode assignments during a binary-upgrade run should be
+@@ -719,7 +816,11 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
+ 			rnode.node.relNode = GetNewObjectId();
+ 
+ 		/* Check for existing file of same name */
+-	} while (DoesRelFileExist(&rnode));
++		/*
++		 * YB: also check for existing relfilenode in the pg_class catalog table.
++		 */
++	} while (DoesRelFileExist(&rnode) ||
++			 YbDoesRelfilenodeExist(htab, rnode.node.relNode));
+ 
+ 	return rnode.node.relNode;
+ }
+diff --git a/src/postgres/src/backend/utils/cache/relcache.c b/src/postgres/src/backend/utils/cache/relcache.c
+index 7e37b9468c..3d2d98d7f7 100644
+--- a/src/postgres/src/backend/utils/cache/relcache.c
++++ b/src/postgres/src/backend/utils/cache/relcache.c
+@@ -5862,26 +5862,11 @@ RelationSetNewRelfilenode(Relation relation, char persistence,
+ 	TransactionId freezeXid = InvalidTransactionId;
+ 	RelFileNode newrnode;
+ 
+-	/*
+-	 * YB Note: this code that opens pg_class table was moved here from below.
+-	 * Get a writable copy of the pg_class tuple for the given relation.
+-	 */
+-	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+-
+ 	if (!IsBinaryUpgrade || yb_binary_restore)
+ 	{
+-		if (IsYugaByteEnabled())
+-			/*
+-			 * In YB, always use pg_class to check for OID collision. During
+-			 * table rewrite a relfilenode is used by DocDB to construct a
+-			 * table id in the same way as a regular table OID.
+-			 */
+-			newrelfilenode = GetNewRelFileNode(relation->rd_rel->reltablespace,
+-											   pg_class, persistence);
+-		else
+-			/* Allocate a new relfilenode */
+-			newrelfilenode = GetNewRelFileNode(relation->rd_rel->reltablespace,
+-											   NULL, persistence);
++		/* Allocate a new relfilenode */
++		newrelfilenode = GetNewRelFileNode(relation->rd_rel->reltablespace,
++										   NULL, persistence);
+ 	}
+ 	else if (relation->rd_rel->relkind == RELKIND_INDEX)
+ 	{
+@@ -5909,8 +5894,9 @@ RelationSetNewRelfilenode(Relation relation, char persistence,
+ 				 errmsg("unexpected request for new relfilenode in binary upgrade mode")));
+ 
+ 	/*
+-	 * YB Note: native PG code setup pg_class here, YB has moved that code up above.
++	 * Get a writable copy of the pg_class tuple for the given relation.
+ 	 */
++	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+ 
+ 	tuple = SearchSysCacheLockedCopy1(RELOID,
+ 									  ObjectIdGetDatum(RelationGetRelid(relation)));
+diff --git a/src/yb/yql/pgwrapper/pg_libpq-test.cc b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+index 34b8c6afe1..b7d01db93d 100644
+--- a/src/yb/yql/pgwrapper/pg_libpq-test.cc
++++ b/src/yb/yql/pgwrapper/pg_libpq-test.cc
+@@ -4509,7 +4509,6 @@ TEST_F(PgLibPqTest, TableRewriteOidCollision) {
+   // Turn off restore simulation and run regular "ALTER TABLE" operation.
+   ASSERT_OK(conn.ExecuteFormat("SET yb_binary_restore = false"));
+   ASSERT_OK(conn.ExecuteFormat("SET yb_ignore_pg_class_oids = true"));
+-  ASSERT_OK(conn.Execute("SET yb_ignore_relfilenode_ids = true"));
+ 
+   // This DDL used to show "Duplicate table" error due to OID collision because the OID
+   // 16393 was already used by yugabyte.t2_idx2 and is reused as relfilenode for t3_idx1
+@@ -4517,6 +4516,46 @@ TEST_F(PgLibPqTest, TableRewriteOidCollision) {
+   ASSERT_OK(conn.ExecuteFormat("ALTER TABLE t3 ALTER COLUMN id TYPE TEXT"));
+ }
+ 
++TEST_F(PgLibPqTest, RelfilenodeOidCollision) {
++  auto conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.Execute("CREATE DATABASE db1"));
++  conn = ASSERT_RESULT(ConnectToDB("db1"));
++  ASSERT_OK(conn.Execute("CREATE TABLE base_t(k int, c1 INT, c2 INT)"));
++  ASSERT_OK(conn.Execute("CREATE INDEX base_t_c1_idx ON base_t(c1)"));
++  ASSERT_OK(conn.Execute("CREATE INDEX base_t_c2_idx ON base_t(c2)"));
++  auto result = ASSERT_RESULT(conn.FetchAllAsString(
++    "SELECT oid,relfilenode,relname FROM pg_class WHERE relname LIKE 'base_t%'"));
++  LOG(INFO) << "result: " << result;
++  ASSERT_OK(conn.Execute("ALTER TABLE base_t ADD PRIMARY KEY (k)"));
++  result = ASSERT_RESULT(conn.FetchAllAsString(
++    "SELECT oid,relfilenode,relname FROM pg_class WHERE relname LIKE 'base_t%'"));
++  LOG(INFO) << "result: " << result;
++  std::string tmpname = std::tmpnam(nullptr);
++  auto hostport = cluster_->ysql_hostport(0);
++  std::string ysql_dump_path = ASSERT_RESULT(path_utils::GetPgToolPath("ysql_dump"));
++  std::string ysql_dump_cmd = Format(
++    "$0 --include-yb-metadata --serializable-deferrable --create --schema-only "
++    "--dbname db1 --file $1 -h $2 -p $3",
++    ysql_dump_path, tmpname, hostport.host(), hostport.port());
++  LOG(INFO) << "Executing " << ysql_dump_cmd;
++  ASSERT_EQ(system(ysql_dump_cmd.c_str()), 0);
++  conn = ASSERT_RESULT(Connect());
++  ASSERT_OK(conn.Execute("DROP DATABASE db1"));
++  std::string ysqlsh_path = ASSERT_RESULT(path_utils::GetPgToolPath("ysqlsh"));
++  std::string ysqlsh_cmd = Format(
++    "$0 -f $1 -h $2 -p $3", ysqlsh_path, tmpname, hostport.host(), hostport.port());
++  LOG(INFO) << "Executing " << ysqlsh_cmd;
++  ASSERT_EQ(system(ysqlsh_cmd.c_str()), 0);
++  conn = ASSERT_RESULT(ConnectToDB("db1"));
++  ASSERT_OK(conn.Execute("CREATE TABLE base_t_dummy1(k INT)"));
++  ASSERT_OK(conn.Execute("CREATE TABLE base_t_faulty(k INT, c1 INT, c2 INT)"));
++  ASSERT_OK(conn.Execute("CREATE INDEX base_t_faulty_c1_idx ON base_t_faulty(c1)"));
++  ASSERT_OK(conn.Execute("CREATE INDEX base_t_faulty_c2_idx ON base_t_faulty(c2)"));
++  std::string rm_cmd = Format("rm -f $0", tmpname);
++  LOG(INFO) << "Executing " << rm_cmd;
++  ASSERT_EQ(system(rm_cmd.c_str()), 0);
++}
++
+ TEST_F(PgLibPqTest, TablePartitionByCollationTextColumn) {
+   PGConn conn = ASSERT_RESULT(Connect());
+   ASSERT_OK(conn.Execute(

@@ -1,0 +1,171 @@
+diff --git a/src/yb/client/ql-transaction-test.cc b/src/yb/client/ql-transaction-test.cc
+index 9b0cb6c6a5..2bcc48adfa 100644
+--- a/src/yb/client/ql-transaction-test.cc
++++ b/src/yb/client/ql-transaction-test.cc
+@@ -63,6 +63,7 @@ DECLARE_uint64(aborted_intent_cleanup_ms);
+ DECLARE_int32(intents_flush_max_delay_ms);
+ DECLARE_int32(remote_bootstrap_max_chunk_size);
+ DECLARE_int32(load_balancer_max_concurrent_adds);
++DECLARE_int32(master_inject_latency_on_transactional_tablet_lookups_ms);
+ 
+ namespace yb {
+ namespace client {
+@@ -350,6 +351,17 @@ TEST_F(QLTransactionTest, Simple) {
+   CheckNoRunningTransactions();
+ }
+ 
++TEST_F(QLTransactionTest, LookupTabletFailure) {
++  google::FlagSaver saver;
++  FLAGS_master_inject_latency_on_transactional_tablet_lookups_ms =
++      TransactionRpcTimeout().ToMilliseconds();
++
++  auto txn = CreateTransaction();
++  auto result = WriteRow(CreateSession(txn), 0 /* key */, 1 /* value */);
++
++  ASSERT_TRUE(!result.ok() && result.status().IsTimedOut()) << "Result: " << result;
++}
++
+ TEST_F(QLTransactionTest, ReadWithTimeInFuture) {
+   WriteData();
+   server::SkewedClockDeltaChanger delta_changer(100ms, skewed_clock_);
+diff --git a/src/yb/client/transaction.cc b/src/yb/client/transaction.cc
+index d12c0c0965..814684d71f 100644
+--- a/src/yb/client/transaction.cc
++++ b/src/yb/client/transaction.cc
+@@ -568,31 +568,27 @@ class YBTransaction::Impl final {
+                           const YBTransactionPtr& transaction) {
+     VLOG_WITH_PREFIX(2) << "Picked status tablet: " << tablet;
+ 
+-    if (tablet.ok()) {
+-      manager_->client()->LookupTabletById(
+-          *tablet,
+-          TransactionRpcDeadline(),
+-          std::bind(&Impl::LookupTabletDone, this, _1, transaction),
+-          client::UseCache::kTrue);
+-    } else {
+-      std::vector<Waiter> waiters;
+-      {
+-        std::lock_guard<std::mutex> lock(mutex_);
+-        SetError(tablet.status(), &lock);
+-        waiters_.swap(waiters);
+-      }
+-      for (const auto& waiter : waiters) {
+-        waiter(tablet.status());
+-      }
++    if (!tablet.ok()) {
++      NotifyWaiters(tablet.status());
++      return;
+     }
++
++    manager_->client()->LookupTabletById(
++        *tablet,
++        TransactionRpcDeadline(),
++        std::bind(&Impl::LookupTabletDone, this, _1, transaction),
++        client::UseCache::kTrue);
+   }
+ 
+   void LookupTabletDone(const Result<client::internal::RemoteTabletPtr>& result,
+                         const YBTransactionPtr& transaction) {
+     VLOG_WITH_PREFIX(1) << "Lookup tablet done: " << yb::ToString(result);
+ 
+-    // TODO(dtxn) Handle failure here.
+-    CHECK_OK(result);
++    if (!result.ok()) {
++      NotifyWaiters(result.status());
++      return;
++    }
++
+     {
+       std::lock_guard<std::mutex> lock(mutex_);
+       status_tablet_ = std::move(*result);
+@@ -602,6 +598,18 @@ class YBTransaction::Impl final {
+                   transaction_->shared_from_this());
+   }
+ 
++  void NotifyWaiters(const Status& status) {
++    std::vector<Waiter> waiters;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      SetError(status, &lock);
++      waiters_.swap(waiters);
++    }
++    for (const auto& waiter : waiters) {
++      waiter(status);
++    }
++  }
++
+   void SendHeartbeat(TransactionStatus status,
+                      const TransactionId& id,
+                      std::weak_ptr<YBTransaction> weak_transaction) {
+diff --git a/src/yb/common/transaction.cc b/src/yb/common/transaction.cc
+index 4764401bc3..4714031ee9 100644
+--- a/src/yb/common/transaction.cc
++++ b/src/yb/common/transaction.cc
+@@ -92,9 +92,13 @@ std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata)
+                        metadata.status_tablet, metadata.priority, metadata.start_time);
+ }
+ 
++MonoDelta TransactionRpcTimeout() {
++  return 5s * kTimeMultiplier;
++}
++
+ // TODO(dtxn) correct deadline should be calculated and propagated.
+ MonoTime TransactionRpcDeadline() {
+-  return MonoTime::Now() + 5s * kTimeMultiplier;
++  return MonoTime::Now() + TransactionRpcTimeout();
+ }
+ 
+ bool TransactionOperationContext::transactional() const {
+diff --git a/src/yb/common/transaction.h b/src/yb/common/transaction.h
+index 922a1b9030..1d0d068931 100644
+--- a/src/yb/common/transaction.h
++++ b/src/yb/common/transaction.h
+@@ -222,6 +222,7 @@ inline bool operator!=(const TransactionMetadata& lhs, const TransactionMetadata
+ 
+ std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata);
+ 
++MonoDelta TransactionRpcTimeout();
+ MonoTime TransactionRpcDeadline();
+ 
+ extern const std::string kTransactionsTableName;
+diff --git a/src/yb/master/master_service.cc b/src/yb/master/master_service.cc
+index bd5aecd21e..28e7e5fa4e 100644
+--- a/src/yb/master/master_service.cc
++++ b/src/yb/master/master_service.cc
+@@ -55,6 +55,10 @@ DEFINE_int32(master_inject_latency_on_tablet_lookups_ms, 0,
+ TAG_FLAG(master_inject_latency_on_tablet_lookups_ms, unsafe);
+ TAG_FLAG(master_inject_latency_on_tablet_lookups_ms, hidden);
+ 
++DEFINE_test_flag(int32, master_inject_latency_on_transactional_tablet_lookups_ms, 0,
++                 "Number of milliseconds that the master will sleep before responding to "
++                 "requests for transactional tablet locations.");
++
+ DEFINE_double(master_slow_get_registration_probability, 0,
+               "Probability of injecting delay in GetMasterRegistration.");
+ 
+@@ -202,6 +206,25 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
+   if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
+     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
+   }
++  if (PREDICT_FALSE(FLAGS_master_inject_latency_on_transactional_tablet_lookups_ms > 0)) {
++    std::vector<scoped_refptr<TableInfo>> tables;
++    server_->catalog_manager()->GetAllTables(&tables);
++    const auto& tablet_id = req->tablet_ids(0);
++    for (const auto& table : tables) {
++      TabletInfos tablets;
++      table->GetAllTablets(&tablets);
++      for (const auto& tablet : tablets) {
++        if (tablet->tablet_id() == tablet_id) {
++          auto lock = table->LockForRead();
++          if (table->metadata().state().table_type() == TableType::TRANSACTION_STATUS_TABLE_TYPE) {
++            SleepFor(MonoDelta::FromMilliseconds(
++                FLAGS_master_inject_latency_on_transactional_tablet_lookups_ms));
++          }
++          break;
++        }
++      }
++    }
++  }
+ 
+   for (const TabletId& tablet_id : req->tablet_ids()) {
+     // TODO: once we have catalog data. ACL checks would also go here, probably.

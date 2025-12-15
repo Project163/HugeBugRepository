@@ -1,0 +1,565 @@
+diff --git a/src/yb/client/client-internal.cc b/src/yb/client/client-internal.cc
+index 5535dd4bdf..9febdbb369 100644
+--- a/src/yb/client/client-internal.cc
++++ b/src/yb/client/client-internal.cc
+@@ -1153,6 +1153,11 @@ Status YBClient::Data::IsCloneNamespaceInProgress(
+   *create_in_progress =
+       !(state == master::SysCloneStatePB::ABORTED || state == master::SysCloneStatePB::RESTORED);
+ 
++  if (state == master::SysCloneStatePB_State_ABORTED) {
++    return STATUS_FORMAT(
++        InternalError, "Clone operation aborted: $0", resp.entries(0).abort_message());
++  }
++
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/integration-tests/minicluster-snapshot-test.cc b/src/yb/integration-tests/minicluster-snapshot-test.cc
+index c9b03717cd..98c3b47d31 100644
+--- a/src/yb/integration-tests/minicluster-snapshot-test.cc
++++ b/src/yb/integration-tests/minicluster-snapshot-test.cc
+@@ -78,7 +78,9 @@
+ DECLARE_bool(enable_db_clone);
+ DECLARE_bool(master_auto_run_initdb);
+ DECLARE_int32(pgsql_proxy_webserver_port);
++DECLARE_uint64(snapshot_coordinator_poll_interval_ms);
+ DECLARE_string(ysql_hba_conf_csv);
++DECLARE_bool(TEST_fail_clone_pg_schema);
+ DECLARE_string(TEST_mini_cluster_pg_host_port);
+ 
+ namespace yb {
+@@ -370,6 +372,11 @@ TEST_F(MasterSnapshotTest, FailSysCatalogWriteWithStaleTable) {
+ class PostgresMiniClusterTest : public pgwrapper::PgMiniTestBase,
+                                 public ::testing::WithParamInterface<master::YsqlColocationConfig> {
+  public:
++  void SetUp() override {
++    ANNOTATE_UNPROTECTED_WRITE(FLAGS_snapshot_coordinator_poll_interval_ms) = 250;
++    pgwrapper::PgMiniTestBase::SetUp();
++  }
++
+   MiniCluster* mini_cluster() { return cluster_.get(); }
+ 
+   Status CreateDatabase(
+@@ -540,40 +547,7 @@ class PgCloneTest : public PostgresMiniClusterTest {
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_db_clone) = true;
+     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_mini_cluster_pg_host_port) = pg_host_port().ToString();
+     ASSERT_OK(CreateMasterBackupProxy());
+-  }
+-
+-  Status CloneAndWaitForState(
+-      const master::CloneNamespaceRequestPB& clone_req,
+-      master::SysCloneStatePB::State clone_state) {
+-    rpc::RpcController controller;
+-    controller.set_timeout(120s);
+-    master::CloneNamespaceResponsePB clone_resp;
+-    RETURN_NOT_OK(master_backup_proxy_->CloneNamespace(clone_req, &clone_resp, &controller));
+-    if (clone_resp.has_error()) {
+-      return StatusFromPB(clone_resp.error().status());
+-    }
+-
+-    // Wait until clone is done.
+-    master::ListClonesRequestPB done_req;
+-    master::ListClonesResponsePB done_resp;
+-    done_req.set_seq_no(clone_resp.seq_no());
+-    done_req.set_source_namespace_id(clone_resp.source_namespace_id());
+-    RETURN_NOT_OK(WaitFor(
+-        [&]() -> Result<bool> {
+-          controller.Reset();
+-          RETURN_NOT_OK(master_backup_proxy_->ListClones(done_req, &done_resp, &controller));
+-          if (done_resp.has_error()) {
+-            return StatusFromPB(clone_resp.error().status());
+-          }
+-          RSTATUS_DCHECK(
+-              done_resp.entries_size() == 1, IllegalState,
+-              Format("Expected 1 clone entry, got $0", done_resp.entries_size()));
+-          auto state = done_resp.entries(0).aggregate_state();
+-          return state == clone_state;
+-        },
+-        120s, "Wait for clone to finish"));
+-
+-    return Status::OK();
++    ASSERT_OK(CreateSourceDbAndSnapshotSchedule());
+   }
+ 
+   Status CreateMasterBackupProxy() {
+@@ -584,6 +558,19 @@ class PgCloneTest : public PostgresMiniClusterTest {
+     return Status::OK();
+   }
+ 
++  Status CreateSourceDbAndSnapshotSchedule() {
++    auto conn = VERIFY_RESULT(Connect());
++    RETURN_NOT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kSourceNamespaceName));
++    source_conn_ = std::make_unique<pgwrapper::PGConn>(
++        VERIFY_RESULT(ConnectToDB(kSourceNamespaceName)));
++    SnapshotScheduleId schedule_id = VERIFY_RESULT(CreateSnapshotSchedule(
++        master_backup_proxy_.get(), YQL_DATABASE_PGSQL, kSourceNamespaceName, kInterval, kRetention,
++        kTimeout));
++    RETURN_NOT_OK(WaitScheduleSnapshot(master_backup_proxy_.get(), schedule_id, kTimeout));
++    RETURN_NOT_OK(source_conn_->Execute("CREATE TABLE t1 (key INT PRIMARY KEY, value INT)"));
++    return Status::OK();
++  }
++
+   void DoTearDown() override {
+     messenger_->Shutdown();
+     PostgresMiniClusterTest::DoTearDown();
+@@ -594,6 +581,7 @@ class PgCloneTest : public PostgresMiniClusterTest {
+   std::unique_ptr<rpc::Messenger> messenger_;
+   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
+   std::shared_ptr<MasterBackupProxy> master_backup_proxy_;
++  std::unique_ptr<pgwrapper::PGConn> source_conn_;
+ 
+   const std::string kSourceNamespaceName = "testdb";
+   const std::string kTargetNamespaceName1 = "testdb_clone1";
+@@ -601,100 +589,36 @@ class PgCloneTest : public PostgresMiniClusterTest {
+   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+ };
+ 
+-TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(Clone)) {
+-  // Basic clone test for PG.
+-  // Writes some data before time t and some data after t, and verifies that the cloning as of t
+-  // creates a clone with only the first set of rows, and cloning after t creates a clone with both
+-  // sets of rows.
+-  auto conn = ASSERT_RESULT(Connect());
+-  const std::vector<std::tuple<int32_t, int32_t>> kRows = {{1, 10}, {2, 20}};
+-  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kSourceNamespaceName));
+-  // Create a snapshot schedule.
+-  SnapshotScheduleId schedule_id = ASSERT_RESULT(CreateSnapshotSchedule(
+-      master_backup_proxy().get(), YQL_DATABASE_PGSQL, kSourceNamespaceName, kInterval, kRetention,
+-      kTimeout));
+-  ASSERT_OK(WaitScheduleSnapshot(master_backup_proxy().get(), schedule_id, kTimeout));
+-
+-  // Write a row.
+-  auto source_conn = ASSERT_RESULT(ConnectToDB(kSourceNamespaceName));
+-  ASSERT_OK(source_conn.Execute("CREATE TABLE t1 (key INT PRIMARY KEY, value INT)"));
+-  ASSERT_OK(source_conn.ExecuteFormat("INSERT INTO t1 VALUES ($0, $1)",
+-            std::get<0>(kRows[0]), std::get<1>(kRows[0])));
+-
+-  // Write a second row after recording the hybrid time.
+-  auto ht1 = HybridTime::FromMicros(static_cast<uint64>(ASSERT_RESULT(GetCurrentTime()).ToInt64()));
+-  ASSERT_OK(source_conn.ExecuteFormat(
+-      "INSERT INTO t1 VALUES ($0, $1)", std::get<0>(kRows[1]), std::get<1>(kRows[1])));
+-  auto ht2 = HybridTime::FromMicros(static_cast<uint64>(ASSERT_RESULT(GetCurrentTime()).ToInt64()));
+-
+-  CloneNamespaceRequestPB req;
+-  NamespaceIdentifierPB source_namespace;
+-  source_namespace.set_name(kSourceNamespaceName);
+-  source_namespace.set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+-  *req.mutable_source_namespace() = source_namespace;
+-  req.set_restore_ht(ht1.ToUint64());
+-  req.set_target_namespace_name(kTargetNamespaceName1);
+-
+-  ASSERT_OK(CloneAndWaitForState(req, master::SysCloneStatePB::RESTORED));
+-
+-  req.set_restore_ht(ht2.ToUint64());
+-  req.set_target_namespace_name(kTargetNamespaceName2);
+-  ASSERT_OK(CloneAndWaitForState(req, master::SysCloneStatePB::RESTORED));
+-
+-  // Verify source rows are unchanged.
+-  auto rows = ASSERT_RESULT((source_conn.FetchRows<int32_t, int32_t>("SELECT * FROM t1")));
+-  ASSERT_VECTORS_EQ(rows, kRows);
+-
+-  // Verify first clone only has the first row.
+-  auto target_conn1 = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName1));
+-  auto row = ASSERT_RESULT((target_conn1.FetchRow<int32_t, int32_t>("SELECT * FROM t1")));
+-  ASSERT_EQ(row, kRows[0]);
+-
+-  // Verify second clone has both rows.
+-  auto target_conn2 = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName2));
+-  rows = ASSERT_RESULT((target_conn2.FetchRows<int32_t, int32_t>("SELECT * FROM t1")));
+-  ASSERT_VECTORS_EQ(rows, kRows);
+-}
+-
+-// The test is disabled in Sanitizers as ysql_dump fails in ASAN builds due to memory leaks
++// This test is disabled in sanitizers as ysql_dump fails in ASAN builds due to memory leaks
+ // inherited from pg_dump.
+ TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(CloneYsqlSyntax)) {
+   // Basic clone test for PG using the YSQL TEMPLATE syntax.
+   // Writes some data before time t and some data after t, and verifies that the cloning as of t
+   // creates a clone with only the first set of rows, and cloning after t creates a clone with both
+   // sets of rows.
+-  auto conn = ASSERT_RESULT(Connect());
+-  const std::vector<std::tuple<int32_t, int32_t>> kRows = {{1, 10}, {2, 20}};
+-  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kSourceNamespaceName));
+-
+-  // Create a snapshot schedule.
+-  SnapshotScheduleId schedule_id = ASSERT_RESULT(CreateSnapshotSchedule(
+-      master_backup_proxy().get(), YQL_DATABASE_PGSQL, kSourceNamespaceName, kInterval, kRetention,
+-      kTimeout));
+-  ASSERT_OK(WaitScheduleSnapshot(master_backup_proxy().get(), schedule_id, kTimeout));
+ 
+   // Write a row.
+-  auto source_conn = ASSERT_RESULT(ConnectToDB(kSourceNamespaceName));
+-  ASSERT_OK(source_conn.Execute("CREATE TABLE t1 (key INT PRIMARY KEY, value INT)"));
+-  ASSERT_OK(source_conn.ExecuteFormat(
++  const std::vector<std::tuple<int32_t, int32_t>> kRows = {{1, 10}, {2, 20}};
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "INSERT INTO t1 VALUES ($0, $1)", std::get<0>(kRows[0]), std::get<1>(kRows[0])));
+ 
+   // Write a second row after recording the hybrid time.
+-  auto ht1 = HybridTime::FromMicros(static_cast<uint64>(ASSERT_RESULT(GetCurrentTime()).ToInt64()));
+-  ASSERT_OK(source_conn.ExecuteFormat(
++  auto ht = HybridTime::FromMicros(static_cast<uint64>(ASSERT_RESULT(GetCurrentTime()).ToInt64()));
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "INSERT INTO t1 VALUES ($0, $1)", std::get<0>(kRows[1]), std::get<1>(kRows[1])));
+-  // Perform the first clone operation to ht1
+-  ASSERT_OK(source_conn.ExecuteFormat(
++
++  // Perform the first clone operation to ht.
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "CREATE DATABASE $0 TEMPLATE $1 AS OF $2", kTargetNamespaceName1, kSourceNamespaceName,
+-      ht1.GetPhysicalValueMicros()));
++      ht.GetPhysicalValueMicros()));
+ 
+   // Perform the second clone operation to clone the source DB using the current timestamp (AS OF is
+   // not specified)
+-  ASSERT_OK(source_conn.ExecuteFormat(
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "CREATE DATABASE $0 TEMPLATE $1", kTargetNamespaceName2, kSourceNamespaceName));
+ 
+   // Verify source rows are unchanged.
+-  auto rows = ASSERT_RESULT((source_conn.FetchRows<int32_t, int32_t>("SELECT * FROM t1")));
++  auto rows = ASSERT_RESULT((source_conn_->FetchRows<int32_t, int32_t>("SELECT * FROM t1")));
+   ASSERT_VECTORS_EQ(rows, kRows);
+ 
+   // Verify first clone only has the first row.
+@@ -713,41 +637,22 @@ TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(CloneWithAlterTableSchema)) {
+   // Writes some data before time t and alter the table schema after t and add some data according
+   // to the new schema. Verifies that the cloning as of t creates a clone with the correct schema
+   // and only the first row.
+-  auto conn = ASSERT_RESULT(Connect());
+   const std::tuple<int32_t, int32_t> kRow = {1, 10};
+   const std::tuple<int32_t, int32_t, int32_t> kRowNewSchema = {2, 20, 200};
+-  const auto kTimeout = MonoDelta::FromSeconds(30);
+-
+-  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0", kSourceNamespaceName));
+-
+-  // Create a snapshot schedule.
+-  SnapshotScheduleId schedule_id = ASSERT_RESULT(CreateSnapshotSchedule(
+-      master_backup_proxy().get(), YQL_DATABASE_PGSQL, kSourceNamespaceName, kInterval, kRetention,
+-      kTimeout));
+-  ASSERT_OK(WaitScheduleSnapshot(master_backup_proxy().get(), schedule_id, kTimeout));
+-
+-  // Write a row.
+-  auto source_conn = ASSERT_RESULT(ConnectToDB(kSourceNamespaceName));
+-  ASSERT_OK(source_conn.Execute("CREATE TABLE t1 (key INT PRIMARY KEY, value INT)"));
+-  ASSERT_OK(source_conn.ExecuteFormat(
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "INSERT INTO t1 VALUES ($0, $1)", std::get<0>(kRow), std::get<1>(kRow)));
+ 
+   // Write a second row after recording the hybrid time.
+   auto ht = HybridTime::FromMicros(static_cast<uint64>(ASSERT_RESULT(GetCurrentTime()).ToInt64()));
+ 
+-  ASSERT_OK(source_conn.ExecuteFormat("ALTER TABLE t1 ADD COLUMN c1 INT"));
+-  ASSERT_OK(source_conn.ExecuteFormat(
++  ASSERT_OK(source_conn_->ExecuteFormat("ALTER TABLE t1 ADD COLUMN c1 INT"));
++  ASSERT_OK(source_conn_->ExecuteFormat(
+       "INSERT INTO t1 VALUES ($0, $1, $2)", std::get<0>(kRowNewSchema), std::get<1>(kRowNewSchema),
+       std::get<2>(kRowNewSchema)));
+-  CloneNamespaceRequestPB req;
+-  NamespaceIdentifierPB source_namespace;
+-  source_namespace.set_name(kSourceNamespaceName);
+-  source_namespace.set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+-  *req.mutable_source_namespace() = source_namespace;
+-  req.set_restore_ht(ht.ToUint64());
+-  req.set_target_namespace_name(kTargetNamespaceName1);
+ 
+-  ASSERT_OK(CloneAndWaitForState(req, master::SysCloneStatePB::RESTORED));
++  ASSERT_OK(source_conn_->ExecuteFormat(
++      "CREATE DATABASE $0 TEMPLATE $1 AS OF $2", kTargetNamespaceName1, kSourceNamespaceName,
++      ht.GetPhysicalValueMicros()));
+ 
+   // Verify clone only has the first row.
+   auto target_conn = ASSERT_RESULT(ConnectToDB(kTargetNamespaceName1));
+@@ -756,5 +661,14 @@ TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(CloneWithAlterTableSchema)) {
+   ASSERT_EQ(rows[0], kRow);
+ }
+ 
++TEST_F(PgCloneTest, YB_DISABLE_TEST_IN_SANITIZERS(AbortMessage)) {
++  // Assert that we propagate the error message from the clone operation to the user.
++  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_clone_pg_schema) = true;
++  auto status = source_conn_->ExecuteFormat(
++      "CREATE DATABASE $0 TEMPLATE $1", kTargetNamespaceName1, kSourceNamespaceName);
++  ASSERT_NOK(status);
++  ASSERT_STR_CONTAINS(status.message().ToBuffer(), "fail_clone_pg_schema");
++}
++
+ }  // namespace master
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/xcluster/xcluster_test_base.h b/src/yb/integration-tests/xcluster/xcluster_test_base.h
+index 094e37d3cb..1bec8f992f 100644
+--- a/src/yb/integration-tests/xcluster/xcluster_test_base.h
++++ b/src/yb/integration-tests/xcluster/xcluster_test_base.h
+@@ -322,13 +322,13 @@ class XClusterTestBase : public YBTest {
+   }
+ 
+   Result<std::string> CallAdminVec(const std::vector<std::string>& args) {
+-    std::string result;
++    std::string output, error;
+     LOG(INFO) << "Execute: " << AsString(args);
+-    auto status = Subprocess::Call(args, &result, StdFdTypes{StdFdType::kOut, StdFdType::kErr});
++    auto status = Subprocess::Call(args, &output, &error);
+     if (!status.ok()) {
+-      return status.CloneAndAppend(result);
++      return status.CloneAndAppend(error);
+     }
+-    return result;
++    return output;
+   }
+ 
+   // Wait for the xcluster safe time to advance to the given time on all TServers.
+diff --git a/src/yb/master/clone/clone_state_manager.cc b/src/yb/master/clone/clone_state_manager.cc
+index 1c2f6465b7..2baaf5add9 100644
+--- a/src/yb/master/clone/clone_state_manager.cc
++++ b/src/yb/master/clone/clone_state_manager.cc
+@@ -21,9 +21,11 @@
+ #include "yb/common/hybrid_time.h"
+ #include "yb/common/snapshot.h"
+ #include "yb/common/wire_protocol.h"
++
+ #include "yb/gutil/macros.h"
+ #include "yb/gutil/map-util.h"
+ #include "yb/gutil/ref_counted.h"
++
+ #include "yb/master/async_rpc_tasks.h"
+ #include "yb/master/catalog_entity_info.pb.h"
+ #include "yb/master/clone/clone_state_entity.h"
+@@ -35,8 +37,10 @@
+ #include "yb/master/master_types.pb.h"
+ #include "yb/master/sys_catalog.h"
+ #include "yb/master/ts_manager.h"
++
+ #include "yb/rpc/rpc_context.h"
+ #include "yb/rpc/rpc_controller.h"
++
+ #include "yb/util/flags/flag_tags.h"
+ #include "yb/util/monotime.h"
+ #include "yb/util/oid_generator.h"
+@@ -46,6 +50,7 @@
+ 
+ DEFINE_RUNTIME_PREVIEW_bool(enable_db_clone, false, "Enable DB cloning.");
+ DECLARE_int32(ysql_clone_pg_schema_rpc_timeout_ms);
++DEFINE_test_flag(bool, fail_clone_pg_schema, false, "Fail clone pg schema operation for testing");
+ 
+ namespace yb {
+ namespace master {
+@@ -339,6 +344,10 @@ Status CloneStateManager::ClonePgSchemaObjects(
+     const std::string& target_db_name,
+     const SnapshotScheduleId& snapshot_schedule_id,
+     const LeaderEpoch& epoch) {
++  if (FLAGS_TEST_fail_clone_pg_schema) {
++    return STATUS_FORMAT(RuntimeError, "Failing clone due to test flag fail_clone_pg_schema");
++  }
++
+   // Pick one of the live tservers to send ysql_dump and ysqlsh requests to.
+   auto ts = external_funcs_->PickTserver();
+   auto ts_permanent_uuid = ts->permanent_uuid();
+diff --git a/src/yb/master/master_snapshot_coordinator.cc b/src/yb/master/master_snapshot_coordinator.cc
+index 2af18b59f8..8d10c8627a 100644
+--- a/src/yb/master/master_snapshot_coordinator.cc
++++ b/src/yb/master/master_snapshot_coordinator.cc
+@@ -69,8 +69,8 @@ using namespace std::placeholders;
+ DECLARE_int32(sys_catalog_write_timeout_ms);
+ DECLARE_bool(enable_fast_pitr);
+ 
+-DEFINE_UNKNOWN_uint64(snapshot_coordinator_poll_interval_ms, 5000,
+-              "Poll interval for snapshot coordinator in milliseconds.");
++DEFINE_NON_RUNTIME_uint64(snapshot_coordinator_poll_interval_ms, 5000,
++                          "Poll interval for snapshot coordinator in milliseconds.");
+ 
+ DEFINE_test_flag(bool, skip_sending_restore_finished, false,
+                  "Whether we should skip sending RESTORE_FINISHED to tablets.");
+diff --git a/src/yb/tools/admin-test-base.cc b/src/yb/tools/admin-test-base.cc
+index 54bc53d4f9..028165dcdd 100644
+--- a/src/yb/tools/admin-test-base.cc
++++ b/src/yb/tools/admin-test-base.cc
+@@ -45,13 +45,13 @@ std::string AdminTestBase::GetMasterAddresses() const {
+ }
+ 
+ Result<std::string> AdminTestBase::CallAdminVec(const std::vector<std::string>& args) {
+-  std::string result;
++  std::string output, error;
+   LOG(INFO) << "Execute: " << AsString(args);
+-  auto status = Subprocess::Call(args, &result, StdFdTypes{StdFdType::kOut, StdFdType::kErr});
++  auto status = Subprocess::Call(args, &output, &error);
+   if (!status.ok()) {
+-    return status.CloneAndAppend(result);
++    return status.CloneAndAppend(error);
+   }
+-  return result;
++  return output;
+ }
+ 
+ Result<CassandraSession> AdminTestBase::CqlConnect(const std::string& db_name) {
+diff --git a/src/yb/tools/yb-admin-test-base.h b/src/yb/tools/yb-admin-test-base.h
+index 27eb061a5d..6102f6388e 100644
+--- a/src/yb/tools/yb-admin-test-base.h
++++ b/src/yb/tools/yb-admin-test-base.h
+@@ -37,7 +37,7 @@ class AdminCliTestBase : public client::KeyValueTableTest<MiniCluster> {
+         GetToolPath("yb-admin"), "-master_addresses", cluster_->GetMasterAddresses(),
+         "--never_fsync=true", std::forward<Args>(args)...);
+     LOG(INFO) << "Run tool: " << AsString(command);
+-    return Subprocess::Call(command, error_msg, StdFdTypes{StdFdType::kErr});
++    return Subprocess::Call(command, /* output */ nullptr, error_msg);
+   }
+ 
+   template <class... Args>
+diff --git a/src/yb/tools/yb-admin-test.cc b/src/yb/tools/yb-admin-test.cc
+index 782d134a4a..b8c2158416 100644
+--- a/src/yb/tools/yb-admin-test.cc
++++ b/src/yb/tools/yb-admin-test.cc
+@@ -382,7 +382,7 @@ TEST_F(AdminCliTest, InvalidMasterAddresses) {
+   std::string error_string;
+   ASSERT_NOK(Subprocess::Call(ToStringVector(
+       GetAdminToolPath(), "-master_addresses", unreachable_host,
+-      "-timeout_ms", "1000", "list_tables"), &error_string, StdFdTypes{StdFdType::kErr}));
++      "-timeout_ms", "1000", "list_tables"), /* output */ nullptr, &error_string));
+   ASSERT_STR_CONTAINS(error_string, "verify the addresses");
+ }
+ 
+@@ -406,22 +406,21 @@ TEST_F(AdminCliTest, CheckTableIdUsage) {
+   // Check bad optional integer argument.
+   args.resize(args_size);
+   args.push_back("bad");
+-  std::string output;
+-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
++  std::string error;
++  ASSERT_NOK(Subprocess::Call(args, /* output */ nullptr, &error));
+   // Due to greedy algorithm all bad arguments are treated as table identifier.
+-  ASSERT_NE(output.find("Namespace 'bad' of type 'ycql' not found"), std::string::npos);
++  ASSERT_NE(error.find("Namespace 'bad' of type 'ycql' not found"), std::string::npos);
+   // Check multiple tables when single one is expected.
+   args.resize(args_size);
+   args.push_back(table_id_arg);
+-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
+-  ASSERT_NE(output.find("Single table expected, 2 found"), std::string::npos);
++  ASSERT_NOK(Subprocess::Call(args, /* output */ nullptr, &error));
++  ASSERT_NE(error.find("Single table expected, 2 found"), std::string::npos);
+   // Check wrong table id.
+   args.resize(args_size - 1);
+   const auto bad_table_id = table_id + "_bad";
+   args.push_back(Format("tableid.$0", bad_table_id));
+-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
+-  ASSERT_NE(
+-      output.find(Format("Table with id '$0' not found", bad_table_id)), std::string::npos);
++  ASSERT_NOK(Subprocess::Call(args, /*output*/ nullptr, &error));
++  ASSERT_NE(error.find(Format("Table with id '$0' not found", bad_table_id)), std::string::npos);
+ }
+ 
+ TEST_F(AdminCliTest, TestSnapshotCreation) {
+diff --git a/src/yb/util/subprocess.cc b/src/yb/util/subprocess.cc
+index 8c461504b3..91acf425ef 100644
+--- a/src/yb/util/subprocess.cc
++++ b/src/yb/util/subprocess.cc
+@@ -581,15 +581,22 @@ Status Subprocess::Call(const vector<string>& argv) {
+       retcode));
+ }
+ 
+-Status Subprocess::Call(const vector<string>& argv, string* output, StdFdTypes read_fds) {
++Status Subprocess::Call(const vector<string>& argv, string* output, string* error) {
+   Subprocess p(argv[0], argv);
+-  return p.Call(output, read_fds);
++  return p.Call(output, error);
+ }
+ 
+-Status Subprocess::Call(string* output, StdFdTypes read_fds) {
+-  if (read_fds.Test(StdFdType::kIn)) {
+-    return STATUS(InvalidArgument, "Cannot read from child stdin");
++Status Subprocess::Call(string* output, string* error) {
++  StdFdTypes read_fds;
++  if (output) {
++    read_fds.Set(StdFdType::kOut);
++    output->clear();
+   }
++  if (error) {
++    read_fds.Set(StdFdType::kErr);
++    error->clear();
++  }
++
+   for (const auto fd_type : read_fds) {
+     SetFdShared(to_underlying(fd_type), SubprocessStreamMode::kPiped);
+   }
+@@ -600,28 +607,19 @@ Status Subprocess::Call(string* output, StdFdTypes read_fds) {
+     return STATUS(IOError, "Unable to close child process stdin", Errno(errno));
+   }
+ 
+-  output->clear();
+   char buf[1024];
+-  boost::container::small_vector<int, 2> fds;
++  ssize_t n;
+   for (const auto fd_type : read_fds) {
+-    fds.push_back(CheckAndOffer(to_underlying(fd_type)));
+-  }
+-
+-  while (!fds.empty()) {
+-    auto it = fds.end();
+-    while (it != fds.begin()) {
+-      auto fd = *--it;
+-      ssize_t n = read(fd, buf, arraysize(buf));
++    int fd = CheckAndOffer(to_underlying(fd_type));
++    auto* stream = (fd_type == StdFdType::kOut) ? output : error;
++    do {
++      n = read(fd, buf, arraysize(buf));
+       if (n < 0) {
+         if (errno == EINTR) continue;
+         return STATUS(IOError, "IO error reading from " + argv_[0], Errno(errno));
+       }
+-      if (n == 0) {
+-        fds.erase(it);
+-        continue;
+-      }
+-      output->append(buf, n);
+-    }
++      stream->append(buf, n);
++    } while (n != 0);
+   }
+ 
+   int retcode = 0;
+diff --git a/src/yb/util/subprocess.h b/src/yb/util/subprocess.h
+index e4a49beb40..5b865ce331 100644
+--- a/src/yb/util/subprocess.h
++++ b/src/yb/util/subprocess.h
+@@ -169,10 +169,8 @@ class Subprocess {
+ 
+   // Same as above, but collects the output from the child process stdout into
+   // the output parameter.
+-  // If read_stderr is set to true, stderr is collected instead.
+   static Status Call(
+-      const std::vector<std::string>& argv,
+-      std::string* output, StdFdTypes read_fds = StdFdTypes{StdFdType::kOut});
++      const std::vector<std::string>& argv, std::string* output, std::string* error = nullptr);
+ 
+   // Return the pipe fd to the child's standard stream.
+   // Stream should not be disabled or shared.
+@@ -192,9 +190,9 @@ class Subprocess {
+ 
+   void SetEnv(const std::string& key, const std::string& value);
+ 
+-  // Issues Start() then Wait() and collects the output from the child process
+-  // (stdout or stderr) into the output parameter.
+-  Status Call(std::string* output, StdFdTypes read_fds = StdFdTypes{StdFdType::kOut});
++  // Issues Start() then Wait() and collects the desired streams from the child process
++  // into the output parameter(s).
++  Status Call(std::string* output, std::string* error = nullptr);
+ 
+   // Writes pid to cgroup specified by path
+   void AddPIDToCGroup(const std::string& path, pid_t pid);
+diff --git a/src/yb/util/ysql_binary_runner.cc b/src/yb/util/ysql_binary_runner.cc
+index 0deda58566..c20c7f080b 100644
+--- a/src/yb/util/ysql_binary_runner.cc
++++ b/src/yb/util/ysql_binary_runner.cc
+@@ -31,9 +31,12 @@ Result<std::string> YsqlBinaryRunner::Run(const std::optional<std::vector<std::s
+     complete_args.insert(complete_args.end(), args->begin(), args->end());
+   }
+   LOG(INFO) << "Running tool: " << AsString(complete_args);
+-  std::string execution_output;
+-  RETURN_NOT_OK(Subprocess::Call(complete_args, &execution_output));
+-  return execution_output;
++  std::string output, error;
++  auto status = Subprocess::Call(complete_args, &output, &error);
++  if (!status.ok()) {
++    return status.CloneAndAppend(error);
++  }
++  return output;
+ }
+ 
+ // ============================================================================

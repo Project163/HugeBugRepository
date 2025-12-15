@@ -1,0 +1,752 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index fb22dd0d8f..0387a35826 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3335,6 +3335,7 @@ name = "next-swc"
+ version = "0.0.0"
+ dependencies = [
+  "chrono",
++ "convert_case 0.5.0",
+  "easy-error",
+  "either",
+  "fxhash",
+@@ -3343,6 +3344,7 @@ dependencies = [
+  "once_cell",
+  "pathdiff",
+  "regex",
++ "rustc-hash",
+  "serde",
+  "serde_json",
+  "sha1 0.10.5",
+diff --git a/packages/next-swc/crates/core/Cargo.toml b/packages/next-swc/crates/core/Cargo.toml
+index d7fc2a94cc..9ee942057c 100644
+--- a/packages/next-swc/crates/core/Cargo.toml
++++ b/packages/next-swc/crates/core/Cargo.toml
+@@ -9,6 +9,7 @@ plugin = ["turbopack-binding/__swc_core_binding_napi_plugin"]
+ 
+ [dependencies]
+ chrono = "0.4"
++convert_case = "0.5.0"
+ easy-error = "1.0.0"
+ either = "1"
+ fxhash = "0.2.1"
+@@ -17,6 +18,7 @@ once_cell = { workspace = true }
+ next-transform-font = {workspace = true}
+ pathdiff = "0.2.0"
+ regex = "1.5"
++rustc-hash = "1"
+ serde = "1"
+ serde_json = "1"
+ sha1 = "0.10.1"
+diff --git a/packages/next-swc/crates/core/src/cjs_optimizer.rs b/packages/next-swc/crates/core/src/cjs_optimizer.rs
+new file mode 100644
+index 0000000000..62d06a7df5
+--- /dev/null
++++ b/packages/next-swc/crates/core/src/cjs_optimizer.rs
+@@ -0,0 +1,279 @@
++use rustc_hash::{FxHashMap, FxHashSet};
++use serde::Deserialize;
++use turbopack_binding::swc::core::{
++    common::{util::take::Take, SyntaxContext, DUMMY_SP},
++    ecma::{
++        ast::{
++            CallExpr, Callee, Decl, Expr, Id, Ident, Lit, MemberExpr, MemberProp, Module,
++            ModuleItem, Pat, Script, Stmt, VarDecl, VarDeclKind, VarDeclarator,
++        },
++        atoms::{Atom, JsWord},
++        utils::{prepend_stmts, private_ident, ExprFactory, IdentRenamer},
++        visit::{
++            as_folder, noop_visit_mut_type, noop_visit_type, Fold, Visit, VisitMut, VisitMutWith,
++            VisitWith,
++        },
++    },
++};
++
++pub fn cjs_optimizer(config: Config, unresolved_ctxt: SyntaxContext) -> impl Fold + VisitMut {
++    as_folder(CjsOptimizer {
++        data: State::default(),
++        packages: config.packages,
++        unresolved_ctxt,
++    })
++}
++
++#[derive(Clone, Debug, Deserialize)]
++pub struct Config {
++    pub packages: FxHashMap<String, PackageConfig>,
++}
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct PackageConfig {
++    pub transforms: FxHashMap<JsWord, JsWord>,
++}
++
++struct CjsOptimizer {
++    data: State,
++    packages: FxHashMap<String, PackageConfig>,
++    unresolved_ctxt: SyntaxContext,
++}
++
++#[derive(Debug, Default)]
++struct State {
++    /// List of `require` calls **which should be replaced**.
++    ///
++    ///  `(identifier): (module_record)`
++    imports: FxHashMap<Id, ImportRecord>,
++
++    /// `(module_specifier, property): (identifier)`
++    replaced: FxHashMap<(Atom, JsWord), Id>,
++
++    extra_stmts: Vec<Stmt>,
++
++    rename_map: FxHashMap<Id, Id>,
++
++    /// Ignored identifiers for `obj` of [MemberExpr].
++    ignored: FxHashSet<Id>,
++
++    is_prepass: bool,
++}
++
++#[derive(Debug)]
++struct ImportRecord {
++    module_specifier: Atom,
++}
++
++impl CjsOptimizer {
++    fn should_rewrite(&self, module_specifier: &str) -> Option<&FxHashMap<JsWord, JsWord>> {
++        self.packages.get(module_specifier).map(|v| &v.transforms)
++    }
++}
++
++impl VisitMut for CjsOptimizer {
++    noop_visit_mut_type!();
++
++    fn visit_mut_module_items(&mut self, stmts: &mut Vec<ModuleItem>) {
++        self.data.is_prepass = true;
++        stmts.visit_mut_children_with(self);
++        self.data.is_prepass = false;
++        stmts.visit_mut_children_with(self);
++    }
++
++    fn visit_mut_expr(&mut self, e: &mut Expr) {
++        e.visit_mut_children_with(self);
++
++        if let Expr::Member(n) = e {
++            if let MemberProp::Ident(prop) = &n.prop {
++                if let Expr::Ident(obj) = &*n.obj {
++                    let key = obj.to_id();
++                    if self.data.ignored.contains(&key) {
++                        return;
++                    }
++
++                    if let Some(record) = self.data.imports.get(&key) {
++                        let mut replaced = false;
++
++                        let new_id = self
++                            .data
++                            .replaced
++                            .entry((record.module_specifier.clone(), prop.sym.clone()))
++                            .or_insert_with(|| private_ident!(prop.sym.clone()).to_id())
++                            .clone();
++
++                        if let Some(map) = self.should_rewrite(&record.module_specifier) {
++                            if let Some(renamed) = map.get(&prop.sym) {
++                                replaced = true;
++                                if !self.data.is_prepass {
++                                    // Transform as `require('foo').bar`
++                                    let var = VarDeclarator {
++                                        span: DUMMY_SP,
++                                        name: Pat::Ident(new_id.clone().into()),
++                                        init: Some(Box::new(Expr::Member(MemberExpr {
++                                            span: DUMMY_SP,
++                                            obj: Box::new(Expr::Call(CallExpr {
++                                                span: DUMMY_SP,
++                                                callee: Ident::new(
++                                                    "require".into(),
++                                                    DUMMY_SP.with_ctxt(self.unresolved_ctxt),
++                                                )
++                                                .as_callee(),
++                                                args: vec![Expr::Lit(Lit::Str(
++                                                    renamed.clone().into(),
++                                                ))
++                                                .as_arg()],
++                                                type_args: None,
++                                            })),
++                                            prop: MemberProp::Ident(Ident::new(
++                                                prop.sym.clone(),
++                                                DUMMY_SP.with_ctxt(self.unresolved_ctxt),
++                                            )),
++                                        }))),
++                                        definite: false,
++                                    };
++
++                                    self.data.extra_stmts.push(Stmt::Decl(Decl::Var(Box::new(
++                                        VarDecl {
++                                            span: DUMMY_SP,
++                                            kind: VarDeclKind::Const,
++                                            declare: false,
++                                            decls: vec![var],
++                                        },
++                                    ))));
++
++                                    *e = Expr::Ident(new_id.into());
++                                }
++                            }
++                        }
++
++                        if !replaced {
++                            self.data.ignored.insert(key);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    fn visit_mut_module(&mut self, n: &mut Module) {
++        n.visit_children_with(&mut Analyzer {
++            data: &mut self.data,
++            in_member_or_var: false,
++        });
++
++        n.visit_mut_children_with(self);
++
++        prepend_stmts(
++            &mut n.body,
++            self.data.extra_stmts.drain(..).map(ModuleItem::Stmt),
++        );
++
++        n.visit_mut_children_with(&mut IdentRenamer::new(&self.data.rename_map));
++    }
++
++    fn visit_mut_script(&mut self, n: &mut Script) {
++        n.visit_children_with(&mut Analyzer {
++            data: &mut self.data,
++            in_member_or_var: false,
++        });
++
++        n.visit_mut_children_with(self);
++
++        prepend_stmts(&mut n.body, self.data.extra_stmts.drain(..));
++
++        n.visit_mut_children_with(&mut IdentRenamer::new(&self.data.rename_map));
++    }
++
++    fn visit_mut_stmt(&mut self, n: &mut Stmt) {
++        n.visit_mut_children_with(self);
++
++        if let Stmt::Decl(Decl::Var(v)) = n {
++            if v.decls.is_empty() {
++                n.take();
++            }
++        }
++    }
++
++    fn visit_mut_var_declarator(&mut self, n: &mut VarDeclarator) {
++        n.visit_mut_children_with(self);
++
++        // Find `require('foo')`
++        if let Some(Expr::Call(CallExpr {
++            callee: Callee::Expr(callee),
++            args,
++            ..
++        })) = n.init.as_deref()
++        {
++            if let Expr::Ident(ident) = &**callee {
++                if ident.span.ctxt == self.unresolved_ctxt && ident.sym == *"require" {
++                    if let Some(arg) = args.get(0) {
++                        if let Expr::Lit(Lit::Str(v)) = &*arg.expr {
++                            // TODO: Config
++
++                            if let Pat::Ident(name) = &n.name {
++                                if let Some(..) = self.should_rewrite(&v.value) {
++                                    let key = name.to_id();
++
++                                    if !self.data.is_prepass {
++                                        if !self.data.ignored.contains(&key) {
++                                            // Drop variable declarator.
++                                            n.name.take();
++                                        }
++                                    } else {
++                                        self.data.imports.insert(
++                                            key,
++                                            ImportRecord {
++                                                module_specifier: v.value.clone().into(),
++                                            },
++                                        );
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    fn visit_mut_var_declarators(&mut self, n: &mut Vec<VarDeclarator>) {
++        n.visit_mut_children_with(self);
++
++        // We make `name` invalid if we should drop it.
++        n.retain(|v| !v.name.is_invalid());
++    }
++}
++
++struct Analyzer<'a> {
++    in_member_or_var: bool,
++    data: &'a mut State,
++}
++
++impl Visit for Analyzer<'_> {
++    noop_visit_type!();
++
++    fn visit_var_declarator(&mut self, n: &VarDeclarator) {
++        self.in_member_or_var = true;
++        n.visit_children_with(self);
++        self.in_member_or_var = false;
++    }
++
++    fn visit_member_expr(&mut self, e: &MemberExpr) {
++        self.in_member_or_var = true;
++        e.visit_children_with(self);
++        self.in_member_or_var = false;
++
++        if let (Expr::Ident(obj), MemberProp::Computed(..)) = (&*e.obj, &e.prop) {
++            self.data.ignored.insert(obj.to_id());
++        }
++    }
++
++    fn visit_ident(&mut self, i: &Ident) {
++        i.visit_children_with(self);
++        if !self.in_member_or_var {
++            self.data.ignored.insert(i.to_id());
++        }
++    }
++}
+diff --git a/packages/next-swc/crates/core/src/lib.rs b/packages/next-swc/crates/core/src/lib.rs
+index 790492a29a..becf6f7168 100644
+--- a/packages/next-swc/crates/core/src/lib.rs
++++ b/packages/next-swc/crates/core/src/lib.rs
+@@ -38,7 +38,10 @@ use fxhash::FxHashSet;
+ use next_transform_font::next_font_loaders;
+ use serde::Deserialize;
+ use turbopack_binding::swc::core::{
+-    common::{chain, comments::Comments, pass::Optional, FileName, SourceFile, SourceMap},
++    common::{
++        chain, comments::Comments, pass::Optional, FileName, Mark, SourceFile, SourceMap,
++        SyntaxContext,
++    },
+     ecma::{
+         ast::EsVersion, parser::parse_file_as_module, transforms::base::pass::noop, visit::Fold,
+     },
+@@ -46,6 +49,7 @@ use turbopack_binding::swc::core::{
+ 
+ pub mod amp_attributes;
+ mod auto_cjs;
++pub mod cjs_optimizer;
+ pub mod disallow_re_export_all_in_page;
+ pub mod next_dynamic;
+ pub mod next_ssg;
+@@ -125,6 +129,9 @@ pub struct TransformOptions {
+ 
+     #[serde(default)]
+     pub server_actions: Option<server_actions::Config>,
++
++    #[serde(default)]
++    pub cjs_require_optimizer: Option<cjs_optimizer::Config>,
+ }
+ 
+ pub fn custom_before_pass<'a, C: Comments + 'a>(
+@@ -133,6 +140,7 @@ pub fn custom_before_pass<'a, C: Comments + 'a>(
+     opts: &'a TransformOptions,
+     comments: C,
+     eliminated_packages: Rc<RefCell<FxHashSet<String>>>,
++    unresolved_mark: Mark,
+ ) -> impl Fold + 'a
+ where
+     C: Clone,
+@@ -277,6 +285,12 @@ where
+             )),
+             None => Either::Right(noop()),
+         },
++        match &opts.cjs_require_optimizer {
++            Some(config) => {
++                Either::Left(cjs_optimizer::cjs_optimizer(config.clone(), SyntaxContext::empty().apply_mark(unresolved_mark)))
++            },
++            None => Either::Right(noop()),
++        },
+     )
+ }
+ 
+diff --git a/packages/next-swc/crates/core/tests/fixture.rs b/packages/next-swc/crates/core/tests/fixture.rs
+index ac7a28d0ec..43027af140 100644
+--- a/packages/next-swc/crates/core/tests/fixture.rs
++++ b/packages/next-swc/crates/core/tests/fixture.rs
+@@ -2,6 +2,7 @@ use std::{env::current_dir, path::PathBuf};
+ 
+ use next_swc::{
+     amp_attributes::amp_attributes,
++    cjs_optimizer::cjs_optimizer,
+     next_dynamic::next_dynamic,
+     next_ssg::next_ssg,
+     page_config::page_config_test,
+@@ -12,9 +13,10 @@ use next_swc::{
+     shake_exports::{shake_exports, Config as ShakeExportsConfig},
+ };
+ use next_transform_font::{next_font_loaders, Config as FontLoaderConfig};
++use serde::de::DeserializeOwned;
+ use turbopack_binding::swc::{
+     core::{
+-        common::{chain, comments::SingleThreadedComments, FileName, Mark},
++        common::{chain, comments::SingleThreadedComments, FileName, Mark, SyntaxContext},
+         ecma::{
+             parser::{EsConfig, Syntax},
+             transforms::{
+@@ -354,3 +356,47 @@ fn server_actions_client_fixture(input: PathBuf) {
+         Default::default(),
+     );
+ }
++
++#[fixture("tests/fixture/cjs-optimize/**/input.js")]
++fn cjs_optimize_fixture(input: PathBuf) {
++    let output = input.parent().unwrap().join("output.js");
++    test_fixture(
++        syntax(),
++        &|_tr| {
++            let unresolved_mark = Mark::new();
++            let top_level_mark = Mark::new();
++
++            let unresolved_ctxt = SyntaxContext::empty().apply_mark(unresolved_mark);
++
++            chain!(
++                resolver(unresolved_mark, top_level_mark, false),
++                cjs_optimizer(
++                    json(
++                        r###"
++                        {
++                            "packages": {
++                                "next/server": {
++                                    "transforms": {
++                                        "Response": "next/server/response"
++                                    }
++                                }
++                            }
++                        }
++                        "###
++                    ),
++                    unresolved_ctxt
++                )
++            )
++        },
++        &input,
++        &output,
++        Default::default(),
++    );
++}
++
++fn json<T>(s: &str) -> T
++where
++    T: DeserializeOwned,
++{
++    serde_json::from_str(s).expect("failed to deserialize")
++}
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/input.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/input.js
+new file mode 100644
+index 0000000000..2ae2c355a7
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/input.js
+@@ -0,0 +1,5 @@
++const foo = require('next/server')
++const preserved = require('next/unmatched')
++
++console.log(foo.Response)
++console.log(preserved.Preserved)
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/output.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/output.js
+new file mode 100644
+index 0000000000..b0bd4b2755
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/1/output.js
+@@ -0,0 +1,5 @@
++const Response = require("next/server/response").Response;
++;
++const preserved = require('next/unmatched');
++console.log(Response);
++console.log(preserved.Preserved);
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/input.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/input.js
+new file mode 100644
+index 0000000000..9984cbbe4b
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/input.js
+@@ -0,0 +1,8 @@
++'use strict'
++Object.defineProperty(exports, '__esModule', {
++  value: true,
++})
++const server_1 = require('next/server')
++const createResponse = (...args) => {
++  return new server_1.Response(...args)
++}
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/output.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/output.js
+new file mode 100644
+index 0000000000..5c75490fb5
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/2/output.js
+@@ -0,0 +1,9 @@
++'use strict';
++const Response = require("next/server/response").Response;
++Object.defineProperty(exports, '__esModule', {
++    value: true
++});
++;
++const createResponse = (...args)=>{
++    return new Response(...args);
++};
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/input.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/input.js
+new file mode 100644
+index 0000000000..c2f964a50d
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/input.js
+@@ -0,0 +1,3 @@
++const foo = require('next/server')
++
++console.log(foo.bar)
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/output.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/output.js
+new file mode 100644
+index 0000000000..1196b63767
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-2/output.js
+@@ -0,0 +1,3 @@
++const foo = require('next/server');
++
++console.log(foo.bar);
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/input.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/input.js
+new file mode 100644
+index 0000000000..034aa33d13
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/input.js
+@@ -0,0 +1,3 @@
++const foo = require('next/server')
++
++console.log(foo)
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/output.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/output.js
+new file mode 100644
+index 0000000000..7699c791c3
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed-3/output.js
+@@ -0,0 +1,3 @@
++const foo = require('next/server');
++
++console.log(foo);
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/input.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/input.js
+new file mode 100644
+index 0000000000..14c75b0809
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/input.js
+@@ -0,0 +1,6 @@
++const foo = require('next/server')
++const preserved = require('next/unmatched')
++
++console.log(foo.Response)
++console.log(foo['Re' + 'spawn'])
++console.log(preserved.Preserved)
+diff --git a/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/output.js b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/output.js
+new file mode 100644
+index 0000000000..590e9ef5a1
+--- /dev/null
++++ b/packages/next-swc/crates/core/tests/fixture/cjs-optimize/not-processed/output.js
+@@ -0,0 +1,5 @@
++const foo = require('next/server');
++const preserved = require('next/unmatched');
++console.log(foo.Response);
++console.log(foo['Re' + 'spawn']);
++console.log(preserved.Preserved);
+diff --git a/packages/next-swc/crates/core/tests/full.rs b/packages/next-swc/crates/core/tests/full.rs
+index 98920786b6..0c1d5f8373 100644
+--- a/packages/next-swc/crates/core/tests/full.rs
++++ b/packages/next-swc/crates/core/tests/full.rs
+@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
+ use turbopack_binding::swc::{
+     core::{
+         base::Compiler,
+-        common::comments::SingleThreadedComments,
++        common::{comments::SingleThreadedComments, Mark},
+         ecma::{
+             parser::{Syntax, TsConfig},
+             transforms::base::pass::noop,
+@@ -77,9 +77,12 @@ fn test(input: &Path, minify: bool) {
+                 font_loaders: None,
+                 app_dir: None,
+                 server_actions: None,
++                cjs_require_optimizer: None,
+             };
+ 
+-            let options = options.patch(&fm);
++            let unresolved_mark = Mark::new();
++            let mut options = options.patch(&fm);
++            options.swc.unresolved_mark = Some(unresolved_mark);
+ 
+             let comments = SingleThreadedComments::default();
+             match c.process_js_with_custom_pass(
+@@ -95,6 +98,7 @@ fn test(input: &Path, minify: bool) {
+                         &options,
+                         comments.clone(),
+                         Default::default(),
++                        unresolved_mark,
+                     )
+                 },
+                 |_| noop(),
+diff --git a/packages/next-swc/crates/napi/src/transform.rs b/packages/next-swc/crates/napi/src/transform.rs
+index 1c52fbd610..a3f1bdff56 100644
+--- a/packages/next-swc/crates/napi/src/transform.rs
++++ b/packages/next-swc/crates/napi/src/transform.rs
+@@ -40,7 +40,7 @@ use napi::bindgen_prelude::*;
+ use next_swc::{custom_before_pass, TransformOptions};
+ use turbopack_binding::swc::core::{
+     base::{try_with_handler, Compiler, TransformOutput},
+-    common::{comments::SingleThreadedComments, errors::ColorConfig, FileName, GLOBALS},
++    common::{comments::SingleThreadedComments, errors::ColorConfig, FileName, Mark, GLOBALS},
+     ecma::transforms::base::pass::noop,
+ };
+ 
+@@ -107,7 +107,9 @@ impl Task for TransformTask {
+                                     )
+                                 }
+                             };
+-                            let options = options.patch(&fm);
++                            let unresolved_mark = Mark::new();
++                            let mut options = options.patch(&fm);
++                            options.swc.unresolved_mark = Some(unresolved_mark);
+ 
+                             let cm = self.c.cm.clone();
+                             let file = fm.clone();
+@@ -126,6 +128,7 @@ impl Task for TransformTask {
+                                         &options,
+                                         comments.clone(),
+                                         eliminated_packages.clone(),
++                                        unresolved_mark,
+                                     )
+                                 },
+                                 |_| noop(),
+diff --git a/packages/next-swc/crates/wasm/src/lib.rs b/packages/next-swc/crates/wasm/src/lib.rs
+index 32b9d35118..bfd8d42f86 100644
+--- a/packages/next-swc/crates/wasm/src/lib.rs
++++ b/packages/next-swc/crates/wasm/src/lib.rs
+@@ -3,6 +3,7 @@ use std::sync::Arc;
+ use anyhow::{Context, Error};
+ use js_sys::JsString;
+ use next_swc::{custom_before_pass, TransformOptions};
++use swc_core::common::Mark;
+ use turbopack_binding::swc::core::{
+     base::{
+         config::{JsMinifyOptions, ParseOptions},
+@@ -66,7 +67,9 @@ pub fn transform_sync(s: JsValue, opts: JsValue) -> Result<JsValue, JsValue> {
+     console_error_panic_hook::set_once();
+ 
+     let c = compiler();
+-    let opts: TransformOptions = serde_wasm_bindgen::from_value(opts)?;
++    let unresolved_mark = Mark::new();
++    let mut opts: TransformOptions = serde_wasm_bindgen::from_value(opts)?;
++    opts.swc.unresolved_mark = Some(unresolved_mark);
+ 
+     let s = s.dyn_into::<js_sys::JsString>();
+     let out = try_with_handler(
+@@ -103,6 +106,7 @@ pub fn transform_sync(s: JsValue, opts: JsValue) -> Result<JsValue, JsValue> {
+                                     &opts,
+                                     comments.clone(),
+                                     Default::default(),
++                                    unresolved_mark,
+                                 )
+                             },
+                             |_| noop(),
+diff --git a/packages/next/src/build/swc/options.ts b/packages/next/src/build/swc/options.ts
+index 722692f4f8..0d8ecf6bf7 100644
+--- a/packages/next/src/build/swc/options.ts
++++ b/packages/next/src/build/swc/options.ts
+@@ -330,6 +330,19 @@ export function getLoaderSWCOptions({
+     ],
+     relativeFilePathFromRoot,
+   }
++  baseOptions.cjsRequireOptimizer = {
++    packages: {
++      'next/server': {
++        transforms: {
++          NextRequest: 'next/dist/server/web/spec-extension/request',
++          NextResponse: 'next/dist/server/web/spec-extension/response',
++          ImageResponse: 'next/dist/server/web/spec-extension/image-response',
++          userAgentFromString: 'next/dist/server/web/spec-extension/user-agent',
++          userAgent: 'next/dist/server/web/spec-extension/user-agent',
++        },
++      },
++    },
++  }
+ 
+   const isNextDist = nextDistPath.test(filename)
+ 
+diff --git a/packages/next/src/build/webpack-config.ts b/packages/next/src/build/webpack-config.ts
+index de1537cd0d..615c659e23 100644
+--- a/packages/next/src/build/webpack-config.ts
++++ b/packages/next/src/build/webpack-config.ts
+@@ -1999,7 +1999,7 @@ export default async function getBaseWebpackConfig(
+               use: loaderForAPIRoutes,
+             },
+             {
+-              ...codeCondition,
++              test: codeCondition.test,
+               issuerLayer: WEBPACK_LAYERS.middleware,
+               use: defaultLoaders.babel,
+             },
+diff --git a/test/e2e/app-dir/app-external/app-external.test.ts b/test/e2e/app-dir/app-external/app-external.test.ts
+index 5f791b1897..e69b5b80b5 100644
+--- a/test/e2e/app-dir/app-external/app-external.test.ts
++++ b/test/e2e/app-dir/app-external/app-external.test.ts
+@@ -211,5 +211,13 @@ createNextDescribe(
+         )
+       })
+     }
++
++    it('should have proper tree-shaking for known modules in CJS', async () => {
++      const html = await next.render('/test-middleware')
++      expect(html).toContain('it works')
++
++      const middlewareBundle = await next.readFile('.next/server/middleware.js')
++      expect(middlewareBundle).not.toContain('image-response')
++    })
+   }
+ )
+diff --git a/test/e2e/app-dir/app-external/middleware.js b/test/e2e/app-dir/app-external/middleware.js
+new file mode 100644
+index 0000000000..bc818e60c7
+--- /dev/null
++++ b/test/e2e/app-dir/app-external/middleware.js
+@@ -0,0 +1,7 @@
++import { createResponse } from 'cjs-lib'
++
++export function middleware(request) {
++  if (request.nextUrl.pathname === '/test-middleware') {
++    return createResponse('it works')
++  }
++}
+diff --git a/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/index.js b/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/index.js
+new file mode 100644
+index 0000000000..a6865d191c
+--- /dev/null
++++ b/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/index.js
+@@ -0,0 +1,8 @@
++Object.defineProperty(exports, '__esModule', { value: true })
++const server_1 = require('next/server')
++const createResponse = (...args) => {
++  return new server_1.NextResponse(...args)
++}
++exports.createResponse = createResponse
++
++// Note: this is a CJS library that used the `NextResponse` export from `next/server`.
+diff --git a/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/package.json b/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/package.json
+new file mode 100644
+index 0000000000..3b26284716
+--- /dev/null
++++ b/test/e2e/app-dir/app-external/node_modules_bak/cjs-lib/package.json
+@@ -0,0 +1,4 @@
++{
++  "name": "cjs-lib",
++  "exports": "./index.js"
++}

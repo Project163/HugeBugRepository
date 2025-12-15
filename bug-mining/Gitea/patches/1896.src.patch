@@ -1,0 +1,514 @@
+diff --git a/models/pull/automerge.go b/models/pull/automerge.go
+index 3cafacc3a4..7f940a9849 100644
+--- a/models/pull/automerge.go
++++ b/models/pull/automerge.go
+@@ -5,12 +5,14 @@ package pull
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	repo_model "code.gitea.io/gitea/models/repo"
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	"code.gitea.io/gitea/modules/timeutil"
++	"code.gitea.io/gitea/modules/util"
+ )
+ 
+ // AutoMerge represents a pull request scheduled for merging when checks succeed
+@@ -76,7 +78,10 @@ func GetScheduledMergeByPullID(ctx context.Context, pullID int64) (bool, *AutoMe
+ 		return false, nil, err
+ 	}
+ 
+-	doer, err := user_model.GetUserByID(ctx, scheduledPRM.DoerID)
++	doer, err := user_model.GetPossibleUserByID(ctx, scheduledPRM.DoerID)
++	if errors.Is(err, util.ErrNotExist) {
++		doer, err = user_model.NewGhostUser(), nil
++	}
+ 	if err != nil {
+ 		return false, nil, err
+ 	}
+diff --git a/services/automerge/automerge.go b/services/automerge/automerge.go
+index 0520a097d3..1a37d70e5a 100644
+--- a/services/automerge/automerge.go
++++ b/services/automerge/automerge.go
+@@ -22,23 +22,21 @@ import (
+ 	"code.gitea.io/gitea/modules/log"
+ 	"code.gitea.io/gitea/modules/process"
+ 	"code.gitea.io/gitea/modules/queue"
++	"code.gitea.io/gitea/services/automergequeue"
+ 	notify_service "code.gitea.io/gitea/services/notify"
+ 	pull_service "code.gitea.io/gitea/services/pull"
+ 	repo_service "code.gitea.io/gitea/services/repository"
+ )
+ 
+-// prAutoMergeQueue represents a queue to handle update pull request tests
+-var prAutoMergeQueue *queue.WorkerPoolQueue[string]
+-
+ // Init runs the task queue to that handles auto merges
+ func Init() error {
+ 	notify_service.RegisterNotifier(NewNotifier())
+ 
+-	prAutoMergeQueue = queue.CreateUniqueQueue(graceful.GetManager().ShutdownContext(), "pr_auto_merge", handler)
+-	if prAutoMergeQueue == nil {
++	automergequeue.AutoMergeQueue = queue.CreateUniqueQueue(graceful.GetManager().ShutdownContext(), "pr_auto_merge", handler)
++	if automergequeue.AutoMergeQueue == nil {
+ 		return errors.New("unable to create pr_auto_merge queue")
+ 	}
+-	go graceful.GetManager().RunWithCancel(prAutoMergeQueue)
++	go graceful.GetManager().RunWithCancel(automergequeue.AutoMergeQueue)
+ 	return nil
+ }
+ 
+@@ -56,24 +54,23 @@ func handler(items ...string) []string {
+ 	return nil
+ }
+ 
+-func addToQueue(pr *issues_model.PullRequest, sha string) {
+-	log.Trace("Adding pullID: %d to the pull requests patch checking queue with sha %s", pr.ID, sha)
+-	if err := prAutoMergeQueue.Push(fmt.Sprintf("%d_%s", pr.ID, sha)); err != nil {
+-		log.Error("Error adding pullID: %d to the pull requests patch checking queue %v", pr.ID, err)
+-	}
+-}
+-
+ // ScheduleAutoMerge if schedule is false and no error, pull can be merged directly
+ func ScheduleAutoMerge(ctx context.Context, doer *user_model.User, pull *issues_model.PullRequest, style repo_model.MergeStyle, message string, deleteBranchAfterMerge bool) (scheduled bool, err error) {
+ 	err = db.WithTx(ctx, func(ctx context.Context) error {
+ 		if err := pull_model.ScheduleAutoMerge(ctx, doer, pull.ID, style, message, deleteBranchAfterMerge); err != nil {
+ 			return err
+ 		}
+-		scheduled = true
+-
+ 		_, err = issues_model.CreateAutoMergeComment(ctx, issues_model.CommentTypePRScheduledToAutoMerge, pull, doer)
+ 		return err
+ 	})
++	// Old code made "scheduled" to be true after "ScheduleAutoMerge", but it's not right:
++	// If the transaction rolls back, then the pull request is not scheduled to auto merge.
++	// So we should only set "scheduled" to true if there is no error.
++	scheduled = err == nil
++	if scheduled {
++		log.Trace("Pull request [%d] scheduled for auto merge with style [%s] and message [%s]", pull.ID, style, message)
++		automergequeue.StartPRCheckAndAutoMerge(ctx, pull)
++	}
+ 	return scheduled, err
+ }
+ 
+@@ -99,38 +96,12 @@ func StartPRCheckAndAutoMergeBySHA(ctx context.Context, sha string, repo *repo_m
+ 	}
+ 
+ 	for _, pr := range pulls {
+-		addToQueue(pr, sha)
++		automergequeue.AddToQueue(pr, sha)
+ 	}
+ 
+ 	return nil
+ }
+ 
+-// StartPRCheckAndAutoMerge start an automerge check and auto merge task for a pull request
+-func StartPRCheckAndAutoMerge(ctx context.Context, pull *issues_model.PullRequest) {
+-	if pull == nil || pull.HasMerged || !pull.CanAutoMerge() {
+-		return
+-	}
+-
+-	if err := pull.LoadBaseRepo(ctx); err != nil {
+-		log.Error("LoadBaseRepo: %v", err)
+-		return
+-	}
+-
+-	gitRepo, err := gitrepo.OpenRepository(ctx, pull.BaseRepo)
+-	if err != nil {
+-		log.Error("OpenRepository: %v", err)
+-		return
+-	}
+-	defer gitRepo.Close()
+-	commitID, err := gitRepo.GetRefCommitID(pull.GetGitRefName())
+-	if err != nil {
+-		log.Error("GetRefCommitID: %v", err)
+-		return
+-	}
+-
+-	addToQueue(pull, commitID)
+-}
+-
+ func getPullRequestsByHeadSHA(ctx context.Context, sha string, repo *repo_model.Repository, filter func(*issues_model.PullRequest) bool) (map[int64]*issues_model.PullRequest, error) {
+ 	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
+ 	if err != nil {
+diff --git a/services/automerge/notify.go b/services/automerge/notify.go
+index b6bbca333b..8a1bb5fc90 100644
+--- a/services/automerge/notify.go
++++ b/services/automerge/notify.go
+@@ -12,6 +12,7 @@ import (
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	"code.gitea.io/gitea/modules/log"
+ 	"code.gitea.io/gitea/modules/repository"
++	"code.gitea.io/gitea/services/automergequeue"
+ 	notify_service "code.gitea.io/gitea/services/notify"
+ )
+ 
+@@ -45,7 +46,7 @@ func (n *automergeNotifier) PullReviewDismiss(ctx context.Context, doer *user_mo
+ 		return
+ 	}
+ 	// as reviews could have blocked a pending automerge let's recheck
+-	StartPRCheckAndAutoMerge(ctx, review.Issue.PullRequest)
++	automergequeue.StartPRCheckAndAutoMerge(ctx, review.Issue.PullRequest)
+ }
+ 
+ func (n *automergeNotifier) CreateCommitStatus(ctx context.Context, repo *repo_model.Repository, commit *repository.PushCommit, sender *user_model.User, status *git_model.CommitStatus) {
+diff --git a/services/automergequeue/automergequeue.go b/services/automergequeue/automergequeue.go
+new file mode 100644
+index 0000000000..cdf257e6c8
+--- /dev/null
++++ b/services/automergequeue/automergequeue.go
+@@ -0,0 +1,49 @@
++// Copyright 2025 The Gitea Authors. All rights reserved.
++// SPDX-License-Identifier: MIT
++
++package automergequeue
++
++import (
++	"context"
++	"fmt"
++
++	issues_model "code.gitea.io/gitea/models/issues"
++	"code.gitea.io/gitea/modules/gitrepo"
++	"code.gitea.io/gitea/modules/log"
++	"code.gitea.io/gitea/modules/queue"
++)
++
++var AutoMergeQueue *queue.WorkerPoolQueue[string]
++
++var AddToQueue = func(pr *issues_model.PullRequest, sha string) {
++	log.Trace("Adding pullID: %d to the pull requests patch checking queue with sha %s", pr.ID, sha)
++	if err := AutoMergeQueue.Push(fmt.Sprintf("%d_%s", pr.ID, sha)); err != nil {
++		log.Error("Error adding pullID: %d to the pull requests patch checking queue %v", pr.ID, err)
++	}
++}
++
++// StartPRCheckAndAutoMerge start an automerge check and auto merge task for a pull request
++func StartPRCheckAndAutoMerge(ctx context.Context, pull *issues_model.PullRequest) {
++	if pull == nil || pull.HasMerged || !pull.CanAutoMerge() {
++		return
++	}
++
++	if err := pull.LoadBaseRepo(ctx); err != nil {
++		log.Error("LoadBaseRepo: %v", err)
++		return
++	}
++
++	gitRepo, err := gitrepo.OpenRepository(ctx, pull.BaseRepo)
++	if err != nil {
++		log.Error("OpenRepository: %v", err)
++		return
++	}
++	defer gitRepo.Close()
++	commitID, err := gitRepo.GetRefCommitID(pull.GetGitRefName())
++	if err != nil {
++		log.Error("GetRefCommitID: %v", err)
++		return
++	}
++
++	AddToQueue(pull, commitID)
++}
+diff --git a/services/pull/check.go b/services/pull/check.go
+index 5d8990aa00..bf6c5fa1c4 100644
+--- a/services/pull/check.go
++++ b/services/pull/check.go
+@@ -1,5 +1,4 @@
+-// Copyright 2019 The Gitea Authors.
+-// All rights reserved.
++// Copyright 2019 The Gitea Authors. All rights reserved.
+ // SPDX-License-Identifier: MIT
+ 
+ package pull
+@@ -16,6 +15,7 @@ import (
+ 	git_model "code.gitea.io/gitea/models/git"
+ 	issues_model "code.gitea.io/gitea/models/issues"
+ 	access_model "code.gitea.io/gitea/models/perm/access"
++	"code.gitea.io/gitea/models/pull"
+ 	repo_model "code.gitea.io/gitea/models/repo"
+ 	"code.gitea.io/gitea/models/unit"
+ 	user_model "code.gitea.io/gitea/models/user"
+@@ -29,6 +29,7 @@ import (
+ 	"code.gitea.io/gitea/modules/setting"
+ 	"code.gitea.io/gitea/modules/timeutil"
+ 	asymkey_service "code.gitea.io/gitea/services/asymkey"
++	"code.gitea.io/gitea/services/automergequeue"
+ 	notify_service "code.gitea.io/gitea/services/notify"
+ )
+ 
+@@ -238,7 +239,7 @@ func isSignedIfRequired(ctx context.Context, pr *issues_model.PullRequest, doer
+ // markPullRequestAsMergeable checks if pull request is possible to leaving checking status,
+ // and set to be either conflict or mergeable.
+ func markPullRequestAsMergeable(ctx context.Context, pr *issues_model.PullRequest) {
+-	// If status has not been changed to conflict by testPullRequestTmpRepoBranchMergeable then we are mergeable
++	// If the status has not been changed to conflict by testPullRequestTmpRepoBranchMergeable then we are mergeable
+ 	if pr.Status == issues_model.PullRequestStatusChecking {
+ 		pr.Status = issues_model.PullRequestStatusMergeable
+ 	}
+@@ -257,6 +258,16 @@ func markPullRequestAsMergeable(ctx context.Context, pr *issues_model.PullReques
+ 	if err := pr.UpdateColsIfNotMerged(ctx, "merge_base", "status", "conflicted_files", "changed_protected_files"); err != nil {
+ 		log.Error("Update[%-v]: %v", pr, err)
+ 	}
++
++	// if there is a scheduled merge for this pull request, start the auto merge check (again)
++	exist, _, err := pull.GetScheduledMergeByPullID(ctx, pr.ID)
++	if err != nil {
++		log.Error("GetScheduledMergeByPullID[%-v]: %v", pr, err)
++		return
++	} else if !exist {
++		return
++	}
++	automergequeue.StartPRCheckAndAutoMerge(ctx, pr)
+ }
+ 
+ // getMergeCommit checks if a pull request has been merged
+diff --git a/services/pull/check_test.go b/services/pull/check_test.go
+index fa3a676ef1..eb66615dcf 100644
+--- a/services/pull/check_test.go
++++ b/services/pull/check_test.go
+@@ -1,5 +1,4 @@
+-// Copyright 2019 The Gitea Authors.
+-// All rights reserved.
++// Copyright 2019 The Gitea Authors. All rights reserved.
+ // SPDX-License-Identifier: MIT
+ 
+ package pull
+@@ -11,11 +10,18 @@ import (
+ 
+ 	"code.gitea.io/gitea/models/db"
+ 	issues_model "code.gitea.io/gitea/models/issues"
++	"code.gitea.io/gitea/models/pull"
++	repo_model "code.gitea.io/gitea/models/repo"
+ 	"code.gitea.io/gitea/models/unittest"
++	user_model "code.gitea.io/gitea/models/user"
++	"code.gitea.io/gitea/modules/graceful"
+ 	"code.gitea.io/gitea/modules/queue"
+ 	"code.gitea.io/gitea/modules/setting"
++	"code.gitea.io/gitea/modules/test"
++	"code.gitea.io/gitea/services/automergequeue"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestPullRequest_AddToTaskQueue(t *testing.T) {
+@@ -63,6 +69,46 @@ func TestPullRequest_AddToTaskQueue(t *testing.T) {
+ 	pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
+ 	assert.Equal(t, issues_model.PullRequestStatusChecking, pr.Status)
+ 
+-	prPatchCheckerQueue.ShutdownWait(5 * time.Second)
++	prPatchCheckerQueue.ShutdownWait(time.Second)
+ 	prPatchCheckerQueue = nil
+ }
++
++func TestMarkPullRequestAsMergeable(t *testing.T) {
++	assert.NoError(t, unittest.PrepareTestDatabase())
++
++	prPatchCheckerQueue = queue.CreateUniqueQueue(graceful.GetManager().ShutdownContext(), "pr_patch_checker", func(items ...string) []string { return nil })
++	go prPatchCheckerQueue.Run()
++	defer func() {
++		prPatchCheckerQueue.ShutdownWait(time.Second)
++		prPatchCheckerQueue = nil
++	}()
++
++	addToQueueShaChan := make(chan string, 1)
++	defer test.MockVariableValue(&automergequeue.AddToQueue, func(pr *issues_model.PullRequest, sha string) {
++		addToQueueShaChan <- sha
++	})()
++	ctx := t.Context()
++	_, _ = db.GetEngine(ctx).ID(2).Update(&issues_model.PullRequest{Status: issues_model.PullRequestStatusChecking})
++	pr := unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
++	require.False(t, pr.HasMerged)
++	require.Equal(t, issues_model.PullRequestStatusChecking, pr.Status)
++
++	err := pull.ScheduleAutoMerge(ctx, &user_model.User{ID: 99999}, pr.ID, repo_model.MergeStyleMerge, "test msg", true)
++	require.NoError(t, err)
++
++	exist, scheduleMerge, err := pull.GetScheduledMergeByPullID(ctx, pr.ID)
++	require.NoError(t, err)
++	assert.True(t, exist)
++	assert.True(t, scheduleMerge.Doer.IsGhost())
++
++	markPullRequestAsMergeable(ctx, pr)
++	pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: 2})
++	require.Equal(t, issues_model.PullRequestStatusMergeable, pr.Status)
++
++	select {
++	case sha := <-addToQueueShaChan:
++		assert.Equal(t, "985f0301dba5e7b34be866819cd15ad3d8f508ee", sha) // ref: refs/pull/3/head
++	case <-time.After(1 * time.Second):
++		assert.FailNow(t, "Timeout: nothing was added to automergequeue")
++	}
++}
+diff --git a/tests/integration/git_general_test.go b/tests/integration/git_general_test.go
+index 3b0f9589d2..e72b7b4ff1 100644
+--- a/tests/integration/git_general_test.go
++++ b/tests/integration/git_general_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"path/filepath"
+ 	"slices"
+ 	"strconv"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -489,40 +490,60 @@ func doBranchProtectPRMerge(baseCtx *APITestContext, dstPath string) func(t *tes
+ }
+ 
+ func doProtectBranch(ctx APITestContext, branch, userToWhitelistPush, userToWhitelistForcePush, unprotectedFilePatterns, protectedFilePatterns string) func(t *testing.T) {
++	return doProtectBranchExt(ctx, branch, doProtectBranchOptions{
++		UserToWhitelistPush:      userToWhitelistPush,
++		UserToWhitelistForcePush: userToWhitelistForcePush,
++		UnprotectedFilePatterns:  unprotectedFilePatterns,
++		ProtectedFilePatterns:    protectedFilePatterns,
++	})
++}
++
++type doProtectBranchOptions struct {
++	UserToWhitelistPush, UserToWhitelistForcePush, UnprotectedFilePatterns, ProtectedFilePatterns string
++
++	StatusCheckPatterns []string
++}
++
++func doProtectBranchExt(ctx APITestContext, ruleName string, opts doProtectBranchOptions) func(t *testing.T) {
+ 	// We are going to just use the owner to set the protection.
+ 	return func(t *testing.T) {
+ 		csrf := GetUserCSRFToken(t, ctx.Session)
+ 
+ 		formData := map[string]string{
+ 			"_csrf":                     csrf,
+-			"rule_name":                 branch,
+-			"unprotected_file_patterns": unprotectedFilePatterns,
+-			"protected_file_patterns":   protectedFilePatterns,
++			"rule_name":                 ruleName,
++			"unprotected_file_patterns": opts.UnprotectedFilePatterns,
++			"protected_file_patterns":   opts.ProtectedFilePatterns,
+ 		}
+ 
+-		if userToWhitelistPush != "" {
+-			user, err := user_model.GetUserByName(db.DefaultContext, userToWhitelistPush)
++		if opts.UserToWhitelistPush != "" {
++			user, err := user_model.GetUserByName(db.DefaultContext, opts.UserToWhitelistPush)
+ 			assert.NoError(t, err)
+ 			formData["whitelist_users"] = strconv.FormatInt(user.ID, 10)
+ 			formData["enable_push"] = "whitelist"
+ 			formData["enable_whitelist"] = "on"
+ 		}
+ 
+-		if userToWhitelistForcePush != "" {
+-			user, err := user_model.GetUserByName(db.DefaultContext, userToWhitelistForcePush)
++		if opts.UserToWhitelistForcePush != "" {
++			user, err := user_model.GetUserByName(db.DefaultContext, opts.UserToWhitelistForcePush)
+ 			assert.NoError(t, err)
+ 			formData["force_push_allowlist_users"] = strconv.FormatInt(user.ID, 10)
+ 			formData["enable_force_push"] = "whitelist"
+ 			formData["enable_force_push_allowlist"] = "on"
+ 		}
+ 
++		if len(opts.StatusCheckPatterns) > 0 {
++			formData["enable_status_check"] = "on"
++			formData["status_check_contexts"] = strings.Join(opts.StatusCheckPatterns, "\n")
++		}
++
+ 		// Send the request to update branch protection settings
+ 		req := NewRequestWithValues(t, "POST", fmt.Sprintf("/%s/%s/settings/branches/edit", url.PathEscape(ctx.Username), url.PathEscape(ctx.Reponame)), formData)
+ 		ctx.Session.MakeRequest(t, req, http.StatusSeeOther)
+ 
+-		// Check if master branch has been locked successfully
++		// Check if the "master" branch has been locked successfully
+ 		flashMsg := ctx.Session.GetCookieFlashMessage()
+-		assert.Equal(t, `Branch protection for rule "`+branch+`" has been updated.`, flashMsg.SuccessMsg)
++		assert.Equal(t, `Branch protection for rule "`+ruleName+`" has been updated.`, flashMsg.SuccessMsg)
+ 	}
+ }
+ 
+@@ -688,6 +709,10 @@ func doAutoPRMerge(baseCtx *APITestContext, dstPath string) func(t *testing.T) {
+ 
+ 		ctx := NewAPITestContext(t, baseCtx.Username, baseCtx.Reponame, auth_model.AccessTokenScopeWriteRepository)
+ 
++		// automerge will merge immediately if the PR is mergeable and there is no "status check" because no status check also means "all checks passed"
++		// so we must set up a status check to test the auto merge feature
++		doProtectBranchExt(ctx, "protected", doProtectBranchOptions{StatusCheckPatterns: []string{"*"}})(t)
++
+ 		t.Run("CheckoutProtected", doGitCheckoutBranch(dstPath, "protected"))
+ 		t.Run("PullProtected", doGitPull(dstPath, "origin", "protected"))
+ 		t.Run("GenerateCommit", func(t *testing.T) {
+@@ -728,13 +753,13 @@ func doAutoPRMerge(baseCtx *APITestContext, dstPath string) func(t *testing.T) {
+ 
+ 		// Cancel not existing auto merge
+ 		ctx.ExpectedCode = http.StatusNotFound
+-		t.Run("CancelAutoMergePR", doAPICancelAutoMergePullRequest(ctx, baseCtx.Username, baseCtx.Reponame, pr.Index))
++		t.Run("CancelAutoMergePRNotExist", doAPICancelAutoMergePullRequest(ctx, baseCtx.Username, baseCtx.Reponame, pr.Index))
+ 
+ 		// Add auto merge request
+ 		ctx.ExpectedCode = http.StatusCreated
+ 		t.Run("AutoMergePR", doAPIAutoMergePullRequest(ctx, baseCtx.Username, baseCtx.Reponame, pr.Index))
+ 
+-		// Can not create schedule twice
++		// Cannot create schedule twice
+ 		ctx.ExpectedCode = http.StatusConflict
+ 		t.Run("AutoMergePRTwice", doAPIAutoMergePullRequest(ctx, baseCtx.Username, baseCtx.Reponame, pr.Index))
+ 
+diff --git a/tests/integration/pull_merge_test.go b/tests/integration/pull_merge_test.go
+index 73b4c22070..897a78cef4 100644
+--- a/tests/integration/pull_merge_test.go
++++ b/tests/integration/pull_merge_test.go
+@@ -35,6 +35,7 @@ import (
+ 	"code.gitea.io/gitea/modules/test"
+ 	"code.gitea.io/gitea/modules/translation"
+ 	"code.gitea.io/gitea/services/automerge"
++	"code.gitea.io/gitea/services/automergequeue"
+ 	pull_service "code.gitea.io/gitea/services/pull"
+ 	repo_service "code.gitea.io/gitea/services/repository"
+ 	commitstatus_service "code.gitea.io/gitea/services/repository/commitstatus"
+@@ -727,7 +728,7 @@ func TestPullAutoMergeAfterCommitStatusSucceed(t *testing.T) {
+ 
+ 		// add protected branch for commit status
+ 		csrf := GetUserCSRFToken(t, session)
+-		// Change master branch to protected
++		// Change the "master" branch to "protected"
+ 		req := NewRequestWithValues(t, "POST", "/user2/repo1/settings/branches/edit", map[string]string{
+ 			"_csrf":                 csrf,
+ 			"rule_name":             "master",
+@@ -737,10 +738,22 @@ func TestPullAutoMergeAfterCommitStatusSucceed(t *testing.T) {
+ 		})
+ 		session.MakeRequest(t, req, http.StatusSeeOther)
+ 
++		oldAutoMergeAddToQueue := automergequeue.AddToQueue
++		addToQueueShaChan := make(chan string, 1)
++		automergequeue.AddToQueue = func(pr *issues_model.PullRequest, sha string) {
++			addToQueueShaChan <- sha
++		}
+ 		// first time insert automerge record, return true
+ 		scheduled, err := automerge.ScheduleAutoMerge(db.DefaultContext, user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+ 		assert.NoError(t, err)
+ 		assert.True(t, scheduled)
++		// and the pr should be added to automergequeue, in case it is already "mergeable"
++		select {
++		case <-addToQueueShaChan:
++		case <-time.After(time.Second):
++			assert.FailNow(t, "Timeout: nothing was added to automergequeue")
++		}
++		automergequeue.AddToQueue = oldAutoMergeAddToQueue
+ 
+ 		// second time insert automerge record, return false because it does exist
+ 		scheduled, err = automerge.ScheduleAutoMerge(db.DefaultContext, user1, pr, repo_model.MergeStyleMerge, "auto merge test", false)
+@@ -775,13 +788,11 @@ func TestPullAutoMergeAfterCommitStatusSucceed(t *testing.T) {
+ 		})
+ 		assert.NoError(t, err)
+ 
+-		time.Sleep(2 * time.Second)
+-
+-		// realod pr again
+-		pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
+-		assert.True(t, pr.HasMerged)
++		assert.Eventually(t, func() bool {
++			pr = unittest.AssertExistsAndLoadBean(t, &issues_model.PullRequest{ID: pr.ID})
++			return pr.HasMerged
++		}, 2*time.Second, 100*time.Millisecond)
+ 		assert.NotEmpty(t, pr.MergedCommitID)
+-
+ 		unittest.AssertNotExistsBean(t, &pull_model.AutoMerge{PullID: pr.ID})
+ 	})
+ }

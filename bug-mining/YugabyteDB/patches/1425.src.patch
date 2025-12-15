@@ -1,0 +1,181 @@
+diff --git a/src/yb/integration-tests/cdc_service-int-test.cc b/src/yb/integration-tests/cdc_service-int-test.cc
+index 4ec964e212..9379bf0c38 100644
+--- a/src/yb/integration-tests/cdc_service-int-test.cc
++++ b/src/yb/integration-tests/cdc_service-int-test.cc
+@@ -1805,6 +1805,57 @@ TEST_F(CDCServiceTest, TestCheckpointUpdate) {
+   VerifyStreamDeletedFromCdcState(client_.get(), stream_id_, tablet_id);
+ }
+ 
++class CDCServiceShutdownTest : public CDCServiceTest {
++  void DoTearDown() override {
++    YBMiniClusterTestBase::DoTearDown();
++  }
++};
++
++TEST_F(CDCServiceShutdownTest, Shutdown) {
++  // Skip cluster verification.
++  DontVerifyClusterBeforeNextTearDown();
++  stream_id_ = ASSERT_RESULT(CreateXClusterStream(*client_, table_.table()->id()));
++
++  std::string tablet_id = GetTablet();
++
++  GetChangesRequestPB change_req;
++  change_req.set_tablet_id(tablet_id);
++  change_req.set_stream_id(stream_id_.ToString());
++
++  // Sanity check we can successfully call the GetChanges RPC.
++  {
++    GetChangesResponsePB resp;
++    RpcController rpc;
++    ASSERT_OK(cdc_proxy_->GetChanges(change_req, &resp, &rpc));
++    ASSERT_FALSE(resp.has_error());
++    ASSERT_EQ(resp.records_size(), 0);
++  }
++
++  OneTimeBool stop;
++  TestThreadHolder thread_holder;
++  thread_holder.AddThreadFunctor([&stop, this, &change_req]() {
++    do {
++      GetChangesResponsePB resp;
++      RpcController rpc;
++      auto result = cdc_proxy_->GetChanges(change_req, &resp, &rpc);
++    } while (!stop);
++  });
++  LOG(INFO) << "Shutting down cluster.";
++  auto shutdown_thread = ASSERT_RESULT(
++      Thread::Make("shutdown_thread", "shutdown_thread", [&]() { cluster_->Shutdown(); }));
++  auto status =
++      ThreadJoiner(shutdown_thread.get()).give_up_after(MonoDelta::FromSeconds(30)).Join();
++  if (!status.ok()) {
++    std::stringstream ss;
++    RenderAllThreadStacks(ss);
++    LOG(INFO) << "Failed to shut down in time, dumping all thread stacks:\n" << ss.str();
++  }
++  WARN_NOT_OK(ThreadJoiner(shutdown_thread.get()).Join(), "Failed to join shutdown thread");
++  stop.Set();
++  thread_holder.Stop();
++  thread_holder.JoinAll();
++}
++
+ class CDCServiceTestFourServers : public CDCServiceTest {
+  public:
+   void SetUp() override {
+diff --git a/src/yb/integration-tests/object_lock-test.cc b/src/yb/integration-tests/object_lock-test.cc
+index 4c75bf8b5c..d563486076 100644
+--- a/src/yb/integration-tests/object_lock-test.cc
++++ b/src/yb/integration-tests/object_lock-test.cc
+@@ -227,7 +227,6 @@ class ExternalObjectLockTest : public YBMiniClusterTestBase<ExternalMiniCluster>
+   virtual ExternalMiniClusterOptions MakeExternalMiniClusterOptions();
+   virtual int ReplicationFactor() { return 3; }
+   virtual size_t NumberOfTabletServers() { return 3; }
+-  Result<pgwrapper::PGConn> ConnectToTabletServer(ExternalTabletServer* ts, size_t timeout_seconds);
+   ExternalTabletServer* tablet_server(size_t index);
+   Status WaitForTServerLeaseToExpire(const std::string& ts_uuid, MonoDelta timeout);
+   Status WaitForTServerLease(const std::string& ts_uuid, MonoDelta timeout);
+@@ -1678,16 +1677,6 @@ ExternalMiniClusterOptions ExternalObjectLockTest::MakeExternalMiniClusterOption
+   return opts;
+ }
+ 
+-Result<pgwrapper::PGConn> ExternalObjectLockTest::ConnectToTabletServer(
+-    ExternalTabletServer* ts, size_t timeout_seconds) {
+-  auto settings = pgwrapper::PGConnSettings{
+-      .host = ts->bind_host(),
+-      .port = ts->ysql_port(),
+-      .dbname = "yugabyte",
+-      .connect_timeout = timeout_seconds};
+-  return pgwrapper::PGConnBuilder(settings).Connect(/* simple_query_protocol */ false);
+-}
+-
+ ExternalTabletServer* ExternalObjectLockTest::tablet_server(size_t index) {
+   return cluster_->tablet_server(index);
+ }
+diff --git a/src/yb/rpc/messenger.cc b/src/yb/rpc/messenger.cc
+index ef113dbcb4..11e3a25c5f 100644
+--- a/src/yb/rpc/messenger.cc
++++ b/src/yb/rpc/messenger.cc
+@@ -451,17 +451,17 @@ void Messenger::ShutdownThreadPools() {
+ }
+ 
+ void Messenger::UnregisterAllServices() {
+-  if (!rpc_services_counter_stopped_) {
+-    CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
+-    rpc_services_counter_.UnlockExclusiveOpMutex();
+-    rpc_services_counter_stopped_ = true;
++  if (!rpc_services_stopped_.Set()) {
++    return;
+   }
++  CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
++  rpc_services_counter_.UnlockExclusiveOpMutex();
+ 
+-  for (const auto& p : rpc_services_) {
+-    p.second->StartShutdown();
++  for (const auto& [_, rpc_service]  : rpc_services_) {
++    rpc_service->StartShutdown();
+   }
+-  for (const auto& p : rpc_services_) {
+-    p.second->CompleteShutdown();
++  for (const auto& [_, rpc_service] : rpc_services_) {
++    rpc_service->CompleteShutdown();
+   }
+ 
+   rpc_endpoints_.clear();
+diff --git a/src/yb/rpc/messenger.h b/src/yb/rpc/messenger.h
+index 79b1cc30a6..cbbae674e8 100644
+--- a/src/yb/rpc/messenger.h
++++ b/src/yb/rpc/messenger.h
+@@ -51,15 +51,16 @@
+ #include "yb/rpc/proxy_context.h"
+ #include "yb/rpc/scheduler.h"
+ 
+-#include "yb/util/metrics_fwd.h"
+-#include "yb/util/status_fwd.h"
+ #include "yb/util/async_util.h"
+ #include "yb/util/atomic.h"
+ #include "yb/util/locks.h"
++#include "yb/util/metrics_fwd.h"
+ #include "yb/util/monotime.h"
+ #include "yb/util/net/sockaddr.h"
++#include "yb/util/one_time_bool.h"
+ #include "yb/util/operation_counter.h"
+ #include "yb/util/stack_trace.h"
++#include "yb/util/status_fwd.h"
+ 
+ namespace yb {
+ 
+@@ -367,7 +368,7 @@ class Messenger : public ProxyContext {
+ 
+   // RPC services that handle inbound requests.
+   mutable RWOperationCounter rpc_services_counter_;
+-  std::atomic_bool rpc_services_counter_stopped_ = false;
++  OneTimeBool rpc_services_stopped_;
+   std::unordered_multimap<std::string, RpcServicePtr> rpc_services_;
+   RpcEndpointMap rpc_endpoints_;
+ 
+diff --git a/src/yb/server/server_base.h b/src/yb/server/server_base.h
+index dbec4fe145..8f28d30c81 100644
+--- a/src/yb/server/server_base.h
++++ b/src/yb/server/server_base.h
+@@ -68,7 +68,7 @@ class ServerStatusPB;
+ // a YB tablet server and master.
+ class RpcServerBase {
+  public:
+-  const RpcServer *rpc_server() const { return rpc_server_.get(); }
++  const RpcServer* rpc_server() const { return rpc_server_.get(); }
+   rpc::Messenger* messenger() const { return messenger_.get(); }
+   rpc::ProxyCache& proxy_cache() { return *proxy_cache_; }
+ 
+diff --git a/src/yb/tserver/tablet_server.cc b/src/yb/tserver/tablet_server.cc
+index c12e8c6abb..e4ebe9dc8d 100644
+--- a/src/yb/tserver/tablet_server.cc
++++ b/src/yb/tserver/tablet_server.cc
+@@ -783,10 +783,6 @@ void TabletServer::Shutdown() {
+     xcluster_consumer->Shutdown();
+   }
+ 
+-  if (cdc_service_) {
+-    cdc_service_->Shutdown();
+-  }
+-
+   maintenance_manager_->Shutdown();
+   WARN_NOT_OK(heartbeater_->Stop(), "Failed to stop TS Heartbeat thread");
+   WARN_NOT_OK(ysql_lease_poller_->Stop(), "Failed to stop ysql lease client thread");

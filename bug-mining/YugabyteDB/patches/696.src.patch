@@ -1,0 +1,342 @@
+diff --git a/src/yb/yql/cql/ql/ptree/pt_dml.h b/src/yb/yql/cql/ql/ptree/pt_dml.h
+index 63221943aa..302a4b3028 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_dml.h
++++ b/src/yb/yql/cql/ql/ptree/pt_dml.h
+@@ -316,6 +316,16 @@ class PTDmlStmt : public PTCollection {
+     return bind_variables_;
+   }
+ 
++  // Compare 2 bind variables for their hash column ids.
++  struct HashColCmp {
++    bool operator()(const PTBindVar* v1, const PTBindVar* v2) const;
++  };
++  typedef MCSet<PTBindVar*, HashColCmp> PTBindVarSet;
++
++  const PTBindVarSet& TEST_hash_col_bindvars() const {
++    return hash_col_bindvars_;
++  }
++
+   virtual std::vector<int64_t> hash_col_indices() const;
+ 
+   // Access for column_args.
+@@ -477,13 +487,8 @@ class PTDmlStmt : public PTCollection {
+   // restrictions involving all hash/partition columns -- i.e. read requests using Token builtin
+   MCList<PartitionKeyOp> partition_key_ops_;
+ 
+-  // Compare 2 bind variables for their hash column ids.
+-  struct HashColCmp {
+-    bool operator()(const PTBindVar* v1, const PTBindVar* v2) const;
+-  };
+-
+   // List of bind variables associated with hash columns ordered by their column ids.
+-  MCSet<PTBindVar*, HashColCmp> hash_col_bindvars_;
++  PTBindVarSet hash_col_bindvars_;
+ 
+   MCSharedPtr<MCVector<ColumnArg>> column_args_;
+   MCSharedPtr<MCVector<SubscriptedColumnArg>> subscripted_col_args_;
+diff --git a/src/yb/yql/cql/ql/ptree/pt_expr.cc b/src/yb/yql/cql/ql/ptree/pt_expr.cc
+index a6027be893..3769c135b4 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_expr.cc
++++ b/src/yb/yql/cql/ql/ptree/pt_expr.cc
+@@ -1613,8 +1613,11 @@ Status PTBindVar::Analyze(SemContext *sem_context) {
+ 
+   internal_type_ = sem_context->expr_expected_internal_type();
+   expected_internal_type_ = internal_type_;
+-  hash_col_ = sem_context->hash_col();
+-  if (hash_col_ != nullptr) {
++  const ColumnDesc* const hash_col_in_context = sem_context->hash_col();
++  // If this bindvar is valid in this statement context (table/index)
++  // then add it to the binvar list for this statement.
++  if (hash_col_in_context != nullptr) {
++    hash_col_ = hash_col_in_context; // Store this hash column desc.
+     DCHECK(sem_context->current_dml_stmt() != nullptr);
+     sem_context->current_dml_stmt()->AddHashColumnBindVar(this);
+   }
+diff --git a/src/yb/yql/cql/ql/ptree/pt_select.cc b/src/yb/yql/cql/ql/ptree/pt_select.cc
+index 8f19a1a507..c5315bf05c 100644
+--- a/src/yb/yql/cql/ql/ptree/pt_select.cc
++++ b/src/yb/yql/cql/ql/ptree/pt_select.cc
+@@ -298,6 +298,8 @@ class Selectivity {
+       }
+       const auto iter = id_to_idx.find(col_op.desc()->id());
+       if (iter != id_to_idx.end()) {
++        LOG_IF(DFATAL, iter->second >= ops.size())
++            << "Bad op index=" << iter->second << " for vector size=" << ops.size();
+         ops[iter->second] = GetOperatorSelectivity(col_op.yb_op());
+       } else {
+         num_non_key_ops_++;
+diff --git a/src/yb/yql/cql/ql/test/ql-semanalyzer-test.cc b/src/yb/yql/cql/ql/test/ql-semanalyzer-test.cc
+index 556c33ce3a..500fe69105 100644
+--- a/src/yb/yql/cql/ql/test/ql-semanalyzer-test.cc
++++ b/src/yb/yql/cql/ql/test/ql-semanalyzer-test.cc
+@@ -16,11 +16,14 @@
+ #include "yb/common/ql_type.h"
+ 
+ #include "yb/client/client.h"
++#include "yb/client/table.h"
++#include "yb/client/table_info.h"
+ 
+ #include "yb/util/result.h"
+ #include "yb/util/status_log.h"
+ #include "yb/util/varint.h"
+ 
++#include "yb/yql/cql/ql/ptree/column_desc.h"
+ #include "yb/yql/cql/ql/ptree/parse_tree.h"
+ #include "yb/yql/cql/ql/ptree/pt_create_table.h"
+ #include "yb/yql/cql/ql/ptree/pt_expr.h"
+@@ -295,6 +298,76 @@ TEST_F(QLTestAnalyzer, TestBindVariableAnalyzer) {
+   CHECK_OK(processor->Run("DROP TABLE t;"));
+ }
+ 
++TEST_F(QLTestAnalyzer, TestBindVariableInChildSelect) {
++  CreateSimulatedCluster();
++  TestQLProcessor *processor = GetQLProcessor();
++  EXEC_VALID_STMT("CREATE TABLE tbl ("
++                  "  h1 INT, h2 TEXT, r1 INT, r2 TEXT, c1 INT, PRIMARY KEY ((h1, h2), r1, r2)"
++                  ") WITH transactions = {'enabled': 'true'};");
++  EXEC_VALID_STMT("CREATE INDEX ind ON tbl ((h1, r2), h2, r1);");
++
++  // Wait for read permissions on the index.
++  client::YBTableName table_name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "tbl");
++  client::YBTableName index_name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "ind");
++  ASSERT_OK(client_->WaitUntilIndexPermissionsAtLeast(
++      table_name, index_name, INDEX_PERM_READ_WRITE_AND_DELETE));
++
++  const client::YBTableInfo table_info = ASSERT_RESULT(client_->GetYBTableInfo(table_name));
++  // The first column id is 0 in Release and 10 in Debug.
++  const int base_id = table_info.schema.ColumnId(0);
++
++  auto checkPTBindVar =
++      [base_id](PTSelectStmt::PTBindVarSet::const_iterator it,
++                const char* name, int id, int64_t pos) {
++        ASSERT_STREQ((*it)->name()->c_str(), name);
++        ASSERT_EQ((*it)->pos(), pos);
++        ASSERT_NE((*it)->hash_col(), nullptr);
++        ASSERT_EQ((*it)->hash_col()->id(), base_id + id);
++      };
++
++  EXEC_INVALID_STMT_WITH_ERROR(
++      "SELECT h2, r1, c1 FROM tbl WHERE h1 = :h1 AND h2 = :h2 AND r2 = :r2;",
++      "no bind variable available");
++  // The block here is needed to clean temporary shared pointers (like 'main_select')
++  // before the ParserTree destructor call.
++  {
++    TreeNodePtr root = processor->GetLastParseTreeRoot();
++    ASSERT_EQ(TreeNodeOpcode::kPTSelectStmt, root->opcode());
++    PTSelectStmt::SharedPtr main_select = std::static_pointer_cast<PTSelectStmt>(root);
++    // PTSelectStmt::table_name() returns a referenced table name from the 'FROM' clause.
++    ASSERT_EQ(main_select->table_name(), table_name);
++    ASSERT_EQ(main_select->table()->name(), table_name);
++    ASSERT_FALSE(main_select->table()->IsIndex());
++
++    // In the SELECT statement the bind variables positions: :h1 - 0, :h2 - 1, :r2 - 2.
++    {
++      const PTSelectStmt::PTBindVarSet& hash_col_bindvars = main_select->TEST_hash_col_bindvars();
++      ASSERT_EQ(2, hash_col_bindvars.size());
++      PTSelectStmt::PTBindVarSet::const_iterator it = hash_col_bindvars.begin();
++      // In the table hash columns: h1, h2 - positions in SELECT: 0, 1.
++      checkPTBindVar(it, "h1", 0, 0);
++      checkPTBindVar(++it, "h2", 1, 1);
++    }
++
++    PTSelectStmt::SharedPtr child_select = main_select->child_select();
++    ASSERT_NE(child_select, nullptr);
++    ASSERT_EQ(child_select->table()->name(), index_name);
++    ASSERT_TRUE(child_select->table()->IsIndex());
++    ASSERT_FALSE(child_select->covers_fully());
++    {
++      const PTSelectStmt::PTBindVarSet& hash_col_bindvars = child_select->TEST_hash_col_bindvars();
++      ASSERT_EQ(2, hash_col_bindvars.size());
++      PTSelectStmt::PTBindVarSet::const_iterator it = hash_col_bindvars.begin();
++      // In the index hash columns: h1, r2 - positions in SELECT: 0, 2.
++      checkPTBindVar(it, "h1", 0, 0);
++      checkPTBindVar(++it, "r2", 1, 2);
++    }
++  }
++
++  EXEC_VALID_STMT("DROP TABLE tbl;");
++  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
++}
++
+ TEST_F(QLTestAnalyzer, TestCreateIndex) {
+   CreateSimulatedCluster();
+   TestQLProcessor *processor = GetQLProcessor();
+diff --git a/src/yb/yql/cql/ql/test/ql-statement-test.cc b/src/yb/yql/cql/ql/test/ql-statement-test.cc
+index 79a23c8116..85d90b610c 100644
+--- a/src/yb/yql/cql/ql/test/ql-statement-test.cc
++++ b/src/yb/yql/cql/ql/test/ql-statement-test.cc
+@@ -15,6 +15,8 @@
+ 
+ #include "yb/gutil/strings/substitute.h"
+ 
++#include "yb/client/client.h"
++
+ #include "yb/util/async_util.h"
+ #include "yb/util/status_log.h"
+ 
+@@ -45,6 +47,12 @@ class TestQLStatement : public QLTestBase {
+                               Bind(&TestQLStatement::ExecuteAsyncDone, Unretained(this), cb));
+   }
+ 
++  void WaitForIndex(const string& table_name, const string& index_name) {
++    client::YBTableName yb_table_name(YQL_DATABASE_CQL, kDefaultKeyspaceName, table_name);
++    client::YBTableName yb_index_name(YQL_DATABASE_CQL, kDefaultKeyspaceName, index_name);
++    ASSERT_OK(client_->WaitUntilIndexPermissionsAtLeast(
++        yb_table_name, yb_index_name, INDEX_PERM_READ_WRITE_AND_DELETE));
++  }
+ };
+ 
+ TEST_F(TestQLStatement, TestExecutePrepareAfterTableDrop) {
+@@ -115,10 +123,27 @@ TEST_F(TestQLStatement, TestPrepareWithUnknownSystemTableAndUnknownField) {
+   LOG(INFO) << "Done.";
+ }
+ 
++void prepareAndCheck(TestQLProcessor* processor,
++                     const string& query,
++                     std::initializer_list<int64_t> positions) {
++  // Prepare a select statement.
++  LOG(INFO) << "Prepare statement: " << query;
++  PreparedResult::UniPtr result;
++  Statement stmt(processor->CurrentKeyspace(), query);
++  ASSERT_OK(stmt.Prepare(
++      &processor->ql_processor(), nullptr /* mem_tracker */, false /* internal */, &result));
++
++  const std::vector<int64_t>& hash_col_indices = result->hash_col_indices();
++  EXPECT_EQ(hash_col_indices.size(), positions.size());
++  std::initializer_list<int64_t>::iterator it = positions.begin();
++  for (int i = 0; it != positions.end(); ++i, ++it) {
++    EXPECT_EQ(hash_col_indices[i], *it);
++  }
++}
++
+ TEST_F(TestQLStatement, TestPKIndices) {
+   // Init the simulated cluster.
+   ASSERT_NO_FATALS(CreateSimulatedCluster());
+-
+   // Get a processor.
+   TestQLProcessor *processor = GetQLProcessor();
+ 
+@@ -127,21 +152,110 @@ TEST_F(TestQLStatement, TestPKIndices) {
+   EXEC_VALID_STMT("create table test_pk_indices "
+                   "(h1 int, h2 text, h3 timestamp, r int, primary key ((h1, h2, h3), r));");
+ 
+-  // Prepare a select statement.
+-  LOG(INFO) << "Prepare select statement.";
+-  Statement stmt(processor->CurrentKeyspace(),
+-                 "select * from test_pk_indices where h3 = ? and h1 = ? and h2 = ?;");
+-  PreparedResult::UniPtr result;
+-  CHECK_OK(stmt.Prepare(
+-      &processor->ql_processor(), nullptr /* mem_tracker */, false /* internal */, &result));
++  // The hash columns: h1 (pos=1 in SELECT), h2 (pos=2 in SELECT), h3 (pos=0 in SELECT).
++  prepareAndCheck(
++      processor, "select * from test_pk_indices where h3 = ? and h1 = ? and h2 = ?;", {1, 2, 0});
+ 
+-  const std::vector<int64_t>& hash_col_indices = result->hash_col_indices();
+-  EXPECT_EQ(hash_col_indices.size(), 3);
+-  EXPECT_EQ(hash_col_indices[0], 1);
+-  EXPECT_EQ(hash_col_indices[1], 2);
+-  EXPECT_EQ(hash_col_indices[2], 0);
++  EXEC_VALID_STMT("DROP TABLE test_pk_indices;");
++  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
++}
+ 
+-  LOG(INFO) << "Done.";
++TEST_F(TestQLStatement, TestBindVarPositions) {
++  // Init the simulated cluster.
++  ASSERT_NO_FATALS(CreateSimulatedCluster());
++  // Get a processor.
++  TestQLProcessor *processor = GetQLProcessor();
++
++  LOG(INFO) << "Create test table and index.";
++  EXEC_VALID_STMT(
++      "CREATE TABLE tbl (h1 INT, h2 TEXT, r1 INT, r2 TEXT, c1 INT, "
++      "PRIMARY KEY ((h1, h2), r1, r2)) WITH transactions = {'enabled' : 'true'};");
++  EXEC_VALID_STMT("CREATE INDEX ind1 ON tbl ((h1, r2), h2, r1);");
++  EXEC_VALID_STMT("CREATE INDEX ind2 ON tbl ((h2, r1), h1, c1);");
++  // Wait for read permissions on the indexes.
++  WaitForIndex("tbl", "ind1");
++  WaitForIndex("tbl", "ind2");
++
++  // Primary index 'tbl' is the chosen scan method. Hash columns: h1, h2.
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h2 = ? AND h1 = ?;", {1, 0});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h2 = ? AND h1 = ? AND r1 IN (?, ?);", {1, 0});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE r1 IN (?, ?) AND h2 = ? AND h1 = ?;", {3, 2});
++
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 = ? AND h2 = ?;", {0, 1});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 = ? AND h2 = ? AND r1 = ?;", {0, 1});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE r1 = ? AND h1 = ? AND h2 = ?;", {1, 2});
++  prepareAndCheck(processor,
++      "SELECT * FROM tbl WHERE h1 = ? AND h2 = ? AND (r1, r2) IN ((?, ?));", {0, 1});
++  prepareAndCheck(processor,
++      "SELECT * FROM tbl WHERE (r1, r2) IN ((?, ?)) AND h1 = ? AND h2 = ?;", {2, 3});
++
++  // Test operator IN with a hash column.
++  // TOFIX: EMPTY HASH-COL POSITIONS ARE NOT EXPECTED HERE.
++  //        https://github.com/yugabyte/yugabyte-db/issues/13710
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 IN (?);", {});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 IN (?) AND h2 = ?;", {});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 = ? AND h2 IN (?);", {});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 IN (?, ?) AND h2 = ?;", {});
++
++  // Index 'ind1' is the chosen scan method. Hash columns: h1, r2.
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 = ? AND h2 = ? AND r2 = ?;", {0, 2});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE r2 = ? AND h2 = ? AND h1 = ?;", {2, 0});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE h1 = ? AND r2 = ? AND h2 = ?;", {0, 1});
++  prepareAndCheck(processor, "SELECT * FROM tbl WHERE r2 = ? AND h1 = ? AND h2 = ?;", {1, 0});
++
++  // Index 'ind2' is the chosen scan method. Hash columns: h2, r1.
++  prepareAndCheck(processor, "SELECT h2, c1 FROM tbl WHERE c1 = ? AND r1 = ? AND h2 = ?;", {2, 1});
++  prepareAndCheck(processor, "SELECT h2, c1 FROM tbl WHERE c1 = ? AND h2 = ? AND r1 = ?;", {1, 2});
++  prepareAndCheck(processor, "SELECT h2, c1 FROM tbl WHERE h2 = ? AND c1 = ? AND r1 = ?;", {0, 2});
++  prepareAndCheck(processor, "SELECT h2, c1 FROM tbl WHERE r1 = ? AND c1 = ? AND h2 = ?;", {2, 0});
++
++  // Test UPDATE.
++  prepareAndCheck(processor,
++      "UPDATE tbl SET c1 = 0 WHERE h1 = ? AND h2 = ? AND r2 = ? AND r1 = ?;", {0, 1});
++  prepareAndCheck(processor,
++      "UPDATE tbl SET c1 = 0 WHERE r2 = ? AND r1 = ? AND h2 = ? AND h1 = ?;", {3, 2});
++
++  // Test DELETE.
++  prepareAndCheck(processor,
++      "DELETE FROM tbl WHERE h2 = ? AND h1 = ? AND r2 = ? AND r1 = ?;", {1, 0});
++  prepareAndCheck(processor,
++      "DELETE FROM tbl WHERE r2 = ? AND r1 = ? AND h1 = ? AND h2 = ? IF EXISTS;", {2, 3});
++
++  // Test hash column based on json attribute.
++  EXEC_VALID_STMT("CREATE TABLE tbl_json (\"j->>'a'\" INT, \"j->>'b'\" INT, j JSONB, "
++                  "PRIMARY KEY(\"j->>'a'\")) WITH transactions = {'enabled' : true};");
++  prepareAndCheck(processor, "SELECT * FROM tbl_json WHERE j = ?;", {});
++  prepareAndCheck(processor, "SELECT * FROM tbl_json WHERE \"j->>'a'\" = ?;", {0});
++  prepareAndCheck(processor,
++      "SELECT * FROM tbl_json WHERE \"j->>'b'\" = ? AND \"j->>'a'\" = ?;", {1});
++  prepareAndCheck(processor, "UPDATE tbl_json SET \"j->>'b'\" = ? WHERE \"j->>'a'\" = ?;", {1});
++  prepareAndCheck(processor, "DELETE FROM tbl_json WHERE \"j->>'a'\" = ?;", {0});
++
++  EXEC_VALID_STMT("CREATE TABLE tbl_json2 (h1 INT, \"j->>'a'\" INT, j JSONB, v1 INT, "
++                  "PRIMARY KEY((h1, \"j->>'a'\"))) WITH transactions = {'enabled' : true};");
++  EXEC_VALID_STMT("CREATE INDEX ind ON tbl_json2 ((j->>'b', h1));");
++  WaitForIndex("tbl_json2", "ind");
++
++  // Using main table PRIMARY KEY: (h1, j->>'a').
++  // TOFIX: Memory error: out of bounds index: "Bad op index=2 for vector size=2"
++  //        https://github.com/yugabyte/yugabyte-db/issues/13731
++  //        Uncomment following 2 lines to reproduce the error:
++  //  prepareAndCheck(processor,
++  //      "SELECT * FROM tbl_json2 WHERE v1 = ? AND h1 = ? AND \"j->>'a'\" = ?;", {1, 2});
++  prepareAndCheck(processor,
++      "UPDATE tbl_json2 SET v1 = ? WHERE \"j->>'a'\" = ? AND h1 = ?;", {2, 1});
++  prepareAndCheck(processor, "DELETE FROM tbl_json2 WHERE h1 = ? AND \"j->>'a'\" = ?;", {0, 1});
++  // Using index PRIMARY KEY: (j->>'b', h1)
++  prepareAndCheck(processor,
++      "SELECT h1 FROM tbl_json2 WHERE j->>'b' = ? AND h1 = ?;", {0, 1});
++  prepareAndCheck(processor,
++      "SELECT * FROM tbl_json2 WHERE v1 = ? AND h1 = ? AND j->>'b' = ?;", {2, 1});
++
++  // Clean-up.
++  EXEC_VALID_STMT("DROP TABLE tbl;");
++  EXEC_VALID_STMT("DROP TABLE tbl_json;");
++  EXEC_VALID_STMT("DROP TABLE tbl_json2;");
++  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+ }
+ 
+ } // namespace ql

@@ -1,0 +1,663 @@
+diff --git a/routers/api/actions/runner/runner.go b/routers/api/actions/runner/runner.go
+index 46c5147d99..86bab4b340 100644
+--- a/routers/api/actions/runner/runner.go
++++ b/routers/api/actions/runner/runner.go
+@@ -217,10 +217,7 @@ func (s *Service) UpdateTask(
+ 		return nil, status.Errorf(codes.Internal, "load run: %v", err)
+ 	}
+ 
+-	// don't create commit status for cron job
+-	if task.Job.Run.ScheduleID == 0 {
+-		actions_service.CreateCommitStatus(ctx, task.Job)
+-	}
++	actions_service.CreateCommitStatusForRunJobs(ctx, task.Job.Run, task.Job)
+ 
+ 	if task.Status.IsDone() {
+ 		notify_service.WorkflowJobStatusUpdate(ctx, task.Job.Run.Repo, task.Job.Run.TriggerUser, task.Job, task)
+diff --git a/routers/web/repo/actions/view.go b/routers/web/repo/actions/view.go
+index 232c627709..b409e887be 100644
+--- a/routers/web/repo/actions/view.go
++++ b/routers/web/repo/actions/view.go
+@@ -541,7 +541,7 @@ func rerunJob(ctx *context_module.Context, job *actions_model.ActionRunJob, shou
+ 		return err
+ 	}
+ 
+-	actions_service.CreateCommitStatus(ctx, job)
++	actions_service.CreateCommitStatusForRunJobs(ctx, job.Run, job)
+ 	notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, nil)
+ 
+ 	return nil
+@@ -569,7 +569,7 @@ func Logs(ctx *context_module.Context) {
+ func Cancel(ctx *context_module.Context) {
+ 	runIndex := getRunIndex(ctx)
+ 
+-	_, jobs := getRunJobs(ctx, runIndex, -1)
++	firstJob, jobs := getRunJobs(ctx, runIndex, -1)
+ 	if ctx.Written() {
+ 		return
+ 	}
+@@ -588,7 +588,7 @@ func Cancel(ctx *context_module.Context) {
+ 		return
+ 	}
+ 
+-	actions_service.CreateCommitStatus(ctx, jobs...)
++	actions_service.CreateCommitStatusForRunJobs(ctx, firstJob.Run, jobs...)
+ 	actions_service.EmitJobsIfReadyByJobs(updatedJobs)
+ 
+ 	for _, job := range updatedJobs {
+@@ -642,7 +642,7 @@ func Approve(ctx *context_module.Context) {
+ 		return
+ 	}
+ 
+-	actions_service.CreateCommitStatus(ctx, jobs...)
++	actions_service.CreateCommitStatusForRunJobs(ctx, current.Run, jobs...)
+ 
+ 	if len(updatedJobs) > 0 {
+ 		job := updatedJobs[0]
+diff --git a/services/actions/clear_tasks.go b/services/actions/clear_tasks.go
+index 727a18443d..e49bda1b16 100644
+--- a/services/actions/clear_tasks.go
++++ b/services/actions/clear_tasks.go
+@@ -37,13 +37,19 @@ func StopEndlessTasks(ctx context.Context) error {
+ }
+ 
+ func notifyWorkflowJobStatusUpdate(ctx context.Context, jobs []*actions_model.ActionRunJob) {
+-	if len(jobs) > 0 {
+-		CreateCommitStatus(ctx, jobs...)
+-		for _, job := range jobs {
+-			_ = job.LoadAttributes(ctx)
+-			notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, nil)
++	if len(jobs) == 0 {
++		return
++	}
++	for _, job := range jobs {
++		if err := job.LoadAttributes(ctx); err != nil {
++			log.Error("Failed to load job attributes: %v", err)
++			continue
+ 		}
+-		job := jobs[0]
++		CreateCommitStatusForRunJobs(ctx, job.Run, job)
++		notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, nil)
++	}
++
++	if job := jobs[0]; job.Run != nil && job.Run.Repo != nil {
+ 		notify_service.WorkflowRunStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job.Run)
+ 	}
+ }
+@@ -208,7 +214,10 @@ func CancelAbandonedJobs(ctx context.Context) error {
+ 			log.Warn("cancel abandoned job %v: %v", job.ID, err)
+ 			// go on
+ 		}
+-		CreateCommitStatus(ctx, job)
++		if job.Run == nil || job.Run.Repo == nil {
++			continue // error occurs during loading attributes, the following code that depends on "Run.Repo" will fail, so ignore and skip
++		}
++		CreateCommitStatusForRunJobs(ctx, job.Run, job)
+ 		if updated {
+ 			updatedJobs = append(updatedJobs, job)
+ 			notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, nil)
+diff --git a/services/actions/commit_status.go b/services/actions/commit_status.go
+index ef241e5091..d3f2b0f3cc 100644
+--- a/services/actions/commit_status.go
++++ b/services/actions/commit_status.go
+@@ -8,14 +8,15 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"path"
++	"strconv"
+ 
+ 	actions_model "code.gitea.io/gitea/models/actions"
+ 	"code.gitea.io/gitea/models/db"
+ 	git_model "code.gitea.io/gitea/models/git"
++	repo_model "code.gitea.io/gitea/models/repo"
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	actions_module "code.gitea.io/gitea/modules/actions"
+ 	"code.gitea.io/gitea/modules/commitstatus"
+-	git "code.gitea.io/gitea/modules/git"
+ 	"code.gitea.io/gitea/modules/log"
+ 	webhook_module "code.gitea.io/gitea/modules/webhook"
+ 	commitstatus_service "code.gitea.io/gitea/services/repository/commitstatus"
+@@ -23,38 +24,46 @@ import (
+ 	"github.com/nektos/act/pkg/jobparser"
+ )
+ 
+-// CreateCommitStatus creates a commit status for the given job.
++// CreateCommitStatusForRunJobs creates a commit status for the given job if it has a supported event and related commit.
+ // It won't return an error failed, but will log it, because it's not critical.
+-func CreateCommitStatus(ctx context.Context, jobs ...*actions_model.ActionRunJob) {
++func CreateCommitStatusForRunJobs(ctx context.Context, run *actions_model.ActionRun, jobs ...*actions_model.ActionRunJob) {
++	// don't create commit status for cron job
++	if run.ScheduleID != 0 {
++		return
++	}
++
++	event, commitID, err := getCommitStatusEventNameAndCommitID(run)
++	if err != nil {
++		log.Error("GetCommitStatusEventNameAndSHA: %v", err)
++	}
++	if event == "" || commitID == "" {
++		return // unsupported event, or no commit id, or error occurs, do nothing
++	}
++
++	if err = run.LoadAttributes(ctx); err != nil {
++		log.Error("run.LoadAttributes: %v", err)
++		return
++	}
++
+ 	for _, job := range jobs {
+-		if err := createCommitStatus(ctx, job); err != nil {
++		if err = createCommitStatus(ctx, run.Repo, event, commitID, run, job); err != nil {
+ 			log.Error("Failed to create commit status for job %d: %v", job.ID, err)
+ 		}
+ 	}
+ }
+ 
+-func createCommitStatus(ctx context.Context, job *actions_model.ActionRunJob) error {
+-	if err := job.LoadAttributes(ctx); err != nil {
+-		return fmt.Errorf("load run: %w", err)
+-	}
+-
+-	run := job.Run
+-
+-	var (
+-		sha   string
+-		event string
+-	)
++func getCommitStatusEventNameAndCommitID(run *actions_model.ActionRun) (event, commitID string, _ error) {
+ 	switch run.Event {
+ 	case webhook_module.HookEventPush:
+ 		event = "push"
+ 		payload, err := run.GetPushEventPayload()
+ 		if err != nil {
+-			return fmt.Errorf("GetPushEventPayload: %w", err)
++			return "", "", fmt.Errorf("GetPushEventPayload: %w", err)
+ 		}
+ 		if payload.HeadCommit == nil {
+-			return errors.New("head commit is missing in event payload")
++			return "", "", errors.New("head commit is missing in event payload")
+ 		}
+-		sha = payload.HeadCommit.ID
++		commitID = payload.HeadCommit.ID
+ 	case // pull_request
+ 		webhook_module.HookEventPullRequest,
+ 		webhook_module.HookEventPullRequestSync,
+@@ -69,32 +78,33 @@ func createCommitStatus(ctx context.Context, job *actions_model.ActionRunJob) er
+ 		}
+ 		payload, err := run.GetPullRequestEventPayload()
+ 		if err != nil {
+-			return fmt.Errorf("GetPullRequestEventPayload: %w", err)
++			return "", "", fmt.Errorf("GetPullRequestEventPayload: %w", err)
+ 		}
+ 		if payload.PullRequest == nil {
+-			return errors.New("pull request is missing in event payload")
++			return "", "", errors.New("pull request is missing in event payload")
+ 		} else if payload.PullRequest.Head == nil {
+-			return errors.New("head of pull request is missing in event payload")
++			return "", "", errors.New("head of pull request is missing in event payload")
+ 		}
+-		sha = payload.PullRequest.Head.Sha
++		commitID = payload.PullRequest.Head.Sha
+ 	case webhook_module.HookEventRelease:
+ 		event = string(run.Event)
+-		sha = run.CommitSHA
+-	default:
+-		return nil
++		commitID = run.CommitSHA
++	default: // do nothing, return empty
+ 	}
++	return event, commitID, nil
++}
+ 
+-	repo := run.Repo
++func createCommitStatus(ctx context.Context, repo *repo_model.Repository, event, commitID string, run *actions_model.ActionRun, job *actions_model.ActionRunJob) error {
+ 	// TODO: store workflow name as a field in ActionRun to avoid parsing
+ 	runName := path.Base(run.WorkflowID)
+ 	if wfs, err := jobparser.Parse(job.WorkflowPayload); err == nil && len(wfs) > 0 {
+ 		runName = wfs[0].Name
+ 	}
+-	ctxname := fmt.Sprintf("%s / %s (%s)", runName, job.Name, event)
++	ctxName := fmt.Sprintf("%s / %s (%s)", runName, job.Name, event)
+ 	state := toCommitStatus(job.Status)
+-	if statuses, err := git_model.GetLatestCommitStatus(ctx, repo.ID, sha, db.ListOptionsAll); err == nil {
++	if statuses, err := git_model.GetLatestCommitStatus(ctx, repo.ID, commitID, db.ListOptionsAll); err == nil {
+ 		for _, v := range statuses {
+-			if v.Context == ctxname {
++			if v.Context == ctxName {
+ 				if v.State == state {
+ 					// no need to update
+ 					return nil
+@@ -106,7 +116,7 @@ func createCommitStatus(ctx context.Context, job *actions_model.ActionRunJob) er
+ 		return fmt.Errorf("GetLatestCommitStatus: %w", err)
+ 	}
+ 
+-	description := ""
++	var description string
+ 	switch job.Status {
+ 	// TODO: if we want support description in different languages, we need to support i18n placeholders in it
+ 	case actions_model.StatusSuccess:
+@@ -123,6 +133,8 @@ func createCommitStatus(ctx context.Context, job *actions_model.ActionRunJob) er
+ 		description = "Waiting to run"
+ 	case actions_model.StatusBlocked:
+ 		description = "Blocked by required conditions"
++	default:
++		description = "Unknown status: " + strconv.Itoa(int(job.Status))
+ 	}
+ 
+ 	index, err := getIndexOfJob(ctx, job)
+@@ -131,20 +143,16 @@ func createCommitStatus(ctx context.Context, job *actions_model.ActionRunJob) er
+ 	}
+ 
+ 	creator := user_model.NewActionsUser()
+-	commitID, err := git.NewIDFromString(sha)
+-	if err != nil {
+-		return fmt.Errorf("HashTypeInterfaceFromHashString: %w", err)
+-	}
+ 	status := git_model.CommitStatus{
+-		SHA:         sha,
++		SHA:         commitID,
+ 		TargetURL:   fmt.Sprintf("%s/jobs/%d", run.Link(), index),
+ 		Description: description,
+-		Context:     ctxname,
++		Context:     ctxName,
+ 		CreatorID:   creator.ID,
+ 		State:       state,
+ 	}
+ 
+-	return commitstatus_service.CreateCommitStatus(ctx, repo, creator, commitID.String(), &status)
++	return commitstatus_service.CreateCommitStatus(ctx, repo, creator, commitID, &status)
+ }
+ 
+ func toCommitStatus(status actions_model.Status) commitstatus.CommitStatusState {
+diff --git a/services/actions/job_emitter.go b/services/actions/job_emitter.go
+index 762d28e9cc..74a8a127ef 100644
+--- a/services/actions/job_emitter.go
++++ b/services/actions/job_emitter.go
+@@ -89,7 +89,7 @@ func checkJobsByRunID(ctx context.Context, runID int64) error {
+ 	}); err != nil {
+ 		return err
+ 	}
+-	CreateCommitStatus(ctx, jobs...)
++	CreateCommitStatusForRunJobs(ctx, run, jobs...)
+ 	for _, job := range updatedJobs {
+ 		_ = job.LoadAttributes(ctx)
+ 		notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, nil)
+diff --git a/services/actions/notifier_helper.go b/services/actions/notifier_helper.go
+index fc1894c5d8..d17955b029 100644
+--- a/services/actions/notifier_helper.go
++++ b/services/actions/notifier_helper.go
+@@ -27,9 +27,7 @@ import (
+ 	api "code.gitea.io/gitea/modules/structs"
+ 	webhook_module "code.gitea.io/gitea/modules/webhook"
+ 	"code.gitea.io/gitea/services/convert"
+-	notify_service "code.gitea.io/gitea/services/notify"
+ 
+-	"github.com/nektos/act/pkg/jobparser"
+ 	"github.com/nektos/act/pkg/model"
+ )
+ 
+@@ -346,65 +344,10 @@ func handleWorkflows(
+ 
+ 		run.NeedApproval = need
+ 
+-		if err := run.LoadAttributes(ctx); err != nil {
+-			log.Error("LoadAttributes: %v", err)
++		if err := PrepareRunAndInsert(ctx, dwf.Content, run, nil); err != nil {
++			log.Error("PrepareRunAndInsert: %v", err)
+ 			continue
+ 		}
+-
+-		vars, err := actions_model.GetVariablesOfRun(ctx, run)
+-		if err != nil {
+-			log.Error("GetVariablesOfRun: %v", err)
+-			continue
+-		}
+-
+-		wfRawConcurrency, err := jobparser.ReadWorkflowRawConcurrency(dwf.Content)
+-		if err != nil {
+-			log.Error("ReadWorkflowRawConcurrency: %v", err)
+-			continue
+-		}
+-		if wfRawConcurrency != nil {
+-			err = EvaluateRunConcurrencyFillModel(ctx, run, wfRawConcurrency, vars)
+-			if err != nil {
+-				log.Error("EvaluateRunConcurrencyFillModel: %v", err)
+-				continue
+-			}
+-		}
+-
+-		giteaCtx := GenerateGiteaContext(run, nil)
+-
+-		jobs, err := jobparser.Parse(dwf.Content, jobparser.WithVars(vars), jobparser.WithGitContext(giteaCtx.ToGitHubContext()))
+-		if err != nil {
+-			log.Error("jobparser.Parse: %v", err)
+-			continue
+-		}
+-
+-		if len(jobs) > 0 && jobs[0].RunName != "" {
+-			run.Title = jobs[0].RunName
+-		}
+-
+-		if err := InsertRun(ctx, run, jobs); err != nil {
+-			log.Error("InsertRun: %v", err)
+-			continue
+-		}
+-
+-		alljobs, err := db.Find[actions_model.ActionRunJob](ctx, actions_model.FindRunJobOptions{RunID: run.ID})
+-		if err != nil {
+-			log.Error("FindRunJobs: %v", err)
+-			continue
+-		}
+-		CreateCommitStatus(ctx, alljobs...)
+-		if len(alljobs) > 0 {
+-			job := alljobs[0]
+-			err := job.LoadRun(ctx)
+-			if err != nil {
+-				log.Error("LoadRun: %v", err)
+-				continue
+-			}
+-			notify_service.WorkflowRunStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job.Run)
+-		}
+-		for _, job := range alljobs {
+-			notify_service.WorkflowJobStatusUpdate(ctx, input.Repo, input.Doer, job, nil)
+-		}
+ 	}
+ 	return nil
+ }
+@@ -559,24 +502,6 @@ func handleSchedules(
+ 			Content:       dwf.Content,
+ 		}
+ 
+-		vars, err := actions_model.GetVariablesOfRun(ctx, run.ToActionRun())
+-		if err != nil {
+-			log.Error("GetVariablesOfRun: %v", err)
+-			continue
+-		}
+-
+-		giteaCtx := GenerateGiteaContext(run.ToActionRun(), nil)
+-
+-		jobs, err := jobparser.Parse(dwf.Content, jobparser.WithVars(vars), jobparser.WithGitContext(giteaCtx.ToGitHubContext()))
+-		if err != nil {
+-			log.Error("jobparser.Parse: %v", err)
+-			continue
+-		}
+-
+-		if len(jobs) > 0 && jobs[0].RunName != "" {
+-			run.Title = jobs[0].RunName
+-		}
+-
+ 		crons = append(crons, run)
+ 	}
+ 
+diff --git a/services/actions/run.go b/services/actions/run.go
+index a3356d71c1..90413e9bc2 100644
+--- a/services/actions/run.go
++++ b/services/actions/run.go
+@@ -10,14 +10,71 @@ import (
+ 	actions_model "code.gitea.io/gitea/models/actions"
+ 	"code.gitea.io/gitea/models/db"
+ 	"code.gitea.io/gitea/modules/util"
++	notify_service "code.gitea.io/gitea/services/notify"
+ 
+ 	"github.com/nektos/act/pkg/jobparser"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
++// PrepareRunAndInsert prepares a run and inserts it into the database
++// It parses the workflow content, evaluates concurrency if needed, and inserts the run and its jobs into the database.
++// The title will be cut off at 255 characters if it's longer than 255 characters.
++func PrepareRunAndInsert(ctx context.Context, content []byte, run *actions_model.ActionRun, inputsWithDefaults map[string]any) error {
++	if err := run.LoadAttributes(ctx); err != nil {
++		return fmt.Errorf("LoadAttributes: %w", err)
++	}
++
++	vars, err := actions_model.GetVariablesOfRun(ctx, run)
++	if err != nil {
++		return fmt.Errorf("GetVariablesOfRun: %w", err)
++	}
++
++	wfRawConcurrency, err := jobparser.ReadWorkflowRawConcurrency(content)
++	if err != nil {
++		return fmt.Errorf("ReadWorkflowRawConcurrency: %w", err)
++	}
++
++	if wfRawConcurrency != nil {
++		err = EvaluateRunConcurrencyFillModel(ctx, run, wfRawConcurrency, vars)
++		if err != nil {
++			return fmt.Errorf("EvaluateRunConcurrencyFillModel: %w", err)
++		}
++	}
++
++	giteaCtx := GenerateGiteaContext(run, nil)
++
++	jobs, err := jobparser.Parse(content, jobparser.WithVars(vars), jobparser.WithGitContext(giteaCtx.ToGitHubContext()), jobparser.WithInputs(inputsWithDefaults))
++	if err != nil {
++		return fmt.Errorf("parse workflow: %w", err)
++	}
++
++	if len(jobs) > 0 && jobs[0].RunName != "" {
++		run.Title = jobs[0].RunName
++	}
++
++	if err = InsertRun(ctx, run, jobs, vars); err != nil {
++		return fmt.Errorf("InsertRun: %w", err)
++	}
++
++	// Load the newly inserted jobs with all fields from database (the job models in InsertRun are partial, so load again)
++	allJobs, err := db.Find[actions_model.ActionRunJob](ctx, actions_model.FindRunJobOptions{RunID: run.ID})
++	if err != nil {
++		return fmt.Errorf("FindRunJob: %w", err)
++	}
++
++	CreateCommitStatusForRunJobs(ctx, run, allJobs...)
++
++	notify_service.WorkflowRunStatusUpdate(ctx, run.Repo, run.TriggerUser, run)
++	for _, job := range allJobs {
++		notify_service.WorkflowJobStatusUpdate(ctx, run.Repo, run.TriggerUser, job, nil)
++	}
++
++	return nil
++}
++
+ // InsertRun inserts a run
+ // The title will be cut off at 255 characters if it's longer than 255 characters.
+-func InsertRun(ctx context.Context, run *actions_model.ActionRun, jobs []*jobparser.SingleWorkflow) error {
++func InsertRun(ctx context.Context, run *actions_model.ActionRun, jobs []*jobparser.SingleWorkflow, vars map[string]string) error {
+ 	return db.WithTx(ctx, func(ctx context.Context) error {
+ 		index, err := db.GetNextResourceIndex(ctx, "action_run_index", run.RepoID)
+ 		if err != nil {
+@@ -44,12 +101,6 @@ func InsertRun(ctx context.Context, run *actions_model.ActionRun, jobs []*jobpar
+ 			return err
+ 		}
+ 
+-		// query vars for evaluating job concurrency groups
+-		vars, err := actions_model.GetVariablesOfRun(ctx, run)
+-		if err != nil {
+-			return fmt.Errorf("get run %d variables: %w", run.ID, err)
+-		}
+-
+ 		runJobs := make([]*actions_model.ActionRunJob, 0, len(jobs))
+ 		var hasWaitingJobs bool
+ 		for _, v := range jobs {
+diff --git a/services/actions/schedule_tasks.go b/services/actions/schedule_tasks.go
+index 3b37b44ac4..037bf5cddd 100644
+--- a/services/actions/schedule_tasks.go
++++ b/services/actions/schedule_tasks.go
+@@ -15,9 +15,6 @@ import (
+ 	"code.gitea.io/gitea/modules/log"
+ 	"code.gitea.io/gitea/modules/timeutil"
+ 	webhook_module "code.gitea.io/gitea/modules/webhook"
+-	notify_service "code.gitea.io/gitea/services/notify"
+-
+-	"github.com/nektos/act/pkg/jobparser"
+ )
+ 
+ // StartScheduleTasks start the task
+@@ -119,44 +116,12 @@ func CreateScheduleTask(ctx context.Context, cron *actions_model.ActionSchedule)
+ 		Status:        actions_model.StatusWaiting,
+ 	}
+ 
+-	vars, err := actions_model.GetVariablesOfRun(ctx, run)
+-	if err != nil {
+-		log.Error("GetVariablesOfRun: %v", err)
+-		return err
+-	}
+-
+-	// Parse the workflow specification from the cron schedule
+-	workflows, err := jobparser.Parse(cron.Content, jobparser.WithVars(vars))
+-	if err != nil {
+-		return err
+-	}
+-	wfRawConcurrency, err := jobparser.ReadWorkflowRawConcurrency(cron.Content)
+-	if err != nil {
+-		return err
+-	}
+-	if wfRawConcurrency != nil {
+-		err = EvaluateRunConcurrencyFillModel(ctx, run, wfRawConcurrency, vars)
+-		if err != nil {
+-			return fmt.Errorf("EvaluateRunConcurrencyFillModel: %w", err)
+-		}
+-	}
+-
++	// FIXME cron.Content might be outdated if the workflow file has been changed.
++	// Load the latest sha from default branch
+ 	// Insert the action run and its associated jobs into the database
+-	if err := InsertRun(ctx, run, workflows); err != nil {
++	if err := PrepareRunAndInsert(ctx, cron.Content, run, nil); err != nil {
+ 		return err
+ 	}
+-	allJobs, err := db.Find[actions_model.ActionRunJob](ctx, actions_model.FindRunJobOptions{RunID: run.ID})
+-	if err != nil {
+-		log.Error("FindRunJobs: %v", err)
+-	}
+-	err = run.LoadAttributes(ctx)
+-	if err != nil {
+-		log.Error("LoadAttributes: %v", err)
+-	}
+-	notify_service.WorkflowRunStatusUpdate(ctx, run.Repo, run.TriggerUser, run)
+-	for _, job := range allJobs {
+-		notify_service.WorkflowJobStatusUpdate(ctx, run.Repo, run.TriggerUser, job, nil)
+-	}
+ 
+ 	// Return nil if no errors occurred
+ 	return nil
+diff --git a/services/actions/task.go b/services/actions/task.go
+index 6a547c1c12..cf2164f456 100644
+--- a/services/actions/task.go
++++ b/services/actions/task.go
+@@ -97,7 +97,7 @@ func PickTask(ctx context.Context, runner *actions_model.ActionRunner) (*runnerv
+ 		return nil, false, nil
+ 	}
+ 
+-	CreateCommitStatus(ctx, job)
++	CreateCommitStatusForRunJobs(ctx, job.Run, job)
+ 	notify_service.WorkflowJobStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job, actionTask)
+ 
+ 	return task, true, nil
+diff --git a/services/actions/workflow.go b/services/actions/workflow.go
+index e3e60d4967..25801d6fa1 100644
+--- a/services/actions/workflow.go
++++ b/services/actions/workflow.go
+@@ -8,7 +8,6 @@ import (
+ 	"strings"
+ 
+ 	actions_model "code.gitea.io/gitea/models/actions"
+-	"code.gitea.io/gitea/models/db"
+ 	"code.gitea.io/gitea/models/perm"
+ 	access_model "code.gitea.io/gitea/models/perm/access"
+ 	repo_model "code.gitea.io/gitea/models/repo"
+@@ -16,13 +15,11 @@ import (
+ 	user_model "code.gitea.io/gitea/models/user"
+ 	"code.gitea.io/gitea/modules/actions"
+ 	"code.gitea.io/gitea/modules/git"
+-	"code.gitea.io/gitea/modules/log"
+ 	"code.gitea.io/gitea/modules/reqctx"
+ 	api "code.gitea.io/gitea/modules/structs"
+ 	"code.gitea.io/gitea/modules/util"
+ 	"code.gitea.io/gitea/services/context"
+ 	"code.gitea.io/gitea/services/convert"
+-	notify_service "code.gitea.io/gitea/services/notify"
+ 
+ 	"github.com/nektos/act/pkg/jobparser"
+ 	"github.com/nektos/act/pkg/model"
+@@ -98,9 +95,7 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
+ 	}
+ 
+ 	// find workflow from commit
+-	var workflows []*jobparser.SingleWorkflow
+ 	var entry *git.TreeEntry
+-	var wfRawConcurrency *model.RawConcurrency
+ 
+ 	run := &actions_model.ActionRun{
+ 		Title:             strings.SplitN(runTargetCommit.CommitMessage, "\n", 2)[0],
+@@ -153,29 +148,6 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
+ 		}
+ 	}
+ 
+-	giteaCtx := GenerateGiteaContext(run, nil)
+-
+-	workflows, err = jobparser.Parse(content, jobparser.WithGitContext(giteaCtx.ToGitHubContext()), jobparser.WithInputs(inputsWithDefaults))
+-	if err != nil {
+-		return err
+-	}
+-
+-	if len(workflows) > 0 && workflows[0].RunName != "" {
+-		run.Title = workflows[0].RunName
+-	}
+-
+-	if len(workflows) == 0 {
+-		return util.ErrorWrapLocale(
+-			util.NewNotExistErrorf("workflow %q doesn't exist", workflowID),
+-			"actions.workflow.not_found", workflowID,
+-		)
+-	}
+-
+-	wfRawConcurrency, err = jobparser.ReadWorkflowRawConcurrency(content)
+-	if err != nil {
+-		return err
+-	}
+-
+ 	// ctx.Req.PostForm -> WorkflowDispatchPayload.Inputs -> ActionRun.EventPayload -> runner: ghc.Event
+ 	// https://docs.github.com/en/actions/learn-github-actions/contexts#github-context
+ 	// https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_dispatch
+@@ -193,39 +165,9 @@ func DispatchActionWorkflow(ctx reqctx.RequestContext, doer *user_model.User, re
+ 	}
+ 	run.EventPayload = string(eventPayload)
+ 
+-	// cancel running jobs of the same concurrency group
+-	if wfRawConcurrency != nil {
+-		vars, err := actions_model.GetVariablesOfRun(ctx, run)
+-		if err != nil {
+-			return fmt.Errorf("GetVariablesOfRun: %w", err)
+-		}
+-		err = EvaluateRunConcurrencyFillModel(ctx, run, wfRawConcurrency, vars)
+-		if err != nil {
+-			return fmt.Errorf("EvaluateRunConcurrencyFillModel: %w", err)
+-		}
+-	}
+-
+ 	// Insert the action run and its associated jobs into the database
+-	if err := InsertRun(ctx, run, workflows); err != nil {
+-		return fmt.Errorf("InsertRun: %w", err)
+-	}
+-
+-	allJobs, err := db.Find[actions_model.ActionRunJob](ctx, actions_model.FindRunJobOptions{RunID: run.ID})
+-	if err != nil {
+-		log.Error("FindRunJobs: %v", err)
+-	}
+-	CreateCommitStatus(ctx, allJobs...)
+-	if len(allJobs) > 0 {
+-		job := allJobs[0]
+-		err := job.LoadRun(ctx)
+-		if err != nil {
+-			log.Error("LoadRun: %v", err)
+-		} else {
+-			notify_service.WorkflowRunStatusUpdate(ctx, job.Run.Repo, job.Run.TriggerUser, job.Run)
+-		}
+-	}
+-	for _, job := range allJobs {
+-		notify_service.WorkflowJobStatusUpdate(ctx, repo, doer, job, nil)
++	if err := PrepareRunAndInsert(ctx, content, run, inputsWithDefaults); err != nil {
++		return fmt.Errorf("PrepareRun: %w", err)
+ 	}
+ 	return nil
+ }

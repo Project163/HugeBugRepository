@@ -1,0 +1,1007 @@
+diff --git a/src/yb/common/CMakeLists.txt b/src/yb/common/CMakeLists.txt
+index 5f54dc75b1..ae870962ea 100644
+--- a/src/yb/common/CMakeLists.txt
++++ b/src/yb/common/CMakeLists.txt
+@@ -91,6 +91,7 @@ set(COMMON_SRCS
+   id_mapping.cc
+   init.cc
+   key_encoder.cc
++  object_lock_tracker.cc
+   opid.cc
+   pgsql_error.cc
+   pg_types.cc
+diff --git a/src/yb/common/object_lock_tracker.cc b/src/yb/common/object_lock_tracker.cc
+new file mode 100644
+index 0000000000..e881321b8e
+--- /dev/null
++++ b/src/yb/common/object_lock_tracker.cc
+@@ -0,0 +1,149 @@
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++
++#include "yb/common/object_lock_tracker.h"
++
++#include "yb/util/shared_lock.h"
++
++namespace yb {
++
++void ObjectLockTracker::TrackLocks(
++    const std::vector<ObjectLockContext>& lock_contexts, ObjectLockState lock_state,
++    HybridTime wait_start) {
++  for (const auto& lock_context : lock_contexts) {
++    TrackLock(lock_context, lock_state, wait_start);
++  }
++}
++
++void ObjectLockTracker::TrackLock(
++    const ObjectLockContext& lock_context, ObjectLockState lock_state, HybridTime wait_start) {
++  const auto txn_id = lock_context.txn_id;
++  const auto subtxn_id = lock_context.subtxn_id;
++  const auto lock_id = LockId{
++    .database_oid = lock_context.database_oid,
++    .relation_oid = lock_context.relation_oid,
++    .object_oid = lock_context.object_oid,
++    .object_sub_oid = lock_context.object_sub_oid,
++    .lock_type = lock_context.lock_type
++  };
++
++  std::lock_guard l(mutex_);
++  auto& lock_id_map = lock_map_[txn_id][subtxn_id];
++
++  auto lock_it = lock_id_map.find(lock_id);
++  if (lock_it != lock_id_map.end()) {
++    auto& existing = lock_it->second;
++    existing.counter++;
++    if (existing.lock_state == ObjectLockState::WAITING &&
++        lock_state == ObjectLockState::GRANTED) {
++      // Upgrade from WAITING to GRANTED state and
++      // keep the wait_start time as it is for pg_locks view.
++      existing.lock_state = ObjectLockState::GRANTED;
++    }
++    return;
++  }
++
++  LockInfo new_lock{
++    .lock_state = lock_state,
++    .wait_start = (lock_state == ObjectLockState::WAITING) ? wait_start : HybridTime::kInvalid,
++    .counter = 1
++  };
++  lock_id_map.emplace(lock_id, new_lock);
++}
++
++void ObjectLockTracker::UntrackLocks(const std::vector<ObjectLockContext>& lock_contexts) {
++  for (const auto& lock_context : lock_contexts) {
++    UntrackLock(lock_context);
++  }
++}
++
++void ObjectLockTracker::UntrackLock(const ObjectLockContext& lock_context) {
++  if (lock_context.subtxn_id == 0) {
++    UntrackAllLocks(lock_context.txn_id, lock_context.subtxn_id);
++    return;
++  }
++
++  std::lock_guard l(mutex_);
++  auto txn_it = lock_map_.find(lock_context.txn_id);
++  if (txn_it == lock_map_.end()) {
++    return;
++  }
++  auto subtxn_it = txn_it->second.find(lock_context.subtxn_id);
++  if (subtxn_it == txn_it->second.end()) {
++    return;
++  }
++
++  auto& lock_id_map = subtxn_it->second;
++  const auto lock_id = LockId{
++    .database_oid = lock_context.database_oid,
++    .relation_oid = lock_context.relation_oid,
++    .object_oid = lock_context.object_oid,
++    .object_sub_oid = lock_context.object_sub_oid,
++    .lock_type = lock_context.lock_type
++  };
++  auto lock_it = lock_id_map.find(lock_id);
++  DCHECK(lock_it != lock_id_map.end());
++  if (lock_it->second.counter > 1) {
++    lock_it->second.counter--;
++    return;
++  }
++
++  lock_id_map.erase(lock_it);
++  // // clean up empty txn map
++  if (lock_id_map.empty()) {
++    txn_it->second.erase(subtxn_it);
++    if (txn_it->second.empty()) {
++      lock_map_.erase(txn_it);
++    }
++  }
++}
++
++void ObjectLockTracker::UntrackAllLocks(TransactionId txn_id, SubTransactionId subtxn_id) {
++  std::lock_guard l(mutex_);
++  if (subtxn_id == 0) {
++    // Remove all subtransactions for this transaction.
++    lock_map_.erase(txn_id);
++  } else {
++    auto txn_iter = lock_map_.find(txn_id);
++    if (txn_iter != lock_map_.end()) {
++      txn_iter->second.erase(subtxn_id);
++      if (txn_iter->second.empty()) {
++        lock_map_.erase(txn_iter);
++      }
++    }
++  }
++}
++
++void ObjectLockTracker::PopulateObjectLocks(
++    google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const {
++  object_lock_infos->Clear();
++  SharedLock l(mutex_);
++  for (const auto& [txn_id, subtxn_map] : lock_map_) {
++    for (const auto& [subtxn_id, lock_id_map] : subtxn_map) {
++      for (const auto& [lock_id, lock_info] : lock_id_map) {
++        auto* object_lock_info_pb = object_lock_infos->Add();
++        object_lock_info_pb->set_transaction_id(txn_id.data(), txn_id.size());
++        object_lock_info_pb->set_subtransaction_id(subtxn_id);
++        object_lock_info_pb->set_database_oid(lock_id.database_oid);
++        object_lock_info_pb->set_relation_oid(lock_id.relation_oid);
++        object_lock_info_pb->set_object_oid(lock_id.object_oid);
++        object_lock_info_pb->set_object_sub_oid(lock_id.object_sub_oid);
++        object_lock_info_pb->set_mode(lock_id.lock_type);
++        object_lock_info_pb->set_lock_state(lock_info.lock_state);
++        object_lock_info_pb->set_wait_start_ht(lock_info.wait_start.ToUint64());
++      }
++    }
++  }
++}
++
++} // namespace yb
+diff --git a/src/yb/common/object_lock_tracker.h b/src/yb/common/object_lock_tracker.h
+new file mode 100644
+index 0000000000..d72e790c1a
+--- /dev/null
++++ b/src/yb/common/object_lock_tracker.h
+@@ -0,0 +1,103 @@
++//
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++//
++
++#pragma once
++
++#include <memory>
++#include <shared_mutex>
++
++#include "yb/common/common_fwd.h"
++#include "yb/common/transaction.h"
++
++#include "yb/util/hash_util.h"
++
++namespace yb {
++
++struct ObjectLockContext {
++  ObjectLockContext(
++      TransactionId txn_id, SubTransactionId subtxn_id, uint64_t database_oid,
++      uint64_t relation_oid, uint64_t object_oid, uint64_t object_sub_oid, TableLockType lock_type)
++      : txn_id(txn_id),
++        subtxn_id(subtxn_id),
++        database_oid(database_oid),
++        relation_oid(relation_oid),
++        object_oid(object_oid),
++        object_sub_oid(object_sub_oid),
++        lock_type(lock_type) {}
++
++  YB_STRUCT_DEFINE_HASH(
++      ObjectLockContext, txn_id, subtxn_id, database_oid, relation_oid, object_oid, object_sub_oid,
++      lock_type);
++
++  auto operator<=>(const ObjectLockContext&) const = default;
++
++  TransactionId txn_id;
++  SubTransactionId subtxn_id;
++  uint64_t database_oid;
++  uint64_t relation_oid;
++  uint64_t object_oid;
++  uint64_t object_sub_oid;
++  TableLockType lock_type;
++};
++
++// This class tracks object locks specifically for the pg_locks view.
++// An alternative would be to extract and decrypt locks directly from ObjectLockManager,
++// but for simplicity, we decided to maintain a separate tracker here.
++class ObjectLockTracker {
++ public:
++
++  void TrackLocks(
++    const std::vector<ObjectLockContext>& lock_contexts, ObjectLockState lock_state,
++    HybridTime wait_start = HybridTime::kInvalid);
++
++  void TrackLock(
++      const ObjectLockContext& lock_context, ObjectLockState lock_state,
++      HybridTime wait_start = HybridTime::kInvalid);
++
++  void UntrackLocks(const std::vector<ObjectLockContext>& lock_contexts);
++
++  void UntrackLock(const ObjectLockContext& lock_context);
++
++  void UntrackAllLocks(TransactionId txn_id, SubTransactionId subtxn_id);
++
++  void PopulateObjectLocks(
++      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const;
++
++ private:
++  mutable std::shared_mutex mutex_;
++
++  struct LockId {
++    YB_STRUCT_DEFINE_HASH(
++        LockId, database_oid, relation_oid, object_oid, object_sub_oid, lock_type);
++    auto operator<=>(const LockId&) const = default;
++    uint64_t database_oid;
++    uint64_t relation_oid;
++    uint64_t object_oid;
++    uint64_t object_sub_oid;
++    TableLockType lock_type;
++  };
++
++  struct LockInfo {
++    ObjectLockState lock_state;
++    HybridTime wait_start = HybridTime::kInvalid;
++    size_t counter = 0;
++  };
++
++  std::unordered_map<TransactionId,
++      std::unordered_map<SubTransactionId,
++          std::unordered_map<LockId, LockInfo>>> lock_map_;
++};
++
++}  // namespace yb
+diff --git a/src/yb/docdb/object_lock_manager.cc b/src/yb/docdb/object_lock_manager.cc
+index a15d007b38..110e610898 100644
+--- a/src/yb/docdb/object_lock_manager.cc
++++ b/src/yb/docdb/object_lock_manager.cc
+@@ -303,6 +303,8 @@ class ObjectLockManagerImpl {
+ 
+   void DumpStatusHtml(std::ostream& out) EXCLUDES(global_mutex_);
+ 
++  void ConsumePendingSharedLockRequests() EXCLUDES(global_mutex_);
++
+   size_t TEST_LocksSize(LocksMapType locks_map);
+   size_t TEST_GrantedLocksSize();
+   size_t TEST_WaitingLocksSize();
+@@ -312,8 +314,9 @@ class ObjectLockManagerImpl {
+  private:
+   friend struct WaiterEntry;
+ 
+-  void ConsumePendingSharedLockRequests() REQUIRES(global_mutex_);
+-  void ConsumePendingSharedLockRequest(ObjectSharedLockRequest& request) REQUIRES(global_mutex_);
++  void ConsumePendingSharedLockRequestsUnlocked() REQUIRES(global_mutex_);
++  void ConsumePendingSharedLockRequestUnlocked(
++      ObjectSharedLockRequest& request) REQUIRES(global_mutex_);
+   void AcquireExclusiveLockIntents(const LockData& data) EXCLUDES(global_mutex_);
+   void ReleaseExclusiveLockIntents(const LockIntentCounts& lock_intents);
+   void ReleaseExclusiveLockIntents(const LockData& data);
+@@ -498,18 +501,19 @@ LockState TrackedTransactionLockEntry::GetLockStateForKeyUnlocked(
+   return existing_states[object_id];
+ }
+ 
+-void ObjectLockManagerImpl::ConsumePendingSharedLockRequests() {
++void ObjectLockManagerImpl::ConsumePendingSharedLockRequestsUnlocked() {
+   if (shared_manager_) {
+     size_t consumed = shared_manager_->ConsumePendingSharedLockRequests(
+         make_lw_function([this](ObjectSharedLockRequest request) NO_THREAD_SAFETY_ANALYSIS {
+-          ConsumePendingSharedLockRequest(request);
++          ConsumePendingSharedLockRequestUnlocked(request);
+         }));
+     IncrementCounterBy(metric_num_acquires_, consumed);
+     IncrementCounterBy(metric_num_fastpath_acquires_, consumed);
+   }
+ }
+ 
+-void ObjectLockManagerImpl::ConsumePendingSharedLockRequest(ObjectSharedLockRequest& request) {
++void ObjectLockManagerImpl::ConsumePendingSharedLockRequestUnlocked(
++    ObjectSharedLockRequest& request) {
+   auto& lock_entry = request.entry;
+   auto transaction_entry = DoReserve({&lock_entry, 1}, request.owner);
+   std::lock_guard lock(transaction_entry->mutex);
+@@ -531,7 +535,7 @@ void ObjectLockManagerImpl::AcquireExclusiveLockIntents(const LockData& data) {
+   std::lock_guard lock(global_mutex_);
+   size_t consumed = shared_manager_->ConsumeAndAcquireExclusiveLockIntents(
+       make_lw_function([this](ObjectSharedLockRequest request) NO_THREAD_SAFETY_ANALYSIS {
+-        ConsumePendingSharedLockRequest(request);
++        ConsumePendingSharedLockRequestUnlocked(request);
+       }),
+       exclusive_locks);
+   IncrementCounterBy(metric_num_acquires_, consumed);
+@@ -769,7 +773,7 @@ void ObjectLockManagerImpl::Unlock(const ObjectLockOwner& object_lock_owner) {
+   TrackedTxnLockEntryPtr txn_entry;
+   {
+     std::lock_guard lock(global_mutex_);
+-    ConsumePendingSharedLockRequests();
++    ConsumePendingSharedLockRequestsUnlocked();
+     auto txn_itr = txn_locks_.find(object_lock_owner.txn_id);
+     if (txn_itr == txn_locks_.end()) {
+       return;
+@@ -1136,7 +1140,7 @@ void ObjectLockManagerImpl::DumpStatusHtml(std::ostream& out) {
+   out << "<table class='table table-striped'>\n";
+   out << "<tr><th>Prefix</th><th>LockBatchEntry</th></tr>" << std::endl;
+   std::lock_guard l(global_mutex_);
+-  ConsumePendingSharedLockRequests();
++  ConsumePendingSharedLockRequestsUnlocked();
+   for (const auto& [prefix, entry] : locks_) {
+     auto key_str = AsString(prefix);
+     out << "<tr>"
+@@ -1150,6 +1154,11 @@ void ObjectLockManagerImpl::DumpStatusHtml(std::ostream& out) {
+   DumpStoredObjectLocksMap(out, "Waiting object locks", LocksMapType::kWaiting);
+ }
+ 
++void ObjectLockManagerImpl::ConsumePendingSharedLockRequests() {
++  std::lock_guard l(global_mutex_);
++  ConsumePendingSharedLockRequestsUnlocked();
++}
++
+ void ObjectLockManagerImpl::DumpStoredObjectLocksMap(
+     std::ostream& out, std::string_view caption, LocksMapType locks_map) {
+   out << R"(
+@@ -1179,7 +1188,7 @@ void ObjectLockManagerImpl::DumpStoredObjectLocksMap(
+ 
+ size_t ObjectLockManagerImpl::TEST_LocksSize(LocksMapType locks_map) {
+   std::lock_guard lock(global_mutex_);
+-  ConsumePendingSharedLockRequests();
++  ConsumePendingSharedLockRequestsUnlocked();
+   size_t size = 0;
+   for (const auto& [txn, txn_entry] : txn_locks_) {
+     UniqueLock txn_lock(txn_entry->mutex);
+@@ -1248,6 +1257,10 @@ void ObjectLockManager::DumpStatusHtml(std::ostream& out) {
+   impl_->DumpStatusHtml(out);
+ }
+ 
++void ObjectLockManager::ConsumePendingSharedLockRequests() {
++  impl_->ConsumePendingSharedLockRequests();
++}
++
+ size_t ObjectLockManager::TEST_GrantedLocksSize() {
+   return impl_->TEST_GrantedLocksSize();
+ }
+diff --git a/src/yb/docdb/object_lock_manager.h b/src/yb/docdb/object_lock_manager.h
+index 6a4d9040d9..a76d55f1b6 100644
+--- a/src/yb/docdb/object_lock_manager.h
++++ b/src/yb/docdb/object_lock_manager.h
+@@ -85,6 +85,8 @@ class ObjectLockManager {
+ 
+   void DumpStatusHtml(std::ostream& out);
+ 
++  void ConsumePendingSharedLockRequests();
++
+   size_t TEST_GrantedLocksSize();
+   size_t TEST_WaitingLocksSize();
+   std::unordered_map<ObjectLockPrefix, LockState>
+diff --git a/src/yb/docdb/object_lock_shared_state.h b/src/yb/docdb/object_lock_shared_state.h
+index 02fd43d0c5..868f31bf7d 100644
+--- a/src/yb/docdb/object_lock_shared_state.h
++++ b/src/yb/docdb/object_lock_shared_state.h
+@@ -29,6 +29,8 @@
+ 
+ namespace yb::docdb {
+ 
++TableLockType FastpathLockTypeToTableLockType(ObjectLockFastpathLockType lock_type);
++
+ std::optional<ObjectLockFastpathLockType> MakeObjectLockFastpathLockType(TableLockType lock_type);
+ 
+ [[nodiscard]] std::span<const LockTypeEntry> GetEntriesForFastpathLockType(
+diff --git a/src/yb/docdb/object_lock_shared_state_manager.cc b/src/yb/docdb/object_lock_shared_state_manager.cc
+index db3a4709ac..287b00186f 100644
+--- a/src/yb/docdb/object_lock_shared_state_manager.cc
++++ b/src/yb/docdb/object_lock_shared_state_manager.cc
+@@ -138,6 +138,14 @@ size_t ObjectLockSharedStateManager::CallWithRequestConsumer(
+               .key = MakeLockPrefix(request, entry_type),
+               .intent_types = intent_types}});
+     }
++
++    // Track fastpath object locks for pg_locks.
++    object_lock_tracker_->TrackLock(
++        ObjectLockContext{
++            owner_info->txn_id, request.subtxn_id, request.database_oid, request.relation_oid,
++            request.object_oid, request.object_sub_oid,
++            FastpathLockTypeToTableLockType(request.lock_type)},
++        ObjectLockState::GRANTED);
+   };
+ 
+   ParentProcessGuard g;
+diff --git a/src/yb/docdb/object_lock_shared_state_manager.h b/src/yb/docdb/object_lock_shared_state_manager.h
+index 186482f9b2..236786e475 100644
+--- a/src/yb/docdb/object_lock_shared_state_manager.h
++++ b/src/yb/docdb/object_lock_shared_state_manager.h
+@@ -16,6 +16,7 @@
+ #include <memory>
+ 
+ #include "yb/common/transaction.h"
++#include "yb/common/object_lock_tracker.h"
+ 
+ #include "yb/docdb/docdb_fwd.h"
+ #include "yb/docdb/lock_util.h"
+@@ -80,6 +81,9 @@ class ObjectLockOwnerRegistry {
+ 
+ class ObjectLockSharedStateManager {
+  public:
++  explicit ObjectLockSharedStateManager(std::shared_ptr<ObjectLockTracker> object_lock_tracker)
++      : object_lock_tracker_(std::move(object_lock_tracker)) {}
++
+   void SetupShared(ObjectLockSharedState& shared);
+ 
+   [[nodiscard]] ObjectLockOwnerRegistry& registry() { return registry_; }
+@@ -99,6 +103,8 @@ class ObjectLockSharedStateManager {
+ 
+   ObjectLockSharedState* shared_ = nullptr;
+   ObjectLockOwnerRegistry registry_;
++
++  const std::shared_ptr<ObjectLockTracker> object_lock_tracker_;
+ };
+ 
+ } // namespace yb::docdb
+diff --git a/src/yb/tserver/tablet_server.cc b/src/yb/tserver/tablet_server.cc
+index a68e2f4e74..a96cb942ab 100644
+--- a/src/yb/tserver/tablet_server.cc
++++ b/src/yb/tserver/tablet_server.cc
+@@ -371,7 +371,9 @@ TabletServer::TabletServer(const TabletServerOptions& opts)
+       maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)),
+       master_config_index_(0),
+       xcluster_context_(new TserverXClusterContext()),
+-      object_lock_shared_state_manager_(new docdb::ObjectLockSharedStateManager()) {
++      object_lock_tracker_(std::make_shared<ObjectLockTracker>()),
++      object_lock_shared_state_manager_(
++          new docdb::ObjectLockSharedStateManager(object_lock_tracker_)) {
+   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>(
+       FLAGS_inbound_rpc_memory_limit, mem_tracker()));
+   if (FLAGS_ysql_enable_db_catalog_version_mode) {
+@@ -825,7 +827,7 @@ void TabletServer::StartTSLocalLockManager() {
+     ts_local_lock_manager_ = std::make_shared<tserver::TSLocalLockManager>(
+         clock_, this /* TabletServerIf* */, *this /* RpcServerBase& */,
+         tablet_manager_->waiting_txn_pool(), metric_entity(),
+-        object_lock_shared_state_manager_.get());
++        object_lock_tracker_, object_lock_shared_state_manager_.get());
+     ts_local_lock_manager_->Start(tablet_manager_->waiting_txn_registry());
+   }
+ }
+diff --git a/src/yb/tserver/tablet_server.h b/src/yb/tserver/tablet_server.h
+index bcc83b24d0..53c2dc65d4 100644
+--- a/src/yb/tserver/tablet_server.h
++++ b/src/yb/tserver/tablet_server.h
+@@ -89,6 +89,7 @@ namespace yb {
+ 
+ class Env;
+ class MaintenanceManager;
++class ObjectLockTracker;
+ 
+ namespace cdc {
+ 
+@@ -664,6 +665,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
+   std::atomic<yb::server::RpcAndWebServerBase*> cql_server_{nullptr};
+   std::atomic<yb::server::YCQLStatementStatsProvider*> cql_stmt_provider_{nullptr};
+ 
++  std::shared_ptr<ObjectLockTracker> object_lock_tracker_;
++
+   // Lock Manager to maintain table/object locking activity in memory.
+   tserver::TSLocalLockManagerPtr ts_local_lock_manager_ GUARDED_BY(lock_);
+ 
+diff --git a/src/yb/tserver/ts_local_lock_manager.cc b/src/yb/tserver/ts_local_lock_manager.cc
+index f81212ebb7..e19fdd3667 100644
+--- a/src/yb/tserver/ts_local_lock_manager.cc
++++ b/src/yb/tserver/ts_local_lock_manager.cc
+@@ -20,6 +20,7 @@
+ #include "yb/docdb/docdb.h"
+ #include "yb/docdb/docdb_fwd.h"
+ #include "yb/docdb/object_lock_manager.h"
++#include "yb/docdb/object_lock_shared_state_manager.h"
+ 
+ #include "yb/master/master_ddl.pb.h"
+ 
+@@ -62,174 +63,6 @@ namespace yb::tserver {
+ 
+ YB_STRONGLY_TYPED_BOOL(WaitForBootstrap);
+ 
+-// This class tracks object locks specifically for the pg_locks view.
+-// An alternative would be to extract and decrypt locks directly from ObjectLockManager,
+-// but for simplicity, we decided to maintain a separate tracker here.
+-class ObjectLockTracker {
+- public:
+-
+-  Status TrackLocks(
+-    const std::vector<ObjectLockContext>& lock_contexts, ObjectLockState lock_state,
+-    HybridTime wait_start = HybridTime::kInvalid) {
+-    for (const auto& lock_context : lock_contexts) {
+-      RETURN_NOT_OK(TrackLock(lock_context, lock_state, wait_start));
+-    }
+-    return Status::OK();
+-  }
+-
+-  Status TrackLock(
+-      const ObjectLockContext& lock_context, ObjectLockState lock_state,
+-      HybridTime wait_start = HybridTime::kInvalid) {
+-    const auto txn_id = lock_context.txn_id;
+-    const auto subtxn_id = lock_context.subtxn_id;
+-    const auto lock_id = LockId{
+-      .database_oid = lock_context.database_oid,
+-      .relation_oid = lock_context.relation_oid,
+-      .object_oid = lock_context.object_oid,
+-      .object_sub_oid = lock_context.object_sub_oid,
+-      .lock_type = lock_context.lock_type
+-    };
+-
+-    std::lock_guard l(mutex_);
+-    auto& lock_id_map = lock_map_[txn_id][subtxn_id];
+-
+-    auto lock_it = lock_id_map.find(lock_id);
+-    if (lock_it != lock_id_map.end()) {
+-      auto& existing = lock_it->second;
+-      existing.counter++;
+-      if (existing.lock_state == ObjectLockState::WAITING &&
+-          lock_state == ObjectLockState::GRANTED) {
+-        // Upgrade from WAITING to GRANTED state and
+-        // keep the wait_start time as it is for pg_locks view.
+-        existing.lock_state = ObjectLockState::GRANTED;
+-      }
+-      return Status::OK();
+-    }
+-
+-    LockInfo new_lock{
+-      .lock_state = lock_state,
+-      .wait_start = (lock_state == ObjectLockState::WAITING) ? wait_start : HybridTime::kInvalid,
+-      .counter = 1
+-    };
+-    lock_id_map.emplace(lock_id, new_lock);
+-
+-    return Status::OK();
+-  }
+-
+-  Status UntrackLocks(const std::vector<ObjectLockContext>& lock_contexts) {
+-    for (const auto& lock_context : lock_contexts) {
+-      RETURN_NOT_OK(UntrackLock(lock_context));
+-    }
+-    return Status::OK();
+-  }
+-
+-  Status UntrackLock(const ObjectLockContext& lock_context) {
+-    if (lock_context.subtxn_id == 0) {
+-      return UntrackAllLocks(lock_context.txn_id, lock_context.subtxn_id);
+-    }
+-
+-    std::lock_guard l(mutex_);
+-    auto txn_it = lock_map_.find(lock_context.txn_id);
+-    if (txn_it == lock_map_.end()) {
+-      return Status::OK();
+-    }
+-    auto subtxn_it = txn_it->second.find(lock_context.subtxn_id);
+-    if (subtxn_it == txn_it->second.end()) {
+-      return Status::OK();
+-    }
+-
+-    auto& lock_id_map = subtxn_it->second;
+-    const auto lock_id = LockId{
+-      .database_oid = lock_context.database_oid,
+-      .relation_oid = lock_context.relation_oid,
+-      .object_oid = lock_context.object_oid,
+-      .object_sub_oid = lock_context.object_sub_oid,
+-      .lock_type = lock_context.lock_type
+-    };
+-    auto lock_it = lock_id_map.find(lock_id);
+-    DCHECK(lock_it != lock_id_map.end());
+-    if (lock_it->second.counter > 1) {
+-      lock_it->second.counter--;
+-      return Status::OK();
+-    }
+-
+-    // cleanup
+-    lock_id_map.erase(lock_it);
+-    if (lock_id_map.empty()) {
+-      txn_it->second.erase(subtxn_it);
+-      if (txn_it->second.empty()) {
+-        lock_map_.erase(txn_it);
+-      }
+-    }
+-
+-    return Status::OK();
+-  }
+-
+-  Status UntrackAllLocks(TransactionId txn_id, SubTransactionId subtxn_id) {
+-    std::lock_guard l(mutex_);
+-    if (subtxn_id == 0) {
+-      // Remove all subtransactions for this transaction
+-      lock_map_.erase(txn_id);
+-    } else {
+-      auto txn_iter = lock_map_.find(txn_id);
+-      if (txn_iter != lock_map_.end()) {
+-        txn_iter->second.erase(subtxn_id);
+-        if (txn_iter->second.empty()) {
+-          lock_map_.erase(txn_iter);
+-        }
+-      }
+-    }
+-    return Status::OK();
+-  }
+-
+-  void PopulateObjectLocks(
+-      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const {
+-    object_lock_infos->Clear();
+-    SharedLock l(mutex_);
+-    for (const auto& [txn_id, subtxn_map] : lock_map_) {
+-      for (const auto& [subtxn_id, lock_id_map] : subtxn_map) {
+-        for (const auto& [lock_id, lock_info] : lock_id_map) {
+-          auto* object_lock_info_pb = object_lock_infos->Add();
+-          object_lock_info_pb->set_transaction_id(txn_id.data(), txn_id.size());
+-          object_lock_info_pb->set_subtransaction_id(subtxn_id);
+-          object_lock_info_pb->set_database_oid(lock_id.database_oid);
+-          object_lock_info_pb->set_relation_oid(lock_id.relation_oid);
+-          object_lock_info_pb->set_object_oid(lock_id.object_oid);
+-          object_lock_info_pb->set_object_sub_oid(lock_id.object_sub_oid);
+-          object_lock_info_pb->set_mode(lock_id.lock_type);
+-          object_lock_info_pb->set_lock_state(lock_info.lock_state);
+-          DCHECK_NE(lock_info.wait_start, HybridTime::kInvalid);
+-          object_lock_info_pb->set_wait_start_ht(lock_info.wait_start.ToUint64());
+-        }
+-      }
+-    }
+-  }
+-
+- private:
+-  mutable std::shared_mutex mutex_;
+-
+-  struct LockId {
+-    YB_STRUCT_DEFINE_HASH(
+-        LockId, database_oid, relation_oid, object_oid, object_sub_oid, lock_type);
+-    auto operator<=>(const LockId&) const = default;
+-    uint64_t database_oid;
+-    uint64_t relation_oid;
+-    uint64_t object_oid;
+-    uint64_t object_sub_oid;
+-    TableLockType lock_type;
+-  };
+-
+-  struct LockInfo {
+-    ObjectLockState lock_state;
+-    HybridTime wait_start = HybridTime::kInvalid;
+-    size_t counter = 0;
+-  };
+-
+-  std::unordered_map<TransactionId,
+-      std::unordered_map<SubTransactionId,
+-          std::unordered_map<LockId, LockInfo>>> lock_map_;
+-};
+-
+ namespace {
+ 
+ void ReleaseWithRetriesGlobalNow(
+@@ -294,10 +127,17 @@ class TSLocalLockManager::Impl {
+   Impl(
+       const server::ClockPtr& clock, TabletServerIf* tablet_server,
+       server::RpcServerBase& messenger_server, ThreadPool* thread_pool,
+-      const MetricEntityPtr& metric_entity, docdb::ObjectLockSharedStateManager* shared_manager)
++      const MetricEntityPtr& metric_entity, std::shared_ptr<ObjectLockTracker> lock_tracker,
++      docdb::ObjectLockSharedStateManager* shared_manager)
+       : clock_(clock), server_(tablet_server), messenger_base_(messenger_server),
+         object_lock_manager_(thread_pool, messenger_server, metric_entity, shared_manager),
+-        poller_("TSLocalLockManager", std::bind(&Impl::Poll, this)) {}
++        poller_("TSLocalLockManager", std::bind(&Impl::Poll, this)) {
++    if (lock_tracker) {
++      lock_tracker_ = std::move(lock_tracker);
++    } else {
++      lock_tracker_ = std::make_shared<ObjectLockTracker>();
++    }
++  }
+ 
+   ~Impl() = default;
+ 
+@@ -490,9 +330,7 @@ class TSLocalLockManager::Impl {
+           txn, req.subtxn_id(), object_lock.database_oid(), object_lock.relation_oid(),
+           object_lock.object_oid(), object_lock.object_sub_oid(), object_lock.lock_type());
+     }
+-    auto tracker_status =
+-        lock_tracker_.TrackLocks(lock_contexts, ObjectLockState::WAITING, clock_->Now());
+-    DCHECK_OK(tracker_status);
++    lock_tracker_->TrackLocks(lock_contexts, ObjectLockState::WAITING, clock_->Now());
+ 
+     object_lock_manager_.Lock(
+       docdb::LockData{
+@@ -507,11 +345,10 @@ class TSLocalLockManager::Impl {
+                        cb = std::move(callback)](Status status) -> void {
+             Status tracker_status;
+             if (status.ok()) {
+-              tracker_status = lock_tracker_.TrackLocks(lock_contexts, ObjectLockState::GRANTED);
++              lock_tracker_->TrackLocks(lock_contexts, ObjectLockState::GRANTED);
+             } else {
+-              tracker_status = lock_tracker_.UntrackLocks(lock_contexts);
++              lock_tracker_->UntrackLocks(lock_contexts);
+             }
+-            DCHECK_OK(tracker_status);
+             // Call the original callback with the final status
+             cb(status);
+           }
+@@ -588,8 +425,7 @@ class TSLocalLockManager::Impl {
+     }
+ 
+     object_lock_manager_.Unlock(object_lock_owner);
+-    auto tracker_status = lock_tracker_.UntrackAllLocks(txn, req.subtxn_id());
+-    DCHECK_OK(tracker_status);
++    lock_tracker_->UntrackAllLocks(txn, req.subtxn_id());
+     return Status::OK();
+   }
+ 
+@@ -713,8 +549,10 @@ class TSLocalLockManager::Impl {
+   server::ClockPtr clock() const { return clock_; }
+ 
+   void PopulateObjectLocks(
+-      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const {
+-    lock_tracker_.PopulateObjectLocks(object_lock_infos);
++      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) {
++    // We need to load and track the fastpath object locks from shared memory first
++    object_lock_manager_.ConsumePendingSharedLockRequests();
++    lock_tracker_->PopulateObjectLocks(object_lock_infos);
+   }
+ 
+  private:
+@@ -735,16 +573,17 @@ class TSLocalLockManager::Impl {
+   docdb::ObjectLockManager object_lock_manager_;
+   std::atomic<bool> shutdown_{false};
+   rpc::Poller poller_;
+-  ObjectLockTracker lock_tracker_;
++  std::shared_ptr<ObjectLockTracker> lock_tracker_;
+ };
+ 
+ TSLocalLockManager::TSLocalLockManager(
+     const server::ClockPtr& clock, TabletServerIf* tablet_server,
+     server::RpcServerBase& messenger_server, ThreadPool* thread_pool,
+-    const MetricEntityPtr& metric_entity, docdb::ObjectLockSharedStateManager* shared_manager)
++    const MetricEntityPtr& metric_entity, std::shared_ptr<ObjectLockTracker> lock_tracker,
++    docdb::ObjectLockSharedStateManager* shared_manager)
+       : impl_(new Impl(
+           clock, CHECK_NOTNULL(tablet_server), messenger_server, CHECK_NOTNULL(thread_pool),
+-          metric_entity, shared_manager)) {}
++          metric_entity, lock_tracker, shared_manager)) {}
+ 
+ TSLocalLockManager::~TSLocalLockManager() {}
+ 
+@@ -800,7 +639,7 @@ server::ClockPtr TSLocalLockManager::clock() const {
+ }
+ 
+ void TSLocalLockManager::PopulateObjectLocks(
+-    google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const {
++    google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) {
+   impl_->PopulateObjectLocks(object_lock_infos);
+ }
+ 
+diff --git a/src/yb/tserver/ts_local_lock_manager.h b/src/yb/tserver/ts_local_lock_manager.h
+index abd0990164..60297fa563 100644
+--- a/src/yb/tserver/ts_local_lock_manager.h
++++ b/src/yb/tserver/ts_local_lock_manager.h
+@@ -33,40 +33,13 @@
+ 
+ namespace yb {
+ 
++class ObjectLockTracker;
+ class ThreadPool;
+ 
+ namespace master {
+ class ReleaseObjectLocksGlobalRequestPB;
+ }
+ namespace tserver {
+-
+-struct ObjectLockContext {
+-  ObjectLockContext(
+-      TransactionId txn_id, SubTransactionId subtxn_id, uint64_t database_oid,
+-      uint64_t relation_oid, uint64_t object_oid, uint64_t object_sub_oid, TableLockType lock_type)
+-      : txn_id(txn_id),
+-        subtxn_id(subtxn_id),
+-        database_oid(database_oid),
+-        relation_oid(relation_oid),
+-        object_oid(object_oid),
+-        object_sub_oid(object_sub_oid),
+-        lock_type(lock_type) {}
+-
+-  YB_STRUCT_DEFINE_HASH(
+-      ObjectLockContext, txn_id, subtxn_id, database_oid, relation_oid, object_oid, object_sub_oid,
+-      lock_type);
+-
+-  auto operator<=>(const ObjectLockContext&) const = default;
+-
+-  TransactionId txn_id;
+-  SubTransactionId subtxn_id;
+-  uint64_t database_oid;
+-  uint64_t relation_oid;
+-  uint64_t object_oid;
+-  uint64_t object_sub_oid;
+-  TableLockType lock_type;
+-};
+-
+ // LockManager for acquiring table/object locks of type TableLockType on a given object id.
+ // TSLocalLockManager uses LockManagerImpl<ObjectLockPrefix> to acheive the locking/unlocking
+ // behavior, yet the scope of the object lock is not just limited to the scope of the lock rpc
+@@ -90,6 +63,7 @@ class TSLocalLockManager {
+       const server::ClockPtr& clock, TabletServerIf* tablet_server,
+       server::RpcServerBase& messenger_server, ThreadPool* thread_pool,
+       const MetricEntityPtr& metric_entity,
++      std::shared_ptr<ObjectLockTracker> lock_tracker = nullptr,
+       docdb::ObjectLockSharedStateManager* shared_manager = nullptr);
+   ~TSLocalLockManager();
+ 
+@@ -137,7 +111,7 @@ class TSLocalLockManager {
+   server::ClockPtr clock() const;
+ 
+   void PopulateObjectLocks(
+-      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos) const;
++      google::protobuf::RepeatedPtrField<ObjectLockInfoPB>* object_lock_infos);
+ 
+   size_t TEST_GrantedLocksSize();
+   size_t TEST_WaitingLocksSize();
+diff --git a/src/yb/yql/pgwrapper/pg_object_locks-test.cc b/src/yb/yql/pgwrapper/pg_object_locks-test.cc
+index ac2e80ed71..7e8186a022 100644
+--- a/src/yb/yql/pgwrapper/pg_object_locks-test.cc
++++ b/src/yb/yql/pgwrapper/pg_object_locks-test.cc
+@@ -125,12 +125,65 @@ class PgObjectLocksTestRF1 : public PgMiniTestBase {
+     ASSERT_OK(conn.Execute("INSERT INTO test SELECT generate_series(1, 10), 0"));
+   }
+ 
++  void TestAllBlockingPairs(bool test_pg_locks) {
++    static const std::vector<std::pair<std::string, std::string>> kBlockingPairs = {
++      {"ACCESS EXCLUSIVE", "ACCESS SHARE"},
++      {"ACCESS EXCLUSIVE", "ROW SHARE"},
++      {"ACCESS EXCLUSIVE", "ROW EXCLUSIVE"},
++      {"ACCESS EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
++      {"ACCESS EXCLUSIVE", "SHARE"},
++      {"ACCESS EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
++      {"ACCESS EXCLUSIVE", "EXCLUSIVE"},
++      {"ACCESS EXCLUSIVE", "ACCESS EXCLUSIVE"},
++      {"EXCLUSIVE", "ROW SHARE"},
++      {"EXCLUSIVE", "ROW EXCLUSIVE"},
++      {"EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
++      {"EXCLUSIVE", "SHARE"},
++      {"EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
++      {"EXCLUSIVE", "EXCLUSIVE"},
++      {"SHARE ROW EXCLUSIVE", "ROW EXCLUSIVE"},
++      {"SHARE ROW EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
++      {"SHARE ROW EXCLUSIVE", "SHARE"},
++      {"SHARE ROW EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
++      {"SHARE", "ROW EXCLUSIVE"},
++      {"SHARE", "SHARE UPDATE EXCLUSIVE"},
++      {"SHARE UPDATE EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
++    };
++
++    CreateTestTable();
++    auto conn1 = ASSERT_RESULT(Connect());
++    auto conn2 = ASSERT_RESULT(Connect());
++    for (const auto& lock_types : kBlockingPairs) {
++      VerifyBlockingBehavior(conn1, conn2, lock_types.first, lock_types.second, test_pg_locks);
++      VerifyBlockingBehavior(conn1, conn2, lock_types.second, lock_types.first, test_pg_locks);
++    }
++  }
++
++  std::string ToMode(const std::string& table_lock_type_str) {
++    static const std::map<std::string, std::string> kLockModeMap = {
++      {"ACCESS SHARE", "AccessShareLock"},
++      {"ROW SHARE", "RowShareLock"},
++      {"ROW EXCLUSIVE", "RowExclusiveLock"},
++      {"SHARE UPDATE EXCLUSIVE", "ShareUpdateExclusiveLock"},
++      {"SHARE", "ShareLock"},
++      {"SHARE ROW EXCLUSIVE", "ShareRowExclusiveLock"},
++      {"EXCLUSIVE", "ExclusiveLock"},
++      {"ACCESS EXCLUSIVE", "AccessExclusiveLock"}
++    };
++    auto mode_it = kLockModeMap.find(table_lock_type_str);
++    if (mode_it == kLockModeMap.end()) {
++      return "UnknownLockMode";
++    }
++    return mode_it->second;
++  }
++
+   void VerifyBlockingBehavior(
+-      PGConn& conn1, PGConn& conn2, const std::string& lock_stmt_1,
+-      const std::string& lock_stmt_2) {
+-    LOG(INFO) << "Checking blocking behavior: " << lock_stmt_1 << " and " << lock_stmt_2;
++      PGConn& conn1, PGConn& conn2, const std::string& holder_lock_type,
++      const std::string& waiter_lock_type, bool test_pg_locks) {
++    LOG(INFO) << "Checking blocking behavior: " << holder_lock_type << " and " << waiter_lock_type;
++    static const std::string lock_query = "LOCK TABLE test IN $0 MODE";
+     ASSERT_OK(conn1.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+-    ASSERT_OK(conn1.Execute(lock_stmt_1));
++    ASSERT_OK(conn1.ExecuteFormat(lock_query, holder_lock_type));
+ 
+     // In sync point ObjectLockManagerImpl::DoLockSingleEntry, the lock is in waiting state.
+     SyncPoint::GetInstance()->LoadDependency(
+@@ -140,7 +193,17 @@ class PgObjectLocksTestRF1 : public PgMiniTestBase {
+ 
+     auto conn2_lock_future = std::async(std::launch::async, [&]() -> Status {
+       RETURN_NOT_OK(conn2.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
+-      RETURN_NOT_OK(conn2.Execute(lock_stmt_2));
++      RETURN_NOT_OK(conn2.ExecuteFormat(lock_query, waiter_lock_type));
++
++      if (test_pg_locks) {
++        SleepFor(500ms * kTimeMultiplier);
++        auto granted_lock_mode = VERIFY_RESULT(conn2.FetchRow<std::string>(
++            "SELECT mode FROM pg_locks WHERE granted = true AND relation = 'test'::regclass"));
++        // The waiter should have acquired the lock at this point.
++        SCHECK_EQ(granted_lock_mode, ToMode(waiter_lock_type),
++            IllegalState, "Expected the waiter to be unblocked");
++      }
++
+       RETURN_NOT_OK(conn2.Execute("INSERT INTO test (k, v) VALUES (11, 1)"));
+       RETURN_NOT_OK(conn2.CommitTransaction());
+       return Status::OK();
+@@ -148,6 +211,17 @@ class PgObjectLocksTestRF1 : public PgMiniTestBase {
+ 
+     // Ensure lock is in waiting state.
+     DEBUG_ONLY_TEST_SYNC_POINT("WaitingLock");
++
++    if (test_pg_locks) {
++      SleepFor(500ms * kTimeMultiplier);
++      auto granted_lock_mode = ASSERT_RESULT(conn1.FetchRow<std::string>(
++          "SELECT mode FROM pg_locks WHERE granted = true AND relation = 'test'::regclass"));
++      ASSERT_EQ(granted_lock_mode, ToMode(holder_lock_type));
++      auto waiting_lock_mode = ASSERT_RESULT(conn1.FetchRow<std::string>(
++          "SELECT mode FROM pg_locks WHERE granted = false AND relation = 'test'::regclass"));
++      ASSERT_EQ(waiting_lock_mode, ToMode(waiter_lock_type));
++    }
++
+     ASSERT_EQ(ASSERT_RESULT(conn1.FetchRow<PGUint64>("SELECT COUNT(*) FROM test WHERE v = 1")), 0);
+ 
+     // After conn1 releases the lock, conn2 should be able to acquire it.
+@@ -247,39 +321,11 @@ TEST_F(PgObjectLocksTestRF1, TestWaitingOnConflictingLocks) {
+ }
+ 
+ TEST_F(PgObjectLocksTestRF1, VerifyTableLockBlockingBehavior) {
+-  CreateTestTable();
+-  auto conn1 = ASSERT_RESULT(Connect());
+-  auto conn2 = ASSERT_RESULT(Connect());
+-  const std::vector<std::pair<std::string, std::string>> blocking_pairs = {
+-    {"ACCESS EXCLUSIVE", "ACCESS SHARE"},
+-    {"ACCESS EXCLUSIVE", "ROW SHARE"},
+-    {"ACCESS EXCLUSIVE", "ROW EXCLUSIVE"},
+-    {"ACCESS EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
+-    {"ACCESS EXCLUSIVE", "SHARE"},
+-    {"ACCESS EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
+-    {"ACCESS EXCLUSIVE", "EXCLUSIVE"},
+-    {"ACCESS EXCLUSIVE", "ACCESS EXCLUSIVE"},
+-    {"EXCLUSIVE", "ROW SHARE"},
+-    {"EXCLUSIVE", "ROW EXCLUSIVE"},
+-    {"EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
+-    {"EXCLUSIVE", "SHARE"},
+-    {"EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
+-    {"EXCLUSIVE", "EXCLUSIVE"},
+-    {"SHARE ROW EXCLUSIVE", "ROW EXCLUSIVE"},
+-    {"SHARE ROW EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
+-    {"SHARE ROW EXCLUSIVE", "SHARE"},
+-    {"SHARE ROW EXCLUSIVE", "SHARE ROW EXCLUSIVE"},
+-    {"SHARE", "ROW EXCLUSIVE"},
+-    {"SHARE", "SHARE UPDATE EXCLUSIVE"},
+-    {"SHARE UPDATE EXCLUSIVE", "SHARE UPDATE EXCLUSIVE"},
+-  };
++  TestAllBlockingPairs(/*test_pg_locks=*/false);
++}
+ 
+-  for (const auto& pair : blocking_pairs) {
+-    std::string lock_stmt_1 = "LOCK TABLE test IN " + pair.first + " MODE";
+-    std::string lock_stmt_2 = "LOCK TABLE test IN " + pair.second + " MODE";
+-    VerifyBlockingBehavior(conn1, conn2, lock_stmt_1, lock_stmt_2);
+-    VerifyBlockingBehavior(conn1, conn2, lock_stmt_2, lock_stmt_1);
+-  }
++TEST_F(PgObjectLocksTestRF1, TestPgLocks) {
++  TestAllBlockingPairs(/*test_pg_locks=*/true);
+ }
+ 
+ class PgObjectLocksTestRF1SessionExpiry : public PgObjectLocksTestRF1 {

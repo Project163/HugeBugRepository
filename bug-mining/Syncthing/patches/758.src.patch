@@ -1,0 +1,690 @@
+diff --git a/lib/fs/basicfs_copy_range.go b/lib/fs/basicfs_copy_range.go
+index 2774f3d82..fbb5076cd 100644
+--- a/lib/fs/basicfs_copy_range.go
++++ b/lib/fs/basicfs_copy_range.go
+@@ -14,6 +14,9 @@ type copyRangeImplementationBasicFile func(src, dst basicFile, srcOffset, dstOff
+ 
+ func copyRangeImplementationForBasicFile(impl copyRangeImplementationBasicFile) copyRangeImplementation {
+ 	return func(src, dst File, srcOffset, dstOffset, size int64) error {
++		src = unwrap(src)
++		dst = unwrap(dst)
++		// Then see if it's basic files
+ 		srcFile, srcOk := src.(basicFile)
+ 		dstFile, dstOk := dst.(basicFile)
+ 		if !srcOk || !dstOk {
+@@ -22,3 +25,38 @@ func copyRangeImplementationForBasicFile(impl copyRangeImplementationBasicFile)
+ 		return impl(srcFile, dstFile, srcOffset, dstOffset, size)
+ 	}
+ }
++
++func withFileDescriptors(first, second basicFile, fn func(first, second uintptr) (int, error)) (int, error) {
++	fc, err := first.SyscallConn()
++	if err != nil {
++		return 0, err
++	}
++	sc, err := second.SyscallConn()
++	if err != nil {
++		return 0, err
++	}
++	var n int
++	var ferr, serr, fnerr error
++	ferr = fc.Control(func(first uintptr) {
++		serr = sc.Control(func(second uintptr) {
++			n, fnerr = fn(first, second)
++		})
++	})
++	if ferr != nil {
++		return n, ferr
++	}
++	if serr != nil {
++		return n, serr
++	}
++	return n, fnerr
++}
++
++func unwrap(f File) File {
++	for {
++		if wrapped, ok := f.(interface{ unwrap() File }); ok {
++			f = wrapped.unwrap()
++		} else {
++			return f
++		}
++	}
++}
+diff --git a/lib/fs/basicfs_copy_range_copyfilerange.go b/lib/fs/basicfs_copy_range_copyfilerange.go
+index b7ba8fa68..1dbf0c320 100644
+--- a/lib/fs/basicfs_copy_range_copyfilerange.go
++++ b/lib/fs/basicfs_copy_range_copyfilerange.go
+@@ -29,7 +29,9 @@ func copyRangeCopyFileRange(src, dst basicFile, srcOffset, dstOffset, size int64
+ 		// appropriately.
+ 		//
+ 		// Also, even if explicitly not stated, the same is true for dstOffset
+-		n, err := unix.CopyFileRange(int(src.Fd()), &srcOffset, int(dst.Fd()), &dstOffset, int(size), 0)
++		n, err := withFileDescriptors(src, dst, func(srcFd, dstFd uintptr) (int, error) {
++			return unix.CopyFileRange(int(srcFd), &srcOffset, int(dstFd), &dstOffset, int(size), 0)
++		})
+ 		if n == 0 && err == nil {
+ 			return io.ErrUnexpectedEOF
+ 		}
+diff --git a/lib/fs/basicfs_copy_range_duplicateextents.go b/lib/fs/basicfs_copy_range_duplicateextents.go
+index f168d9dd9..58dacd324 100644
+--- a/lib/fs/basicfs_copy_range_duplicateextents.go
++++ b/lib/fs/basicfs_copy_range_duplicateextents.go
+@@ -9,6 +9,7 @@
+ package fs
+ 
+ import (
++	"io"
+ 	"syscall"
+ 	"unsafe"
+ 
+@@ -46,13 +47,24 @@ type duplicateExtentsData struct {
+ func copyRangeDuplicateExtents(src, dst basicFile, srcOffset, dstOffset, size int64) error {
+ 	var err error
+ 	// Check that the destination file has sufficient space
+-	if fi, err := dst.Stat(); err != nil {
++	dstFi, err := dst.Stat()
++	if err != nil {
+ 		return err
+-	} else if fi.Size() < dstOffset+size {
++	}
++	dstSize := dstFi.Size()
++	if dstSize < dstOffset+size {
+ 		// set file size. There is a requirements "The destination region must not extend past the end of file."
+ 		if err = dst.Truncate(dstOffset + size); err != nil {
+ 			return err
+ 		}
++		dstSize = dstOffset + size
++	}
++
++	// The source file has to be big enough
++	if fi, err := src.Stat(); err != nil {
++		return err
++	} else if fi.Size() < srcOffset+size {
++		return io.ErrUnexpectedEOF
+ 	}
+ 
+ 	// Requirement
+@@ -60,9 +72,25 @@ func copyRangeDuplicateExtents(src, dst basicFile, srcOffset, dstOffset, size in
+ 	// * cloneRegionSize less than 4GiB.
+ 	// see https://docs.microsoft.com/windows/win32/fileio/block-cloning
+ 
++	smallestClusterSize := availableClusterSize[len(availableClusterSize)-1]
++
++	if srcOffset%smallestClusterSize != 0 || dstOffset%smallestClusterSize != 0 {
++		return syscall.EINVAL
++	}
++
++	// Each file gets allocated multiple of "clusterSize" blocks, yet file size determines how much of the last block
++	// is readable/visible.
++	// Copies only happen in block sized chunks, hence you can copy non block sized regions of data to a file, as long
++	// as the regions are copied at the end of the file where the block visibility is adjusted by the file size.
++	if size%smallestClusterSize != 0 && dstOffset+size != dstSize {
++		return syscall.EINVAL
++	}
++
+ 	// Clone first xGiB region.
+ 	for size > GiB {
+-		err = callDuplicateExtentsToFile(src.Fd(), dst.Fd(), srcOffset, dstOffset, GiB)
++		_, err = withFileDescriptors(src, dst, func(srcFd, dstFd uintptr) (int, error) {
++			return 0, callDuplicateExtentsToFile(srcFd, dstFd, srcOffset, dstOffset, GiB)
++		})
+ 		if err != nil {
+ 			return wrapError(err)
+ 		}
+@@ -73,7 +101,9 @@ func copyRangeDuplicateExtents(src, dst basicFile, srcOffset, dstOffset, size in
+ 
+ 	// Clone tail. First try with 64KiB round up, then fallback to 4KiB.
+ 	for _, cloneRegionSize := range availableClusterSize {
+-		err = callDuplicateExtentsToFile(src.Fd(), dst.Fd(), srcOffset, dstOffset, roundUp(size, cloneRegionSize))
++		_, err = withFileDescriptors(src, dst, func(srcFd, dstFd uintptr) (int, error) {
++			return 0, callDuplicateExtentsToFile(srcFd, dstFd, srcOffset, dstOffset, roundUp(size, cloneRegionSize))
++		})
+ 		if err != nil {
+ 			continue
+ 		}
+@@ -94,7 +124,7 @@ func wrapError(err error) error {
+ // see https://docs.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_duplicate_extents_to_file
+ //
+ // memo: Overflow (cloneRegionSize is greater than file ends) is safe and just ignored by windows.
+-func callDuplicateExtentsToFile(src, dst uintptr, srcOffset, dstOffset int64, cloneRegionSize int64) (err error) {
++func callDuplicateExtentsToFile(src, dst uintptr, srcOffset, dstOffset int64, cloneRegionSize int64) error {
+ 	var (
+ 		bytesReturned uint32
+ 		overlapped    windows.Overlapped
+diff --git a/lib/fs/basicfs_copy_range_ioctl.go b/lib/fs/basicfs_copy_range_ioctl.go
+index 52a9e0b66..9d166c6de 100644
+--- a/lib/fs/basicfs_copy_range_ioctl.go
++++ b/lib/fs/basicfs_copy_range_ioctl.go
+@@ -4,11 +4,12 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ // You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-// +build !windows,!solaris,!darwin
++// +build linux
+ 
+ package fs
+ 
+ import (
++	"io"
+ 	"syscall"
+ 	"unsafe"
+ )
+@@ -43,6 +44,10 @@ func copyRangeIoctl(src, dst basicFile, srcOffset, dstOffset, size int64) error
+ 		return err
+ 	}
+ 
++	if srcOffset+size > fi.Size() {
++		return io.ErrUnexpectedEOF
++	}
++
+ 	// https://www.man7.org/linux/man-pages/man2/ioctl_ficlonerange.2.html
+ 	// If src_length is zero, the ioctl reflinks to the end of the source file.
+ 	if srcOffset+size == fi.Size() {
+@@ -51,20 +56,36 @@ func copyRangeIoctl(src, dst basicFile, srcOffset, dstOffset, size int64) error
+ 
+ 	if srcOffset == 0 && dstOffset == 0 && size == 0 {
+ 		// Optimization for whole file copies.
+-		_, _, errNo := syscall.Syscall(syscall.SYS_IOCTL, dst.Fd(), FICLONE, src.Fd())
++		var errNo syscall.Errno
++		_, err := withFileDescriptors(src, dst, func(srcFd, dstFd uintptr) (int, error) {
++			_, _, errNo = syscall.Syscall(syscall.SYS_IOCTL, dstFd, FICLONE, srcFd)
++			return 0, nil
++		})
++		// Failure in withFileDescriptors
++		if err != nil {
++			return err
++		}
+ 		if errNo != 0 {
+ 			return errNo
+ 		}
+ 		return nil
+ 	}
+ 
+-	params := fileCloneRange{
+-		srcFd:     int64(src.Fd()),
+-		srcOffset: uint64(srcOffset),
+-		srcLength: uint64(size),
+-		dstOffset: uint64(dstOffset),
++	var errNo syscall.Errno
++	_, err = withFileDescriptors(src, dst, func(srcFd, dstFd uintptr) (int, error) {
++		params := fileCloneRange{
++			srcFd:     int64(srcFd),
++			srcOffset: uint64(srcOffset),
++			srcLength: uint64(size),
++			dstOffset: uint64(dstOffset),
++		}
++		_, _, errNo = syscall.Syscall(syscall.SYS_IOCTL, dstFd, FICLONERANGE, uintptr(unsafe.Pointer(&params)))
++		return 0, nil
++	})
++	// Failure in withFileDescriptors
++	if err != nil {
++		return err
+ 	}
+-	_, _, errNo := syscall.Syscall(syscall.SYS_IOCTL, dst.Fd(), FICLONERANGE, uintptr(unsafe.Pointer(&params)))
+ 	if errNo != 0 {
+ 		return errNo
+ 	}
+diff --git a/lib/fs/basicfs_copy_range_sendfile.go b/lib/fs/basicfs_copy_range_sendfile.go
+index 49be2c385..94239a5dd 100644
+--- a/lib/fs/basicfs_copy_range_sendfile.go
++++ b/lib/fs/basicfs_copy_range_sendfile.go
+@@ -4,7 +4,7 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ // You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+-// +build !windows,!darwin
++// +build linux solaris
+ 
+ package fs
+ 
+@@ -51,7 +51,9 @@ func copyRangeSendFile(src, dst basicFile, srcOffset, dstOffset, size int64) err
+ 		// following the last byte that was read. If offset is not NULL, then sendfile() does not modify the current
+ 		// file offset of in_fd; otherwise the current file offset is adjusted to reflect the number of bytes read from
+ 		// in_fd.
+-		n, err := syscall.Sendfile(int(dst.Fd()), int(src.Fd()), &srcOffset, int(size))
++		n, err := withFileDescriptors(dst, src, func(dstFd, srcFd uintptr) (int, error) {
++			return syscall.Sendfile(int(dstFd), int(srcFd), &srcOffset, int(size))
++		})
+ 		if n == 0 && err == nil {
+ 			err = io.ErrUnexpectedEOF
+ 		}
+diff --git a/lib/fs/filesystem_copy_range_test.go b/lib/fs/filesystem_copy_range_test.go
+index 6299cd576..e2db04fb9 100644
+--- a/lib/fs/filesystem_copy_range_test.go
++++ b/lib/fs/filesystem_copy_range_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"io/ioutil"
+ 	"math/rand"
+ 	"os"
++	"path/filepath"
+ 	"syscall"
+ 	"testing"
+ )
+@@ -51,7 +52,7 @@ var (
+ 			expectedErrors:           nil,
+ 		},
+ 		{
+-			name:                     "append to end, offsets at start",
++			name:                     "append to end offsets at start",
+ 			srcSize:                  generationSize,
+ 			dstSize:                  generationSize,
+ 			srcOffset:                0,
+@@ -124,27 +125,87 @@ var (
+ 			copySize:                 defaultCopySize * 10,
+ 			// ioctl returns syscall.EINVAL, rest are wrapped
+ 			expectedErrors: map[CopyRangeMethod]error{
+-				CopyRangeMethodIoctl:           syscall.EINVAL,
+-				CopyRangeMethodStandard:        io.ErrUnexpectedEOF,
+-				CopyRangeMethodCopyFileRange:   io.ErrUnexpectedEOF,
+-				CopyRangeMethodSendFile:        io.ErrUnexpectedEOF,
+-				CopyRangeMethodAllWithFallback: io.ErrUnexpectedEOF,
++				CopyRangeMethodIoctl:            io.ErrUnexpectedEOF,
++				CopyRangeMethodStandard:         io.ErrUnexpectedEOF,
++				CopyRangeMethodCopyFileRange:    io.ErrUnexpectedEOF,
++				CopyRangeMethodSendFile:         io.ErrUnexpectedEOF,
++				CopyRangeMethodAllWithFallback:  io.ErrUnexpectedEOF,
++				CopyRangeMethodDuplicateExtents: io.ErrUnexpectedEOF,
+ 			},
+ 		},
+-		// Non block sized file
+ 		{
+-			name:                     "not block aligned write",
+-			srcSize:                  generationSize + 2,
++			name:                     "unaligned source offset unaligned size",
++			srcSize:                  generationSize,
+ 			dstSize:                  0,
+ 			srcOffset:                1,
+ 			dstOffset:                0,
+ 			srcStartingPos:           0,
+ 			dstStartingPos:           0,
+-			expectedDstSizeAfterCopy: generationSize + 1,
+-			copySize:                 generationSize + 1,
+-			// Only fails for ioctl
++			expectedDstSizeAfterCopy: defaultCopySize + 1,
++			copySize:                 defaultCopySize + 1,
+ 			expectedErrors: map[CopyRangeMethod]error{
+-				CopyRangeMethodIoctl: syscall.EINVAL,
++				CopyRangeMethodIoctl:            syscall.EINVAL,
++				CopyRangeMethodDuplicateExtents: syscall.EINVAL,
++			},
++		},
++		{
++			name:                     "unaligned source offset aligned size",
++			srcSize:                  generationSize,
++			dstSize:                  0,
++			srcOffset:                1,
++			dstOffset:                0,
++			srcStartingPos:           0,
++			dstStartingPos:           0,
++			expectedDstSizeAfterCopy: defaultCopySize,
++			copySize:                 defaultCopySize,
++			expectedErrors: map[CopyRangeMethod]error{
++				CopyRangeMethodIoctl:            syscall.EINVAL,
++				CopyRangeMethodDuplicateExtents: syscall.EINVAL,
++			},
++		},
++		{
++			name:                     "unaligned destination offset unaligned size",
++			srcSize:                  generationSize,
++			dstSize:                  generationSize,
++			srcOffset:                0,
++			dstOffset:                1,
++			srcStartingPos:           0,
++			dstStartingPos:           0,
++			expectedDstSizeAfterCopy: generationSize,
++			copySize:                 defaultCopySize + 1,
++			expectedErrors: map[CopyRangeMethod]error{
++				CopyRangeMethodIoctl:            syscall.EINVAL,
++				CopyRangeMethodDuplicateExtents: syscall.EINVAL,
++			},
++		},
++		{
++			name:                     "unaligned destination offset aligned size",
++			srcSize:                  generationSize,
++			dstSize:                  generationSize,
++			srcOffset:                0,
++			dstOffset:                1,
++			srcStartingPos:           0,
++			dstStartingPos:           0,
++			expectedDstSizeAfterCopy: generationSize,
++			copySize:                 defaultCopySize,
++			expectedErrors: map[CopyRangeMethod]error{
++				CopyRangeMethodIoctl:            syscall.EINVAL,
++				CopyRangeMethodDuplicateExtents: syscall.EINVAL,
++			},
++		},
++		{
++			name:                     "aligned offsets unaligned size",
++			srcSize:                  generationSize,
++			dstSize:                  generationSize,
++			srcOffset:                0,
++			dstOffset:                0,
++			srcStartingPos:           0,
++			dstStartingPos:           0,
++			expectedDstSizeAfterCopy: generationSize,
++			copySize:                 defaultCopySize + 1,
++			expectedErrors: map[CopyRangeMethod]error{
++				CopyRangeMethodIoctl:            syscall.EINVAL,
++				CopyRangeMethodDuplicateExtents: syscall.EINVAL,
+ 			},
+ 		},
+ 		// Last block that starts on a nice boundary
+@@ -189,131 +250,149 @@ var (
+ 	}
+ )
+ 
+-func TestCopyRange(ttt *testing.T) {
++func TestCopyRange(tttt *testing.T) {
+ 	randSrc := rand.New(rand.NewSource(rand.Int63()))
+-	for copyMethod, impl := range copyRangeMethods {
+-		ttt.Run(copyMethod.String(), func(tt *testing.T) {
+-			for _, testCase := range testCases {
+-				tt.Run(testCase.name, func(t *testing.T) {
+-					srcBuf := make([]byte, testCase.srcSize)
+-					dstBuf := make([]byte, testCase.dstSize)
+-					td, err := ioutil.TempDir(os.Getenv("STFSTESTPATH"), "")
+-					if err != nil {
+-						t.Fatal(err)
+-					}
+-					defer func() { _ = os.RemoveAll(td) }()
+-					fs := NewFilesystem(FilesystemTypeBasic, td)
++	paths := filepath.SplitList(os.Getenv("STFSTESTPATH"))
++	if len(paths) == 0 {
++		paths = []string{""}
++	}
++	for _, path := range paths {
++		testPath, err := ioutil.TempDir(path, "")
++		if err != nil {
++			tttt.Fatal(err)
++		}
++		defer os.RemoveAll(testPath)
++		name := path
++		if name == "" {
++			name = "tmp"
++		}
++		tttt.Run(name, func(ttt *testing.T) {
++			for copyMethod, impl := range copyRangeMethods {
++				ttt.Run(copyMethod.String(), func(tt *testing.T) {
++					for _, testCase := range testCases {
++						tt.Run(testCase.name, func(t *testing.T) {
++							srcBuf := make([]byte, testCase.srcSize)
++							dstBuf := make([]byte, testCase.dstSize)
++							td, err := ioutil.TempDir(testPath, "")
++							if err != nil {
++								t.Fatal(err)
++							}
++							defer os.RemoveAll(td)
+ 
+-					if _, err := io.ReadFull(randSrc, srcBuf); err != nil {
+-						t.Fatal(err)
+-					}
++							fs := NewFilesystem(FilesystemTypeBasic, td)
+ 
+-					if _, err := io.ReadFull(randSrc, dstBuf); err != nil {
+-						t.Fatal(err)
+-					}
++							if _, err := io.ReadFull(randSrc, srcBuf); err != nil {
++								t.Fatal(err)
++							}
+ 
+-					src, err := fs.Create("src")
+-					if err != nil {
+-						t.Fatal(err)
+-					}
+-					defer func() { _ = src.Close() }()
++							if _, err := io.ReadFull(randSrc, dstBuf); err != nil {
++								t.Fatal(err)
++							}
+ 
+-					dst, err := fs.Create("dst")
+-					if err != nil {
+-						t.Fatal(err)
+-					}
+-					defer func() { _ = dst.Close() }()
++							src, err := fs.Create("src")
++							if err != nil {
++								t.Fatal(err)
++							}
++							defer func() { _ = src.Close() }()
+ 
+-					// Write some data
++							dst, err := fs.Create("dst")
++							if err != nil {
++								t.Fatal(err)
++							}
++							defer func() { _ = dst.Close() }()
+ 
+-					if _, err := src.Write(srcBuf); err != nil {
+-						t.Fatal(err)
+-					}
++							// Write some data
+ 
+-					if _, err := dst.Write(dstBuf); err != nil {
+-						t.Fatal(err)
+-					}
++							if _, err := src.Write(srcBuf); err != nil {
++								t.Fatal(err)
++							}
+ 
+-					// Set the offsets
++							if _, err := dst.Write(dstBuf); err != nil {
++								t.Fatal(err)
++							}
+ 
+-					if n, err := src.Seek(testCase.srcStartingPos, io.SeekStart); err != nil || n != testCase.srcStartingPos {
+-						t.Fatal(err)
+-					}
++							// Set the offsets
+ 
+-					if n, err := dst.Seek(testCase.dstStartingPos, io.SeekStart); err != nil || n != testCase.dstStartingPos {
+-						t.Fatal(err)
+-					}
++							if n, err := src.Seek(testCase.srcStartingPos, io.SeekStart); err != nil || n != testCase.srcStartingPos {
++								t.Fatal(err)
++							}
+ 
+-					if err := impl(src.(basicFile), dst.(basicFile), testCase.srcOffset, testCase.dstOffset, testCase.copySize); err != nil {
+-						if err == syscall.ENOTSUP {
+-							// Test runner can adjust directory in which to run the tests, that allow broader tests.
+-							t.Skip("Not supported on the current filesystem, set STFSTESTPATH env var.")
+-						}
+-						if testCase.expectedErrors[copyMethod] == err {
+-							return
+-						}
+-						t.Fatal(err)
+-					} else if testCase.expectedErrors[copyMethod] != nil {
+-						t.Fatal("did not get expected error")
+-					}
++							if n, err := dst.Seek(testCase.dstStartingPos, io.SeekStart); err != nil || n != testCase.dstStartingPos {
++								t.Fatal(err)
++							}
+ 
+-					// Check offsets where we expect them
++							if err := impl(src.(basicFile), dst.(basicFile), testCase.srcOffset, testCase.dstOffset, testCase.copySize); err != nil {
++								if err == syscall.ENOTSUP {
++									// Test runner can adjust directory in which to run the tests, that allow broader tests.
++									t.Skip("Not supported on the current filesystem, set STFSTESTPATH env var.")
++								}
++								if testCase.expectedErrors[copyMethod] == err {
++									return
++								}
++								t.Fatal(err)
++							} else if testCase.expectedErrors[copyMethod] != nil {
++								t.Fatal("did not get expected error")
++							}
+ 
+-					if srcCurPos, err := src.Seek(0, io.SeekCurrent); err != nil {
+-						t.Fatal(err)
+-					} else if srcCurPos != testCase.srcStartingPos {
+-						t.Errorf("src pos expected %d got %d", testCase.srcStartingPos, srcCurPos)
+-					}
++							// Check offsets where we expect them
+ 
+-					if dstCurPos, err := dst.Seek(0, io.SeekCurrent); err != nil {
+-						t.Fatal(err)
+-					} else if dstCurPos != testCase.dstStartingPos {
+-						t.Errorf("dst pos expected %d got %d", testCase.dstStartingPos, dstCurPos)
+-					}
++							if srcCurPos, err := src.Seek(0, io.SeekCurrent); err != nil {
++								t.Fatal(err)
++							} else if srcCurPos != testCase.srcStartingPos {
++								t.Errorf("src pos expected %d got %d", testCase.srcStartingPos, srcCurPos)
++							}
+ 
+-					// Check dst size
++							if dstCurPos, err := dst.Seek(0, io.SeekCurrent); err != nil {
++								t.Fatal(err)
++							} else if dstCurPos != testCase.dstStartingPos {
++								t.Errorf("dst pos expected %d got %d", testCase.dstStartingPos, dstCurPos)
++							}
+ 
+-					if fi, err := dst.Stat(); err != nil {
+-						t.Fatal(err)
+-					} else if fi.Size() != testCase.expectedDstSizeAfterCopy {
+-						t.Errorf("expected %d size, got %d", testCase.expectedDstSizeAfterCopy, fi.Size())
+-					}
++							// Check dst size
+ 
+-					// Check the data is as expected
++							if fi, err := dst.Stat(); err != nil {
++								t.Fatal(err)
++							} else if fi.Size() != testCase.expectedDstSizeAfterCopy {
++								t.Errorf("expected %d size, got %d", testCase.expectedDstSizeAfterCopy, fi.Size())
++							}
+ 
+-					if _, err := dst.Seek(0, io.SeekStart); err != nil {
+-						t.Fatal(err)
+-					}
++							// Check the data is as expected
+ 
+-					resultBuf := make([]byte, testCase.expectedDstSizeAfterCopy)
+-					if _, err := io.ReadFull(dst, resultBuf); err != nil {
+-						t.Fatal(err)
+-					}
++							if _, err := dst.Seek(0, io.SeekStart); err != nil {
++								t.Fatal(err)
++							}
+ 
+-					if !bytes.Equal(srcBuf[testCase.srcOffset:testCase.srcOffset+testCase.copySize], resultBuf[testCase.dstOffset:testCase.dstOffset+testCase.copySize]) {
+-						t.Errorf("Not equal")
+-					}
++							resultBuf := make([]byte, testCase.expectedDstSizeAfterCopy)
++							if _, err := io.ReadFull(dst, resultBuf); err != nil {
++								t.Fatal(err)
++							}
++
++							if !bytes.Equal(srcBuf[testCase.srcOffset:testCase.srcOffset+testCase.copySize], resultBuf[testCase.dstOffset:testCase.dstOffset+testCase.copySize]) {
++								t.Errorf("Not equal")
++							}
+ 
+-					// Check not copied content does not get corrupted
++							// Check not copied content does not get corrupted
+ 
+-					if testCase.dstOffset > testCase.dstSize {
+-						if !bytes.Equal(dstBuf[:testCase.dstSize], resultBuf[:testCase.dstSize]) {
+-							t.Error("region before copy region not equals")
+-						}
+-						if !bytes.Equal(resultBuf[testCase.dstSize:testCase.dstOffset], make([]byte, testCase.dstOffset-testCase.dstSize)) {
+-							t.Error("found non zeroes in expected zero region")
+-						}
+-					} else {
+-						if !bytes.Equal(dstBuf[:testCase.dstOffset], resultBuf[:testCase.dstOffset]) {
+-							t.Error("region before copy region not equals")
+-						}
+-						afterCopyStart := testCase.dstOffset + testCase.copySize
++							if testCase.dstOffset > testCase.dstSize {
++								if !bytes.Equal(dstBuf[:testCase.dstSize], resultBuf[:testCase.dstSize]) {
++									t.Error("region before copy region not equals")
++								}
++								if !bytes.Equal(resultBuf[testCase.dstSize:testCase.dstOffset], make([]byte, testCase.dstOffset-testCase.dstSize)) {
++									t.Error("found non zeroes in expected zero region")
++								}
++							} else {
++								if !bytes.Equal(dstBuf[:testCase.dstOffset], resultBuf[:testCase.dstOffset]) {
++									t.Error("region before copy region not equals")
++								}
++								afterCopyStart := testCase.dstOffset + testCase.copySize
+ 
+-						if afterCopyStart < testCase.dstSize {
+-							if !bytes.Equal(dstBuf[afterCopyStart:], resultBuf[afterCopyStart:len(dstBuf)]) {
+-								t.Error("region after copy region not equals")
++								if afterCopyStart < testCase.dstSize {
++									if !bytes.Equal(dstBuf[afterCopyStart:], resultBuf[afterCopyStart:len(dstBuf)]) {
++										t.Error("region after copy region not equals")
++									}
++								}
+ 							}
+-						}
++						})
+ 					}
+ 				})
+ 			}
+diff --git a/lib/fs/mtimefs.go b/lib/fs/mtimefs.go
+index 66f2f12bc..12437a130 100644
+--- a/lib/fs/mtimefs.go
++++ b/lib/fs/mtimefs.go
+@@ -130,7 +130,7 @@ func (f *MtimeFS) Create(name string) (File, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &mtimeFile{fd, f}, nil
++	return mtimeFile{fd, f}, nil
+ }
+ 
+ func (f *MtimeFS) Open(name string) (File, error) {
+@@ -138,7 +138,7 @@ func (f *MtimeFS) Open(name string) (File, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &mtimeFile{fd, f}, nil
++	return mtimeFile{fd, f}, nil
+ }
+ 
+ func (f *MtimeFS) OpenFile(name string, flags int, mode FileMode) (File, error) {
+@@ -146,7 +146,7 @@ func (f *MtimeFS) OpenFile(name string, flags int, mode FileMode) (File, error)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return &mtimeFile{fd, f}, nil
++	return mtimeFile{fd, f}, nil
+ }
+ 
+ // "real" is the on disk timestamp
+@@ -208,7 +208,7 @@ type mtimeFile struct {
+ 	fs *MtimeFS
+ }
+ 
+-func (f *mtimeFile) Stat() (FileInfo, error) {
++func (f mtimeFile) Stat() (FileInfo, error) {
+ 	info, err := f.File.Stat()
+ 	if err != nil {
+ 		return nil, err
+@@ -228,6 +228,10 @@ func (f *mtimeFile) Stat() (FileInfo, error) {
+ 	return info, nil
+ }
+ 
++func (f mtimeFile) unwrap() File {
++	return f.File
++}
++
+ // The dbMtime is our database representation
+ 
+ type dbMtime struct {
+diff --git a/lib/model/folder_sendrecv_test.go b/lib/model/folder_sendrecv_test.go
+index e3deaab25..edff7c37d 100644
+--- a/lib/model/folder_sendrecv_test.go
++++ b/lib/model/folder_sendrecv_test.go
+@@ -205,7 +205,11 @@ func TestHandleFileWithTemp(t *testing.T) {
+ }
+ 
+ func TestCopierFinder(t *testing.T) {
+-	for _, method := range []fs.CopyRangeMethod{fs.CopyRangeMethodStandard, fs.CopyRangeMethodAllWithFallback} {
++	methods := []fs.CopyRangeMethod{fs.CopyRangeMethodStandard, fs.CopyRangeMethodAllWithFallback}
++	if runtime.GOOS == "linux" {
++		methods = append(methods, fs.CopyRangeMethodSendFile)
++	}
++	for _, method := range methods {
+ 		t.Run(method.String(), func(t *testing.T) {
+ 			// After diff between required and existing we should:
+ 			// Copy: 1, 2, 3, 4, 6, 7, 8

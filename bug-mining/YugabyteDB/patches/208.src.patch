@@ -1,0 +1,201 @@
+diff --git a/src/yb/client/client-internal.cc b/src/yb/client/client-internal.cc
+index 63ae7f989e..829c5e05cb 100644
+--- a/src/yb/client/client-internal.cc
++++ b/src/yb/client/client-internal.cc
+@@ -284,6 +284,7 @@ YB_CLIENT_SPECIALIZE_SIMPLE(IsAlterTableDone);
+ YB_CLIENT_SPECIALIZE_SIMPLE(IsCreateTableDone);
+ YB_CLIENT_SPECIALIZE_SIMPLE(IsTruncateTableDone);
+ YB_CLIENT_SPECIALIZE_SIMPLE(IsDeleteTableDone);
++YB_CLIENT_SPECIALIZE_SIMPLE(IsLoadBalanced);
+ 
+ YBClient::Data::Data()
+     : leader_master_rpc_(rpcs_.InvalidHandle()),
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index 3c8887b657..2a78676bf3 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -85,6 +85,8 @@ using yb::master::GetTableLocationsRequestPB;
+ using yb::master::GetTableLocationsResponsePB;
+ using yb::master::GetTabletLocationsRequestPB;
+ using yb::master::GetTabletLocationsResponsePB;
++using yb::master::IsLoadBalancedRequestPB;
++using yb::master::IsLoadBalancedResponsePB;
+ using yb::master::ListMastersRequestPB;
+ using yb::master::ListMastersResponsePB;
+ using yb::master::ListTablesRequestPB;
+@@ -897,6 +899,20 @@ void YBClient::SetLocalTabletServer(const string& ts_uuid,
+   data_->meta_cache_->SetLocalTabletServer(ts_uuid, proxy, local_tserver);
+ }
+ 
++Result<bool> YBClient::IsLoadBalanced(uint32_t num_servers) {
++  IsLoadBalancedRequestPB req;
++  IsLoadBalancedResponsePB resp;
++
++  req.set_expected_num_servers(num_servers);
++  // Cannot use CALL_SYNC_LEADER_MASTER_RPC directly since this is susbstituted with RETURN_NOT_OK
++  // and we want to capture the status to check if load is balanced.
++  Status s = [&, this]() {
++    CALL_SYNC_LEADER_MASTER_RPC(req, resp, IsLoadBalanced);
++    return Status::OK();
++  }();
++  return s.ok();
++}
++
+ Status YBClient::GetTablets(const YBTableName& table_name,
+                             const int32_t max_tablets,
+                             RepeatedPtrField<TabletLocationsPB>* tablets) {
+@@ -1177,6 +1193,10 @@ bool YBClient::IsMultiMaster() const {
+   return addrs.size() > 1;
+ }
+ 
++void YBClient::TEST_set_admin_operation_timeout(const MonoDelta& timeout) {
++  data_->default_admin_operation_timeout_ = timeout;
++}
++
+ const MonoDelta& YBClient::default_admin_operation_timeout() const {
+   return data_->default_admin_operation_timeout_;
+ }
+diff --git a/src/yb/client/client.h b/src/yb/client/client.h
+index 429daa99d8..333de2ff71 100644
+--- a/src/yb/client/client.h
++++ b/src/yb/client/client.h
+@@ -450,6 +450,8 @@ class YBClient {
+   // Result value is set only on success.
+   Result<bool> TableExists(const YBTableName& table_name);
+ 
++  Result<bool> IsLoadBalanced(uint32_t num_servers);
++
+   // Open the table with the given name or id. This will do an RPC to ensure that
+   // the table exists and look up its schema.
+   //
+@@ -490,6 +492,8 @@ class YBClient {
+ 
+   bool IsMultiMaster() const;
+ 
++  void TEST_set_admin_operation_timeout(const MonoDelta& timeout);
++
+   const MonoDelta& default_admin_operation_timeout() const;
+   const MonoDelta& default_rpc_timeout() const;
+ 
+diff --git a/src/yb/integration-tests/delete_table-test.cc b/src/yb/integration-tests/delete_table-test.cc
+index f036013346..211236419b 100644
+--- a/src/yb/integration-tests/delete_table-test.cc
++++ b/src/yb/integration-tests/delete_table-test.cc
+@@ -261,6 +261,30 @@ void DeleteTableTest::DeleteTabletWithRetries(const TServerDetails* ts,
+   ASSERT_OK(s);
+ }
+ 
++TEST_F(DeleteTableTest, TestPendingDeleteStateClearedOnFailure) {
++  vector<string> tserver_flags, master_flags;
++  master_flags.push_back("--unresponsive_ts_rpc_timeout_ms=5000");
++  // Disable tablet delete operations.
++  tserver_flags.push_back("--rpc_delete_tablet_fail=true");
++  ASSERT_NO_FATALS(StartCluster(tserver_flags, master_flags, 3));
++  // Create a table on the cluster. We're just using TestWorkload
++  // as a convenient way to create it.
++  auto test_workload = TestWorkload(cluster_.get());
++  test_workload.Setup();
++
++  // The table should have replicas on all three tservers.
++  ASSERT_OK(inspect_->WaitForReplicaCount(3));
++
++  client_->TEST_set_admin_operation_timeout(MonoDelta::FromSeconds(10));
++
++  // Delete the table.
++  DeleteTable(TestWorkloadOptions::kDefaultTableName);
++
++  // Wait for the load balancer to report no pending deletes after the delete table fails.
++  ASSERT_OK(WaitFor([&] () { return client_->IsLoadBalanced(3); },
++            MonoDelta::FromSeconds(30), "IsLoadBalanced"));
++}
++
+ // Test deleting an empty table, and ensure that the tablets get removed,
+ // and the master no longer shows the table as existing.
+ TEST_F(DeleteTableTest, TestDeleteEmptyTable) {
+diff --git a/src/yb/master/async_rpc_tasks.cc b/src/yb/master/async_rpc_tasks.cc
+index a7dd5cb43c..848755cb82 100644
+--- a/src/yb/master/async_rpc_tasks.cc
++++ b/src/yb/master/async_rpc_tasks.cc
+@@ -323,7 +323,11 @@ void RetryingTSRpcTask::RunDelayedTask(const Status& status) {
+   }
+ }
+ 
++void RetryingTSRpcTask::UnregisterAsyncTaskCallback() {}
++
+ void RetryingTSRpcTask::UnregisterAsyncTask() {
++  UnregisterAsyncTaskCallback();
++
+   auto s = state();
+   if (!IsStateTerminal(s)) {
+     LOG_WITH_PREFIX(FATAL) << "Invalid task state " << s;
+@@ -475,11 +479,7 @@ void AsyncDeleteReplica::HandleResponse(int attempt) {
+     VLOG(1) << "TS " << permanent_uuid_ << ": delete complete on tablet " << tablet_id_;
+   }
+   if (delete_done) {
+-    master_->catalog_manager()->NotifyTabletDeleteFinished(permanent_uuid_, tablet_id_);
+-    shared_ptr<TSDescriptor> ts_desc;
+-    if (master_->ts_manager()->LookupTSByUUID(permanent_uuid_, &ts_desc)) {
+-      ts_desc->ClearPendingTabletDelete(tablet_id_);
+-    }
++    UnregisterAsyncTaskCallback();
+   }
+ }
+ 
+@@ -500,6 +500,10 @@ bool AsyncDeleteReplica::SendRequest(int attempt) {
+   return true;
+ }
+ 
++void AsyncDeleteReplica::UnregisterAsyncTaskCallback() {
++  master_->catalog_manager()->NotifyTabletDeleteFinished(permanent_uuid_, tablet_id_);
++}
++
+ // ============================================================================
+ //  Class AsyncAlterTable.
+ // ============================================================================
+diff --git a/src/yb/master/async_rpc_tasks.h b/src/yb/master/async_rpc_tasks.h
+index fba956c80c..a089b36324 100644
+--- a/src/yb/master/async_rpc_tasks.h
++++ b/src/yb/master/async_rpc_tasks.h
+@@ -171,6 +171,9 @@ class RetryingTSRpcTask : public MonitoredTask {
+   // pool, rather than a reactor thread, so it may do blocking IO operations.
+   void DoRpcCallback();
+ 
++  // Called when the async task unregisters either successfully or unsuccessfully.
++  virtual void UnregisterAsyncTaskCallback();
++
+   Master* const master_;
+   ThreadPool* const callback_pool_;
+   const gscoped_ptr<TSPicker> replica_picker_;
+@@ -294,6 +297,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
+ 
+   void HandleResponse(int attempt) override;
+   bool SendRequest(int attempt) override;
++  void UnregisterAsyncTaskCallback() override;
+ 
+   const TabletId tablet_id_;
+   const tablet::TabletDataState delete_type_;
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index ebb79ae3d2..ddb7f49921 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -147,6 +147,8 @@ DEFINE_test_flag(bool, simulate_time_out_failures, false, "If true, we will rand
+ DEFINE_test_flag(double, respond_write_failed_probability, 0.0,
+                  "Probability to respond that write request is failed");
+ 
++DEFINE_test_flag(bool, rpc_delete_tablet_fail, false, "Should delete tablet RPC fail.");
++
+ DECLARE_uint64(max_clock_skew_usec);
+ 
+ namespace yb {
+@@ -624,6 +626,11 @@ void TabletServiceAdminImpl::CreateTablet(const CreateTabletRequestPB* req,
+ void TabletServiceAdminImpl::DeleteTablet(const DeleteTabletRequestPB* req,
+                                           DeleteTabletResponsePB* resp,
+                                           rpc::RpcContext context) {
++  if (PREDICT_FALSE(FLAGS_rpc_delete_tablet_fail)) {
++    context.RespondFailure(STATUS(NetworkError, "Simulating network partition for test"));
++    return;
++  }
++
+   if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "DeleteTablet", req, resp, &context)) {
+     return;
+   }

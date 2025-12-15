@@ -1,0 +1,559 @@
+diff --git a/ent/src/yb/tools/yb-admin-test_ent.cc b/ent/src/yb/tools/yb-admin-test_ent.cc
+index 10788b9ffe..2b2712635b 100644
+--- a/ent/src/yb/tools/yb-admin-test_ent.cc
++++ b/ent/src/yb/tools/yb-admin-test_ent.cc
+@@ -170,7 +170,7 @@ void AdminCliTest::CheckImportedTable(const YBTable* src_table,
+ 
+   ASSERT_EQ(same_ids, table->id() == src_table->id());
+   ASSERT_EQ(table->table_type(), src_table->table_type());
+-  ASSERT_EQ(table->GetPartitions(), src_table->GetPartitions());
++  ASSERT_EQ(table->GetPartitionsCopy(), src_table->GetPartitionsCopy());
+   ASSERT_TRUE(table->partition_schema().Equals(src_table->partition_schema()));
+   ASSERT_TRUE(table->schema().Equals(src_table->schema()));
+   ASSERT_EQ(table->schema().table_properties().is_transactional(),
+diff --git a/src/yb/client/client-test.cc b/src/yb/client/client-test.cc
+index 292d21686e..9cf8136890 100644
+--- a/src/yb/client/client-test.cc
++++ b/src/yb/client/client-test.cc
+@@ -89,6 +89,7 @@
+ #include "yb/util/metrics.h"
+ #include "yb/util/net/dns_resolver.h"
+ #include "yb/util/net/sockaddr.h"
++#include "yb/util/random_util.h"
+ #include "yb/util/status.h"
+ #include "yb/util/stopwatch.h"
+ #include "yb/util/test_util.h"
+@@ -2284,5 +2285,72 @@ TEST_F(ClientTest, BadMasterAddress) {
+   messenger->Shutdown();
+ }
+ 
++TEST_F(ClientTest, RefreshPartitions) {
++  const auto kLookupTimeout = 10s;
++  const auto kNumLookupThreads = 2;
++  const auto kNumLookups = 100;
++
++  std::atomic<bool> stop_requested{false};
++  std::atomic<size_t> num_lookups_called{0};
++  std::atomic<size_t> num_lookups_done{0};
++
++  const auto callback = [&num_lookups_done](
++                            size_t lookup_idx, const Result<internal::RemoteTabletPtr>& tablet) {
++    const auto prefix = Format("Lookup $0 got ", lookup_idx);
++    if (tablet.ok()) {
++      LOG(INFO) << prefix << "tablet: " << (*tablet)->tablet_id();
++    } else {
++      LOG(INFO) << prefix << "error: " << AsString(tablet.status());
++    }
++    num_lookups_done.fetch_add(1);
++  };
++
++  const auto lookup_func = [&]() {
++    while(!stop_requested) {
++      const auto hash_code = RandomUniformInt<uint16_t>(0, PartitionSchema::kMaxPartitionKey);
++      const auto partition_key = PartitionSchema::EncodeMultiColumnHashValue(hash_code);
++      client_->LookupTabletByKey(
++          client_table_.table(), partition_key, CoarseMonoClock::now() + kLookupTimeout,
++          std::bind(callback, num_lookups_called.fetch_add(1), std::placeholders::_1));
++    }
++  };
++
++  const auto marker_func = [&]() {
++    while(!stop_requested) {
++      const auto table = client_table_.table();
++      table->MarkPartitionsAsStale();
++      const auto result = table->MaybeRefreshPartitions();
++      if (!result.ok()) {
++        LOG(INFO) << AsString(result.status());
++      }
++    }
++  };
++
++  LOG(INFO) << "Starting threads";
++
++  std::vector<std::thread> threads;
++  for (int i = 0; i < kNumLookupThreads; ++i) {
++    threads.push_back(std::thread(lookup_func));
++  }
++  threads.push_back(std::thread(marker_func));
++
++  ASSERT_OK(LoggedWaitFor([&num_lookups_called]{
++    return num_lookups_called >= kNumLookups;
++  }, 120s, "Tablet lookup calls"));
++
++  LOG(INFO) << "Stopping threads";
++  stop_requested = true;
++  for (auto& thread : threads) {
++    thread.join();
++  }
++  LOG(INFO) << "Stopped threads";
++
++  ASSERT_OK(LoggedWaitFor([&num_lookups_done, num_lookups = num_lookups_called.load()] {
++    return num_lookups_done >= num_lookups;
++  }, kLookupTimeout, "Tablet lookup responses"));
++
++  LOG(INFO) << "num_lookups_done: " << num_lookups_done;
++}
++
+ }  // namespace client
+ }  // namespace yb
+diff --git a/src/yb/client/client_fwd.h b/src/yb/client/client_fwd.h
+index df4e1e9e82..4115502ba5 100644
+--- a/src/yb/client/client_fwd.h
++++ b/src/yb/client/client_fwd.h
+@@ -62,6 +62,8 @@ typedef std::shared_ptr<YBSession> YBSessionPtr;
+ 
+ class YBTable;
+ typedef std::shared_ptr<YBTable> YBTablePtr;
++typedef std::vector<std::string> TablePartitions;
++struct VersionedTablePartitions;
+ 
+ class YBOperation;
+ typedef std::shared_ptr<YBOperation> YBOperationPtr;
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index 56aff30dbb..5572513076 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -1316,7 +1316,7 @@ RemoteTabletPtr MetaCache::LookupTabletByKeyFastPathUnlocked(
+     return nullptr;
+   }
+ 
+-  DCHECK_EQ(partition_key, table->FindPartitionStart(partition_key));
++  DCHECK_EQ(partition_key, *table->FindPartitionStart(partition_key));
+   auto tablet_it = it->second.tablets_by_partition.find(partition_key);
+   if (PREDICT_FALSE(tablet_it == it->second.tablets_by_partition.end())) {
+     // No tablets with a start partition key lower than 'partition_key'.
+@@ -1367,7 +1367,7 @@ template <class Lock>
+ bool MetaCache::DoLookupTabletByKey(
+     const std::shared_ptr<const YBTable>& table, const std::string& partition_start,
+     CoarseTimePoint deadline, LookupTabletCallback* callback,
+-    const std::string** partition_group_start) {
++    std::shared_ptr<const std::string>* partition_group_start) {
+   RemoteTabletPtr tablet;
+   auto scope_exit = ScopeExit([callback, &tablet] {
+     if (tablet) {
+@@ -1383,7 +1383,7 @@ bool MetaCache::DoLookupTabletByKey(
+     }
+ 
+     if (!*partition_group_start) {
+-      *partition_group_start = &table->FindPartitionStart(partition_start, kPartitionGroupSize);
++      *partition_group_start = table->FindPartitionStart(partition_start, kPartitionGroupSize);
+     }
+ 
+     auto table_it = tables_.find(table->id());
+@@ -1433,19 +1433,19 @@ void MetaCache::LookupTabletByKey(const std::shared_ptr<const YBTable>& table,
+                                   const string& partition_key,
+                                   CoarseTimePoint deadline,
+                                   LookupTabletCallback callback) {
+-  const auto& partition_start = table->FindPartitionStart(partition_key);
++  const auto partition_start = table->FindPartitionStart(partition_key);
+   VLOG_WITH_FUNC(4) << "Table: " << table->ToString()
+                     << ", partition_key: " << Slice(partition_key).ToDebugHexString()
+-                    << ", partition_start: " << Slice(partition_start).ToDebugHexString();
++                    << ", partition_start: " << Slice(*partition_start).ToDebugHexString();
+ 
+-  const std::string* partition_group_start = nullptr;
++  std::shared_ptr<const std::string> partition_group_start;
+   if (DoLookupTabletByKey<SharedLock<boost::shared_mutex>>(
+-          table, partition_start, deadline, &callback, &partition_group_start)) {
++          table, *partition_start, deadline, &callback, &partition_group_start)) {
+     return;
+   }
+ 
+   bool result = DoLookupTabletByKey<std::lock_guard<boost::shared_mutex>>(
+-      table, partition_start, deadline, &callback, &partition_group_start);
++      table, *partition_start, deadline, &callback, &partition_group_start);
+   LOG_IF(DFATAL, !result)
+       << "Lookup was not started for table " << table->ToString()
+       << ", partition_key: " << Slice(partition_key).ToDebugHexString();
+diff --git a/src/yb/client/meta_cache.h b/src/yb/client/meta_cache.h
+index 1f86c56c4a..f188b5c58b 100644
+--- a/src/yb/client/meta_cache.h
++++ b/src/yb/client/meta_cache.h
+@@ -565,7 +565,7 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+   bool DoLookupTabletByKey(
+       const std::shared_ptr<const YBTable>& table, const std::string& partition_start,
+       CoarseTimePoint deadline, LookupTabletCallback* callback,
+-      const std::string** partition_group_start);
++      std::shared_ptr<const std::string>* partition_group_start);
+ 
+   template <class Lock>
+   bool DoLookupTabletById(
+diff --git a/src/yb/client/ql-dml-test-base.cc b/src/yb/client/ql-dml-test-base.cc
+index 7c2495a1c0..f1ecd0b8f0 100644
+--- a/src/yb/client/ql-dml-test-base.cc
++++ b/src/yb/client/ql-dml-test-base.cc
+@@ -270,7 +270,7 @@ Result<int32_t> SelectRow(
+ Result<std::map<int32_t, int32_t>> SelectAllRows(
+     TableHandle* table, const YBSessionPtr& session) {
+   std::vector<YBqlReadOpPtr> ops;
+-  auto partitions = table->table()->GetPartitions();
++  auto partitions = table->table()->GetPartitionsCopy();
+   partitions.push_back(std::string()); // Upper bound for last partition.
+ 
+   uint16_t prev_code = 0;
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index 3559dc8ebd..9f39f681a0 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -388,7 +388,7 @@ void QLStressTest::TestRetryWrites(bool restarts) {
+   }
+ 
+   size_t total_entries = 0;
+-  size_t expected_leaders = table_.table()->GetPartitions().size();
++  size_t expected_leaders = table_.table()->GetPartitionCount();
+   ASSERT_OK(WaitFor(
+       std::bind(&QLStressTest::CheckRetryableRequestsCountsAndLeaders, this,
+                 expected_leaders, &total_entries),
+diff --git a/src/yb/client/table.cc b/src/yb/client/table.cc
+index fca63249ab..effb7984c8 100644
+--- a/src/yb/client/table.cc
++++ b/src/yb/client/table.cc
+@@ -157,19 +157,35 @@ bool YBTable::IsRangePartitioned() const {
+   return info_.schema.num_hash_key_columns() == 0;
+ }
+ 
+-const std::vector<std::string>& YBTable::GetPartitions() const {
++std::shared_ptr<const TablePartitions> YBTable::GetPartitionsShared() const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+-  return partitions_.keys;
++  return std::shared_ptr<const TablePartitions>(partitions_, &partitions_->keys);
++}
++
++std::shared_ptr<const VersionedTablePartitions> YBTable::GetVersionedPartitions() const {
++  SharedLock<decltype(mutex_)> lock(mutex_);
++  return partitions_;
++}
++
++TablePartitions YBTable::GetPartitionsCopy() const {
++  TablePartitions result;
++
++  SharedLock<decltype(mutex_)> lock(mutex_);
++  result.reserve(partitions_->keys.size());
++  for (const auto& key : partitions_->keys) {
++    result.push_back(key);
++  }
++  return result;
+ }
+ 
+ int32_t YBTable::GetPartitionCount() const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+-  return partitions_.keys.size();
++  return partitions_->keys.size();
+ }
+ 
+ int32_t YBTable::GetPartitionsVersion() const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+-  return partitions_.version;
++  return partitions_->version;
+ }
+ 
+ //--------------------------------------------------------------------------------------------------
+@@ -200,14 +216,14 @@ std::unique_ptr<YBqlReadOp> YBTable::NewQLRead() {
+ 
+ size_t YBTable::FindPartitionStartIndex(const std::string& partition_key, size_t group_by) const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+-  return client::FindPartitionStartIndex(partitions_.keys, partition_key, group_by);
++  return client::FindPartitionStartIndex(partitions_->keys, partition_key, group_by);
+ }
+ 
+-const std::string& YBTable::FindPartitionStart(
++std::shared_ptr<const std::string> YBTable::FindPartitionStart(
+     const std::string& partition_key, size_t group_by) const {
+   SharedLock<decltype(mutex_)> lock(mutex_);
+   size_t idx = FindPartitionStartIndex(partition_key, group_by);
+-  return partitions_.keys[idx];
++  return std::shared_ptr<const std::string>(partitions_, &partitions_->keys[idx]);
+ }
+ 
+ Result<bool> YBTable::MaybeRefreshPartitions() {
+@@ -219,18 +235,19 @@ Result<bool> YBTable::MaybeRefreshPartitions() {
+     // Has been refreshed by concurrent thread.
+     return true;
+   }
+-  auto partitions = FetchPartitions();
+-  if (!partitions.ok()) {
+-    return partitions.status();
++  const auto partitions_result = FetchPartitions();
++  if (!partitions_result.ok()) {
++    return partitions_result.status();
+   }
++  const auto& partitions = *partitions_result;
+   {
+     std::lock_guard<rw_spinlock> partitions_lock(mutex_);
+-    if (partitions->version <= partitions_.version) {
++    if (partitions->version <= partitions_->version) {
+       return STATUS_FORMAT(
+           TryAgain, "Received table $0 partitions version: $1, ours is: $2", id(),
+-          partitions->version, partitions_.version);
++          partitions->version, partitions_->version);
+     }
+-    std::swap(partitions_, *partitions);
++    partitions_ = partitions;
+   }
+   partitions_are_stale_ = false;
+   return true;
+@@ -244,9 +261,9 @@ bool YBTable::ArePartitionsStale() const {
+   return partitions_are_stale_;
+ }
+ 
+-Result<YBTable::VersionedPartitions> YBTable::FetchPartitions() {
++Result<std::shared_ptr<const VersionedTablePartitions>> YBTable::FetchPartitions() {
+   // TODO: fetch the schema from the master here once catalog is available.
+-  VersionedPartitions partitions;
++  auto partitions = std::make_shared<VersionedTablePartitions>();
+ 
+   master::GetTableLocationsRequestPB req;
+   req.set_max_returned_locations(std::numeric_limits<int32_t>::max());
+@@ -325,12 +342,12 @@ Result<YBTable::VersionedPartitions> YBTable::FetchPartitions() {
+     if (!s.ok()) {
+       YB_LOG_EVERY_N_SECS(WARNING, 10) << "Error getting table locations: " << s << ", retrying.";
+     } else if (resp.tablet_locations_size() > 0) {
+-      partitions.version = resp.partitions_version();
+-      partitions.keys.reserve(resp.tablet_locations().size());
++      partitions->version = resp.partitions_version();
++      partitions->keys.reserve(resp.tablet_locations().size());
+       for (const auto& tablet_location : resp.tablet_locations()) {
+-        partitions.keys.push_back(tablet_location.partition().partition_key_start());
++        partitions->keys.push_back(tablet_location.partition().partition_key_start());
+       }
+-      std::sort(partitions.keys.begin(), partitions.keys.end());
++      std::sort(partitions->keys.begin(), partitions->keys.end());
+       break;
+     }
+ 
+diff --git a/src/yb/client/table.h b/src/yb/client/table.h
+index 5cfd2271ba..7da05da0d0 100644
+--- a/src/yb/client/table.h
++++ b/src/yb/client/table.h
+@@ -50,6 +50,12 @@ struct YBTableInfo {
+   boost::optional<master::ReplicationInfoPB> replication_info;
+ };
+ 
++struct VersionedTablePartitions {
++  TablePartitions keys;
++  // See SysTablesEntryPB::partitions_version.
++  int32_t version;
++};
++
+ // A YBTable represents a table on a particular cluster. It holds the current
+ // schema of the table. Any given YBTable instance belongs to a specific YBClient
+ // instance.
+@@ -84,10 +90,13 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+   bool IsHashPartitioned() const;
+   bool IsRangePartitioned() const;
+ 
+-  const std::vector<std::string>& GetPartitions() const;
+-
++  // Note that table partitions are mutable could change at any time because of tablet splitting.
++  // So it is not safe to rely on following Get*Partition* functions to return information that
++  // is consistent across subsequent calls.
++  std::shared_ptr<const TablePartitions> GetPartitionsShared() const;
++  std::shared_ptr<const VersionedTablePartitions> GetVersionedPartitions() const;
++  TablePartitions GetPartitionsCopy() const;
+   int32_t GetPartitionCount() const;
+-
+   int32_t GetPartitionsVersion() const;
+ 
+   // Indexes available on the table.
+@@ -120,9 +129,8 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+   std::unique_ptr<YBqlReadOp> NewQLSelect();
+ 
+   // Finds partition start for specified partition_key.
+-  // Partitions could be groupped by group_by bunches, in this case start of such bunch is returned.
+-  size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
+-  const std::string& FindPartitionStart(
++  // Partitions could be grouped by group_by bunches, in this case start of such bunch is returned.
++  std::shared_ptr<const std::string> FindPartitionStart(
+       const std::string& partition_key, size_t group_by = 1) const;
+ 
+   void MarkPartitionsAsStale();
+@@ -149,18 +157,14 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+   friend class internal::GetTableSchemaRpc;
+   friend class internal::GetColocatedTabletSchemaRpc;
+ 
+-  struct VersionedPartitions {
+-    std::vector<std::string> keys;
+-    // See SysTablesEntryPB::partitions_version.
+-    int32_t version;
+-  };
+-
+   YBTable(client::YBClient* client, const YBTableInfo& info);
+ 
+   CHECKED_STATUS Open();
+ 
+   // Fetches tablet partitions from master using GetTableLocations RPC.
+-  Result<VersionedPartitions> FetchPartitions();
++  Result<std::shared_ptr<const VersionedTablePartitions>> FetchPartitions();
++
++  size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
+ 
+   client::YBClient* const client_;
+   YBTableType table_type_;
+@@ -168,7 +172,7 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
+ 
+   // Mutex protecting partitions_.
+   mutable rw_spinlock mutex_;
+-  VersionedPartitions partitions_ GUARDED_BY(mutex_);
++  std::shared_ptr<const VersionedTablePartitions> partitions_ GUARDED_BY(mutex_);
+ 
+   std::atomic<bool> partitions_are_stale_{false};
+   std::mutex partitions_refresh_mutex_;
+diff --git a/src/yb/client/yb_op.cc b/src/yb/client/yb_op.cc
+index 4006d15aa9..b2b9f142a2 100644
+--- a/src/yb/client/yb_op.cc
++++ b/src/yb/client/yb_op.cc
+@@ -572,7 +572,7 @@ CHECKED_STATUS SetRangePartitionBounds(const YBPgsqlReadOp& op,
+       key->clear();
+     } else {
+       // In case of backward scan process must be start from the last partition.
+-      *key = op.table()->GetPartitions().back();
++      *key = op.table()->GetPartitionsShared()->back();
+     }
+     key_upper_bound->clear();
+     return Status::OK();
+@@ -1016,15 +1016,15 @@ CHECKED_STATUS ReviewResponsePagingState(YBPgsqlReadOp* op) {
+       return Status::OK();
+     }
+   }
+-  const auto& partitions = op->table()->GetPartitions();
+-  const auto idx = FindPartitionStartIndex(partitions, current_next_partition_key);
++  const auto partitions = op->table()->GetPartitionsShared();
++  const auto idx = FindPartitionStartIndex(*partitions, current_next_partition_key);
+   SCHECK_GT(
+       idx, 0,
+       IllegalState, "Paging state for backward scan cannot point to first partition");
+   SCHECK_EQ(
+-      partitions[idx], current_next_partition_key,
++      (*partitions)[idx], current_next_partition_key,
+       IllegalState, "Paging state for backward scan must point to partition start key");
+-  const auto& next_partition_key = partitions[idx - 1];
++  const auto& next_partition_key = (*partitions)[idx - 1];
+   response.mutable_paging_state()->set_next_partition_key(next_partition_key);
+   return Status::OK();
+ }
+diff --git a/src/yb/yql/pggate/pg_doc_op.cc b/src/yb/yql/pggate/pg_doc_op.cc
+index d1a695e7d7..20281c9769 100644
+--- a/src/yb/yql/pggate/pg_doc_op.cc
++++ b/src/yb/yql/pggate/pg_doc_op.cc
+@@ -407,6 +407,8 @@ Status PgDocReadOp::PopulateDmlByYbctidOps(const vector<Slice> *ybctids) {
+     // - For hash partitioning, we use hashcode to find the right index.
+     // - For range partitioning, we pass partition key to seek the index.
+     SCHECK(ybctid.size() > 0, InternalError, "Invalid ybctid value");
++    // TODO(tsplit): what if table partition is changed during PgDocReadOp lifecycle before or after
++    // the following lines?
+     int partition = VERIFY_RESULT(table_desc_->FindPartitionIndex(ybctid));
+     SCHECK(partition >= 0 || partition < table_desc_->GetPartitionCount(), InternalError,
+            "Ybctid value is not within partition boundary");
+@@ -445,6 +447,8 @@ Status PgDocReadOp::PopulateDmlByYbctidOps(const vector<Slice> *ybctids) {
+ }
+ 
+ Status PgDocReadOp::InitializeYbctidOperators() {
++  // TODO(tsplit): what if table partition is changed during PgDocReadOp lifecycle before or after
++  // the following lines?
+   int op_count = table_desc_->GetPartitionCount();
+ 
+   if (batch_row_orders_.size() == 0) {
+@@ -554,8 +558,9 @@ Status PgDocReadOp::InitializeHashPermutationStates() {
+ 
+ Status PgDocReadOp::PopulateParallelSelectCountOps() {
+   // Create batch operators, one per partition, to SELECT COUNT() in parallel.
++  // TODO(tsplit): what if table partition is changed during PgDocReadOp lifecycle before or after
++  // the following line?
+   RETURN_NOT_OK(ClonePgsqlOps(table_desc_->GetPartitionCount()));
+-
+   // Set "pararallelism_level_" to control how many operators can be sent at one time.
+   //
+   // TODO(neil) The calculation for this control variable should be applied to ALL operators, but
+@@ -575,7 +580,7 @@ Status PgDocReadOp::PopulateParallelSelectCountOps() {
+   }
+ 
+   // Assign partitions to operators.
+-  const auto& partition_keys = table_desc_->table()->GetPartitions();
++  const auto& partition_keys = table_desc_->GetPartitions();
+   SCHECK_EQ(partition_keys.size(), pgsql_ops_.size(), IllegalState,
+             "Number of partitions and number of partition keys are not the same");
+ 
+@@ -612,7 +617,9 @@ Status PgDocReadOp::SetScanPartitionBoundary() {
+   SCHECK(exec_params_.partition_key != nullptr, Uninitialized, "expected non-null partition_key");
+ 
+   // Seek the tablet of the given key.
+-  const std::vector<std::string>& partition_keys = table_desc_->table()->GetPartitions();
++  // TODO(tsplit): what if table partition is changed during PgDocReadOp lifecycle before or after
++  // the following line?
++  const std::vector<std::string>& partition_keys = table_desc_->GetPartitions();
+   const auto& partition_key = std::find(
+       partition_keys.begin(),
+       partition_keys.end(),
+diff --git a/src/yb/yql/pggate/pg_tabledesc.cc b/src/yb/yql/pggate/pg_tabledesc.cc
+index c57c82837a..000ca3c525 100644
+--- a/src/yb/yql/pggate/pg_tabledesc.cc
++++ b/src/yb/yql/pggate/pg_tabledesc.cc
+@@ -25,7 +25,8 @@ namespace pggate {
+ 
+ using google::protobuf::RepeatedPtrField;
+ 
+-PgTableDesc::PgTableDesc(std::shared_ptr<client::YBTable> pg_table) : table_(pg_table) {
++PgTableDesc::PgTableDesc(std::shared_ptr<client::YBTable> pg_table)
++    : table_(pg_table), table_partitions_(table_->GetVersionedPartitions()) {
+   const auto& schema = pg_table->schema();
+   const int num_columns = schema.num_columns();
+   columns_.resize(num_columns);
+@@ -96,11 +97,11 @@ bool PgTableDesc::IsRangePartitioned() const {
+ }
+ 
+ const std::vector<std::string>& PgTableDesc::GetPartitions() const {
+-  return table_->GetPartitions();
++  return table_partitions_->keys;
+ }
+ 
+ int PgTableDesc::GetPartitionCount() const {
+-  return table_->GetPartitionCount();
++  return table_partitions_->keys.size();
+ }
+ 
+ Result<string> PgTableDesc::DecodeYbctid(const Slice& ybctid) const {
+@@ -127,7 +128,7 @@ Result<int> PgTableDesc::FindPartitionIndex(const Slice& ybctid) const {
+   // - Hash Partition: ybctid -> hashcode -> key -> partition index.
+   // - Range Partition: ybctid == key -> partition index.
+   string partition_key = VERIFY_RESULT(DecodeYbctid(ybctid));
+-  return table_->FindPartitionStartIndex(partition_key);
++  return client::FindPartitionStartIndex(table_partitions_->keys, partition_key);
+ }
+ 
+ Status PgTableDesc::SetScanBoundary(PgsqlReadRequestPB *req,
+diff --git a/src/yb/yql/pggate/pg_tabledesc.h b/src/yb/yql/pggate/pg_tabledesc.h
+index 8c44b348d0..80785f44b6 100644
+--- a/src/yb/yql/pggate/pg_tabledesc.h
++++ b/src/yb/yql/pggate/pg_tabledesc.h
+@@ -92,6 +92,7 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
+ 
+  private:
+   std::shared_ptr<client::YBTable> table_;
++  const std::shared_ptr<const client::VersionedTablePartitions> table_partitions_;
+ 
+   std::vector<PgColumn> columns_;
+   std::unordered_map<int, size_t> attr_num_map_; // Attr number to column index map.
+diff --git a/src/yb/yql/redis/redisserver/redis_commands.cc b/src/yb/yql/redis/redisserver/redis_commands.cc
+index 27d698009b..4cd11240b8 100644
+--- a/src/yb/yql/redis/redisserver/redis_commands.cc
++++ b/src/yb/yql/redis/redisserver/redis_commands.cc
+@@ -630,8 +630,8 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
+     }
+ 
+     auto table = data_.context()->table();
+-    const std::string src_partition_start = table->FindPartitionStart(src_partition_key);
+-    const std::string dest_partition_start = table->FindPartitionStart(dest_partition_key);
++    const std::string src_partition_start = *table->FindPartitionStart(src_partition_key);
++    const std::string dest_partition_start = *table->FindPartitionStart(dest_partition_key);
+     if (src_partition_start == dest_partition_start) {
+       num_tablets_.store(1, std::memory_order_release);
+     } else {
+@@ -881,7 +881,7 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
+  public:
+   explicit KeysProcessor(const LocalCommandData& data)
+       : data_(data),
+-        partitions_(data.table()->GetPartitions()), sessions_(partitions_.size()),
++        partitions_(data.table()->GetPartitionsCopy()), sessions_(partitions_.size()),
+         callbacks_(partitions_.size()) {
+     resp_.set_code(RedisResponsePB::OK);
+   }

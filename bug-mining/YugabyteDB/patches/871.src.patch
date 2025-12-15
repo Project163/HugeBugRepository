@@ -1,0 +1,1054 @@
+diff --git a/src/yb/common/CMakeLists.txt b/src/yb/common/CMakeLists.txt
+index ad192b9f94..9a044327be 100644
+--- a/src/yb/common/CMakeLists.txt
++++ b/src/yb/common/CMakeLists.txt
+@@ -89,10 +89,12 @@ set(COMMON_SRCS
+   roles_permissions.cc
+   row_mark.cc
+   snapshot.cc
++  termination_monitor.cc
+   transaction.cc
+   transaction_error.cc
+   ybc_util.cc
+   ybc-internal.cc
++  llvm_profile_dumper.cc
+   )
+ 
+ set(COMMON_LIBS
+diff --git a/src/yb/common/llvm_profile_dumper.cc b/src/yb/common/llvm_profile_dumper.cc
+new file mode 100644
+index 0000000000..a4ea26e3f7
+--- /dev/null
++++ b/src/yb/common/llvm_profile_dumper.cc
+@@ -0,0 +1,71 @@
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++
++#include "yb/common/llvm_profile_dumper.h"
++
++#include <chrono>
++#include <functional>
++#include "yb/util/thread.h"
++
++#if defined(YB_PROFGEN) && defined(__clang__)
++#define LLVM_PROFILE_DUMPER_ENABLED
++#endif
++
++#if defined(LLVM_PROFILE_DUMPER_ENABLED)
++extern "C" int __llvm_profile_write_file(void);
++extern "C" void __llvm_profile_set_filename(const char *);
++extern "C" void __llvm_profile_reset_counters();
++#endif
++
++using namespace std::chrono_literals;
++
++namespace yb {
++LlvmProfileDumper::~LlvmProfileDumper() {
++  if (thread_) {
++    {
++      std::lock_guard lock(mutex_);
++      stop_ = true;
++    }
++    cond_variable_.notify_all();
++    CHECK_OK(ThreadJoiner(thread_.get()).Join());
++  }
++}
++
++Status LlvmProfileDumper::Start() {
++#if defined(LLVM_PROFILE_DUMPER_ENABLED)
++  std::lock_guard lock(mutex_);
++  if (thread_) {
++    return Status::OK();
++  }
++  return Thread::Create(
++      "llvm_profile_dumper", "loop", &LlvmProfileDumper::ProfileDumpLoop, this, &thread_);
++#else
++  return Status::OK();
++#endif
++}
++
++void LlvmProfileDumper::ProfileDumpLoop() {
++#if defined(LLVM_PROFILE_DUMPER_ENABLED)
++  __llvm_profile_set_filename("tserver-%p-%m.profraw");
++  while (true) {
++    __llvm_profile_write_file();
++    __llvm_profile_reset_counters();
++
++    std::unique_lock lock(mutex_);
++    if (cond_variable_.wait_for(lock, 60s, [this]() REQUIRES(mutex_) { return stop_; })) {
++      return;
++    }
++  }
++#endif
++}
++}  // namespace yb
+diff --git a/src/yb/common/llvm_profile_dumper.h b/src/yb/common/llvm_profile_dumper.h
+new file mode 100644
+index 0000000000..f18c38ea00
+--- /dev/null
++++ b/src/yb/common/llvm_profile_dumper.h
+@@ -0,0 +1,41 @@
++// Copyright (c) YugaByte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++//
++
++#pragma once
++
++#include <mutex>
++#include <condition_variable>
++#include "yb/gutil/ref_counted.h"
++#include "yb/util/status.h"
++#include "yb/gutil/thread_annotations.h"
++
++namespace yb {
++
++class Thread;
++
++class LlvmProfileDumper {
++ public:
++  LlvmProfileDumper() = default;
++  ~LlvmProfileDumper();
++  Status Start() EXCLUDES(mutex_);
++
++ private:
++  void ProfileDumpLoop() EXCLUDES(mutex_);
++
++ private:
++  std::mutex mutex_;
++  bool stop_ GUARDED_BY(mutex_) = false;
++  std::condition_variable cond_variable_;
++  scoped_refptr<Thread> thread_;
++};
++}  // namespace yb
+diff --git a/src/yb/common/termination_monitor.cc b/src/yb/common/termination_monitor.cc
+new file mode 100644
+index 0000000000..d90f56d6a8
+--- /dev/null
++++ b/src/yb/common/termination_monitor.cc
+@@ -0,0 +1,98 @@
++// Copyright (c) Yugabyte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++
++#include "yb/common/termination_monitor.h"
++#include <signal.h>
++#include <sys/time.h>
++
++#include "yb/util/flags.h"
++#include "yb/util/init.h"
++#include "yb/util/thread.h"
++
++DECLARE_bool(TEST_running_test);
++
++namespace yb {
++
++namespace {
++ev::async& GetSigTermEvAsync() {
++  static ev::async async_sig_term_;
++  return async_sig_term_;
++}
++
++void SigtermHandler(int signum) {
++  // This is thread and signal safe
++  GetSigTermEvAsync().send();
++}
++
++}  // namespace
++
++TerminationMonitor::~TerminationMonitor() {
++  if (thread_) {
++    CHECK_OK(InstallSignalHandler(SIGTERM, SIG_DFL));
++    GetSigTermEvAsync().send();
++    CHECK_OK(ThreadJoiner(thread_.get()).Join());
++  }
++}
++
++std::unique_ptr<TerminationMonitor> TerminationMonitor::Create() {
++  static std::atomic_bool instantiated = false;
++  CHECK(!instantiated.exchange(true)) << "Only one instance of TerminationMonitor is allowed";
++
++  auto monitor = std::unique_ptr<TerminationMonitor>(new TerminationMonitor());
++  // Up to this point SIGTERM would have caused an immediate process termination. We are now ready
++  // to gracefully handle SIGTERM so install our handler.
++  monitor->InstallSigtermHandler();
++  return monitor;
++}
++
++void TerminationMonitor::Terminate() {
++  {
++    std::lock_guard lock(mutex_);
++    stopped_ = true;
++  }
++  stop_signal_.notify_all();
++}
++
++void TerminationMonitor::WaitForTermination() {
++  std::unique_lock lock(mutex_);
++  stop_signal_.wait(lock, [this]() REQUIRES(mutex_) { return stopped_; });
++}
++
++void TerminationMonitor::InstallSigtermHandler() {
++  // TODO(Hari) #15061 Limiting this to tests to catch TSAN and ASAN issues before we enable it in
++  // production.
++  if (!FLAGS_TEST_running_test) {
++    return;
++  }
++
++  std::lock_guard lock(mutex_);
++  if (thread_) {
++    return;
++  }
++
++  auto& async_sig_term = GetSigTermEvAsync();
++  async_sig_term.set(async_sig_term_loop_);
++  async_sig_term.set<TerminationMonitor, &TerminationMonitor::SigtermAsyncHandler>(this);
++  async_sig_term.start();
++  CHECK_OK(yb::Thread::Create(
++      "termination_monitor", "sigterm_loop", [this]() { async_sig_term_loop_.run(); }, &thread_));
++
++  CHECK_OK(InstallSignalHandler(SIGTERM, SigtermHandler));
++}
++
++void TerminationMonitor::SigtermAsyncHandler() {
++  GetSigTermEvAsync().stop();
++  Terminate();
++  async_sig_term_loop_.break_loop(ev::how_t::ALL);
++}
++
++}  // namespace yb
+diff --git a/src/yb/common/termination_monitor.h b/src/yb/common/termination_monitor.h
+new file mode 100644
+index 0000000000..64c8baf049
+--- /dev/null
++++ b/src/yb/common/termination_monitor.h
+@@ -0,0 +1,55 @@
++// Copyright (c) Yugabyte, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
++// in compliance with the License.  You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software distributed under the License
++// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++// or implied.  See the License for the specific language governing permissions and limitations
++// under the License.
++
++#pragma once
++
++#include <mutex>
++#include <condition_variable>
++#include <ev++.h>
++
++#include "yb/gutil/ref_counted.h"
++#include "yb/gutil/thread_annotations.h"
++
++namespace yb {
++class Thread;
++
++// Monitors for termination signals. Termination can be called from either the Terminate method or
++// from a SIGTERM signal.
++// Only once instance of this class is allowed.
++class TerminationMonitor {
++ public:
++  ~TerminationMonitor();
++
++  static std::unique_ptr<TerminationMonitor> Create();
++
++  // This is not async-signal-safe.
++  void Terminate() EXCLUDES(mutex_);
++
++  // Installs handler for SIGTERM signal and wait for termination to be called.
++  void WaitForTermination() EXCLUDES(mutex_);
++
++ private:
++  TerminationMonitor() = default;
++
++  void InstallSigtermHandler() EXCLUDES(mutex_);
++  void SigtermAsyncHandler();
++
++  std::mutex mutex_;
++  bool stopped_ GUARDED_BY(mutex_) = false;
++  std::condition_variable stop_signal_;
++
++  ev::dynamic_loop async_sig_term_loop_;
++  scoped_refptr<yb::Thread> thread_;
++
++  DISALLOW_COPY_AND_ASSIGN(TerminationMonitor);
++};
++}  // namespace yb
+diff --git a/src/yb/integration-tests/external_mini_cluster-test.cc b/src/yb/integration-tests/external_mini_cluster-test.cc
+index 77feddf291..6603c73ae0 100644
+--- a/src/yb/integration-tests/external_mini_cluster-test.cc
++++ b/src/yb/integration-tests/external_mini_cluster-test.cc
+@@ -150,4 +150,22 @@ TEST_F(EMCTest, TestUniquePorts) {
+   }
+ }
+ 
++TEST_F(EMCTest, YB_DISABLE_TEST_IN_TSAN(TestYSQLShutdown)) {
++  ExternalMiniClusterOptions opts;
++  opts.num_masters = master_peer_ports_.size();
++  opts.num_tablet_servers = 3;
++  opts.master_rpc_ports = master_peer_ports_;
++  opts.enable_ysql = true;
++
++  ExternalMiniCluster cluster(opts);
++  ASSERT_OK(cluster.Start());
++
++  cluster.Shutdown();
++  for (const auto& server : cluster.daemons()) {
++    if (server) {
++      ASSERT_FALSE(server->WasUnsafeShutdown());
++    }
++  }
++}
++
+ } // namespace yb
+diff --git a/src/yb/integration-tests/external_mini_cluster.cc b/src/yb/integration-tests/external_mini_cluster.cc
+index 280f50edad..a1db08896f 100644
+--- a/src/yb/integration-tests/external_mini_cluster.cc
++++ b/src/yb/integration-tests/external_mini_cluster.cc
+@@ -161,10 +161,6 @@ DEFINE_UNKNOWN_string(external_daemon_heap_profile_prefix, "",
+               "If this is not empty, tcmalloc's HEAPPROFILE is set this, followed by a unique "
+               "suffix for external mini-cluster daemons.");
+ 
+-DEFINE_UNKNOWN_bool(external_daemon_safe_shutdown, false,
+-            "Shutdown external daemons using SIGTERM first. Disabled by default to avoid "
+-            "interfering with kill-testing.");
+-
+ DECLARE_int64(outbound_rpc_block_size);
+ DECLARE_int64(outbound_rpc_memory_limit);
+ 
+@@ -292,13 +288,12 @@ ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
+   opts_.AdjustMasterRpcPorts();
+   // These "extra mini cluster options" are added in the end of the command line.
+   const auto common_extra_flags = {
++      "--TEST_running_test=true"s,
+       "--enable_tracing"s,
+       Format("--memory_limit_hard_bytes=$0", kDefaultMemoryLimitHardBytes),
+       Format("--never_fsync=$0", FLAGS_never_fsync),
+       (opts.log_to_file ? "--alsologtostderr"s : "--logtostderr"s),
+-      (IsTsan() ? "--rpc_slow_query_threshold_ms=20000"s :
+-          "--rpc_slow_query_threshold_ms=10000"s)
+-  };
++      Format("--rpc_slow_query_threshold_ms=$0", NonTsanVsTsan("10000", "20000"))};
+   for (auto* extra_flags : {&opts_.extra_master_flags, &opts_.extra_tserver_flags}) {
+     // Common default extra flags are inserted in the beginning so that they can be overridden by
+     // caller-specified flags.
+@@ -410,13 +405,13 @@ void ExternalMiniCluster::Shutdown(NodeSelectionMode mode) {
+   if (mode == ALL) {
+     for (const scoped_refptr<ExternalMaster>& master : masters_) {
+       if (master) {
+-        master->Shutdown();
++        master->Shutdown(SafeShutdown::kTrue);
+       }
+     }
+   }
+ 
+   for (const scoped_refptr<ExternalTabletServer>& ts : tablet_servers_) {
+-    ts->Shutdown();
++    ts->Shutdown(SafeShutdown::kTrue);
+   }
+   running_ = false;
+ }
+@@ -2309,6 +2304,8 @@ bool ExternalDaemon::IsShutdown() const {
+   return process_.get() == nullptr;
+ }
+ 
++bool ExternalDaemon::WasUnsafeShutdown() const { return sigkill_used_for_shutdown_; }
++
+ bool ExternalDaemon::IsProcessAlive() const {
+   if (IsShutdown()) {
+     return false;
+@@ -2330,17 +2327,22 @@ pid_t ExternalDaemon::pid() const {
+   return process_->pid();
+ }
+ 
+-void ExternalDaemon::Shutdown() {
+-  if (!process_) return;
+-
+-  LOG_WITH_PREFIX(INFO) << "Starting Shutdown()";
++void ExternalDaemon::Shutdown(SafeShutdown safe_shutdown) {
++  if (!process_) {
++    return;
++  }
+ 
+   // Before we kill the process, store the addresses. If we're told to start again we'll reuse
+   // these.
+   bound_rpc_ = bound_rpc_hostport();
+   bound_http_ = bound_http_hostport();
+ 
++  LOG_WITH_PREFIX(INFO) << "Starting Shutdown()";
++
++  const auto start_time = CoarseMonoClock::Now();
++  auto process_name_and_pid = exe_;
+   if (IsProcessAlive()) {
++    process_name_and_pid = ProcessNameAndPidStr();
+     // In coverage builds, ask the process nicely to flush coverage info
+     // before we kill -9 it. Otherwise, we never get any coverage from
+     // external clusters.
+@@ -2350,39 +2352,46 @@ void ExternalDaemon::Shutdown() {
+       // The child process has been configured using the HEAPPROFILESIGNAL environment variable to
+       // create a heap profile on receiving kHeapProfileSignal.
+       static const int kWaitMs = 100;
+-      LOG(INFO) << "Sending signal " << kHeapProfileSignal << " to " << ProcessNameAndPidStr()
+-                << " to capture a heap profile. Waiting for " << kWaitMs << " ms afterwards.";
++      LOG_WITH_PREFIX(INFO) << "Sending signal " << kHeapProfileSignal << " to "
++                            << process_name_and_pid << " to capture a heap profile. Waiting for "
++                            << kWaitMs << " ms afterwards.";
+       WARN_NOT_OK(process_->Kill(kHeapProfileSignal), "Killing process failed");
+       std::this_thread::sleep_for(std::chrono::milliseconds(kWaitMs));
+     }
+ 
+-    if (FLAGS_external_daemon_safe_shutdown) {
++    if (safe_shutdown) {
++      constexpr auto max_graceful_shutdown_wait = 1min * kTimeMultiplier;
+       // We put 'SIGTERM' in quotes because an unquoted one would be treated as a test failure
+       // by our regular expressions in common-test-env.sh.
+-      LOG(INFO) << "Terminating " << ProcessNameAndPidStr() << " using 'SIGTERM' signal";
++      LOG_WITH_PREFIX(INFO) << "Terminating " << process_name_and_pid << " using 'SIGTERM' signal";
+       WARN_NOT_OK(process_->Kill(SIGTERM), "Killing process failed");
+-      int total_delay_ms = 0;
+-      int current_delay_ms = 10;
+-      for (int i = 0; i < 10 && IsProcessAlive(); ++i) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(current_delay_ms));
+-        total_delay_ms += current_delay_ms;
+-        current_delay_ms += 10;  // will sleep for 10ms, then 20ms, etc.
++      CoarseBackoffWaiter waiter(start_time + max_graceful_shutdown_wait, 100ms);
++      while (IsProcessAlive()) {
++        YB_LOG_EVERY_N_SECS(INFO, 1)
++            << LogPrefix() << "Waiting for process termination: " << process_name_and_pid;
++        if (!waiter.Wait()) {
++          break;
++        }
+       }
+ 
+       if (IsProcessAlive()) {
+-        LOG(INFO) << "The process " << ProcessNameAndPidStr() << " is still running after "
+-                  << total_delay_ms << " ms, will send SIGKILL";
++        LOG_WITH_PREFIX(INFO) << "The process " << process_name_and_pid
++                              << " is still running after " << CoarseMonoClock::Now() - start_time
++                              << " ms, will send SIGKILL";
+       }
+     }
+ 
+     if (IsProcessAlive()) {
+-      LOG(INFO) << "Killing " << ProcessNameAndPidStr() << " with SIGKILL";
++      LOG_WITH_PREFIX(INFO) << "Killing " << process_name_and_pid << " with SIGKILL";
++      sigkill_used_for_shutdown_ = true;
+       WARN_NOT_OK(process_->Kill(SIGKILL), "Killing process failed");
+     }
+   }
+   int ret = 0;
+-  WARN_NOT_OK(process_->Wait(&ret), "Waiting on " + exe_);
++  WARN_NOT_OK(process_->Wait(&ret), Format("$0 Waiting on $1", LogPrefix(), process_name_and_pid));
+   process_.reset();
++  LOG_WITH_PREFIX(INFO) << "Process " << process_name_and_pid << " shutdown completed in "
++                        << CoarseMonoClock::Now() - start_time << "ms";
+ }
+ 
+ void ExternalDaemon::FlushCoverage() {
+diff --git a/src/yb/integration-tests/external_mini_cluster.h b/src/yb/integration-tests/external_mini_cluster.h
+index f613cd3882..5d2b06ffcb 100644
+--- a/src/yb/integration-tests/external_mini_cluster.h
++++ b/src/yb/integration-tests/external_mini_cluster.h
+@@ -214,6 +214,7 @@ class ExternalMiniCluster : public MiniClusterBase {
+   Status Start(rpc::Messenger* messenger = nullptr);
+ 
+   // Restarts the cluster. Requires that it has been Shutdown() first.
++  // TODO: #14902 Shutdown the process if it is running.
+   Status Restart();
+ 
+   // Like the previous method but performs initialization synchronously, i.e.  this will wait for
+@@ -563,6 +564,8 @@ class ExternalMiniCluster : public MiniClusterBase {
+   DISALLOW_COPY_AND_ASSIGN(ExternalMiniCluster);
+ };
+ 
++YB_STRONGLY_TYPED_BOOL(SafeShutdown);
++
+ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
+  public:
+   class StringListener {
+@@ -602,13 +605,16 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
+   // Return true if we have explicitly shut down the process.
+   bool IsShutdown() const;
+ 
++  // Was SIGKILL used to shutdown the process?
++  bool WasUnsafeShutdown() const;
++
+   // Return true if the process is still running.  This may return false if the process crashed,
+   // even if we didn't explicitly call Shutdown().
+   bool IsProcessAlive() const;
+ 
+   bool IsProcessPaused() const;
+ 
+-  virtual void Shutdown();
++  virtual void Shutdown(SafeShutdown safe_shutdown = SafeShutdown::kFalse);
+ 
+   std::vector<std::string> GetDataDirs() const { return data_dirs_; }
+ 
+@@ -763,6 +769,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
+ 
+   std::unique_ptr<Subprocess> process_;
+   bool is_paused_ = false;
++  bool sigkill_used_for_shutdown_ = false;
+ 
+   std::unique_ptr<server::ServerStatusPB> status_;
+ 
+@@ -862,6 +869,7 @@ class ExternalTabletServer : public ExternalDaemon {
+   void UpdateMasterAddress(const std::vector<HostPort>& master_addrs);
+ 
+   // Restarts the daemon. Requires that it has previously been shutdown.
++  // TODO: #14902 Shutdown the process if it is running.
+   Status Restart(
+       bool start_cql_proxy = ExternalMiniClusterOptions::kDefaultStartCqlProxy,
+       std::vector<std::pair<std::string, std::string>> flags = {});
+diff --git a/src/yb/master/master_main.cc b/src/yb/master/master_main.cc
+index f8e03a6763..bcbcf0ef8e 100644
+--- a/src/yb/master/master_main.cc
++++ b/src/yb/master/master_main.cc
+@@ -54,9 +54,11 @@
+ #include "yb/util/mem_tracker.h"
+ #include "yb/util/result.h"
+ #include "yb/util/size_literals.h"
++#include "yb/util/thread.h"
+ #include "yb/util/ulimit_util.h"
+ #include "yb/util/debug/trace_event.h"
+ #include "yb/util/path_util.h"
++#include "yb/common/termination_monitor.h"
+ 
+ #include "yb/tserver/server_main_util.h"
+ 
+@@ -124,6 +126,8 @@ static int MasterMain(int argc, char** argv) {
+   LOG_AND_RETURN_FROM_MAIN_NOT_OK(
+       MasterTServerParseFlagsAndInit(MasterOptions::kServerType, &argc, &argv));
+ 
++  auto termination_monitor = TerminationMonitor::Create();
++
+   auto opts_result = MasterOptions::CreateMasterOptions();
+   LOG_AND_RETURN_FROM_MAIN_NOT_OK(opts_result);
+   enterprise::Master server(*opts_result);
+@@ -149,11 +153,25 @@ static int MasterMain(int argc, char** argv) {
+   call_home->ScheduleCallHome();
+ 
+   auto total_mem_watcher = server::TotalMemWatcher::Create();
+-  total_mem_watcher->MemoryMonitoringLoop(
+-      [&server]() { server.Shutdown(); },
+-      [&server]() { return server.IsShutdown(); }
+-  );
+-  return EXIT_FAILURE;
++  scoped_refptr<Thread> total_mem_watcher_thread;
++  LOG_AND_RETURN_FROM_MAIN_NOT_OK(Thread::Create(
++      "total_mem_watcher", "loop",
++      [&total_mem_watcher, &termination_monitor]() {
++        total_mem_watcher->MemoryMonitoringLoop(
++            [&termination_monitor]() { termination_monitor->Terminate(); });
++      },
++      &total_mem_watcher_thread));
++
++  termination_monitor->WaitForTermination();
++
++  total_mem_watcher->Shutdown();
++  LOG_AND_RETURN_FROM_MAIN_NOT_OK(ThreadJoiner(total_mem_watcher_thread.get()).Join());
++
++  call_home.reset();
++
++  server.Shutdown();
++
++  return EXIT_SUCCESS;
+ }
+ 
+ } // namespace master
+@@ -169,6 +187,6 @@ int main(int argc, char** argv) {
+     LOG(FATAL) << "yb-master executable can only function as yb-tserver in LTO mode. "
+                << "The basename of argv[0] is: " << executable_basename;
+ #endif
+-  }
+-  return yb::master::MasterMain(argc, argv);
++    }
++    return yb::master::MasterMain(argc, argv);
+ }
+diff --git a/src/yb/server/total_mem_watcher.cc b/src/yb/server/total_mem_watcher.cc
+index 917acb5b1e..2a2e95d51d 100644
+--- a/src/yb/server/total_mem_watcher.cc
++++ b/src/yb/server/total_mem_watcher.cc
+@@ -11,6 +11,7 @@
+ // under the License.
+ //
+ 
++#include "yb/util/atomic.h"
+ #if defined(__linux__)
+ #include <unistd.h>
+ #endif
+@@ -43,10 +44,10 @@ DEFINE_UNKNOWN_int32(memory_limit_termination_threshold_pct, kDefaultMemoryLimit
+              "root memory tracker limit, the program will exit. RSS is measured using operating "
+              "system means, not the memory allocator. Set to 0 to disable this behavior.");
+ 
+-DEFINE_UNKNOWN_int32(total_mem_watcher_interval_millis, 1000,
+-             "Interval in milliseconds between checking the total memory usage of the current "
+-             "process as seen by the operating system, and deciding whether to terminate in case "
+-             "of excessive memory consumption.");
++DEFINE_RUNTIME_int32(total_mem_watcher_interval_millis, 1000,
++    "Interval in milliseconds between checking the total memory usage of the current "
++    "process as seen by the operating system, and deciding whether to terminate in case "
++    "of excessive memory consumption.");
+ 
+ namespace yb {
+ namespace server {
+@@ -61,12 +62,15 @@ TotalMemWatcher::TotalMemWatcher() {
+   }
+ }
+ 
+-TotalMemWatcher::~TotalMemWatcher() {
++void TotalMemWatcher::Shutdown() {
++  {
++    std::lock_guard l(exit_loop_mutex_);
++    exit_loop_ = true;
++  }
++  exit_loop_cv_.notify_all();
+ }
+ 
+-void TotalMemWatcher::MemoryMonitoringLoop(
+-    std::function<void()> shutdown_fn,
+-    std::function<bool()> is_shutdown_finished_fn) {
++void TotalMemWatcher::MemoryMonitoringLoop(std::function<void()> trigger_termination_fn) {
+   if (FLAGS_memory_limit_termination_threshold_pct > 0) {
+     int64_t root_tracker_limit = MemTracker::GetRootTracker()->limit();
+     LOG(INFO) << "Root memtracker limit: " << root_tracker_limit << " ("
+@@ -75,8 +79,16 @@ void TotalMemWatcher::MemoryMonitoringLoop(
+               << rss_termination_limit_bytes_ << " bytes ("
+               << (rss_termination_limit_bytes_ / 1024 / 1024) << " MiB).";
+   }
++
+   while (true) {
+-    std::this_thread::sleep_for(1ms * FLAGS_total_mem_watcher_interval_millis);
++    {
++      const auto timeout = GetAtomicFlag(&FLAGS_total_mem_watcher_interval_millis) * 1ms;
++      std::unique_lock lock(exit_loop_mutex_);
++      if (exit_loop_cv_.wait_for(
++              lock, timeout, [this]() REQUIRES(exit_loop_mutex_) { return exit_loop_; })) {
++        return;
++      }
++    }
+ 
+     Status mem_check_status = Check();
+     if (!mem_check_status.ok()) {
+@@ -89,16 +101,7 @@ void TotalMemWatcher::MemoryMonitoringLoop(
+       LOG(ERROR) << "Memory usage exceeded configured limit, terminating the process: "
+                  << termination_explanation << "\nDetails:\n"
+                  << GetMemoryUsageDetails();
+-      shutdown_fn();
+-      const int kMaxSecToWait = 10;
+-      for (int secondsLeft = kMaxSecToWait;
+-           secondsLeft > 0 && !is_shutdown_finished_fn();
+-           --secondsLeft) {
+-        LOG(INFO) << "Waiting for server to shut down (will wait up to " << secondsLeft
+-                  << " seconds)";
+-        std::this_thread::sleep_for(1s);
+-      }
+-      LOG(WARNING) << "Server is exiting";
++      trigger_termination_fn();
+       return;
+     }
+   }
+diff --git a/src/yb/server/total_mem_watcher.h b/src/yb/server/total_mem_watcher.h
+index 64c8b16111..c27663a749 100644
+--- a/src/yb/server/total_mem_watcher.h
++++ b/src/yb/server/total_mem_watcher.h
+@@ -15,10 +15,13 @@
+ 
+ #include <functional>
+ #include <memory>
++#include <mutex>
++#include <condition_variable>
+ 
+ #include "yb/gutil/macros.h"
+ 
+ #include "yb/util/status_fwd.h"
++#include "yb/gutil/thread_annotations.h"
+ 
+ namespace yb {
+ namespace server {
+@@ -30,7 +33,9 @@ namespace server {
+ // This class is not thread-safe.
+ class TotalMemWatcher {
+  public:
+-  virtual ~TotalMemWatcher();
++  virtual ~TotalMemWatcher() = default;
++
++  void Shutdown() EXCLUDES(exit_loop_mutex_);
+ 
+   // Re-check the total memory usage and populate the internal state of this watcher object.
+   virtual Status Check() = 0;
+@@ -46,17 +51,21 @@ class TotalMemWatcher {
+ 
+   static std::unique_ptr<TotalMemWatcher> Create();
+ 
+-  // Enters an infinite loop monitoring memory usage. Exits from the loop if the memory usage limit
+-  // has been exceeded. Uses the provided functions to initiate server shutdown and check if
+-  // shutdown has completed.
+-  void MemoryMonitoringLoop(std::function<void()> shutdown_fn,
+-                            std::function<bool()> is_shutdown_finished_fn);
++  // Enters an infinite loop monitoring memory usage. Invokes trigger_termination_fn and exits from
++  // the loop if the memory usage limit has been exceeded. Exits the loop without calling
++  // termination_callback if Shutdown has been called.
++  void MemoryMonitoringLoop(std::function<void()> trigger_termination_fn)
++      EXCLUDES(exit_loop_mutex_);
+ 
+  protected:
+   TotalMemWatcher();
+ 
+   size_t rss_termination_limit_bytes_;
+ 
++  std::mutex exit_loop_mutex_;
++  bool exit_loop_ GUARDED_BY(exit_loop_mutex_) = false;
++  std::condition_variable exit_loop_cv_;
++
+  private:
+   DISALLOW_COPY_AND_ASSIGN(TotalMemWatcher);
+ };
+diff --git a/src/yb/tserver/tablet_server_main_impl.cc b/src/yb/tserver/tablet_server_main_impl.cc
+index 12526fa391..f603eebc2f 100644
+--- a/src/yb/tserver/tablet_server_main_impl.cc
++++ b/src/yb/tserver/tablet_server_main_impl.cc
+@@ -38,6 +38,8 @@
+ #include <boost/optional/optional.hpp>
+ #include <glog/logging.h>
+ 
++#include "yb/common/termination_monitor.h"
++#include "yb/common/llvm_profile_dumper.h"
+ #include "yb/consensus/log_util.h"
+ #include "yb/consensus/consensus_queue.h"
+ 
+@@ -71,20 +73,13 @@
+ #include "yb/util/net/net_util.h"
+ #include "yb/util/status_log.h"
+ #include "yb/util/debug/trace_event.h"
++#include "yb/util/thread.h"
+ 
+ #include "yb/rocksutil/rocksdb_encrypted_file_factory.h"
+ 
+ #include "yb/tserver/server_main_util.h"
+ 
+ using std::string;
+-
+-#if defined(YB_PROFGEN) && defined(__clang__)
+-extern "C" int __llvm_profile_write_file(void);
+-extern "C" void __llvm_profile_set_filename(const char *);
+-extern "C" void __llvm_profile_reset_counters();
+-#endif
+-
+-
+ using namespace std::placeholders;
+ 
+ using yb::redisserver::RedisServer;
+@@ -97,6 +92,7 @@ using yb::pgwrapper::PgProcessConf;
+ using yb::pgwrapper::PgSupervisor;
+ 
+ using namespace yb::size_literals;  // NOLINT
++using namespace std::chrono_literals;
+ 
+ DEFINE_NON_RUNTIME_bool(start_redis_proxy, true,
+     "Starts a redis proxy along with the tablet server");
+@@ -160,17 +156,19 @@ void SetProxyAddresses() {
+   SetProxyAddress(&FLAGS_pgsql_proxy_bind_address, "YSQL", PgProcessConf::kDefaultPort);
+ }
+ 
+-#if defined(YB_PROFGEN) && defined(__clang__)
+-// Force profile dumping
+-void PeriodicDumpLLVMProfileFile() {
+-  __llvm_profile_set_filename("tserver-%p-%m.profraw");
+-  while (true) {
+-    __llvm_profile_write_file();
+-    __llvm_profile_reset_counters();
+-    SleepFor(MonoDelta::FromSeconds(60));
++// Runs the IO service in a loop until it is stopped. Invokes trigger_termination_fn if there is an
++// error and the IO service has not been stopped.
++void RunIOService(
++    std::function<void()> trigger_termination_fn, boost::asio::io_service* io_service) {
++  // Runs forever unless there is some error or explicitly stopped.
++  boost::system::error_code ec;
++  io_service->run(ec);
++
++  if (!io_service->stopped()) {
++    LOG(WARNING) << "Stopping process as IO service run failed: " << ec;
++    trigger_termination_fn();
+   }
+ }
+-#endif
+ 
+ int TabletServerMain(int argc, char** argv) {
+ #ifndef NDEBUG
+@@ -194,6 +192,8 @@ int TabletServerMain(int argc, char** argv) {
+   LOG_AND_RETURN_FROM_MAIN_NOT_OK(MasterTServerParseFlagsAndInit(
+       TabletServerOptions::kServerType, &argc, &argv));
+ 
++  auto termination_monitor = TerminationMonitor::Create();
++
+   SetProxyAddresses();
+ 
+   // Object that manages the universe key registry used for encrypting and decrypting data keys.
+@@ -242,11 +242,11 @@ int TabletServerMain(int argc, char** argv) {
+     auto& pg_process_conf = *pg_process_conf_result;
+     pg_process_conf.master_addresses = tablet_server_options->master_addresses_flag;
+     pg_process_conf.certs_dir = FLAGS_certs_dir.empty()
+-        ? server::DefaultCertsDir(*server->fs_manager())
+-        : FLAGS_certs_dir;
++       ? server::DefaultCertsDir(*server->fs_manager())
++       : FLAGS_certs_dir;
+     pg_process_conf.certs_for_client_dir = FLAGS_certs_for_client_dir.empty()
+-        ? pg_process_conf.certs_dir
+-        : FLAGS_certs_for_client_dir;
++       ? pg_process_conf.certs_dir
++       : FLAGS_certs_for_client_dir;
+     pg_process_conf.enable_tls = FLAGS_use_client_to_server_encryption;
+ 
+     // Follow the same logic as elsewhere, check FLAGS_cert_node_filename then
+@@ -261,14 +261,14 @@ int TabletServerMain(int argc, char** argv) {
+           HostPort::ParseStrings(server->options().rpc_opts.rpc_bind_addresses, 0);
+       LOG_AND_RETURN_FROM_MAIN_NOT_OK(rpc_bind_addresses);
+       pg_process_conf.cert_base_name = !server_broadcast_addresses->empty()
+-                                     ? server_broadcast_addresses->front().host()
+-                                     : rpc_bind_addresses->front().host();
++                                           ? server_broadcast_addresses->front().host()
++                                           : rpc_bind_addresses->front().host();
+     }
+-    LOG(INFO) << "Starting PostgreSQL server listening on "
+-              << pg_process_conf.listen_addresses << ", port " << pg_process_conf.pg_port;
++      LOG(INFO) << "Starting PostgreSQL server listening on "
++                << pg_process_conf.listen_addresses << ", port " << pg_process_conf.pg_port;
+ 
+-    pg_supervisor = std::make_unique<PgSupervisor>(pg_process_conf, server.get());
+-    LOG_AND_RETURN_FROM_MAIN_NOT_OK(pg_supervisor->Start());
++      pg_supervisor = std::make_unique<PgSupervisor>(pg_process_conf, server.get());
++      LOG_AND_RETURN_FROM_MAIN_NOT_OK(pg_supervisor->Start());
+   }
+ 
+   std::unique_ptr<RedisServer> redis_server;
+@@ -280,25 +280,17 @@ int TabletServerMain(int argc, char** argv) {
+     redis_server_options.SetMasterAddresses(tablet_server_options->GetMasterAddresses());
+     redis_server_options.dump_info_path =
+         (tablet_server_options->dump_info_path.empty()
+-             ? ""
+-             : tablet_server_options->dump_info_path + "-redis");
++              ? ""
++              : tablet_server_options->dump_info_path + "-redis");
+     redis_server.reset(new RedisServer(redis_server_options, server.get()));
+     LOG(INFO) << "Starting redis server...";
+     LOG_AND_RETURN_FROM_MAIN_NOT_OK(redis_server->Start());
+     LOG(INFO) << "Redis server successfully started.";
+   }
+ 
+-#if defined(YB_PROFGEN) && defined(__clang__)
+-  // TODO After the TODO below is fixed the call of
+-  // PeriodicDumpLLVMProfileFile can be moved to the infinite while loop
+-  //  at the end of the function.
+-  std::thread llvm_profile_dump_thread(PeriodicDumpLLVMProfileFile);
+-#endif
+-
+-  // TODO(neil): After CQL server is starting, it blocks this thread from moving on.
+-  // This should be fixed such that all processes or service by tablet server are treated equally
+-  // by using different threads for each process.
+   std::unique_ptr<CQLServer> cql_server;
++  std::unique_ptr<boost::asio::io_service> io_service;
++  scoped_refptr<Thread> io_service_thread;
+   if (FLAGS_start_cql_proxy) {
+     CQLServerOptions cql_server_options;
+     cql_server_options.rpc_opts.rpc_bind_addresses = FLAGS_cql_proxy_bind_address;
+@@ -308,35 +300,56 @@ int TabletServerMain(int argc, char** argv) {
+     cql_server_options.SetMasterAddresses(tablet_server_options->GetMasterAddresses());
+     cql_server_options.dump_info_path =
+         (tablet_server_options->dump_info_path.empty()
+-             ? ""
+-             : tablet_server_options->dump_info_path + "-cql");
+-    boost::asio::io_service io;
+-    cql_server = factory.CreateCQLServer(cql_server_options, &io, server.get());
++              ? ""
++              : tablet_server_options->dump_info_path + "-cql");
++
++    io_service = std::make_unique<boost::asio::io_service>();
++    cql_server = factory.CreateCQLServer(cql_server_options, io_service.get(), server.get());
+     LOG(INFO) << "Starting CQL server...";
+     LOG_AND_RETURN_FROM_MAIN_NOT_OK(cql_server->Start());
+     LOG(INFO) << "CQL server successfully started.";
+ 
+-    // Should run forever unless there are some errors.
+-    boost::system::error_code ec;
+-    io.run(ec);
+-    if (ec) {
+-      LOG(WARNING) << "IO service run failure: " << ec;
++    LOG_AND_RETURN_FROM_MAIN_NOT_OK(Thread::Create(
++        "io_service", "loop", &RunIOService,
++        [&termination_monitor]() { termination_monitor->Terminate(); }, io_service.get(),
++        &io_service_thread));
++  }
++
++  auto llvm_profile_dumper_result = std::make_unique<LlvmProfileDumper>();
++  LOG_AND_RETURN_FROM_MAIN_NOT_OK(llvm_profile_dumper_result->Start());
++
++  termination_monitor->WaitForTermination();
++
++  llvm_profile_dumper_result.reset();
++
++  if (io_service) {
++    io_service->stop();
++    if (io_service_thread) {
++      LOG_AND_RETURN_FROM_MAIN_NOT_OK(ThreadJoiner(io_service_thread.get()).Join());
+     }
++  }
+ 
+-    LOG (WARNING) << "CQL Server shutting down";
++  if (cql_server) {
++    LOG(WARNING) << "Stopping CQL server";
+     cql_server->Shutdown();
+   }
+ 
+-  while (true) {
+-    SleepFor(MonoDelta::FromSeconds(60));
++  if (redis_server) {
++    LOG(WARNING) << "Stopping Redis server";
++    redis_server->Shutdown();
+   }
+ 
+-#if defined(YB_PROFGEN) && defined(__clang__)
+-  // Currently unreachable
+-  llvm_profile_dump_thread.join();
+-#endif
++  if (pg_supervisor) {
++    LOG(WARNING) << "Stopping PostgreSQL";
++    pg_supervisor->Stop();
++  }
++
++  call_home.reset();
++
++  LOG(WARNING) << "Stopping Tablet server";
++  server->Shutdown();
+ 
+-  return 0;
++  return EXIT_SUCCESS;
+ }
+ 
+ }  // namespace tserver
+diff --git a/src/yb/util/init.cc b/src/yb/util/init.cc
+index 8bbd0a726b..46cd56961c 100644
+--- a/src/yb/util/init.cc
++++ b/src/yb/util/init.cc
+@@ -32,6 +32,7 @@
+ 
+ #include "yb/util/init.h"
+ 
++#include <signal.h>
+ #include <string>
+ 
+ #include "yb/gutil/cpu.h"
+@@ -39,6 +40,7 @@
+ #include "yb/gutil/strings/substitute.h"
+ #include "yb/util/env.h"
+ #include "yb/util/env_util.h"
++#include "yb/util/errno.h"
+ #include "yb/util/flags.h"
+ #include "yb/util/logging.h"
+ #include "yb/util/path_util.h"
+@@ -51,12 +53,13 @@
+ 
+ using std::string;
+ 
+-DEFINE_UNKNOWN_string(fs_data_dirs, "",
++DEFINE_NON_RUNTIME_string(fs_data_dirs, "",
+               "Comma-separated list of data directories. This argument must be specified.");
+ TAG_FLAG(fs_data_dirs, stable);
+-DEFINE_UNKNOWN_bool(stop_on_parent_termination, false,
+-            "When specified, this process will terminate when parent process terminates."
+-            "Linux-only.");
++
++DEFINE_NON_RUNTIME_bool(stop_on_parent_termination, false,
++    "When specified, this process will terminate when parent process terminates."
++    "Linux-only.");
+ 
+ namespace yb {
+ 
+@@ -124,6 +127,14 @@ void SetGLogHeader(const std::string& server_info) {
+   google::SetApplicationFingerprint(VersionInfo::GetShortVersionString() + server_info);
+ }
+ 
++Status InstallSignalHandler(int signum, void (*handler)(int)) {
++  struct sigaction sig_action{};
++  sig_action.sa_handler = handler;
++  return STATUS_FROM_ERRNO_IF_NONZERO_RV(
++      Format("InstallSignalHandler failed for signal $0 ($1)", signum, strsignal(signum)),
++      sigaction(signum, &sig_action, nullptr));
++}
++
+ Status InitYB(const std::string &server_type, const char* argv0) {
+ #if defined(__linux__)
+   if (FLAGS_stop_on_parent_termination) {
+diff --git a/src/yb/util/init.h b/src/yb/util/init.h
+index ee67fccb3a..a12cc1c7cd 100644
+--- a/src/yb/util/init.h
++++ b/src/yb/util/init.h
+@@ -48,6 +48,9 @@ Status SetupLogDir(const std::string& server_type);
+ 
+ void SetGLogHeader(const std::string& server_info = "");
+ 
++// Installs signal handler. Safe to call before glog is initialized. This is not thread safe.
++Status InstallSignalHandler(int signum, void (*handler)(int));
++
+ // Initialize YB, checking that the platform we are running on is supported, etc.
+ // Issues a FATAL log message if we fail to init.
+ // argv0 is passed to InitGoogleLoggingSafe.
+diff --git a/src/yb/util/test_main.cc b/src/yb/util/test_main.cc
+index b444a3cccf..64c8e14b29 100644
+--- a/src/yb/util/test_main.cc
++++ b/src/yb/util/test_main.cc
+@@ -38,6 +38,7 @@
+ 
+ #include "yb/util/pstack_watcher.h"
+ #include "yb/util/flags.h"
++#include "yb/util/init.h"
+ #include "yb/util/status.h"
+ #include "yb/util/status_log.h"
+ #include "yb/util/debug-util.h"
+@@ -111,14 +112,10 @@ int main(int argc, char **argv) {
+ }
+ 
+ static void CreateAndStartTimer() {
+-  struct sigaction action;
+-  struct itimerval timer;
+-
+   // Create the test-timeout timer.
+-  memset(&action, 0, sizeof(action));
+-  action.sa_handler = &KillTestOnTimeout;
+-  CHECK_ERR(sigaction(SIGALRM, &action, nullptr)) << "Unable to set timeout action";
++  CHECK_OK(yb::InstallSignalHandler(SIGALRM, &KillTestOnTimeout));
+ 
++  struct itimerval timer;
+   timer.it_interval.tv_sec = 0;                      // No repeat.
+   timer.it_interval.tv_usec = 0;
+   timer.it_value.tv_sec = FLAGS_test_timeout_after;  // Fire in timeout seconds.

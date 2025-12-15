@@ -1,0 +1,291 @@
+diff --git a/src/yb/rpc/binary_call_parser.cc b/src/yb/rpc/binary_call_parser.cc
+index 071d1acd6e..801114d4ee 100644
+--- a/src/yb/rpc/binary_call_parser.cc
++++ b/src/yb/rpc/binary_call_parser.cc
+@@ -30,7 +30,7 @@ BinaryCallParser::BinaryCallParser(
+ }
+ 
+ Result<ProcessDataResult> BinaryCallParser::Parse(
+-    const rpc::ConnectionPtr& connection, const IoVecs& data) {
++    const rpc::ConnectionPtr& connection, const IoVecs& data, ReadBufferFull read_buffer_full) {
+   if (!call_data_.empty()) {
+     RETURN_NOT_OK(listener_->HandleCall(connection, &call_data_));
+     call_data_.Reset();
+@@ -55,7 +55,8 @@ Result<ProcessDataResult> BinaryCallParser::Parse(
+     }
+     if (consumed + total_length > full_size) {
+       size_t call_data_size = header_size - body_offset + data_length;
+-      if (buffer_tracker_->TryConsume(call_data_size)) {
++      MemTracker* blocking_mem_tracker = nullptr;
++      if (buffer_tracker_->TryConsume(call_data_size, &blocking_mem_tracker)) {
+         call_data_consumption_ = ScopedTrackedConsumption(
+             buffer_tracker_, call_data_size, AlreadyConsumed::kTrue);
+         call_data_ = CallData(call_data_size);
+@@ -63,9 +64,9 @@ Result<ProcessDataResult> BinaryCallParser::Parse(
+         size_t received_size = full_size - (consumed + body_offset);
+         Slice buffer(call_data_.data() + received_size, call_data_size - received_size);
+         return ProcessDataResult{ full_size, buffer };
+-      } else {
++      } else if (read_buffer_full && consumed == 0) {
+         LOG(WARNING) << "Unable to allocate read buffer because of limit, required: "
+-                     << call_data_size;
++                     << call_data_size << ", blocked by: " << yb::ToString(blocking_mem_tracker);
+       }
+       break;
+     }
+diff --git a/src/yb/rpc/binary_call_parser.h b/src/yb/rpc/binary_call_parser.h
+index 5e0bef65d6..a29f5e3034 100644
+--- a/src/yb/rpc/binary_call_parser.h
++++ b/src/yb/rpc/binary_call_parser.h
+@@ -41,7 +41,8 @@ class BinaryCallParser {
+                             size_t header_size, size_t size_offset, size_t max_message_length,
+                             IncludeHeader include_header, BinaryCallParserListener* listener);
+ 
+-  Result<ProcessDataResult> Parse(const rpc::ConnectionPtr& connection, const IoVecs& data);
++  Result<ProcessDataResult> Parse(const rpc::ConnectionPtr& connection, const IoVecs& data,
++                                  ReadBufferFull read_buffer_full);
+ 
+  private:
+   MemTrackerPtr mandatory_tracker_;
+diff --git a/src/yb/rpc/messenger.h b/src/yb/rpc/messenger.h
+index 3eb856108f..41760db07f 100644
+--- a/src/yb/rpc/messenger.h
++++ b/src/yb/rpc/messenger.h
+@@ -142,6 +142,11 @@ class MessengerBuilder {
+     return *this;
+   }
+ 
++  MessengerBuilder& set_num_connections_to_server(int value) {
++    num_connections_to_server_ = value;
++    return *this;
++  }
++
+   int num_connections_to_server() const {
+     return num_connections_to_server_;
+   }
+diff --git a/src/yb/rpc/mt-rpc-test.cc b/src/yb/rpc/mt-rpc-test.cc
+index 3def569714..14f6536879 100644
+--- a/src/yb/rpc/mt-rpc-test.cc
++++ b/src/yb/rpc/mt-rpc-test.cc
+@@ -285,6 +285,54 @@ TEST_F(MultiThreadedRpcTest, TestShutdownWithIncomingConnections) {
+   }
+ }
+ 
++TEST_F(MultiThreadedRpcTest, MemoryLimit) {
++  constexpr size_t kMemoryLimit = 1;
++  auto read_buffer_tracker = MemTracker::FindOrCreateTracker(kMemoryLimit, "Read Buffer");
++
++  // Set up server.
++  HostPort server_addr;
++  StartTestServer(&server_addr);
++
++  LOG(INFO) << "Server " << server_addr;
++
++  std::atomic<bool> stop(false);
++  MessengerOptions options;
++  options.n_reactors = 1;
++  options.num_connections_to_server = 1;
++  Proxy proxy_for_big(CreateMessenger("Client for big", options), server_addr);
++  Proxy proxy_for_small(CreateMessenger("Client for small", options), server_addr);
++
++  std::vector<std::thread> threads;
++  while (threads.size() != 10) {
++    bool big_call = threads.size() == 0;
++    auto proxy = big_call ? &proxy_for_big : &proxy_for_small;
++    threads.emplace_back([proxy, server_addr, &stop, big_call] {
++      rpc_test::EchoRequestPB req;
++      req.set_data(std::string(big_call ? 5_MB : 5_KB, 'X'));
++      while (!stop.load(std::memory_order_acquire)) {
++        rpc_test::EchoResponsePB resp;
++        RpcController controller;
++        controller.set_timeout(500ms);
++        auto status = proxy->SyncRequest(
++            CalculatorServiceMethods::EchoMethod(), req, &resp, &controller);
++        if (big_call) {
++          ASSERT_NOK(status);
++        } else {
++          ASSERT_OK(status);
++        }
++      }
++    });
++  }
++
++  std::this_thread::sleep_for(10s);
++
++  stop.store(true, std::memory_order_release);
++
++  for (auto& thread : threads) {
++    thread.join();
++  }
++}
++
+ } // namespace rpc
+ } // namespace yb
+ 
+diff --git a/src/yb/rpc/rpc-test-base.cc b/src/yb/rpc/rpc-test-base.cc
+index d033e4c60a..7d8160fcb8 100644
+--- a/src/yb/rpc/rpc-test-base.cc
++++ b/src/yb/rpc/rpc-test-base.cc
+@@ -67,6 +67,9 @@ MessengerBuilder CreateMessengerBuilder(const std::string& name,
+                                         const MessengerOptions& options) {
+   MessengerBuilder bld(name);
+   bld.set_num_reactors(options.n_reactors);
++  if (options.num_connections_to_server >= 0) {
++    bld.set_num_connections_to_server(options.num_connections_to_server);
++  }
+   static constexpr std::chrono::milliseconds kMinCoarseTimeGranularity(1);
+   static constexpr std::chrono::milliseconds kMaxCoarseTimeGranularity(100);
+   auto coarse_time_granularity = std::max(std::min(options.keep_alive_timeout,
+@@ -106,6 +109,8 @@ void GenericCalculatorService::Handle(InboundCallPtr incoming) {
+     DoAdd(incoming.get());
+   } else if (incoming->method_name() == CalculatorServiceMethods::kSleepMethodName) {
+     DoSleep(incoming.get());
++  } else if (incoming->method_name() == CalculatorServiceMethods::kEchoMethodName) {
++    DoEcho(incoming.get());
+   } else if (incoming->method_name() == CalculatorServiceMethods::kSendStringsMethodName) {
+     DoSendStrings(incoming.get());
+   } else {
+@@ -166,6 +171,21 @@ void GenericCalculatorService::DoSleep(InboundCall* incoming) {
+   down_cast<YBInboundCall*>(incoming)->RespondSuccess(resp);
+ }
+ 
++void GenericCalculatorService::DoEcho(InboundCall* incoming) {
++  Slice param(incoming->serialized_request());
++  EchoRequestPB req;
++  if (!req.ParseFromArray(param.data(), param.size())) {
++    incoming->RespondFailure(ErrorStatusPB::ERROR_INVALID_REQUEST,
++        STATUS(InvalidArgument, "Couldn't parse pb",
++            req.InitializationErrorString()));
++    return;
++  }
++
++  EchoResponsePB resp;
++  resp.set_data(std::move(*req.mutable_data()));
++  down_cast<YBInboundCall*>(incoming)->RespondSuccess(resp);
++}
++
+ namespace {
+ 
+ class CalculatorService: public CalculatorServiceIf {
+diff --git a/src/yb/rpc/rpc-test-base.h b/src/yb/rpc/rpc-test-base.h
+index 9b54c54b46..94c5bbd32d 100644
+--- a/src/yb/rpc/rpc-test-base.h
++++ b/src/yb/rpc/rpc-test-base.h
+@@ -122,11 +122,13 @@ class GenericCalculatorService : public ServiceIf {
+   void DoAdd(InboundCall *incoming);
+   void DoSendStrings(InboundCall* incoming);
+   void DoSleep(InboundCall *incoming);
++  void DoEcho(InboundCall *incoming);
+ };
+ 
+ struct MessengerOptions {
+   size_t n_reactors;
+   std::chrono::milliseconds keep_alive_timeout;
++  int num_connections_to_server = -1;
+ };
+ 
+ extern const MessengerOptions kDefaultClientMessengerOptions;
+diff --git a/src/yb/rpc/yb_rpc.cc b/src/yb/rpc/yb_rpc.cc
+index a8c6d34468..8d8a05b09f 100644
+--- a/src/yb/rpc/yb_rpc.cc
++++ b/src/yb/rpc/yb_rpc.cc
+@@ -97,12 +97,12 @@ Result<ProcessDataResult> YBInboundConnectionContext::ProcessCalls(
+     IoVecs data_copy(data);
+     data_copy[0].iov_len -= kConnectionHeaderSize;
+     data_copy[0].iov_base = const_cast<uint8_t*>(slice.data() + kConnectionHeaderSize);
+-    auto result = VERIFY_RESULT(parser().Parse(connection, data_copy));
+-    result.consumed += + kConnectionHeaderSize;
++    auto result = VERIFY_RESULT(parser().Parse(connection, data_copy, ReadBufferFull::kFalse));
++    result.consumed += kConnectionHeaderSize;
+     return result;
+   }
+ 
+-  return parser().Parse(connection, data);
++  return parser().Parse(connection, data, read_buffer_full);
+ }
+ 
+ Status YBInboundConnectionContext::HandleCall(
+@@ -158,11 +158,11 @@ Status YBInboundCall::ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call
+   TRACE_EVENT_FLOW_BEGIN0("rpc", "YBInboundCall", this);
+   TRACE_EVENT0("rpc", "YBInboundCall::ParseFrom");
+ 
+-  consumption_ = ScopedTrackedConsumption(mem_tracker, call_data->size());
++  Slice source(call_data->data(), call_data->size());
++  RETURN_NOT_OK(serialization::ParseYBMessage(source, &header_, &serialized_request_));
+ 
++  consumption_ = ScopedTrackedConsumption(mem_tracker, call_data->size());
+   request_data_ = std::move(*call_data);
+-  Slice source(request_data_.data(), request_data_.size());
+-  RETURN_NOT_OK(serialization::ParseYBMessage(source, &header_, &serialized_request_));
+ 
+   // Adopt the service/method info from the header as soon as it's available.
+   if (PREDICT_FALSE(!header_.has_remote_method())) {
+@@ -398,7 +398,7 @@ void YBOutboundConnectionContext::AssignConnection(const ConnectionPtr& connecti
+ 
+ Result<ProcessDataResult> YBOutboundConnectionContext::ProcessCalls(
+     const ConnectionPtr& connection, const IoVecs& data, ReadBufferFull read_buffer_full) {
+-  return parser().Parse(connection, data);
++  return parser().Parse(connection, data, read_buffer_full);
+ }
+ 
+ } // namespace rpc
+diff --git a/src/yb/util/mem_tracker.cc b/src/yb/util/mem_tracker.cc
+index 5759d0c248..153f6bbf9a 100644
+--- a/src/yb/util/mem_tracker.cc
++++ b/src/yb/util/mem_tracker.cc
+@@ -175,6 +175,7 @@ std::string CreateMetricName(const MemTracker& mem_tracker) {
+   }
+   std::string id = mem_tracker.id();
+   std::replace(id.begin(), id.end(), ' ', '_');
++  std::replace(id.begin(), id.end(), '.', '_');
+   if (mem_tracker.parent()) {
+     return CreateMetricName(*mem_tracker.parent()) + "_" + id;
+   } else {
+@@ -463,7 +464,7 @@ void MemTracker::Consume(int64_t bytes) {
+   }
+ }
+ 
+-bool MemTracker::TryConsume(int64_t bytes) {
++bool MemTracker::TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker) {
+   UpdateConsumption();
+   if (bytes <= 0) {
+     return true;
+@@ -511,6 +512,10 @@ bool MemTracker::TryConsume(int64_t bytes) {
+   for (int j = all_trackers_.size() - 1; j > i; --j) {
+     IncrementBy(-bytes, &all_trackers_[j]->consumption_, all_trackers_[j]->metrics_);
+   }
++  if (blocking_mem_tracker) {
++    *blocking_mem_tracker = all_trackers_[i];
++  }
++
+   return false;
+ }
+ 
+diff --git a/src/yb/util/mem_tracker.h b/src/yb/util/mem_tracker.h
+index db6ad3b403..1236237f68 100644
+--- a/src/yb/util/mem_tracker.h
++++ b/src/yb/util/mem_tracker.h
+@@ -253,7 +253,9 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
+   // they can all consume 'bytes'. If this brings any of them over, none of them
+   // are updated.
+   // Returns true if the try succeeded.
+-  bool TryConsume(int64_t bytes);
++  // In case of failure mem tracker that prevented consumption will be stored to
++  // blocking_mem_tracker.
++  bool TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker = nullptr);
+ 
+   // Decreases consumption of this tracker and its ancestors by 'bytes'.
+   void Release(int64_t bytes);
+diff --git a/src/yb/yql/cql/cqlserver/cql_rpc.cc b/src/yb/yql/cql/cqlserver/cql_rpc.cc
+index d2aed765c8..61d45675de 100644
+--- a/src/yb/yql/cql/cqlserver/cql_rpc.cc
++++ b/src/yb/yql/cql/cqlserver/cql_rpc.cc
+@@ -66,7 +66,7 @@ CQLConnectionContext::CQLConnectionContext(
+ Result<rpc::ProcessDataResult> CQLConnectionContext::ProcessCalls(
+     const rpc::ConnectionPtr& connection, const IoVecs& data,
+     rpc::ReadBufferFull read_buffer_full) {
+-  return parser_.Parse(connection, data);
++  return parser_.Parse(connection, data, read_buffer_full);
+ }
+ 
+ Status CQLConnectionContext::HandleCall(

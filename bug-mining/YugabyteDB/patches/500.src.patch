@@ -1,0 +1,223 @@
+diff --git a/src/yb/client/ql-tablet-test.cc b/src/yb/client/ql-tablet-test.cc
+index 4e0026a755..f0fc428959 100644
+--- a/src/yb/client/ql-tablet-test.cc
++++ b/src/yb/client/ql-tablet-test.cc
+@@ -1363,15 +1363,7 @@ TEST_F(QLTabletTest, ElectUnsynchronizedFollower) {
+   auto session = CreateSession();
+   SetValue(session, 1, -1, table);
+ 
+-  int leader_idx = -1;
+-  for (int i = 1; i != cluster_->num_tablet_servers(); ++i) {
+-    auto* ts_manager = cluster_->mini_tablet_server(i)->server()->tablet_manager();
+-    if (ts_manager->GetLeaderCount() == 1) {
+-      leader_idx = i;
+-      break;
+-    }
+-  }
+-  ASSERT_GE(leader_idx, 1);
++  int leader_idx = ASSERT_RESULT(ServerWithLeaders(cluster_.get()));
+   LOG(INFO) << "Leader: " << cluster_->mini_tablet_server(leader_idx)->server()->permanent_uuid();
+   int follower_idx = 1 ^ 2 ^ leader_idx;
+   LOG(INFO) << "Turning off follower: "
+@@ -1400,5 +1392,46 @@ TEST_F(QLTabletTest, ElectUnsynchronizedFollower) {
+   ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start());
+ }
+ 
++TEST_F(QLTabletTest, FollowerRestartDuringWrite) {
++  TableHandle table;
++  CreateTable(kTable1Name, &table, 1);
++
++  for (auto iter = 0; iter != 6; ++iter) {
++    auto session = CreateSession();
++    SetValue(session, 1, -1, table);
++
++    int leader_idx = ASSERT_RESULT(ServerWithLeaders(cluster_.get()));
++    LOG(INFO) << "Leader: " << cluster_->mini_tablet_server(leader_idx)->server()->permanent_uuid();
++    int follower_idx = (leader_idx + 1) % cluster_->num_tablet_servers();
++    auto follower = cluster_->mini_tablet_server(follower_idx)->server();
++    LOG(INFO) << "Follower: "  << follower->permanent_uuid();
++    auto follower_peers = follower->tablet_manager()->GetTabletPeers();
++    for (const auto& peer : follower_peers) {
++      peer->raft_consensus()->TEST_DelayUpdate(FLAGS_raft_heartbeat_interval_ms / 2 * 1ms);
++    }
++
++    SetValue(session, 2, -2, table);
++    std::this_thread::sleep_for(FLAGS_raft_heartbeat_interval_ms / 2 * 1ms);
++    SetValue(session, 3, -3, table);
++
++    // Shutdown follower, so it would not accept updates and exponential backoff will turn to send
++    // empty operations.
++    cluster_->mini_tablet_server(follower_idx)->Shutdown();
++
++    // Wait exponential backoff goes to empty operations.
++    std::this_thread::sleep_for(FLAGS_raft_heartbeat_interval_ms * 3ms);
++
++    SetValue(session, 4, -4, table);
++
++    ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start());
++
++    // Wait until newly started follower receive a new operation.
++    // Without fix for GH #7145 it would crash in this case.
++    std::this_thread::sleep_for(FLAGS_raft_heartbeat_interval_ms * 3ms);
++
++    ASSERT_OK(cluster_->RestartSync());
++  }
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index 1e903ae82d..2bff298aa5 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -553,6 +553,8 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
+   }
+   *needs_remote_bootstrap = false;
+ 
++  request->clear_propagated_safe_time();
++
+   // If we've never communicated with the peer, we don't know what messages to send, so we'll send a
+   // status-only request. If the peer has not responded to the point that our to_index == next_index
+   // due to exponential backoff of replicated segment size, we also send a status-only request.
+@@ -604,8 +606,6 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
+         num_log_ops_to_send == kSendUnboundedLogOps) {
+       // Get the current local safe time on the leader and propagate it to the follower.
+       request->set_propagated_safe_time(propagated_safe_time.ToUint64());
+-    } else {
+-      request->clear_propagated_safe_time();
+     }
+   }
+ 
+diff --git a/src/yb/consensus/log_cache.cc b/src/yb/consensus/log_cache.cc
+index 14d8a09542..e4e1022709 100644
+--- a/src/yb/consensus/log_cache.cc
++++ b/src/yb/consensus/log_cache.cc
+@@ -299,7 +299,7 @@ Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index,
+ 
+   // Return as many operations as we can, up to the limit.
+   int64_t remaining_space = max_size_bytes;
+-  while (remaining_space > 0 && next_index < to_index) {
++  while (remaining_space >= 0 && next_index < to_index) {
+     // If the messages the peer needs haven't been loaded into the queue yet, load them.
+     MessageCache::const_iterator iter = cache_.lower_bound(next_index);
+     if (iter == cache_.end() || iter->first != next_index) {
+@@ -329,15 +329,13 @@ Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index,
+ 
+         auto current_message_size = TotalByteSizeForMessage(*msg);
+         remaining_space -= current_message_size;
+-        if (remaining_space >= 0 || result.messages.empty()) {
+-          result.messages.push_back(msg);
+-          result.read_from_disk_size += current_message_size;
+-          next_index++;
+-        } else {
+-          result.have_more_messages = true;
++        if (remaining_space < 0 && !result.messages.empty()) {
++          break;
+         }
++        result.messages.push_back(msg);
++        result.read_from_disk_size += current_message_size;
++        next_index++;
+       }
+-
+     } else {
+       // Pull contiguous messages from the cache until the size limit is achieved.
+       for (; iter != cache_.end(); ++iter) {
+@@ -353,7 +351,6 @@ Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index,
+         auto current_message_size = TotalByteSizeForMessage(*msg);
+         remaining_space -= current_message_size;
+         if (remaining_space < 0 && !result.messages.empty()) {
+-          result.have_more_messages = true;
+           break;
+         }
+ 
+@@ -362,6 +359,7 @@ Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index,
+       }
+     }
+   }
++  result.have_more_messages = remaining_space < 0;
+ 
+   return result;
+ }
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 4c33942357..6f704e51ab 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -931,4 +931,18 @@ Status BreakConnectivity(MiniCluster* cluster, int idx1, int idx2) {
+   return Status::OK();
+ }
+ 
++Result<int> ServerWithLeaders(MiniCluster* cluster) {
++  for (int i = 0; i != cluster->num_tablet_servers(); ++i) {
++    auto* server = cluster->mini_tablet_server(i)->server();
++    if (!server) {
++      continue;
++    }
++    auto* ts_manager = server->tablet_manager();
++    if (ts_manager->GetLeaderCount() != 0) {
++      return i;
++    }
++  }
++  return STATUS(NotFound, "No tablet server with leaders");
++}
++
+ }  // namespace yb
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 3028027c0b..7d7dd89db9 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -326,6 +326,7 @@ void ShutdownAllMasters(MiniCluster* cluster);
+ CHECKED_STATUS StartAllMasters(MiniCluster* cluster);
+ 
+ CHECKED_STATUS BreakConnectivity(MiniCluster* cluster, int idx1, int idx2);
++Result<int> ServerWithLeaders(MiniCluster* cluster);
+ 
+ }  // namespace yb
+ 
+diff --git a/src/yb/tablet/mvcc.cc b/src/yb/tablet/mvcc.cc
+index 95910752a0..ed2c475326 100644
+--- a/src/yb/tablet/mvcc.cc
++++ b/src/yb/tablet/mvcc.cc
+@@ -343,28 +343,31 @@ void MvccManager::AddPending(HybridTime* ht) {
+           max_safe_time_returned_with_lease_.safe_time,
+           max_safe_time_returned_without_lease_.safe_time,
+           max_safe_time_returned_for_follower_.safe_time,
++          propagated_safe_time_,
+           last_replicated_,
+           last_ht_in_queue});
+ 
+   if (*ht <= sanity_check_lower_bound) {
+     auto get_details_msg = [&](bool drain_aborted) {
+       std::ostringstream ss;
+-#define LOG_INFO_FOR_HT_LOWER_BOUND(t) \
+-             "\n  " << EXPR_VALUE_FOR_LOG(t) \
+-          << "\n  " << EXPR_VALUE_FOR_LOG(*ht < t.safe_time) \
++#define LOG_INFO_FOR_HT_LOWER_BOUND_IMPL(full, safe_time) \
++             "\n  " << EXPR_VALUE_FOR_LOG(full) \
++          << "\n  " << (*ht < safe_time ? "!!! " : "") << EXPR_VALUE_FOR_LOG(*ht < safe_time) \
+           << "\n  " << EXPR_VALUE_FOR_LOG( \
+-                           static_cast<int64_t>(ht->ToUint64() - t.safe_time.ToUint64())) \
+-          << "\n  " << EXPR_VALUE_FOR_LOG(ht->PhysicalDiff(t.safe_time)) \
++                           static_cast<int64_t>(ht->ToUint64() - safe_time.ToUint64())) \
++          << "\n  " << EXPR_VALUE_FOR_LOG(ht->PhysicalDiff(safe_time)) \
+           << "\n  "
+ 
++#define LOG_INFO_FOR_HT_LOWER_BOUND_WITH_SOURCE(t) LOG_INFO_FOR_HT_LOWER_BOUND_IMPL(t, t.safe_time)
++#define LOG_INFO_FOR_HT_LOWER_BOUND(t) LOG_INFO_FOR_HT_LOWER_BOUND_IMPL(t, t)
++
+       ss << "New operation's hybrid time too low: " << *ht
+-         << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_with_lease_)
+-         << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_without_lease_)
+-         << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_for_follower_)
+-         << LOG_INFO_FOR_HT_LOWER_BOUND(
+-                (SafeTimeWithSource{last_replicated_, SafeTimeSource::kUnknown}))
+-         << LOG_INFO_FOR_HT_LOWER_BOUND(
+-                (SafeTimeWithSource{last_ht_in_queue, SafeTimeSource::kUnknown}))
++         << LOG_INFO_FOR_HT_LOWER_BOUND_WITH_SOURCE(max_safe_time_returned_with_lease_)
++         << LOG_INFO_FOR_HT_LOWER_BOUND_WITH_SOURCE(max_safe_time_returned_without_lease_)
++         << LOG_INFO_FOR_HT_LOWER_BOUND_WITH_SOURCE(max_safe_time_returned_for_follower_)
++         << LOG_INFO_FOR_HT_LOWER_BOUND(last_replicated_)
++         << LOG_INFO_FOR_HT_LOWER_BOUND(last_ht_in_queue)
++         << LOG_INFO_FOR_HT_LOWER_BOUND(propagated_safe_time_)
+          << "\n  " << EXPR_VALUE_FOR_LOG(is_follower_side)
+          << "\n  " << EXPR_VALUE_FOR_LOG(queue_.size())
+          << "\n  " << EXPR_VALUE_FOR_LOG(queue_);

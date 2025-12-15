@@ -1,0 +1,767 @@
+diff --git a/src/yb/client/async_rpc.cc b/src/yb/client/async_rpc.cc
+index 7ce58927b2..a3af614dbb 100644
+--- a/src/yb/client/async_rpc.cc
++++ b/src/yb/client/async_rpc.cc
+@@ -342,38 +342,9 @@ void AsyncRpcBase<Req, Resp>::SendRpcToTserver(int attempt_num) {
+ WriteRpc::WriteRpc(AsyncRpcData* data)
+     : AsyncRpcBase(data, YBConsistencyLevel::STRONG) {
+   TRACE_TO(trace_, "WriteRpc initiated to $0", data->tablet->tablet_id());
+-#ifndef NDEBUG
+-  const Schema& schema = GetSchema(table()->schema());
+-#endif
+-
+   // Add the rows
+   int ctr = 0;
+   for (auto& op : ops_) {
+-#ifndef NDEBUG
+-    const Partition& partition = op->tablet->partition();
+-    const PartitionSchema& partition_schema = table()->partition_schema();
+-
+-    bool partition_contains_row = false;
+-    std::string partition_key;
+-    switch (op->yb_op->type()) {
+-      case YBOperation::QL_READ: FALLTHROUGH_INTENDED;
+-      case YBOperation::QL_WRITE: FALLTHROUGH_INTENDED;
+-      case YBOperation::PGSQL_READ: FALLTHROUGH_INTENDED;
+-      case YBOperation::PGSQL_WRITE: FALLTHROUGH_INTENDED;
+-      case YBOperation::REDIS_READ: FALLTHROUGH_INTENDED;
+-      case YBOperation::REDIS_WRITE: {
+-        CHECK_OK(op->yb_op->GetPartitionKey(&partition_key));
+-        partition_contains_row = partition.ContainsKey(partition_key);
+-        break;
+-      }
+-    }
+-
+-    CHECK(partition_contains_row)
+-        << "Row " << op->yb_op->ToString()
+-        << " not in partition " << partition_schema.PartitionDebugString(partition, schema)
+-        << " partition_key: '" << Slice(partition_key).ToDebugHexString() << "'";
+-
+-#endif
+     // Move write request PB into tserver write request PB for performance.
+     // Will restore in ProcessResponseFromTserver.
+     switch (op->yb_op->type()) {
+diff --git a/src/yb/client/batcher.cc b/src/yb/client/batcher.cc
+index fd35e44644..d3ee7e1b53 100644
+--- a/src/yb/client/batcher.cc
++++ b/src/yb/client/batcher.cc
+@@ -136,8 +136,7 @@ void Batcher::Abort(const Status& status) {
+ 
+     InFlightOps to_abort;
+     for (auto& op : ops_) {
+-      std::lock_guard<simple_spinlock> l(op->lock_);
+-      if (op->state == InFlightOpState::kBufferedToTabletServer) {
++      if (op->state.load(std::memory_order_acquire) == InFlightOpState::kBufferedToTabletServer) {
+         to_abort.push_back(op);
+       }
+     }
+@@ -279,10 +278,8 @@ void Batcher::FlushAsync(StatusFunctor callback) {
+ Status Batcher::Add(shared_ptr<YBOperation> yb_op) {
+   // As soon as we get the op, start looking up where it belongs,
+   // so that when the user calls Flush, we are ready to go.
+-  auto in_flight_op = std::make_shared<InFlightOp>();
++  auto in_flight_op = std::make_shared<InFlightOp>(yb_op);
+   RETURN_NOT_OK(yb_op->GetPartitionKey(&in_flight_op->partition_key));
+-  in_flight_op->yb_op = yb_op;
+-  in_flight_op->state = InFlightOpState::kLookingUpTablet;
+ 
+   if (yb_op->table()->partition_schema().IsHashPartitioning()) {
+     switch (yb_op->type()) {
+@@ -377,10 +374,6 @@ void Batcher::TabletLookupFinished(
+   {
+     std::lock_guard<decltype(mutex_)> lock(mutex_);
+ 
+-    if (lookup_result.ok()) {
+-      op->tablet = *lookup_result;
+-    }
+-
+     --outstanding_lookups_;
+     all_lookups_finished = outstanding_lookups_ == 0;
+ 
+@@ -391,17 +384,55 @@ void Batcher::TabletLookupFinished(
+       return;
+     }
+ 
++    if (state_ != BatcherState::kResolvingTablets && state_ != BatcherState::kGatheringOps) {
++      LOG(DFATAL) << "Lookup finished in wrong state: " << ToString(state_);
++      return;
++    }
++
++    if (lookup_result.ok()) {
++      op->tablet = *lookup_result;
++#ifndef NDEBUG
++      const Partition& partition = op->tablet->partition();
++
++      bool partition_contains_row = false;
++      std::string partition_key;
++      switch (op->yb_op->type()) {
++        case YBOperation::QL_READ: FALLTHROUGH_INTENDED;
++        case YBOperation::QL_WRITE: FALLTHROUGH_INTENDED;
++        case YBOperation::PGSQL_READ: FALLTHROUGH_INTENDED;
++        case YBOperation::PGSQL_WRITE: FALLTHROUGH_INTENDED;
++        case YBOperation::REDIS_READ: FALLTHROUGH_INTENDED;
++        case YBOperation::REDIS_WRITE: {
++          CHECK_OK(op->yb_op->GetPartitionKey(&partition_key));
++          partition_contains_row = partition.ContainsKey(partition_key);
++          break;
++        }
++      }
++
++      if (!partition_contains_row) {
++        const Schema& schema = GetSchema(op->yb_op->table()->schema());
++        const PartitionSchema& partition_schema = op->yb_op->table()->partition_schema();
++        LOG(DFATAL)
++            << "Row " << op->yb_op->ToString()
++            << " not in partition " << partition_schema.PartitionDebugString(partition, schema)
++            << " partition_key: '" << Slice(partition_key).ToDebugHexString() << "'";
++      }
++#endif
++    }
++
+     VLOG(3) << "TabletLookupFinished for " << op->yb_op->ToString() << ": " << lookup_result
+             << ", outstanding lookups: " << outstanding_lookups_;
+ 
+     if (lookup_result.ok()) {
+-      std::lock_guard<simple_spinlock> l2(op->lock_);
+-      CHECK_EQ(op->state, InFlightOpState::kLookingUpTablet);
+       CHECK(*lookup_result);
+ 
+-      op->state = InFlightOpState::kBufferedToTabletServer;
+-
+-      ops_queue_.push_back(op);
++      auto expected_state = InFlightOpState::kLookingUpTablet;
++      if (op->state.compare_exchange_strong(
++          expected_state, InFlightOpState::kBufferedToTabletServer, std::memory_order_acq_rel)) {
++        ops_queue_.push_back(op);
++      } else {
++        LOG(DFATAL) << "Finished lookup for operation in a bad state: " << ToString(expected_state);
++      }
+     } else {
+       MarkInFlightOpFailedUnlocked(op, lookup_result.status());
+     }
+@@ -418,17 +449,7 @@ void Batcher::TabletLookupFinished(
+ 
+ void Batcher::TransactionReady(const Status& status, const BatcherPtr& self) {
+   if (status.ok()) {
+-    {
+-      std::lock_guard<decltype(mutex_)> lock(mutex_);
+-      if (state_ != BatcherState::kTransactionPrepare) {
+-        // Batcher was aborted.
+-        LOG_IF(DFATAL, state_ != BatcherState::kAborted)
+-            << "Batcher in a wrong state when transaction get ready: " << state_;
+-        return;
+-      }
+-      state_ = BatcherState::kTransactionReady;
+-    }
+-    FlushBuffersIfReady();
++    ExecuteOperations();
+   } else {
+     Abort(status);
+   }
+@@ -461,6 +482,11 @@ OpGroup GetOpGroup(const InFlightOpPtr& op) {
+ }
+ 
+ void Batcher::FlushBuffersIfReady() {
++  // We're only ready to flush if both of the following conditions are true:
++  // 1. The batcher is in the "resolving tablets" state (i.e. FlushAsync was called).
++  // 2. All outstanding ops have finished lookup. Why? To avoid a situation
++  //    where ops are flushed one by one as they finish lookup.
++
+   {
+     std::lock_guard<decltype(mutex_)> lock(mutex_);
+     if (outstanding_lookups_ != 0) {
+@@ -470,33 +496,33 @@ void Batcher::FlushBuffersIfReady() {
+       return;
+     }
+ 
+-    if (state_ == BatcherState::kResolvingTablets) {
+-      state_ = BatcherState::kTransactionPrepare;
+-
+-      // All operations were added, and tablets for them were resolved.
+-      // So we could sort them.
+-      std::sort(ops_queue_.begin(),
+-                ops_queue_.end(),
+-                [](const InFlightOpPtr& lhs, const InFlightOpPtr& rhs) {
+-        if (lhs->tablet.get() == rhs->tablet.get()) {
+-          auto lgroup = GetOpGroup(lhs);
+-          auto rgroup = GetOpGroup(rhs);
+-          if (lgroup != rgroup) {
+-            return lgroup < rgroup;
+-          }
+-          return lhs->sequence_number_ < rhs->sequence_number_;
+-        }
+-        return lhs->tablet.get() < rhs->tablet.get();
+-      });
+-    } else if (state_ != BatcherState::kTransactionReady) {
+-      VLOG(3) << "FlushBuffersIfReady: batcher not yet in transaction ready state: " << state_;
++    if (state_ != BatcherState::kResolvingTablets) {
+       return;
+     }
+ 
++    state_ = BatcherState::kTransactionPrepare;
+   }
+ 
+-  bool force_consistent_read = force_consistent_read_;
++  // All operations were added, and tablets for them were resolved.
++  // So we could sort them.
++  std::sort(ops_queue_.begin(),
++            ops_queue_.end(),
++            [](const InFlightOpPtr& lhs, const InFlightOpPtr& rhs) {
++    if (lhs->tablet.get() == rhs->tablet.get()) {
++      auto lgroup = GetOpGroup(lhs);
++      auto rgroup = GetOpGroup(rhs);
++      if (lgroup != rgroup) {
++        return lgroup < rgroup;
++      }
++      return lhs->sequence_number_ < rhs->sequence_number_;
++    }
++    return lhs->tablet.get() < rhs->tablet.get();
++  });
+ 
++  ExecuteOperations();
++}
++
++void Batcher::ExecuteOperations() {
+   auto transaction = this->transaction();
+   if (transaction) {
+     // If this Batcher is executed in context of transaction,
+@@ -511,17 +537,16 @@ void Batcher::FlushBuffersIfReady() {
+                               &transaction_metadata_)) {
+       return;
+     }
+-
+-    // Set force_consistent_read to true, so async rpc would use read time from batcher.
+-    force_consistent_read = true;
+   }
+ 
+-  // We're only ready to flush if:
+-  // 1. The batcher is in the flushing state (i.e. FlushAsync was called).
+-  // 2. All outstanding ops have finished lookup. Why? To avoid a situation
+-  //    where ops are flushed one by one as they finish lookup.
+   {
+     std::lock_guard<decltype(mutex_)> lock(mutex_);
++    if (state_ != BatcherState::kTransactionPrepare) {
++      // Batcher was aborted.
++      LOG_IF(DFATAL, state_ != BatcherState::kAborted)
++          << "Batcher in a wrong state at the moment the transaction became ready: " << state_;
++      return;
++    }
+     state_ = BatcherState::kTransactionReady;
+   }
+ 
+@@ -530,6 +555,10 @@ void Batcher::FlushBuffersIfReady() {
+     return;
+   }
+ 
++  const bool force_consistent_read = force_consistent_read_ || this->transaction();
++
++  const size_t ops_number = ops_queue_.size();
++
+   // Use big enough value for preallocated storage, to avoid unnecessary allocations.
+   boost::container::small_vector<std::shared_ptr<AsyncRpc>, 40> rpcs;
+ 
+@@ -559,6 +588,8 @@ void Batcher::FlushBuffersIfReady() {
+       start->get()->tablet.get(), start, ops_queue_.end(),
+       allow_local_calls_in_curr_thread_, need_consistent_read));
+ 
++  LOG_IF(DFATAL, ops_number != ops_queue_.size())
++    << "Ops queue was modified while creating RPCs";
+   ops_queue_.clear();
+ 
+   for (const auto& rpc : rpcs) {
+diff --git a/src/yb/client/batcher.h b/src/yb/client/batcher.h
+index 84e9a658a9..1d9d746433 100644
+--- a/src/yb/client/batcher.h
++++ b/src/yb/client/batcher.h
+@@ -251,6 +251,8 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
+ 
+   void TransactionReady(const Status& status, const BatcherPtr& self);
+ 
++  void ExecuteOperations();
++
+   // See note about lock ordering in batcher.cc
+   mutable simple_spinlock mutex_;
+ 
+diff --git a/src/yb/client/in_flight_op.cc b/src/yb/client/in_flight_op.cc
+index b064704a6b..636298bc70 100644
+--- a/src/yb/client/in_flight_op.cc
++++ b/src/yb/client/in_flight_op.cc
+@@ -21,6 +21,10 @@ namespace yb {
+ namespace client {
+ namespace internal {
+ 
++InFlightOp::InFlightOp(std::shared_ptr<YBOperation> yb_op_)
++    : yb_op(std::move(yb_op_)) {
++}
++
+ std::string InFlightOp::ToString() const {
+   return strings::Substitute("op[state=$0, yb_op=$1]",
+                              internal::ToString(state),
+diff --git a/src/yb/client/in_flight_op.h b/src/yb/client/in_flight_op.h
+index 6b730d5f14..3c8d3d87ec 100644
+--- a/src/yb/client/in_flight_op.h
++++ b/src/yb/client/in_flight_op.h
+@@ -29,11 +29,6 @@ namespace internal {
+ class RemoteTablet;
+ 
+ YB_DEFINE_ENUM(InFlightOpState,
+-    // Newly created op.
+-    //
+-    // OWNERSHIP: The op is only in this state when in local function scope (Batcher::Add)
+-    (kNew)
+-
+     // Waiting for the MetaCache to determine which tablet ID hosts the row associated
+     // with this operation. In the case that the relevant tablet's key range was
+     // already cached, this state will be passed through immediately. Otherwise,
+@@ -89,19 +84,16 @@ YB_DEFINE_ENUM(InFlightOpState,
+ // we can save a pointer per object by manually incrementing the Batcher ref-count
+ // when we create the object, and decrementing when we delete it.
+ struct InFlightOp {
+-  InFlightOp() : state(InFlightOpState::kNew) {
+-  }
++  explicit InFlightOp(std::shared_ptr<YBOperation> yb_op_);
+ 
+   // Lock protecting the internal state of the op.
+   // This is necessary since callbacks may fire from IO threads
+   // concurrent with the user trying to abort/delete the batch.
+   // See comment above about lock ordering.
+-  simple_spinlock lock_;
+-
+-  InFlightOpState state;
++  std::atomic<InFlightOpState> state{InFlightOpState::kLookingUpTablet};
+ 
+   // The actual operation.
+-  std::shared_ptr<YBOperation> yb_op;
++  const std::shared_ptr<YBOperation> yb_op;
+ 
+   std::string partition_key;
+ 
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index b4a656b447..78ffff618e 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -376,7 +376,8 @@ void RemoteTablet::GetRemoteTabletServers(
+                 }
+                 continue;
+               }
+-              if (!replica.ts->local_tserver()->LeaderAndReady(tablet_id_)) {
++              if (!replica.ts->local_tserver()->LeaderAndReady(
++                      tablet_id_, /* allow_stale */ true)) {
+                 // Should continue here because otherwise failed state will be cleared.
+                 continue;
+               }
+diff --git a/src/yb/client/meta_cache.h b/src/yb/client/meta_cache.h
+index 4b39a3f759..d15b4ec886 100644
+--- a/src/yb/client/meta_cache.h
++++ b/src/yb/client/meta_cache.h
+@@ -85,7 +85,7 @@ class LocalTabletServer {
+   virtual CHECKED_STATUS GetTabletStatus(const GetTabletStatusRequestPB* req,
+                                          GetTabletStatusResponsePB* resp) const = 0;
+ 
+-  virtual bool LeaderAndReady(const TabletId& tablet_id) const = 0;
++  virtual bool LeaderAndReady(const TabletId& tablet_id, bool allow_stale = false) const = 0;
+ };
+ 
+ } // namespace tserver
+diff --git a/src/yb/consensus/consensus.cc b/src/yb/consensus/consensus.cc
+index 857e5ef57e..b22306bbc1 100644
+--- a/src/yb/consensus/consensus.cc
++++ b/src/yb/consensus/consensus.cc
+@@ -81,8 +81,8 @@ Status ConsensusRound::CheckBoundTerm(int64_t current_term) const {
+   return Status::OK();
+ }
+ 
+-LeaderStatus Consensus::GetLeaderStatus() const {
+-  return GetLeaderState().status;
++LeaderStatus Consensus::GetLeaderStatus(bool allow_stale) const {
++  return GetLeaderState(allow_stale).status;
+ }
+ 
+ int64_t Consensus::LeaderTerm() const {
+diff --git a/src/yb/consensus/consensus.h b/src/yb/consensus/consensus.h
+index d9da80f3f5..b1d27c8c2f 100644
+--- a/src/yb/consensus/consensus.h
++++ b/src/yb/consensus/consensus.h
+@@ -277,9 +277,12 @@ class Consensus {
+ 
+   // Returns the leader status (see LeaderStatus type description for details).
+   // If leader is ready, then also returns term, otherwise OpId::kUnknownTerm is returned.
+-  virtual LeaderState GetLeaderState() const = 0;
++  //
++  // allow_stale could be used to avoid refreshing cache, when we are OK to read slightly outdated
++  // value.
++  virtual LeaderState GetLeaderState(bool allow_stale = false) const = 0;
+ 
+-  LeaderStatus GetLeaderStatus() const;
++  LeaderStatus GetLeaderStatus(bool allow_stale = false) const;
+   int64_t LeaderTerm() const;
+ 
+   // Returns the uuid of this peer.
+diff --git a/src/yb/consensus/consensus_queue.cc b/src/yb/consensus/consensus_queue.cc
+index 878cf24eaf..5666f26961 100644
+--- a/src/yb/consensus/consensus_queue.cc
++++ b/src/yb/consensus/consensus_queue.cc
+@@ -125,6 +125,12 @@ METRIC_DEFINE_gauge_int64(tablet, in_progress_ops, "Leader Operations in Progres
+ 
+ const auto kCDCConsumerCheckpointInterval = FLAGS_cdc_checkpoint_opid_interval_ms * 1ms;
+ 
++std::string MajorityReplicatedData::ToString() const {
++  return Format(
++      "{ op_id: $0 leader_lease_expiration: $1 ht_lease_expiration: $2 num_sst_files: $3 }",
++      op_id, leader_lease_expiration, ht_lease_expiration, num_sst_files);
++}
++
+ std::string PeerMessageQueue::TrackedPeer::ToString() const {
+   return Substitute("Peer: $0, Is new: $1, Last received: $2, Next index: $3, "
+                     "Last known committed idx: $4, Last exchange result: $5, "
+diff --git a/src/yb/consensus/consensus_queue.h b/src/yb/consensus/consensus_queue.h
+index f194465a30..e88030f487 100644
+--- a/src/yb/consensus/consensus_queue.h
++++ b/src/yb/consensus/consensus_queue.h
+@@ -514,6 +514,8 @@ struct MajorityReplicatedData {
+   CoarseTimePoint leader_lease_expiration;
+   MicrosTime ht_lease_expiration;
+   uint64_t num_sst_files;
++
++  std::string ToString() const;
+ };
+ 
+ // The interface between RaftConsensus and the PeerMessageQueue.
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 955f9faf35..1f46f913d9 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -843,7 +843,6 @@ Status RaftConsensus::BecomeLeaderUnlocked() {
+   // Don't vote for anyone if we're a leader.
+   withhold_votes_until_ = MonoTime::Max();
+ 
+-  state_->SetLeaderNoOpCommittedUnlocked(false);
+   queue_->RegisterObserver(this);
+ 
+   // Refresh queue and peers before initiating NO_OP.
+@@ -1041,12 +1040,13 @@ void RaftConsensus::UpdateMajorityReplicated(
+   leader_lease_wait_cond_.notify_all();
+ 
+   VLOG_WITH_PREFIX(1) << "Marking majority replicated up to "
+-      << majority_replicated_data.op_id.ShortDebugString();
++      << majority_replicated_data.ToString();
+   TRACE("Marking majority replicated up to $0", majority_replicated_data.op_id.ShortDebugString());
+   bool committed_index_changed = false;
+   s = state_->UpdateMajorityReplicatedUnlocked(
+       majority_replicated_data.op_id, committed_op_id, &committed_index_changed);
+-  if (state_->GetLeaderStateUnlocked().ok()) {
++  auto leader_state = state_->GetLeaderStateUnlocked();
++  if (leader_state.ok() && leader_state.status == LeaderStatus::LEADER_AND_READY) {
+     state_->context()->MajorityReplicated();
+   }
+   if (PREDICT_FALSE(!s.ok())) {
+@@ -2504,8 +2504,8 @@ RaftPeerPB::Role RaftConsensus::role() const {
+   return GetRoleUnlocked();
+ }
+ 
+-LeaderState RaftConsensus::GetLeaderState() const {
+-  return state_->GetLeaderState();
++LeaderState RaftConsensus::GetLeaderState(bool allow_stale) const {
++  return state_->GetLeaderState(allow_stale);
+ }
+ 
+ std::string RaftConsensus::LogPrefix() {
+@@ -2776,6 +2776,7 @@ void RaftConsensus::DoElectionCallback(const LeaderElectionData& data,
+   state_->UpdateOldLeaderLeaseExpirationOnNonLeaderUnlocked(
+       result.old_leader_lease, result.old_leader_ht_lease);
+ 
++  state_->SetLeaderNoOpCommittedUnlocked(false);
+   // Convert role to LEADER.
+   SetLeaderUuidUnlocked(state_->GetPeerUuid());
+ 
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index 220864c754..5cba407f01 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -167,7 +167,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   RaftPeerPB::Role role() const override;
+ 
+-  LeaderState GetLeaderState() const override;
++  LeaderState GetLeaderState(bool allow_stale = false) const override;
+ 
+   std::string peer_uuid() const override;
+ 
+diff --git a/src/yb/consensus/replica_state.cc b/src/yb/consensus/replica_state.cc
+index 1575fe6b2f..544119dc26 100644
+--- a/src/yb/consensus/replica_state.cc
++++ b/src/yb/consensus/replica_state.cc
+@@ -178,13 +178,15 @@ Status ReplicaState::LockForMajorityReplicatedIndexUpdate(UniqueLock* lock) cons
+   return Status::OK();
+ }
+ 
+-LeaderState ReplicaState::GetLeaderState() const {
++LeaderState ReplicaState::GetLeaderState(bool allow_stale) const {
+   auto cache = leader_state_cache_.load(boost::memory_order_acquire);
+ 
+-  CoarseTimePoint now = CoarseMonoClock::Now();
+-  if (now >= cache.expire_at) {
+-    auto lock = LockForRead();
+-    return RefreshLeaderStateCacheUnlocked(&now);
++  if (!allow_stale) {
++    CoarseTimePoint now = CoarseMonoClock::Now();
++    if (now >= cache.expire_at) {
++      auto lock = LockForRead();
++      return RefreshLeaderStateCacheUnlocked(&now);
++    }
+   }
+ 
+   LeaderState result = {cache.status()};
+@@ -1263,6 +1265,8 @@ consensus::LeaderState ReplicaState::RefreshLeaderStateCacheUnlocked(CoarseTimeP
+ }
+ 
+ void ReplicaState::SetLeaderNoOpCommittedUnlocked(bool value) {
++  LOG_WITH_PREFIX(INFO) << __func__ << "(" << value << ")";
++
+   leader_no_op_committed_ = value;
+   CoarseTimePoint now;
+   RefreshLeaderStateCacheUnlocked(&now);
+diff --git a/src/yb/consensus/replica_state.h b/src/yb/consensus/replica_state.h
+index e0cfd25f4f..2d00a20a87 100644
+--- a/src/yb/consensus/replica_state.h
++++ b/src/yb/consensus/replica_state.h
+@@ -170,7 +170,7 @@ class ReplicaState {
+   // Returns OK if leader, IllegalState otherwise.
+   CHECKED_STATUS CheckActiveLeaderUnlocked(LeaderLeaseCheckMode lease_check_mode) const;
+ 
+-  LeaderState GetLeaderState() const;
++  LeaderState GetLeaderState(bool allow_stale = false) const;
+ 
+   // now is used as a cache for current time. It is in/out parameter and could contain or receive
+   // current time if it was used during leader state calculation.
+diff --git a/src/yb/integration-tests/cassandra_cpp_driver-test.cc b/src/yb/integration-tests/cassandra_cpp_driver-test.cc
+index 87d5c090db..66afee6599 100644
+--- a/src/yb/integration-tests/cassandra_cpp_driver-test.cc
++++ b/src/yb/integration-tests/cassandra_cpp_driver-test.cc
+@@ -1326,6 +1326,8 @@ class CppCassandraDriverLowSoftLimitTest : public CppCassandraDriverTest {
+ 
+ TEST_F_EX(CppCassandraDriverTest, BatchWriteDuringSoftMemoryLimit,
+           CppCassandraDriverLowSoftLimitTest) {
++  FLAGS_external_mini_cluster_max_log_bytes = 512_MB;
++
+   constexpr int kBatchSize = 500;
+   constexpr int kWriters = 4;
+   constexpr int kNumMetrics = 5;
+@@ -1377,7 +1379,7 @@ TEST_F_EX(CppCassandraDriverTest, BatchWriteDuringSoftMemoryLimit,
+   thread_holder.WaitAndStop(30s);
+   auto total_writes_value = total_writes.load();
+   LOG(INFO) << "Total writes: " << total_writes_value;
+-  ASSERT_GE(total_writes_value, RegularBuildVsSanitizers(1500, 100));
++  ASSERT_GE(total_writes_value, RegularBuildVsSanitizers(1500, 50));
+ }
+ 
+ class CppCassandraDriverBackpressureTest : public CppCassandraDriverTest {
+diff --git a/src/yb/master/master_tserver.cc b/src/yb/master/master_tserver.cc
+index 0af1a1d0cf..6c11e147b7 100644
+--- a/src/yb/master/master_tserver.cc
++++ b/src/yb/master/master_tserver.cc
+@@ -62,12 +62,12 @@ Status MasterTabletServer::GetTabletStatus(const tserver::GetTabletStatusRequest
+   return Status::OK();
+ }
+ 
+-bool MasterTabletServer::LeaderAndReady(const TabletId& tablet_id) const {
++bool MasterTabletServer::LeaderAndReady(const TabletId& tablet_id, bool allow_stale) const {
+   std::shared_ptr<tablet::TabletPeer> tablet_peer;
+   if (!GetTabletPeer(tablet_id, &tablet_peer).ok()) {
+     return false;
+   }
+-  return tablet_peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
++  return tablet_peer->LeaderStatus(allow_stale) == consensus::LeaderStatus::LEADER_AND_READY;
+ }
+ 
+ const NodeInstancePB& MasterTabletServer::NodeInstance() const {
+diff --git a/src/yb/master/master_tserver.h b/src/yb/master/master_tserver.h
+index 8cc064a937..0cc7be62b2 100644
+--- a/src/yb/master/master_tserver.h
++++ b/src/yb/master/master_tserver.h
+@@ -44,7 +44,7 @@ class MasterTabletServer : public tserver::TabletServerIf,
+   CHECKED_STATUS GetTabletStatus(const tserver::GetTabletStatusRequestPB* req,
+                                  tserver::GetTabletStatusResponsePB* resp) const override;
+ 
+-  bool LeaderAndReady(const TabletId& tablet_id) const override;
++  bool LeaderAndReady(const TabletId& tablet_id, bool allow_stale = false) const override;
+ 
+   const NodeInstancePB& NodeInstance() const override;
+ 
+diff --git a/src/yb/rpc/service_pool.cc b/src/yb/rpc/service_pool.cc
+index fd9feba420..12be2d9eaa 100644
+--- a/src/yb/rpc/service_pool.cc
++++ b/src/yb/rpc/service_pool.cc
+@@ -342,14 +342,11 @@ class ServicePoolImpl final : public InboundCallHandler {
+     time += kTimeoutCheckGranularity;
+     while (CoarseTimePoint(next_check_timeout) > time) {
+       if (next_check_timeout_.compare_exchange_weak(
+-          next_check_timeout, time.time_since_epoch(),
+-          std::memory_order_acq_rel)) {
++              next_check_timeout, time.time_since_epoch(), std::memory_order_acq_rel)) {
+         check_timeout_strand_.dispatch([this, time] {
+           auto check_timeout_task = check_timeout_task_.load(std::memory_order_acquire);
+           if (check_timeout_task != kUninitializedScheduledTaskId) {
+             scheduler_.Abort(check_timeout_task);
+-          } else {
+-            DCHECK_EQ(scheduled_tasks_.load(std::memory_order_acquire), 0);
+           }
+           scheduled_tasks_.fetch_add(1, std::memory_order_acq_rel);
+           auto task_id = scheduler_.Schedule(
+diff --git a/src/yb/tablet/mvcc.cc b/src/yb/tablet/mvcc.cc
+index 56ec30d769..1cf49e4a9a 100644
+--- a/src/yb/tablet/mvcc.cc
++++ b/src/yb/tablet/mvcc.cc
+@@ -138,7 +138,7 @@ void MvccManager::AddPending(HybridTime* ht) {
+           last_replicated_,
+           last_ht_in_queue});
+ 
+-  if (!queue_.empty() && *ht <= sanity_check_lower_bound) {
++  if (*ht <= sanity_check_lower_bound) {
+     auto get_details_msg = [&](bool drain_aborted) {
+       std::ostringstream ss;
+ #define LOG_INFO_FOR_HT_LOWER_BOUND(t) \
+@@ -149,7 +149,7 @@ void MvccManager::AddPending(HybridTime* ht) {
+           << "\n  " << EXPR_VALUE_FOR_LOG(ht->PhysicalDiff(t.safe_time)) \
+           << "\n  "
+ 
+-      ss << LogPrefix() << ": new operation's hybrid time too low: " << *ht
++      ss << "New operation's hybrid time too low: " << *ht
+          << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_with_lease_)
+          << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_without_lease_)
+          << LOG_INFO_FOR_HT_LOWER_BOUND(max_safe_time_returned_for_follower_)
+@@ -179,7 +179,7 @@ void MvccManager::AddPending(HybridTime* ht) {
+         sanity_check_lower_bound &&
+         sanity_check_lower_bound != HybridTime::kMax) {
+       HybridTime incremented_hybrid_time = sanity_check_lower_bound.Incremented();
+-      YB_LOG_EVERY_N_SECS(WARNING, 5)
++      YB_LOG_EVERY_N_SECS(ERROR, 5) << LogPrefix()
+           << "Assigning an artificially incremented hybrid time: " << incremented_hybrid_time
+           << ". This needs to be investigated. " << get_details_msg(/* drain_aborted */ false);
+       *ht = incremented_hybrid_time;
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 1458abae43..c6c83d6e0c 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -736,8 +736,10 @@ void Tablet::StartOperation(WriteOperationState* operation_state) {
+   // before a crash or at another node.
+   HybridTime ht = operation_state->hybrid_time_even_if_unset();
+   bool was_valid = ht.is_valid();
+-  mvcc_.AddPending(&ht);
+   if (!was_valid) {
++    // Add only leader operation here, since follower operations already registered in MVCC,
++    // as soon as they received.
++    mvcc_.AddPending(&ht);
+     operation_state->set_hybrid_time(ht);
+   }
+ }
+diff --git a/src/yb/tablet/tablet_bootstrap.cc b/src/yb/tablet/tablet_bootstrap.cc
+index 4ae2d80179..18fcdc7219 100644
+--- a/src/yb/tablet/tablet_bootstrap.cc
++++ b/src/yb/tablet/tablet_bootstrap.cc
+@@ -1015,7 +1015,10 @@ void TabletBootstrap::PlayWriteRequest(ReplicateMsg* replicate_msg) {
+ 
+   WriteOperationState operation_state(nullptr, write, nullptr);
+   operation_state.mutable_op_id()->CopyFrom(replicate_msg->id());
+-  operation_state.set_hybrid_time(HybridTime(replicate_msg->hybrid_time()));
++  HybridTime hybrid_time(replicate_msg->hybrid_time());
++  operation_state.set_hybrid_time(hybrid_time);
++
++  tablet_->mvcc_manager()->AddPending(&hybrid_time);
+ 
+   tablet_->StartOperation(&operation_state);
+ 
+@@ -1024,7 +1027,7 @@ void TabletBootstrap::PlayWriteRequest(ReplicateMsg* replicate_msg) {
+ 
+   WARN_NOT_OK(tablet_->ApplyRowOperations(&operation_state), "ApplyRowOperations failed: ");
+ 
+-  tablet_->mvcc_manager()->Replicated(operation_state.hybrid_time());
++  tablet_->mvcc_manager()->Replicated(hybrid_time);
+ }
+ 
+ Status TabletBootstrap::PlayChangeMetadataRequest(ReplicateMsg* replicate_msg) {
+diff --git a/src/yb/tablet/tablet_peer.cc b/src/yb/tablet/tablet_peer.cc
+index f63d3c808c..f91fd2bedc 100644
+--- a/src/yb/tablet/tablet_peer.cc
++++ b/src/yb/tablet/tablet_peer.cc
+@@ -870,6 +870,7 @@ Status TabletPeer::StartReplicaOperation(
+   // This sets the monotonic counter to at least replicate_msg.monotonic_counter() atomically.
+   tablet_->UpdateMonotonicCounter(replicate_msg->monotonic_counter());
+ 
++  auto operation_type = operation->operation_type();
+   OperationDriverPtr driver = VERIFY_RESULT(NewReplicaOperationDriver(&operation));
+ 
+   // Unretained is required to avoid a refcount cycle.
+@@ -879,6 +880,11 @@ Status TabletPeer::StartReplicaOperation(
+   if (propagated_safe_time) {
+     driver->SetPropagatedSafeTime(propagated_safe_time, tablet_->mvcc_manager());
+   }
++
++  if (operation_type == OperationType::kWrite) {
++    tablet()->mvcc_manager()->AddPending(&ht);
++  }
++
+   driver->ExecuteAsync();
+   return Status::OK();
+ }
+@@ -1003,13 +1009,13 @@ int64_t TabletPeer::LeaderTerm() const {
+   return consensus ? consensus->LeaderTerm() : yb::OpId::kUnknownTerm;
+ }
+ 
+-consensus::LeaderStatus TabletPeer::LeaderStatus() const {
++consensus::LeaderStatus TabletPeer::LeaderStatus(bool allow_stale) const {
+   shared_ptr<consensus::Consensus> consensus;
+   {
+     std::lock_guard<simple_spinlock> lock(lock_);
+     consensus = consensus_;
+   }
+-  return consensus ? consensus->GetLeaderStatus() : consensus::LeaderStatus::NOT_LEADER;
++  return consensus ? consensus->GetLeaderStatus(allow_stale) : consensus::LeaderStatus::NOT_LEADER;
+ }
+ 
+ HybridTime TabletPeer::HtLeaseExpiration() const {
+diff --git a/src/yb/tablet/tablet_peer.h b/src/yb/tablet/tablet_peer.h
+index f6300626de..7473955691 100644
+--- a/src/yb/tablet/tablet_peer.h
++++ b/src/yb/tablet/tablet_peer.h
+@@ -288,7 +288,7 @@ class TabletPeer : public consensus::ConsensusContext,
+   }
+ 
+   int64_t LeaderTerm() const override;
+-  consensus::LeaderStatus LeaderStatus() const;
++  consensus::LeaderStatus LeaderStatus(bool allow_stale = false) const;
+ 
+   HybridTime HtLeaseExpiration() const override;
+ 
+diff --git a/src/yb/tserver/tablet_server.cc b/src/yb/tserver/tablet_server.cc
+index 3012cec603..9ccfe3e284 100644
+--- a/src/yb/tserver/tablet_server.cc
++++ b/src/yb/tserver/tablet_server.cc
+@@ -365,12 +365,12 @@ Status TabletServer::GetTabletStatus(const GetTabletStatusRequestPB* req,
+   return Status::OK();
+ }
+ 
+-bool TabletServer::LeaderAndReady(const TabletId& tablet_id) const {
++bool TabletServer::LeaderAndReady(const TabletId& tablet_id, bool allow_stale) const {
+   tablet::TabletPeerPtr peer;
+   if (!tablet_manager_->LookupTablet(tablet_id, &peer)) {
+     return false;
+   }
+-  return peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
++  return peer->LeaderStatus(allow_stale) == consensus::LeaderStatus::LEADER_AND_READY;
+ }
+ 
+ Status TabletServer::SetUniverseKeyRegistry(
+diff --git a/src/yb/tserver/tablet_server.h b/src/yb/tserver/tablet_server.h
+index 885250f804..9a0a99e20c 100644
+--- a/src/yb/tserver/tablet_server.h
++++ b/src/yb/tserver/tablet_server.h
+@@ -145,7 +145,7 @@ class TabletServer : public server::RpcAndWebServerBase, public TabletServerIf {
+   CHECKED_STATUS GetTabletStatus(const GetTabletStatusRequestPB* req,
+                                  GetTabletStatusResponsePB* resp) const override;
+ 
+-  bool LeaderAndReady(const TabletId& tablet_id) const override;
++  bool LeaderAndReady(const TabletId& tablet_id, bool allow_stale = false) const override;
+ 
+   const std::string& permanent_uuid() const { return fs_manager_->uuid(); }
+ 

@@ -1,0 +1,215 @@
+diff --git a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgCacheConsistency.java b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgCacheConsistency.java
+index d021ef3f60..fc0887f234 100644
+--- a/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgCacheConsistency.java
++++ b/java/yb-pgsql/src/test/java/org/yb/pgsql/TestPgCacheConsistency.java
+@@ -664,6 +664,62 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
+     }
+   }
+ 
++  @Test
++  public void testDefaultPartitionConsistency() throws Exception {
++    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
++         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
++         Statement stmt1 = connection1.createStatement();
++         Statement stmt2 = connection2.createStatement()) {
++
++      // Create a partitioned table and and a default partition in connection1.
++      stmt1.executeUpdate("CREATE TABLE prt (a int, b varchar) PARTITION BY RANGE(a)");
++      stmt1.executeUpdate("CREATE TABLE prt_default PARTITION OF prt DEFAULT");
++
++      // Concurrently create/attach a new partition in connection 2 while inserting data into the
++      // parent partitioned table in connection 1 and verify that the data is routed to the
++      // newly created partition.
++      for (int part_idx = 0; part_idx < 50; ++part_idx) {
++        final int startPartition = 10 * part_idx;
++        final int endPartition = 10 * (part_idx + 1);
++
++        // Alternatively test creating a new partition and attaching a new partition.
++        if (part_idx % 2 == 1) {
++          stmt2.executeUpdate(String.format("CREATE TABLE prt_p%d (a int, b varchar)",
++                                            part_idx + 1));
++          stmt2.executeUpdate(String.format(
++              "ALTER TABLE prt ATTACH PARTITION prt_p%d FOR VALUES FROM (%d) TO (%d)",
++              part_idx + 1, startPartition, endPartition));
++        } else {
++          stmt2.executeUpdate(String.format(
++                  "CREATE TABLE prt_p%d PARTITION OF prt FOR VALUES FROM (%d) TO (%d)",
++                  part_idx + 1, startPartition, endPartition));
++        }
++
++        // Now insert data into the parent partitioned table that matches this new partition. Verify
++        // that either this statement fails due to schema version mismatch or the row is inserted
++        // into the new partition.
++        try {
++          stmt1.executeUpdate(String.format("INSERT INTO prt(a,b) VALUES (%d, 'abc')",
++                                            startPartition + 1));
++        } catch (Exception e) {
++          final String msg = e.getMessage();
++          if (!(msg.contains("schema version mismatch"))) {
++            LOG.error("Unexpected exception", e);
++            fail("Unexpected exception");
++            continue;
++          }
++        }
++
++        // There should be no rows in the default partition. The new row should have moved into the
++        // newly created partition.
++        final String default_query = "SELECT * FROM prt_default WHERE a>0";
++        assertEquals(getRowList(stmt1, default_query).size(), 0);
++        String query = String.format("SELECT * FROM prt_p%d", part_idx + 1);
++        assertEquals(getRowList(stmt1, query).size(), 1);
++      }
++    }
++  }
++
+   private static Optional<Throwable> captureThrow(ThrowingRunnable action) {
+     try {
+       action.run();
+diff --git a/src/postgres/src/backend/commands/tablecmds.c b/src/postgres/src/backend/commands/tablecmds.c
+index 6ea650ded8..eba443345d 100644
+--- a/src/postgres/src/backend/commands/tablecmds.c
++++ b/src/postgres/src/backend/commands/tablecmds.c
+@@ -1094,6 +1094,25 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+ 		if (OidIsValid(defaultPartOid))
+ 		{
+ 			check_default_partition_contents(parent, defaultRel, bound);
++
++			if (IsYugaByteEnabled())
++			{
++				/*
++				* Increment the schema version of the default partition to
++				* ensure concurrent operations do not insert any data matching
++				* this new partition into the default partition.
++				*/
++				YBCPgStatement alter_cmd_handle = NULL;
++				HandleYBStatus(
++					YBCPgNewAlterTable(
++						YBCGetDatabaseOidByRelid(defaultPartOid),
++						YbGetStorageRelid(defaultRel),
++						&alter_cmd_handle));
++				HandleYBStatus(
++					YBCPgAlterTableIncrementSchemaVersion(alter_cmd_handle));
++				YBCExecAlterTable(alter_cmd_handle, defaultPartOid);
++			}
++
+ 			/* Keep the lock until commit. */
+ 			heap_close(defaultRel, NoLock);
+ 		}
+diff --git a/src/postgres/src/backend/commands/ybccmds.c b/src/postgres/src/backend/commands/ybccmds.c
+index 38248115d2..b2d84aed66 100644
+--- a/src/postgres/src/backend/commands/ybccmds.c
++++ b/src/postgres/src/backend/commands/ybccmds.c
+@@ -30,6 +30,7 @@
+ #include "catalog/index.h"
+ #include "catalog/indexing.h"
+ #include "catalog/namespace.h"
++#include "catalog/partition.h"
+ #include "catalog/pg_am.h"
+ #include "catalog/pg_attribute.h"
+ #include "catalog/pg_class.h"
+@@ -1285,8 +1286,7 @@ YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, List *handles,
+ 					YBCPgAlterTableIncrementSchemaVersion(
+ 						increment_schema_handle));
+ 			}
+-			Relation dependent_rel = NULL;
+-			YBCPgStatement alter_cmd_handle = NULL;
++			List* dependent_rels = NIL;
+ 			/*
+ 			 * For attach and detach partition cases, assigning
+ 			 * the partition table as dependent relation.
+@@ -1308,16 +1308,43 @@ YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, List *handles,
+ 					return handles;
+ 				}
+ 
+-				dependent_rel = heap_openrv(partition_rv, AccessExclusiveLock);
++				List* affectedPartitions = NIL;
++				affectedPartitions = lappend(affectedPartitions,
++					heap_openrv(partition_rv, AccessExclusiveLock));
++
++				/*
++				 * While attaching a partition to the parent partitioned table,
++				 * additionally increment the schema version of the default
++				 * partition as well. This will prevent any concurrent
++				 * operations inserting data matching this new partition from
++				 * being inserted into the default partition
++				 */
++
++				if (cmd->subtype == AT_AttachPartition)
++				{
++					Oid defaultOid = get_default_partition_oid(rel->rd_id);
++					if (OidIsValid(defaultOid))
++					{
++						Relation defaultPartition = heap_open(defaultOid, AccessExclusiveLock);
++						affectedPartitions = lappend(affectedPartitions, defaultPartition);
++					}
++				}
++
+ 				/*
+ 				 * If the partition table is not YB supported table including
+ 				 * foreign table, skip schema version increment.
+ 				 */
+-				if (!IsYBBackedRelation(dependent_rel) ||
+-					dependent_rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
++				ListCell *lc = NULL;
++				foreach(lc, affectedPartitions)
+ 				{
+-					heap_close(dependent_rel, AccessExclusiveLock);
+-					dependent_rel = NULL;
++					Relation partition = (Relation) lfirst(lc);
++					if (!IsYBBackedRelation(partition) ||
++						partition->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
++					{
++						heap_close(partition, AccessExclusiveLock);
++						continue;
++					}
++					dependent_rels = lappend(dependent_rels, partition);
+ 				}
+ 			}
+ 			/*
+@@ -1327,8 +1354,9 @@ YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, List *handles,
+ 			else if (cmd->subtype == AT_AddConstraintRecurse &&
+ 					 ((Constraint *) cmd->def)->contype == CONSTR_FOREIGN)
+ 			{
+-				dependent_rel = heap_openrv(((Constraint *) cmd->def)->pktable,
+-											AccessExclusiveLock);
++				dependent_rels = lappend(dependent_rels,
++					heap_openrv(((Constraint *) cmd->def)->pktable,
++								AccessExclusiveLock));
+ 			}
+ 			/*
+ 			 * For drop foreign key case, assigning the primary key table
+@@ -1378,8 +1406,8 @@ YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, List *handles,
+ 					if (con->contype == CONSTRAINT_FOREIGN &&
+ 						relationId != con->confrelid)
+ 					{
+-						dependent_rel = heap_open(con->confrelid,
+-												  AccessExclusiveLock);
++						dependent_rels = lappend(dependent_rels,
++							heap_open(con->confrelid, AccessExclusiveLock));
+ 					}
+ 				}
+ 			}
+@@ -1401,16 +1429,20 @@ YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, List *handles,
+ 							 errmsg("This ALTER TABLE command is"
+ 									" not yet supported.")));
+ 				}
+-				dependent_rel = heap_openrv(index->relation,
+-											AccessExclusiveLock);
++				dependent_rels = lappend(dependent_rels,
++					heap_openrv(index->relation, AccessExclusiveLock));
+ 			}
+ 			/*
+ 			 * If dependent relation exists, apply increment schema version
+ 			 * operation on the dependent relation.
+ 			 */
+-			if (dependent_rel != NULL)
++			ListCell *lc = NULL;
++			foreach(lc, dependent_rels)
+ 			{
++				Relation dependent_rel = (Relation) lfirst(lc);
++				Assert(dependent_rel != NULL);
+ 				Oid relationId = RelationGetRelid(dependent_rel);
++				YBCPgStatement alter_cmd_handle = NULL;
+ 				HandleYBStatus(
+ 					YBCPgNewAlterTable(
+ 						YBCGetDatabaseOidByRelid(relationId),

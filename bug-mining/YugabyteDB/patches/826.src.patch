@@ -1,0 +1,216 @@
+diff --git a/src/yb/docdb/consensus_frontier.cc b/src/yb/docdb/consensus_frontier.cc
+index 6e5a37b14d..10bc54a6d0 100644
+--- a/src/yb/docdb/consensus_frontier.cc
++++ b/src/yb/docdb/consensus_frontier.cc
+@@ -203,6 +203,20 @@ bool ConsensusFrontier::IsUpdateValid(
+          IsUpdateValidForField(hybrid_time_, rhs.hybrid_time_, update_type);
+ }
+ 
++void ConsensusFrontier::UpdateSchemaVersion(
++    const Uuid& table_id, SchemaVersion version, rocksdb::UpdateUserValueType type) {
++  if (table_id.IsNil()) {
++    UpdateField(&primary_schema_version_, std::optional(version), type);
++  } else {
++    auto it = cotable_schema_versions_.find(table_id);
++    if (it == cotable_schema_versions_.end()) {
++      cotable_schema_versions_[table_id] = version;
++    } else {
++      UpdateField(&it->second, version, type);
++    }
++  }
++}
++
+ void ConsensusFrontier::AddSchemaVersion(const Uuid& table_id, SchemaVersion version) {
+   if (table_id.IsNil()) {
+     primary_schema_version_ = version;
+diff --git a/src/yb/docdb/consensus_frontier.h b/src/yb/docdb/consensus_frontier.h
+index 5316bf92d1..88f5798e0b 100644
+--- a/src/yb/docdb/consensus_frontier.h
++++ b/src/yb/docdb/consensus_frontier.h
+@@ -80,6 +80,8 @@ class ConsensusFrontier : public rocksdb::UserFrontier {
+     hybrid_time_filter_ = value;
+   }
+ 
++  void UpdateSchemaVersion(
++      const Uuid& table_id, SchemaVersion version, rocksdb::UpdateUserValueType type);
+   void AddSchemaVersion(const Uuid& table_id, SchemaVersion version);
+   void ResetSchemaVersion();
+ 
+diff --git a/src/yb/docdb/doc_read_context.cc b/src/yb/docdb/doc_read_context.cc
+index 18dc7096ee..2faa02804e 100644
+--- a/src/yb/docdb/doc_read_context.cc
++++ b/src/yb/docdb/doc_read_context.cc
+@@ -25,7 +25,8 @@ DocReadContext::DocReadContext(const std::string& log_prefix, const Schema& sche
+                                SchemaVersion schema_version)
+     : schema(schema_), log_prefix_(log_prefix) {
+   schema_packing_storage.AddSchema(schema_version, schema_);
+-  LOG_WITH_PREFIX(INFO) << "DocReadContext, from schema, version: " << schema_version;
++  LOG_IF_WITH_PREFIX(INFO, schema_version != 0)
++      << "DocReadContext, from schema, version: " << schema_version;
+ }
+ 
+ DocReadContext::DocReadContext(
+diff --git a/src/yb/docdb/rocksdb_writer.cc b/src/yb/docdb/rocksdb_writer.cc
+index 95b157d066..3b0281a9d2 100644
+--- a/src/yb/docdb/rocksdb_writer.cc
++++ b/src/yb/docdb/rocksdb_writer.cc
+@@ -29,6 +29,7 @@
+ 
+ #include "yb/util/bitmap.h"
+ #include "yb/util/debug-util.h"
++#include "yb/util/fast_varint.h"
+ #include "yb/util/flags.h"
+ #include "yb/util/pb_util.h"
+ 
+@@ -574,6 +575,17 @@ Result<bool> ApplyIntentsContext::Entry(
+     YB_TRANSACTION_DUMP(
+         ApplyIntent, transaction_id(), intent.doc_path.size(), intent.doc_path,
+         commit_ht_, write_id_, decoded_value.body);
++
++    if (frontiers_) {
++      Slice value_slice = decoded_value.body;
++      RETURN_NOT_OK(ValueControlFields::Decode(&value_slice));
++      if (value_slice.TryConsumeByte(ValueEntryTypeAsChar::kPackedRow)) {
++        auto schema_version = narrow_cast<SchemaVersion>(VERIFY_RESULT(
++            util::FastDecodeUnsignedVarInt(&value_slice)));
++        min_schema_version_ = std::min(min_schema_version_, schema_version);
++        max_schema_version_ = std::max(max_schema_version_, schema_version);
++      }
++    }
+   }
+ 
+   return false;
+@@ -585,6 +597,13 @@ void ApplyIntentsContext::Complete(rocksdb::DirectWriteHandler* handler) {
+     std::array<Slice, 1> value_parts = {{Slice(&tombstone_value_type, 1)}};
+     PutApplyState(transaction_id().AsSlice(), commit_ht_, write_id_, value_parts, handler);
+   }
++  if (min_schema_version_ <= max_schema_version_) {
++    auto table_id = Uuid::Nil();
++    frontiers_->Smallest().UpdateSchemaVersion(
++        table_id, min_schema_version_, rocksdb::UpdateUserValueType::kSmallest);
++    frontiers_->Largest().UpdateSchemaVersion(
++        table_id, max_schema_version_, rocksdb::UpdateUserValueType::kLargest);
++  }
+ }
+ 
+ RemoveIntentsContext::RemoveIntentsContext(const TransactionId& transaction_id, uint8_t reason)
+diff --git a/src/yb/docdb/rocksdb_writer.h b/src/yb/docdb/rocksdb_writer.h
+index af743a80b5..bf8669239a 100644
+--- a/src/yb/docdb/rocksdb_writer.h
++++ b/src/yb/docdb/rocksdb_writer.h
+@@ -17,6 +17,7 @@
+ #include "yb/common/hybrid_time.h"
+ #include "yb/common/transaction.h"
+ 
++#include "yb/docdb/consensus_frontier.h"
+ #include "yb/docdb/docdb.h"
+ #include "yb/docdb/docdb.fwd.h"
+ #include "yb/docdb/docdb_fwd.h"
+@@ -197,6 +198,10 @@ class ApplyIntentsContext : public IntentsWriterContext {
+ 
+   void Complete(rocksdb::DirectWriteHandler* handler) override;
+ 
++  void SetFrontiers(ConsensusFrontiers* frontiers) {
++    frontiers_ = frontiers;
++  }
++
+  private:
+   Result<bool> StoreApplyState(const Slice& key, rocksdb::DirectWriteHandler* handler);
+ 
+@@ -207,6 +212,9 @@ class ApplyIntentsContext : public IntentsWriterContext {
+   IntraTxnWriteId write_id_;
+   const KeyBounds* key_bounds_;
+   BoundedRocksDbIterator intent_iter_;
++  SchemaVersion min_schema_version_ = std::numeric_limits<SchemaVersion>::max();
++  SchemaVersion max_schema_version_ = std::numeric_limits<SchemaVersion>::min();
++  ConsensusFrontiers* frontiers_;
+ };
+ 
+ class RemoveIntentsContext : public IntentsWriterContext {
+diff --git a/src/yb/rocksdb/db/write_batch.cc b/src/yb/rocksdb/db/write_batch.cc
+index 4585a7c7f9..069083b518 100644
+--- a/src/yb/rocksdb/db/write_batch.cc
++++ b/src/yb/rocksdb/db/write_batch.cc
+@@ -347,9 +347,6 @@ Status WriteBatch::Iterate(Handler* handler) const {
+   size_t found = 0;
+   Status s;
+ 
+-  if (frontiers_) {
+-    s = handler->Frontiers(*frontiers_);
+-  }
+   if (s.ok() && direct_writer_) {
+     auto result = DirectInsert(handler, direct_writer_, handler_for_logging_);
+     if (result.ok()) {
+@@ -358,6 +355,9 @@ Status WriteBatch::Iterate(Handler* handler) const {
+       s = result.status();
+     }
+   }
++  if (frontiers_) {
++    s = handler->Frontiers(*frontiers_);
++  }
+   while (s.ok() && !input.empty() && handler->Continue()) {
+     char tag = 0;
+     uint32_t column_family = 0;  // default
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 9d9c03460e..55d90f9fbb 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -1874,6 +1874,7 @@ Result<docdb::ApplyTransactionState> Tablet::ApplyIntents(const TransactionApply
+   // We don't set transaction field of put_batch, otherwise we would write another bunch of intents.
+   docdb::ConsensusFrontiers frontiers;
+   auto frontiers_ptr = data.op_id.empty() ? nullptr : InitFrontiers(data, &frontiers);
++  context.SetFrontiers(frontiers_ptr);
+   WriteToRocksDB(frontiers_ptr, &regular_write_batch, StorageDbType::kRegular);
+   return context.apply_state();
+ }
+diff --git a/src/yb/yql/pgwrapper/pg_packed_row-test.cc b/src/yb/yql/pgwrapper/pg_packed_row-test.cc
+index b55915166d..c09456d37d 100644
+--- a/src/yb/yql/pgwrapper/pg_packed_row-test.cc
++++ b/src/yb/yql/pgwrapper/pg_packed_row-test.cc
+@@ -33,10 +33,11 @@ using namespace std::literals;
+ 
+ DECLARE_bool(ysql_enable_packed_row);
+ DECLARE_int32(history_cutoff_propagation_interval_ms);
++DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
+ DECLARE_int32(timestamp_history_retention_interval_sec);
++DECLARE_uint64(rocksdb_universal_compaction_always_include_size_threshold);
+ DECLARE_uint64(ysql_packed_row_size_limit);
+ DECLARE_bool(ysql_enable_packed_row_for_colocated_table);
+-
+ DECLARE_bool(TEST_skip_aborting_active_transactions_during_schema_change);
+ 
+ namespace yb {
+@@ -682,5 +683,33 @@ TEST_F(PgPackedRowTest, YB_DISABLE_TEST_IN_TSAN(Transaction)) {
+   ASSERT_OK(cluster_->CompactTablets());
+ }
+ 
++TEST_F(PgPackedRowTest, YB_DISABLE_TEST_IN_TSAN(AppliedSchemaVersion)) {
++  // Set retention interval to 0, to repack all recently flushed entries.
++  FLAGS_timestamp_history_retention_interval_sec = 0;
++  FLAGS_rocksdb_level0_file_num_compaction_trigger = 2;
++  FLAGS_rocksdb_universal_compaction_always_include_size_threshold = 1_KB;
++
++  auto conn = ASSERT_RESULT(Connect());
++
++  ASSERT_OK(conn.Execute("CREATE TABLE t (key TEXT PRIMARY KEY) SPLIT INTO 1 TABLETS"));
++
++  ASSERT_OK(conn.StartTransaction(IsolationLevel::SNAPSHOT_ISOLATION));
++  ASSERT_OK(conn.ExecuteFormat(
++      "INSERT INTO t (key) VALUES ('$0')", RandomHumanReadableString(512_KB)));
++  ASSERT_OK(conn.CommitTransaction());
++
++  std::this_thread::sleep_for(5s);
++  ASSERT_OK(cluster_->FlushTablets());
++
++  ASSERT_OK(conn.Execute("ALTER TABLE t ADD COLUMN v TEXT"));
++
++  for (int i = 0; i != FLAGS_rocksdb_level0_file_num_compaction_trigger * 2; ++i) {
++    ASSERT_OK(conn.ExecuteFormat("INSERT INTO t (key) VALUES ('$0')", i));
++    ASSERT_OK(cluster_->FlushTablets());
++  }
++
++  ASSERT_OK(cluster_->CompactTablets());
++}
++
+ } // namespace pgwrapper
+ } // namespace yb

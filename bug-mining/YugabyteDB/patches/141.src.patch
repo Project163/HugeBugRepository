@@ -1,0 +1,342 @@
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index 45cbbc8555..edff7cdbe2 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -19,6 +19,7 @@
+ #include "yb/client/transaction.h"
+ 
+ #include "yb/consensus/raft_consensus.h"
++#include "yb/consensus/replica_state.h"
+ #include "yb/consensus/retryable_requests.h"
+ 
+ #include "yb/docdb/consensus_frontier.h"
+@@ -643,5 +644,44 @@ TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingl
+   ASSERT_GT(finish_op_id.index, key);
+ }
+ 
++TEST_F_EX(QLStressTest, SlowUpdateConsensus, QLStressTestSingleTablet) {
++  std::atomic<bool> stop(false);
++  std::atomic<int> key(0);
++
++  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kNonLeaders);
++  ASSERT_EQ(peers.size(), 2);
++
++  down_cast<consensus::RaftConsensus*>(peers[0]->consensus())->TEST_DelayUpdate(20s);
++
++  std::thread writer([this, &stop, &key] {
++    auto session = NewSession();
++    std::string value_prefix = std::string(100_KB, 'X');
++    while (!stop.load(std::memory_order_acquire)) {
++      ASSERT_OK(WriteRow(session, key, value_prefix + std::to_string(key)));
++      std::this_thread::sleep_for(100ms);
++      ++key;
++    }
++  });
++
++  BOOST_SCOPE_EXIT(&stop, &writer) {
++    stop.store(true);
++    writer.join();
++  } BOOST_SCOPE_EXIT_END;
++
++  std::this_thread::sleep_for(30s);
++
++  down_cast<consensus::RaftConsensus*>(peers[0]->consensus())->TEST_DelayUpdate(0s);
++
++  int64_t max_peak_consumption = 0;
++  for (int i = 1; i <= cluster_->num_tablet_servers(); ++i) {
++    auto server_tracker = MemTracker::FindTracker(Format("server $0", i));
++    auto call_tracker = MemTracker::FindTracker("Call", server_tracker);
++    auto inbound_rpc_tracker = MemTracker::FindTracker("Inbound RPC", call_tracker);
++    max_peak_consumption = std::max(max_peak_consumption, inbound_rpc_tracker->peak_consumption());
++  }
++  LOG(INFO) << "Peak consumption: " << max_peak_consumption;
++  ASSERT_LE(max_peak_consumption, 150_MB);
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/consensus/consensus-test-util.h b/src/yb/consensus/consensus-test-util.h
+index 3e04a2cd31..e4d9b940aa 100644
+--- a/src/yb/consensus/consensus-test-util.h
++++ b/src/yb/consensus/consensus-test-util.h
+@@ -59,6 +59,8 @@
+ #include "yb/util/test_macros.h"
+ #include "yb/util/threadpool.h"
+ 
++using namespace std::literals;
++
+ #define TOKENPASTE(x, y) x ## y
+ #define TOKENPASTE2(x, y) TOKENPASTE(x, y)
+ 
+@@ -76,6 +78,10 @@ using log::Log;
+ using rpc::Messenger;
+ using strings::Substitute;
+ 
++inline CoarseTimePoint CoarseBigDeadline() {
++  return CoarseMonoClock::now() + 600s;
++}
++
+ inline ReplicateMsgPtr CreateDummyReplicate(int term,
+                                             int index,
+                                             const HybridTime& hybrid_time,
+@@ -529,7 +535,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
+     Status s = peers_->GetPeerByUuid(peer_uuid_, &peer);
+ 
+     if (s.ok()) {
+-      s = peer->Update(&request, &other_peer_resp);
++      s = peer->Update(&request, &other_peer_resp, CoarseBigDeadline());
+       if (s.ok() && !other_peer_resp.has_error()) {
+         CHECK(other_peer_resp.has_status());
+         CHECK(other_peer_resp.status().IsInitialized());
+diff --git a/src/yb/consensus/consensus.h b/src/yb/consensus/consensus.h
+index cafae00085..9524e93e68 100644
+--- a/src/yb/consensus/consensus.h
++++ b/src/yb/consensus/consensus.h
+@@ -259,7 +259,8 @@ class Consensus {
+   // stringified Status message.
+   virtual CHECKED_STATUS Update(
+       ConsensusRequestPB* request,
+-      ConsensusResponsePB* response) = 0;
++      ConsensusResponsePB* response,
++      CoarseTimePoint deadline) = 0;
+ 
+   // Messages sent from CANDIDATEs to voting peers to request their vote
+   // in leader election.
+diff --git a/src/yb/consensus/raft_consensus-test.cc b/src/yb/consensus/raft_consensus-test.cc
+index 3883727756..525a00f4ab 100644
+--- a/src/yb/consensus/raft_consensus-test.cc
++++ b/src/yb/consensus/raft_consensus-test.cc
+@@ -678,7 +678,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
+   request.mutable_committed_index()->CopyFrom(MakeOpId(3, 6));
+ 
+   ConsensusResponsePB response;
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.has_error());
+ 
+   ASSERT_TRUE(Mock::VerifyAndClearExpectations(consensus_.get()));
+@@ -693,7 +693,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
+   request.mutable_preceding_id()->CopyFrom(MakeOpId(3, 9));
+   request.mutable_committed_index()->CopyFrom(MakeOpId(3, 9));
+ 
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.has_error());
+ }
+ 
+@@ -727,7 +727,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   // Heartbeat. This will cause the term to increment on the follower.
+   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_EQ(caller_term, response.responder_term());
+   ASSERT_OPID_EQ(response.status().last_received(), MinimumOpId());
+@@ -737,7 +737,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   OpId noop_opid = MakeOpId(caller_term, ++log_index);
+   AddNoOpToConsensusRequest(&request, noop_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);
+   ASSERT_OPID_EQ(response.status().last_received_current_leader(),  noop_opid);
+@@ -750,7 +750,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   preceding_opid = noop_opid;
+   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_EQ(caller_term, response.responder_term());
+   ASSERT_OPID_EQ(response.status().last_received(), preceding_opid);
+@@ -760,7 +760,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   noop_opid = MakeOpId(caller_term, ++log_index);
+   AddNoOpToConsensusRequest(&request, noop_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);
+   ASSERT_OPID_EQ(response.status().last_received_current_leader(), noop_opid);
+@@ -771,7 +771,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   preceding_opid = MakeOpId(caller_term, log_index + 1); // Not replicated yet.
+   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_EQ(caller_term, response.responder_term());
+   ASSERT_OPID_EQ(response.status().last_received(), noop_opid); // Not preceding this time.
+   ASSERT_OPID_EQ(response.status().last_received_current_leader(), MinimumOpId());
+@@ -784,7 +784,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
+   AddNoOpToConsensusRequest(&request, noop_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_OPID_EQ(response.status().last_received(), noop_opid) << response.ShortDebugString();
+   ASSERT_OPID_EQ(response.status().last_received_current_leader(), noop_opid)
+@@ -799,7 +799,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
+   request = MakeConsensusRequest(caller_term, caller_uuid, preceding_opid);
+   AddNoOpToConsensusRequest(&request, noop_opid);
+   response.Clear();
+-  ASSERT_OK(consensus_->Update(&request, &response));
++  ASSERT_OK(consensus_->Update(&request, &response, CoarseBigDeadline()));
+   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
+   ASSERT_EQ(caller_term, response.responder_term());
+   ASSERT_OPID_EQ(response.status().last_received(), noop_opid);
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index 29b77610ab..a96f462af1 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -1135,7 +1135,8 @@ void RaftConsensus::TryRemoveFollowerTask(const string& uuid,
+ }
+ 
+ Status RaftConsensus::Update(ConsensusRequestPB* request,
+-                             ConsensusResponsePB* response) {
++                             ConsensusResponsePB* response,
++                             CoarseTimePoint deadline) {
+   if (PREDICT_FALSE(FLAGS_follower_reject_update_consensus_requests)) {
+     return STATUS(IllegalState, "Rejected: --follower_reject_update_consensus_requests "
+                                 "is set to true.");
+@@ -1169,7 +1170,13 @@ Status RaftConsensus::Update(ConsensusRequestPB* request,
+   VLOG_WITH_PREFIX(2) << "Replica received request: " << request->ShortDebugString();
+ 
+   // see var declaration
+-  std::lock_guard<std::mutex> lock(update_lock_);
++  auto wait_start = CoarseMonoClock::now();
++  auto wait_duration = deadline - wait_start;
++  std::unique_lock<decltype(update_mutex_)> lock(update_mutex_, wait_duration);
++  if (!lock.owns_lock()) {
++    return STATUS_FORMAT(TimedOut, "Unable to lock update mutex for $0", wait_duration);
++  }
++
+   Status s = UpdateReplica(request, response);
+   if (PREDICT_FALSE(VLOG_IS_ON(1))) {
+     if (request->ops_size() == 0) {
+@@ -1179,6 +1186,11 @@ Status RaftConsensus::Update(ConsensusRequestPB* request,
+   }
+   RETURN_NOT_OK(s);
+ 
++  auto delay = TEST_delay_update_.load(std::memory_order_acquire);
++  if (delay != MonoDelta::kZero) {
++    std::this_thread::sleep_for(delay.ToSteadyDuration());
++  }
++
+   RETURN_NOT_OK(ExecuteHook(POST_UPDATE));
+   return Status::OK();
+ }
+@@ -1870,7 +1882,7 @@ Status RaftConsensus::RequestVote(const VoteRequestPB* request, VoteResponsePB*
+   // We must acquire the update lock in order to ensure that this vote action
+   // takes place between requests.
+   // Lock ordering: The update lock must be acquired before the ReplicaState lock.
+-  std::unique_lock<std::mutex> update_guard(update_lock_, std::defer_lock);
++  std::unique_lock<decltype(update_mutex_)> update_guard(update_mutex_, std::defer_lock);
+   if (FLAGS_enable_leader_failure_detection) {
+     update_guard.try_lock();
+   } else {
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index 732654375a..cc3f639440 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -151,7 +151,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   CHECKED_STATUS Update(
+       ConsensusRequestPB* request,
+-      ConsensusResponsePB* response) override;
++      ConsensusResponsePB* response,
++      CoarseTimePoint deadline) override;
+ 
+   CHECKED_STATUS RequestVote(const VoteRequestPB* request,
+                              VoteResponsePB* response) override;
+@@ -228,14 +229,18 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   yb::OpId MinRetryableRequestOpId();
+ 
++  CHECKED_STATUS StartElection(const LeaderElectionData& data) override {
++    return DoStartElection(data, PreElected::kFalse);
++  }
++
+   RetryableRequestsCounts TEST_CountRetryableRequests();
+ 
+   void TEST_RejectMode(RejectMode value) {
+     reject_mode_.store(value, std::memory_order_release);
+   }
+ 
+-  CHECKED_STATUS StartElection(const LeaderElectionData& data) override {
+-    return DoStartElection(data, PreElected::kFalse);
++  void TEST_DelayUpdate(MonoDelta duration) {
++    TEST_delay_update_.store(duration, std::memory_order_release);
+   }
+ 
+  protected:
+@@ -614,12 +619,9 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   const Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk_;
+ 
+-  // TODO hack to serialize updates due to repeated/out-of-order messages
+-  // should probably be refactored out.
+-  //
+   // Lock ordering note: If both this lock and the ReplicaState lock are to be
+   // taken, this lock must be taken first.
+-  mutable std::mutex update_lock_;
++  mutable std::timed_mutex update_mutex_;
+ 
+   AtomicBool shutdown_;
+ 
+@@ -649,6 +651,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+ 
+   CoarseTimePoint disable_pre_elections_until_ = CoarseTimePoint::min();
+ 
++  std::atomic<MonoDelta> TEST_delay_update_{MonoDelta::kZero};
++
+   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
+ };
+ 
+diff --git a/src/yb/consensus/raft_consensus_quorum-test.cc b/src/yb/consensus/raft_consensus_quorum-test.cc
+index b972d6ca2f..bbbe395af0 100644
+--- a/src/yb/consensus/raft_consensus_quorum-test.cc
++++ b/src/yb/consensus/raft_consensus_quorum-test.cc
+@@ -875,7 +875,7 @@ TEST_F(RaftConsensusQuorumTest, TestReplicasEnforceTheLogMatchingProperty) {
+ 
+   // Appending this message to peer0 should work and update
+   // its 'last_received' to 'id'.
+-  ASSERT_OK(follower->Update(&req, &resp));
++  ASSERT_OK(follower->Update(&req, &resp, CoarseBigDeadline()));
+   ASSERT_TRUE(OpIdEquals(resp.status().last_received(), *id));
+ 
+   // Now skip one message in the same term. The replica should
+@@ -884,7 +884,7 @@ TEST_F(RaftConsensusQuorumTest, TestReplicasEnforceTheLogMatchingProperty) {
+   id->set_index(id->index() + 2);
+   // Appending this message to peer0 should return a Status::OK
+   // but should contain an error referring to the log matching property.
+-  ASSERT_OK(follower->Update(&req, &resp));
++  ASSERT_OK(follower->Update(&req, &resp, CoarseBigDeadline()));
+   ASSERT_TRUE(resp.has_status());
+   ASSERT_TRUE(resp.status().has_error());
+   ASSERT_EQ(resp.status().error().code(), ConsensusErrorPB::PRECEDING_ENTRY_DIDNT_MATCH);
+@@ -1001,7 +1001,7 @@ TEST_F(RaftConsensusQuorumTest, TestRequestVote) {
+   req.set_caller_uuid("peer-0");
+   req.mutable_committed_index()->CopyFrom(last_op_id);
+   ConsensusResponsePB res;
+-  Status s = peer->Update(&req, &res);
++  Status s = peer->Update(&req, &res, CoarseBigDeadline());
+   ASSERT_EQ(last_op_id.term() + 3, res.responder_term());
+   ASSERT_TRUE(res.status().has_error());
+   ASSERT_EQ(ConsensusErrorPB::INVALID_TERM, res.status().error().code());
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 6cdb590f2c..4cf60f8288 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -1354,7 +1354,8 @@ void ConsensusServiceImpl::UpdateConsensus(const ConsensusRequestPB* req,
+   // Unfortunately, we have to use const_cast here, because the protobuf-generated interface only
+   // gives us a const request, but we need to be able to move messages out of the request for
+   // efficiency.
+-  Status s = consensus->Update(const_cast<ConsensusRequestPB*>(req), resp);
++  Status s = consensus->Update(
++      const_cast<ConsensusRequestPB*>(req), resp, context.GetClientDeadline());
+   if (PREDICT_FALSE(!s.ok())) {
+     // Clear the response first, since a partially-filled response could
+     // result in confusing a caller, or in having missing required fields

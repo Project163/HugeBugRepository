@@ -1,0 +1,158 @@
+diff --git a/ent/src/yb/cdc/cdc_service.cc b/ent/src/yb/cdc/cdc_service.cc
+index bf7f914d48..fdf7481102 100644
+--- a/ent/src/yb/cdc/cdc_service.cc
++++ b/ent/src/yb/cdc/cdc_service.cc
+@@ -113,10 +113,7 @@ CDCServiceImpl::CDCServiceImpl(TSTabletManager* tablet_manager,
+ }
+ 
+ CDCServiceImpl::~CDCServiceImpl() {
+-  if (get_minimum_checkpoints_and_update_peers_thread_) {
+-    cdc_service_stopped_.store(true, std::memory_order_release);
+-    get_minimum_checkpoints_and_update_peers_thread_->join();
+-  }
++  Shutdown();
+ }
+ 
+ namespace {
+@@ -941,8 +938,15 @@ void CDCServiceImpl::BootstrapProducer(const BootstrapProducerRequestPB* req,
+ }
+ 
+ void CDCServiceImpl::Shutdown() {
+-  async_client_init_->Shutdown();
+-  rpcs_.Shutdown();
++  if (async_client_init_) {
++    async_client_init_->Shutdown();
++    rpcs_.Shutdown();
++    if (get_minimum_checkpoints_and_update_peers_thread_) {
++      cdc_service_stopped_.store(true, std::memory_order_release);
++      get_minimum_checkpoints_and_update_peers_thread_->join();
++    }
++    async_client_init_ = boost::none;
++  }
+ }
+ 
+ Result<OpId> CDCServiceImpl::GetLastCheckpoint(
+diff --git a/ent/src/yb/integration-tests/cdc_service-int-test.cc b/ent/src/yb/integration-tests/cdc_service-int-test.cc
+index e665fa5b06..370df29029 100644
+--- a/ent/src/yb/integration-tests/cdc_service-int-test.cc
++++ b/ent/src/yb/integration-tests/cdc_service-int-test.cc
+@@ -46,6 +46,7 @@ DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+ DECLARE_int32(cdc_min_replicated_index_considered_stale_secs);
+ DECLARE_int32(cdc_state_checkpoint_update_interval_ms);
+ DECLARE_int32(cdc_wal_retention_time_secs);
++DECLARE_int32(client_read_write_timeout_ms);
+ DECLARE_int32(follower_unavailable_considered_failed_sec);
+ DECLARE_int32(log_max_seconds_to_retain);
+ DECLARE_int32(log_min_seconds_to_retain);
+@@ -1408,11 +1409,12 @@ class CDCServiceTestThreeServers : public CDCServiceTest {
+     FLAGS_leader_failure_max_missed_heartbeat_periods = 12.0;
+     FLAGS_update_min_cdc_indices_interval_secs = 5;
+     FLAGS_enable_log_retention_by_op_idx = true;
++    FLAGS_client_read_write_timeout_ms = 20 * 1000 * kTimeMultiplier;
+ 
+     // Always update cdc_state table.
+     FLAGS_cdc_state_checkpoint_update_interval_ms = 0;
+ 
+-    FLAGS_follower_unavailable_considered_failed_sec = 20;
++    FLAGS_follower_unavailable_considered_failed_sec = 20 * kTimeMultiplier;
+ 
+     CDCServiceTest::SetUp();
+   }
+@@ -1549,6 +1551,7 @@ TEST_F_EX(CDCServiceTest, TestNewLeaderUpdatesLogCDCAppliedIndex, CDCServiceTest
+   ASSERT_EQ(tablet_peer->tablet_metadata()->cdc_min_replicated_index(), 5);
+ 
+   ASSERT_OK(cluster_->mini_tablet_server(leader_idx)->Start());
++  ASSERT_OK(cluster_->mini_tablet_server(leader_idx)->WaitStarted());
+ }
+ 
+ } // namespace cdc
+diff --git a/src/yb/client/table_handle.cc b/src/yb/client/table_handle.cc
+index 185e53ddd8..a99285ffbb 100644
+--- a/src/yb/client/table_handle.cc
++++ b/src/yb/client/table_handle.cc
+@@ -180,12 +180,17 @@ TableIterator::TableIterator() : table_(nullptr) {}
+     if (!status.ok()) { HandleError(MoveStatus(status)); return; } \
+   } while (false) \
+ 
++#define REPORT_AND_RETURN_FALSE_IF_NOT_OK(expr) \
++  do { \
++    auto&& status = (expr); \
++    if (!status.ok()) { HandleError(MoveStatus(status)); return false; } \
++  } while (false) \
++
+ TableIterator::TableIterator(const TableHandle* table, const TableIteratorOptions& options)
+     : table_(table), error_handler_(options.error_handler) {
+   auto client = (*table)->client();
+ 
+   session_ = client->NewSession();
+-  session_->SetTimeout(60s);
+ 
+   google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+   REPORT_AND_RETURN_IF_NOT_OK(client->GetTablets(table->name(), 0, &tablets));
+@@ -223,18 +228,19 @@ TableIterator::TableIterator(const TableHandle* table, const TableIteratorOption
+     partition_key_ends_.push_back(tablet.partition().partition_key_end());
+   }
+ 
+-  ExecuteOps();
+-  Move();
++  if (ExecuteOps()) {
++    Move();
++  }
+ }
+ 
+-void TableIterator::ExecuteOps() {
++bool TableIterator::ExecuteOps() {
+   constexpr size_t kMaxConcurrentOps = 5;
+   const size_t new_executed_ops = std::min(ops_.size(), executed_ops_ + kMaxConcurrentOps);
+   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
+-    REPORT_AND_RETURN_IF_NOT_OK(session_->Apply(ops_[i]));
++    REPORT_AND_RETURN_FALSE_IF_NOT_OK(session_->Apply(ops_[i]));
+   }
+ 
+-  REPORT_AND_RETURN_IF_NOT_OK(session_->Flush());
++  REPORT_AND_RETURN_FALSE_IF_NOT_OK(session_->Flush());
+ 
+   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
+     const auto& op = ops_[i];
+@@ -244,6 +250,7 @@ void TableIterator::ExecuteOps() {
+   }
+ 
+   executed_ops_ = new_executed_ops;
++  return true;
+ }
+ 
+ bool TableIterator::Equals(const TableIterator& rhs) const {
+@@ -273,7 +280,10 @@ void TableIterator::Move() {
+       } else {
+         ++ops_index_;
+         if (ops_index_ >= executed_ops_ && executed_ops_ < ops_.size()) {
+-          ExecuteOps();
++          if (!ExecuteOps()) {
++            // Error occurred. exit out early.
++            return;
++          }
+         }
+       }
+     }
+@@ -309,6 +319,8 @@ void TableIterator::HandleError(const Status& status) {
+ 
+     LOG(FATAL) << "Failed: " << status;
+   }
++  // Makes this iterator == end().
++  table_ = nullptr;
+ }
+ 
+ template <>
+diff --git a/src/yb/client/table_handle.h b/src/yb/client/table_handle.h
+index 00e8db68e9..dddfed6406 100644
+--- a/src/yb/client/table_handle.h
++++ b/src/yb/client/table_handle.h
+@@ -177,7 +177,7 @@ class TableIterator : public std::iterator<
+   }
+ 
+  private:
+-  void ExecuteOps();
++  bool ExecuteOps();
+   void Move();
+   void HandleError(const Status& status);
+ 

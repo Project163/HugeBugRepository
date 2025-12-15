@@ -1,0 +1,170 @@
+diff --git a/src/postgres/src/backend/tcop/postgres.c b/src/postgres/src/backend/tcop/postgres.c
+index 627851e7eb..7df8f524b9 100644
+--- a/src/postgres/src/backend/tcop/postgres.c
++++ b/src/postgres/src/backend/tcop/postgres.c
+@@ -4650,7 +4650,7 @@ YBCheckSharedCatalogCacheVersion()
+ 	if (YBCIsInitDbModeEnvVarSet())
+ 		return;
+ 
+-	const uint64_t shared_catalog_version = YbGetSharedCatalogVersion();
++	uint64_t shared_catalog_version = YbGetSharedCatalogVersion();
+ 	const uint64_t local_catalog_version = YbGetCatalogCacheVersion();
+ 	const bool	need_global_cache_refresh = (local_catalog_version <
+ 											 shared_catalog_version);
+@@ -4665,7 +4665,7 @@ YBCheckSharedCatalogCacheVersion()
+ 	}
+ 	if (need_global_cache_refresh)
+ 	{
+-		const uint32_t num_catalog_versions =
++		uint32_t num_catalog_versions =
+ 			shared_catalog_version - local_catalog_version;
+ 		YbcCatalogMessageLists message_lists = {0};
+ 		const bool enable_inval_messages =
+@@ -4673,6 +4673,20 @@ YBCheckSharedCatalogCacheVersion()
+ 			*YBCGetGFlags()->TEST_yb_enable_invalidation_messages;
+ 		if (enable_inval_messages)
+ 		{
++			const uint64_t catalog_master_version = YbGetMasterCatalogVersion();
++			if (shared_catalog_version < catalog_master_version)
++			{
++				/*
++				 * This can happen when another session executes many DDLs
++				 * in a batch, when we see a new shared catalog version has
++				 * arrived in shared memory, master may have got a even newer
++				 * version. See comments in YbWaitForSharedCatalogVersionToCatchup
++				 * for a scenario that this wait can help.
++				 */
++				YbWaitForSharedCatalogVersionToCatchup(catalog_master_version);
++				shared_catalog_version = YbGetSharedCatalogVersion();
++				num_catalog_versions = shared_catalog_version - local_catalog_version;
++			}
+ 			HandleYBStatus(YBCGetTserverCatalogMessageLists(MyDatabaseId,
+ 															local_catalog_version,
+ 															num_catalog_versions,
+diff --git a/src/postgres/src/backend/utils/misc/pg_yb_utils.c b/src/postgres/src/backend/utils/misc/pg_yb_utils.c
+index 01eee657cb..ac60080377 100644
+--- a/src/postgres/src/backend/utils/misc/pg_yb_utils.c
++++ b/src/postgres/src/backend/utils/misc/pg_yb_utils.c
+@@ -1080,6 +1080,61 @@ YBOnPostgresBackendShutdown()
+ 	YBCDestroyPgGate();
+ }
+ 
++void
++YbWaitForSharedCatalogVersionToCatchup(uint64_t version)
++{
++	if (!*YBCGetGFlags()->TEST_yb_enable_invalidation_messages)
++		return;
++
++	/*
++	 * When incremental catalog cache is enabled, we want to wait
++	 * for the yb_new_catalog_version to propagate to shared
++	 * memory of this node to allow proper ordering of the following
++	 * scenario:
++	 * SELECT * FROM foo;
++	 * \! ysqlsh -f ddl_script.sql
++	 * SELECT * FROM foo;
++	 * where ddl_script.sql may contain DDL statement(s) that caused
++	 * breaking catalog version to increment. Assume there are no other
++	 * conconcurrent DDLs. Due to heartbeat delay, we may see this
++	 * session's local catalog version as 1, shared memory catalog version
++	 * as 3, but latest breaking catalog version as 5 after ddl_script.sql
++	 * completes. With incremental cache refresh we only ask for inval
++	 * messages of version 2 and 3 and then we will start executing the
++	 * second SELECT. It is possible by the time the read RPC reaches the
++	 * target tablet server (which could be this node itself), a new
++	 * heartbeat has already updated breaking version to 5, causing the
++	 * SELECT to fail because it has only version 3. But from user's
++	 * pespective, ddl_script.sql has synchronously completed and the
++	 * second SELECT had better to see its effect as if ddl_script.sql were
++	 * executed inline from this session without an ERROR.
++	 * By waiting for yb_new_catalog_version showing up in shared memory,
++	 * we avoid the above ERROR because now we ask for inval messages
++	 * of version 2, 3, 4, 5 and the read RPC of the second SELECT will
++	 * not see the ERROR as described above.
++	 */
++	uint64_t shared_catalog_version = YbGetSharedCatalogVersion();
++
++	/* Wait up to 60 seconds, with a 0.1-second interval. */
++	int count = 0;
++	while (shared_catalog_version < version && count++ < 600)
++	{
++		/*
++		 * This can happen if database MyDatabaseId is dropped by another session.
++		 */
++		if (shared_catalog_version == YB_CATCACHE_VERSION_UNINITIALIZED)
++			return;
++		ereport(LOG,
++				(errmsg("waiting for shared catalog version to reach %" PRIu64,
++						version),
++				 errhidestmt(true),
++				 errhidecontext(true)));
++		/* wait 0.1 sec */
++		pg_usleep(100000L);
++		shared_catalog_version = YbGetSharedCatalogVersion();
++	}
++}
++
+ /*---------------------------------------------------------------------------*/
+ /* Transactional DDL support - Common Definitions                            */
+ /*---------------------------------------------------------------------------*/
+@@ -2550,6 +2605,7 @@ YBCommitTransactionContainingDDL()
+ 		if (*YBCGetGFlags()->TEST_yb_enable_invalidation_messages &&
+ 			database_oid == MyDatabaseId && YBIsDBCatalogVersionMode())
+ 		{
++			const uint64_t new_version = YbGetNewCatalogVersion();
+ 			/*
+ 			 * If local version is x and this DDL incremented catalog version to x + 1,
+ 			 * then we can do this optimization because the invalidation messages
+@@ -2564,13 +2620,22 @@ YBCommitTransactionContainingDDL()
+ 			 * of x + 2 is fine because it only causes some redundant on-demand loading
+ 			 * of cache entries that are removed again by reapplying messages of x + 2.
+ 			 */
+-			if (YbGetCatalogCacheVersion() + 1 == YbGetNewCatalogVersion())
++			if (YbGetCatalogCacheVersion() + 1 == new_version)
+ 				YbUpdateCatalogCacheVersion(YbGetNewCatalogVersion());
+ 			else
++			{
+ 				elog(LOG,
+ 					 "skipped optimization, "
+ 					 "local catalog version of db %u "
+ 					 "kept at %" PRIu64, MyDatabaseId, YbGetCatalogCacheVersion());
++				/*
++				 * If we remain at x when the new_version of this DDL is x + 2, we need
++				 * to wait for x + 1's invalidation messages, since we already know the
++				 * latest version is >= x + 2, let's wait for shared memory to catch up
++				 * to x + 2.
++				 */
++				YbWaitForSharedCatalogVersionToCatchup(new_version);
++			}
+ 		}
+ 		else if (database_oid == MyDatabaseId || !YBIsDBCatalogVersionMode())
+ 			YbUpdateCatalogCacheVersion(YbGetCatalogCacheVersion() + 1);
+diff --git a/src/postgres/src/include/pg_yb_utils.h b/src/postgres/src/include/pg_yb_utils.h
+index f5a7a9a462..fc82cea626 100644
+--- a/src/postgres/src/include/pg_yb_utils.h
++++ b/src/postgres/src/include/pg_yb_utils.h
+@@ -1315,4 +1315,6 @@ extern bool yb_is_calling_internal_function_for_ddl;
+ 
+ extern char *YbGetPotentiallyHiddenOidText(Oid oid);
+ 
++extern void YbWaitForSharedCatalogVersionToCatchup(uint64_t version);
++
+ #endif							/* PG_YB_UTILS_H */
+diff --git a/src/yb/yql/pgwrapper/pg_catalog_version-test.cc b/src/yb/yql/pgwrapper/pg_catalog_version-test.cc
+index a43cf6fbb3..9b617fabac 100644
+--- a/src/yb/yql/pgwrapper/pg_catalog_version-test.cc
++++ b/src/yb/yql/pgwrapper/pg_catalog_version-test.cc
+@@ -2142,10 +2142,9 @@ TEST_F(PgCatalogVersionTest, WaitForSharedCatalogVersionToCatchup) {
+     }
+   });
+   YsqlshRunner ysqlsh_runner = CHECK_RESULT(YsqlshRunner::GetYsqlshRunner(hostport));
+-  auto result = ysqlsh_runner.ExecuteSqlScript(
+-      main_script, "WaitForSharedCatalogVersionToCatchup" /* tmp_file_prefix */);
+-  ASSERT_NOK_STR_CONTAINS(result,
+-      "The catalog snapshot used for this transaction has been invalidated");
++  auto output = CHECK_RESULT(ysqlsh_runner.ExecuteSqlScript(
++      main_script, "WaitForSharedCatalogVersionToCatchup" /* tmp_file_prefix */));
++  LOG(INFO) << "output: " << output;
+ }
+ 
+ } // namespace pgwrapper

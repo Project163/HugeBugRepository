@@ -1,0 +1,245 @@
+diff --git a/src/yb/integration-tests/object_lock-test.cc b/src/yb/integration-tests/object_lock-test.cc
+index af30d17fee..8a34942822 100644
+--- a/src/yb/integration-tests/object_lock-test.cc
++++ b/src/yb/integration-tests/object_lock-test.cc
+@@ -415,21 +415,42 @@ Request ReleaseRequestFor(
+   return req;
+ }
+ 
+-Status ReleaseLockAt(
++std::future<Result<tserver::ReleaseObjectLockResponsePB>> ReleaseLockAtAsync(
+     tserver::TabletServerServiceProxy* proxy, const std::string& session_host_uuid,
+     const docdb::ObjectLockOwner& owner, uint64_t lease_epoch = kLeaseEpoch,
+     server::ClockPtr clock = nullptr, std::optional<HybridTime> apply_after = std::nullopt,
+     MonoDelta rpc_timeout = kTimeout) {
+-  tserver::ReleaseObjectLockResponsePB resp;
+-  rpc::RpcController controller = RpcController();
+-  controller.set_timeout(rpc_timeout);
++  auto resp = std::make_shared<tserver::ReleaseObjectLockResponsePB>();
++  auto controller = std::make_shared<rpc::RpcController>();
++  controller->set_timeout(rpc_timeout);
+   auto req = ReleaseRequestFor<tserver::ReleaseObjectLockRequestPB>(
+       session_host_uuid, owner, lease_epoch, clock, apply_after);
+-  auto ret = proxy->ReleaseObjectLocks(req, &resp, &controller);
+-  if (clock && ret.ok() && resp.has_propagated_hybrid_time()) {
+-    clock->Update(HybridTime(resp.propagated_hybrid_time()));
++  auto promise = std::make_shared<std::promise<Result<tserver::ReleaseObjectLockResponsePB>>>();
++  auto callback = [promise, controller, resp]() {
++    if (!controller->status().ok()) {
++      promise->set_value(controller->status());
++    } else if (resp->has_error()) {
++      promise->set_value(ResponseStatus(*resp));
++    } else {
++      promise->set_value(*resp);
++    }
++  };
++  proxy->ReleaseObjectLocksAsync(req, resp.get(), controller.get(), std::move(callback));
++  return promise->get_future();
++}
++
++Status ReleaseLockAt(
++    tserver::TabletServerServiceProxy* proxy, const std::string& session_host_uuid,
++    const docdb::ObjectLockOwner& owner, uint64_t lease_epoch = kLeaseEpoch,
++    server::ClockPtr clock = nullptr, std::optional<HybridTime> apply_after = std::nullopt,
++    MonoDelta rpc_timeout = kTimeout) {
++  auto result = ReleaseLockAtAsync(
++                    proxy, session_host_uuid, owner, lease_epoch, clock, apply_after, rpc_timeout)
++                    .get();
++  if (clock && result.ok() && result->has_propagated_hybrid_time()) {
++    clock->Update(HybridTime(result->propagated_hybrid_time()));
+   }
+-  return ret;
++  return ResultToStatus(result);
+ }
+ 
+ Status ReleaseLockGloballyAt(
+@@ -1379,6 +1400,42 @@ TEST_F(ExternalObjectLockTestOneTSWithoutLease, TServerRefusesPGSessionsWithoutL
+       timeout, "Wait for tserver to accept new pg sessions"));
+ }
+ 
++TEST_F(ExternalObjectLockTestOneTS, ReleaseBlocksUntilBootstrap) {
++  //   1. acquire a lock globally.
++  //   2. start up a tserver that won't acquire a ysql lease.
++  //   3. call release on this new tserver. we expect this to block.
++  //   4. start the new tserver's ysql lease poller.
++  //   5. the new tserver should acquire a lease and process the release.
++  //   6. verify by acquiring a local lock on the same object.
++  auto master_proxy = cluster_->GetLeaderMasterProxy<master::MasterDdlProxy>();
++  auto ts = cluster_->tablet_server(0);
++  ASSERT_OK(AcquireLockGlobally(
++      &master_proxy, ts->uuid(), kTxn1, kDatabaseID, kRelationId, kLeaseEpoch, nullptr,
++      std::nullopt, kTimeout));
++  ASSERT_OK(cluster_->AddTabletServer(
++      false, {"--TEST_tserver_enable_ysql_lease_refresh=false"}, -1, false));
++
++  auto added_ts = cluster_->tablet_server(1);
++  auto added_ts_proxy = cluster_->GetTServerProxy<tserver::TabletServerServiceProxy>(1);
++  auto future = ReleaseLockAtAsync(
++      &added_ts_proxy, ts->uuid(), kTxn1, kLeaseEpoch, /* clock */ nullptr,
++      /* apply_after */ std::nullopt, MonoDelta::FromSeconds(10));
++  ASSERT_OK(LogWaiter(added_ts, "Waiting until object lock manager is bootstrapped")
++                .WaitFor(MonoDelta::FromSeconds(2)));
++  ASSERT_EQ(future.wait_for(0s), std::future_status::timeout)
++      << "Expected release request to block at tserver that has not acquired a lease yet";
++
++  // enable the ysql lease poller on the new ts.
++  ASSERT_OK(cluster_->SetFlag(added_ts, kTServerYsqlLeaseRefreshFlagName, "true"));
++  ASSERT_RESULT(future.get());
++
++  // The lock should be released at the tserver, and we should be able to acquire a conflicting
++  // lock.
++  ASSERT_OK(AcquireLockAt(
++      &added_ts_proxy, added_ts->uuid(), kTxn2, kDatabaseID, kRelationId, kLeaseEpoch, nullptr,
++      std::nullopt, kTimeout));
++}
++
+ class MultiMasterObjectLockTestWithFailover : public MultiMasterObjectLockTest,
+                                               public ::testing::WithParamInterface<bool> {
+  public:
+diff --git a/src/yb/master/object_lock_info_manager.cc b/src/yb/master/object_lock_info_manager.cc
+index 8bec5e212b..bc648178b7 100644
+--- a/src/yb/master/object_lock_info_manager.cc
++++ b/src/yb/master/object_lock_info_manager.cc
+@@ -1293,8 +1293,7 @@ Status UpdateAllTServers<AcquireObjectLockRequestPB>::BeforeRpcs() {
+   // Update Local State.
+   launched_ = true;
+   local_lock_manager->AcquireObjectLocksAsync(
+-      req_, GetClientDeadline(),
+-      [shared_this = shared_from_this()](Status s) {
++      req_, GetClientDeadline(), [shared_this = shared_from_this()](Status s) {
+         if (s.ok()) {
+           s = shared_this->DoPersistRequest();
+         }
+@@ -1304,7 +1303,7 @@ Status UpdateAllTServers<AcquireObjectLockRequestPB>::BeforeRpcs() {
+           return;
+         }
+         shared_this->LaunchRpcs();
+-      }, tserver::WaitForBootstrap::kFalse);
++      });
+   return Status::OK();
+ }
+ 
+diff --git a/src/yb/tserver/ts_local_lock_manager.cc b/src/yb/tserver/ts_local_lock_manager.cc
+index 36463a0464..919db3fa13 100644
+--- a/src/yb/tserver/ts_local_lock_manager.cc
++++ b/src/yb/tserver/ts_local_lock_manager.cc
+@@ -45,6 +45,8 @@ DECLARE_uint64(refresh_waiter_timeout_ms);
+ 
+ namespace yb::tserver {
+ 
++YB_STRONGLY_TYPED_BOOL(WaitForBootstrap);
++
+ // This class tracks object locks specifically for the pg_locks view.
+ // An alternative would be to extract and decrypt locks directly from ObjectLockManager,
+ // but for simplicity, we decided to maintain a separate tracker here.
+@@ -268,6 +270,17 @@ class TSLocalLockManager::Impl {
+     }
+   }
+ 
++  Status WaitUntilBootstrapped(CoarseTimePoint deadline) {
++    LOG(INFO) << "Waiting until object lock manager is bootstrapped.";
++    return Wait(
++        [this]() -> bool {
++          bool ret = is_bootstrapped_;
++          VTRACE(2, "Is bootstrapped: $0", ret);
++          return ret;
++        },
++        deadline, "Waiting to Bootstrap.");
++  }
++
+   Status PrepareAndExecuteAcquire(
+       const tserver::AcquireObjectLockRequestPB& req, CoarseTimePoint deadline,
+       StdStatusCallback& callback, WaitForBootstrap wait) {
+@@ -277,14 +290,7 @@ class TSLocalLockManager::Impl {
+     docdb::ObjectLockOwner object_lock_owner(txn, req.subtxn_id());
+     VLOG(3) << object_lock_owner.ToString() << " Acquiring lock : " << req.ShortDebugString();
+     if (wait) {
+-      VTRACE(1, "Waiting for bootstrap.");
+-      RETURN_NOT_OK(Wait(
+-          [this]() -> bool {
+-            bool ret = is_bootstrapped_;
+-            VTRACE(2, "Is bootstrapped: $0", ret);
+-            return ret;
+-          },
+-          deadline, "Waiting to Bootstrap."));
++      RETURN_NOT_OK(WaitUntilBootstrapped(deadline));
+     }
+     TRACE("Through wait for bootstrap.");
+     ScopedAddToInProgressTxns add_to_in_progress{this, ToString(txn), deadline};
+@@ -368,10 +374,10 @@ class TSLocalLockManager::Impl {
+   Status ReleaseObjectLocks(
+       const tserver::ReleaseObjectLockRequestPB& req, CoarseTimePoint deadline) {
+     RETURN_NOT_OK(CheckShutdown());
++    RETURN_NOT_OK(WaitUntilBootstrapped(deadline));
+     auto txn = VERIFY_RESULT(FullyDecodeTransactionId(req.txn_id()));
+     docdb::ObjectLockOwner object_lock_owner(txn, req.subtxn_id());
+-    VLOG(3) << object_lock_owner.ToString()
+-            << " Releasing locks : " << req.ShortDebugString();
++    VLOG(3) << object_lock_owner.ToString() << " Releasing locks : " << req.ShortDebugString();
+ 
+     UpdateLeaseEpochIfNecessary(req.session_host_uuid(), req.lease_epoch());
+     RETURN_NOT_OK(WaitToApplyIfNecessary(req, deadline));
+@@ -497,8 +503,8 @@ class TSLocalLockManager::Impl {
+     }
+     for (const auto& acquire_req : entries.lock_entries()) {
+       // This call should not block on anything.
+-      CoarseTimePoint deadline = CoarseMonoClock::Now() + 1s;
+-      RETURN_NOT_OK(AcquireObjectLocks(acquire_req, deadline, tserver::WaitForBootstrap::kFalse));
++      RETURN_NOT_OK(AcquireObjectLocks(
++          acquire_req, CoarseMonoClock::Now() + 1s, tserver::WaitForBootstrap::kFalse));
+     }
+     MarkBootstrapped();
+     return Status::OK();
+@@ -537,8 +543,8 @@ TSLocalLockManager::~TSLocalLockManager() {}
+ 
+ void TSLocalLockManager::AcquireObjectLocksAsync(
+     const tserver::AcquireObjectLockRequestPB& req, CoarseTimePoint deadline,
+-    StdStatusCallback&& callback, WaitForBootstrap wait) {
+-  impl_->DoAcquireObjectLocksAsync(req, deadline, std::move(callback), wait);
++    StdStatusCallback&& callback) {
++  impl_->DoAcquireObjectLocksAsync(req, deadline, std::move(callback), WaitForBootstrap::kTrue);
+ }
+ 
+ Status TSLocalLockManager::ReleaseObjectLocks(
+@@ -604,4 +610,4 @@ std::unordered_map<docdb::ObjectLockPrefix, docdb::LockState>
+   return impl_->TEST_GetLockStateMapForTxn(txn);
+ }
+ 
+-} // namespace yb::tserver
++}  // namespace yb::tserver
+diff --git a/src/yb/tserver/ts_local_lock_manager.h b/src/yb/tserver/ts_local_lock_manager.h
+index 025c77c660..7faa595051 100644
+--- a/src/yb/tserver/ts_local_lock_manager.h
++++ b/src/yb/tserver/ts_local_lock_manager.h
+@@ -34,15 +34,16 @@ class ThreadPool;
+ 
+ namespace tserver {
+ 
+-YB_STRONGLY_TYPED_BOOL(WaitForBootstrap);
+-
+ struct ObjectLockContext {
+   ObjectLockContext(
+       TransactionId txn_id, SubTransactionId subtxn_id, uint64_t database_oid,
+-      uint64_t relation_oid, uint64_t object_oid, uint64_t object_sub_oid,
+-      TableLockType lock_type)
+-      : txn_id(txn_id), subtxn_id(subtxn_id), database_oid(database_oid),
+-        relation_oid(relation_oid), object_oid(object_oid), object_sub_oid(object_sub_oid),
++      uint64_t relation_oid, uint64_t object_oid, uint64_t object_sub_oid, TableLockType lock_type)
++      : txn_id(txn_id),
++        subtxn_id(subtxn_id),
++        database_oid(database_oid),
++        relation_oid(relation_oid),
++        object_oid(object_oid),
++        object_sub_oid(object_sub_oid),
+         lock_type(lock_type) {}
+ 
+   YB_STRUCT_DEFINE_HASH(
+@@ -97,7 +98,7 @@ class TSLocalLockManager {
+   // TODO: Augment the 'pg_locks' path to show the acquired/waiting object/table level locks.
+   void AcquireObjectLocksAsync(
+       const tserver::AcquireObjectLockRequestPB& req, CoarseTimePoint deadline,
+-      StdStatusCallback&& callback, WaitForBootstrap wait = WaitForBootstrap::kTrue);
++      StdStatusCallback&& callback);
+ 
+   // When subtxn id is set, releases all locks tagged against <txn, subtxn>. Else releases all
+   // object locks owned by <txn>.

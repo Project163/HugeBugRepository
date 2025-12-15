@@ -1,0 +1,413 @@
+diff --git a/ent/src/yb/cdc/cdc_metrics.cc b/ent/src/yb/cdc/cdc_metrics.cc
+index f5c9c33652..0327c2d7b3 100644
+--- a/ent/src/yb/cdc/cdc_metrics.cc
++++ b/ent/src/yb/cdc/cdc_metrics.cc
+@@ -79,6 +79,16 @@ METRIC_DEFINE_gauge_bool(cdc,
+                          "Is Bootstrap Required",
+                          yb::MetricUnit::kUnits,
+                          "Is bootstrap required for the replication universe.");
++METRIC_DEFINE_gauge_uint64(cdc, last_getchanges_time, "CDC Last GetChanges Physical Time",
++                           yb::MetricUnit::kMicroseconds,
++                           "Physical time of the last GetChanges request received from the "
++                           "consumer.",
++                           {0, yb::AggregationFunction::kMax} /* optional_args */);
++METRIC_DEFINE_gauge_int64(cdc, time_since_last_getchanges, "CDC Physical Time Last GetChanges",
++                          yb::MetricUnit::kMicroseconds,
++                          "Physical time ellapsed since the last GetChanges request received from "
++                          "the consumer.",
++                          {0, yb::AggregationFunction::kMax} /* optional_args */);
+ 
+ // CDC Server Metrics
+ METRIC_DEFINE_counter(server, cdc_rpc_proxy_count, "CDC Rpc Proxy Count", yb::MetricUnit::kRequests,
+@@ -104,6 +114,8 @@ CDCTabletMetrics::CDCTabletMetrics(const scoped_refptr<MetricEntity>& entity)
+       GINIT(async_replication_sent_lag_micros),
+       GINIT(async_replication_committed_lag_micros),
+       GINIT(is_bootstrap_required),
++      GINIT(last_getchanges_time),
++      GINIT(time_since_last_getchanges),
+       entity_(entity) {}
+ 
+ CDCServerMetrics::CDCServerMetrics(const scoped_refptr<MetricEntity>& entity)
+diff --git a/ent/src/yb/cdc/cdc_metrics.h b/ent/src/yb/cdc/cdc_metrics.h
+index d483c4cbd2..f5a092b6cf 100644
+--- a/ent/src/yb/cdc/cdc_metrics.h
++++ b/ent/src/yb/cdc/cdc_metrics.h
+@@ -78,6 +78,10 @@ class CDCTabletMetrics {
+   // Info about if a tablet has fallen too far behind in replication.
+   scoped_refptr<AtomicGauge<bool>> is_bootstrap_required;
+ 
++  // Info on the received GetChanges requests.
++  scoped_refptr<AtomicGauge<uint64_t> > last_getchanges_time;
++  scoped_refptr<AtomicGauge<int64_t> > time_since_last_getchanges;
++
+  private:
+   scoped_refptr<MetricEntity> entity_;
+ };
+diff --git a/ent/src/yb/cdc/cdc_service.cc b/ent/src/yb/cdc/cdc_service.cc
+index b340fd2a8f..2fe7792fb1 100644
+--- a/ent/src/yb/cdc/cdc_service.cc
++++ b/ent/src/yb/cdc/cdc_service.cc
+@@ -1113,7 +1113,7 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
+   }
+ 
+   // This is the leader tablet, so mark cdc as enabled.
+-  cdc_enabled_.store(true, std::memory_order_release);
++  SetCDCServiceEnabled();
+ 
+   auto res = GetStream(stream_id);
+   RPC_CHECK_AND_RETURN_ERROR(res.ok(), res.status(), resp->mutable_error(),
+@@ -1287,7 +1287,10 @@ void CDCServiceImpl::ComputeLagMetric(
+       // 0 and update later when we have a suitable lower bound.
+       metric->set_value(0);
+     } else {
+-      metric->set_value(last_replicated_micros - cdc_state_last_replication_time_micros);
++      // In the case where no GetChanges request propagates while the producer keeps taking writes,
++      // the lag metric will eventually grow large as an indicator of problems.
++      int64_t lag_metric = last_replicated_micros - cdc_state_last_replication_time_micros;
++      metric->set_value(lag_metric > 0 ? lag_metric : 0);
+     }
+   } else {
+     metric->set_value(last_replicated_micros - metric_last_timestamp_micros);
+@@ -1352,6 +1355,17 @@ void CDCServiceImpl::UpdateLagMetrics() {
+       ComputeLagMetric(last_replicated_micros, last_committed_micros,
+                        cdc_state_last_replication_time_micros,
+                        tablet_metric->async_replication_committed_lag_micros);
++
++      // Time elapsed since last GetChanges, or since stream creation if no GetChanges received.
++      // If no GetChanges received and creation time unitialized, do not update the metric.
++      auto last_getchanges_time = tablet_metric->last_getchanges_time->value();
++      if (last_getchanges_time || cdc_state_last_replication_time_micros) {
++        last_getchanges_time = last_getchanges_time == 0
++            ? cdc_state_last_replication_time_micros
++            : last_getchanges_time;
++        tablet_metric->time_since_last_getchanges->set_value(
++            GetCurrentTimeMicros() - last_getchanges_time);
++      }
+     }
+   }
+   if (failed) {
+@@ -1395,6 +1409,10 @@ bool CDCServiceImpl::CDCEnabled() {
+   return cdc_enabled_.load(std::memory_order_acquire);
+ }
+ 
++void CDCServiceImpl::SetCDCServiceEnabled() {
++  cdc_enabled_.store(true, std::memory_order_release);
++}
++
+ Result<std::shared_ptr<client::TableHandle>> CDCServiceImpl::GetCdcStateTable() {
+   bool use_cache = GetAtomicFlag(&FLAGS_enable_cdc_state_table_caching);
+   {
+@@ -1641,7 +1659,7 @@ void CDCServiceImpl::UpdatePeersAndMetrics() {
+ 
+   do {
+     if (!cdc_enabled_.load(std::memory_order_acquire)) {
+-      // Have not yet received any GetChanges requests, so skip background thread work.
++      // CDC service not enabled, so skip background thread work.
+       continue;
+     }
+     // Should we update lag metrics default every 1s.
+@@ -2551,6 +2569,7 @@ void CDCServiceImpl::UpdateCDCTabletMetrics(
+   tablet_metric->last_read_opid_index->set_value(lid.index());
+   tablet_metric->last_readable_opid_index->set_value(last_readable_index);
+   tablet_metric->last_checkpoint_opid_index->set_value(op_id.index);
++  tablet_metric->last_getchanges_time->set_value(GetCurrentTimeMicros());
+   if (resp->records_size() > 0) {
+     auto& last_record = resp->records(resp->records_size() - 1);
+     tablet_metric->last_read_hybridtime->set_value(last_record.time());
+diff --git a/ent/src/yb/cdc/cdc_service.h b/ent/src/yb/cdc/cdc_service.h
+index 5234ccb91d..68af23a5aa 100644
+--- a/ent/src/yb/cdc/cdc_service.h
++++ b/ent/src/yb/cdc/cdc_service.h
+@@ -166,12 +166,15 @@ class CDCServiceImpl : public CDCServiceIf {
+     return server_metrics_;
+   }
+ 
+-  // Returns true if this server has received a GetChanges call.
++  // Returns true if this server is a producer of a valid replication stream.
+   bool CDCEnabled();
+ 
+   Status RetainIntents(
+       const std::shared_ptr<tablet::TabletPeer>& tablet_peer, const OpId& cdc_sdk_op_id);
+ 
++  // Marks the CDC enable flag as true.
++  void SetCDCServiceEnabled();
++
+  private:
+   FRIEND_TEST(CDCServiceTest, TestMetricsOnDeletedReplication);
+   FRIEND_TEST(CDCServiceTestMultipleServersOneTablet, TestMetricsAfterServerFailure);
+@@ -361,7 +364,7 @@ class CDCServiceImpl : public CDCServiceIf {
+   // get_minimum_checkpoints_and_update_peers_thread_ that it should exit.
+   bool cdc_service_stopped_ GUARDED_BY(mutex_){false};
+ 
+-  // True when this service has received a GetChanges request on a valid replication stream.
++  // True when the server is a producer of a valid replication stream.
+   std::atomic<bool> cdc_enabled_{false};
+ };
+ 
+diff --git a/ent/src/yb/integration-tests/twodc-test.cc b/ent/src/yb/integration-tests/twodc-test.cc
+index 82a7155aa3..d2d7a89fc0 100644
+--- a/ent/src/yb/integration-tests/twodc-test.cc
++++ b/ent/src/yb/integration-tests/twodc-test.cc
+@@ -2095,5 +2095,86 @@ TEST_P(TwoDCTest, TestFailedAlterUniverseOnRestart) {
+   ASSERT_TRUE(new_resp.has_error());
+ }
+ 
++TEST_P(TwoDCTest, TestNonZeroLagMetricsWithoutGetChange) {
++  auto tables = ASSERT_RESULT(SetUpWithParams({1}, {1}, 1));
++  std::shared_ptr<client::YBTable> producer_table = tables[0];
++  std::shared_ptr<client::YBTable> consumer_table = tables[1];
++
++  // Stop the consumer tserver before setting up replication.
++  consumer_cluster()->mini_tablet_server(0)->Shutdown();
++
++  ASSERT_OK(SetupUniverseReplication(
++      producer_cluster(), consumer_cluster(), consumer_client(),
++      kUniverseId, {producer_table}));
++  SleepFor(MonoDelta::FromSeconds(5));  // Wait for the stream to setup.
++
++  // Obtain CDC stream id.
++  master::ListCDCStreamsResponsePB stream_resp;
++  ASSERT_OK(GetCDCStreamForTable(producer_table->id(), &stream_resp));
++  ASSERT_FALSE(stream_resp.has_error());
++  ASSERT_EQ(stream_resp.streams_size(), 1);
++  ASSERT_EQ(stream_resp.streams(0).table_id().Get(0), producer_table->id());
++  auto stream_id = stream_resp.streams(0).stream_id();
++
++  // Obtain producer tablet id.
++  TabletId tablet_id;
++  {
++    yb::cdc::ListTabletsRequestPB tablets_req;
++    yb::cdc::ListTabletsResponsePB tablets_resp;
++    rpc::RpcController rpc;
++    tablets_req.set_stream_id(stream_id);
++
++    auto producer_cdc_proxy = std::make_unique<cdc::CDCServiceProxy>(
++        &producer_client()->proxy_cache(),
++        HostPort::FromBoundEndpoint(
++            producer_cluster()->mini_tablet_server(0)->bound_rpc_addr()));
++    ASSERT_OK(producer_cdc_proxy->ListTablets(tablets_req, &tablets_resp, &rpc));
++    ASSERT_FALSE(tablets_resp.has_error());
++    ASSERT_EQ(tablets_resp.tablets_size(), 1);
++    tablet_id = tablets_resp.tablets(0).tablet_id();
++  }
++
++  // Check that the CDC enabled flag is true.
++  tserver::TabletServer* cdc_ts =
++      producer_cluster()->mini_tablet_server(0)->server();
++  auto cdc_service = dynamic_cast<cdc::CDCServiceImpl*>(
++      cdc_ts->rpc_server()->TEST_service_pool("yb.cdc.CDCService")->TEST_get_service().get());
++
++  ASSERT_OK(WaitFor([&]() { return cdc_service->CDCEnabled(); },
++                    MonoDelta::FromSeconds(30), "IsCDCEnabled"));
++
++  // Check that the time_since_last_getchanges metric is updated, even without GetChanges.
++  std::shared_ptr<cdc::CDCTabletMetrics> metrics;
++  ASSERT_OK(WaitFor(
++      [&]() {
++        metrics = cdc_service->GetCDCTabletMetrics({"" /* UUID */, stream_id, tablet_id});
++        if (!metrics) {
++          return false;
++        }
++        return metrics->time_since_last_getchanges->value() > 0;
++      },
++      MonoDelta::FromSeconds(30),
++      "Retrieve CDC metrics and check time_since_last_getchanges > 0."));
++
++  // Write some data to producer, and check that the lag metric is non-zero on producer tserver,
++  // and no GetChanges is received.
++  int i = 0;
++  ASSERT_OK(WaitFor(
++      [&]() {
++        WriteWorkload(i, i+1, producer_client(), producer_table->name());
++        i++;
++        return metrics->async_replication_committed_lag_micros->value() != 0 &&
++            metrics->async_replication_sent_lag_micros->value() != 0;
++      },
++      MonoDelta::FromSeconds(30),
++      "Whether lag != 0 when no GetChanges is received."));
++
++  // Bring up the consumer tserver and verify that replication is successful.
++  ASSERT_OK(consumer_cluster()->mini_tablet_server(0)->Start());
++  ASSERT_OK(VerifyWrittenRecords(producer_table->name(), consumer_table->name()));
++
++  ASSERT_OK(DeleteUniverseReplication(kUniverseId));
++}
++
+ } // namespace enterprise
+ } // namespace yb
+diff --git a/ent/src/yb/master/catalog_manager.h b/ent/src/yb/master/catalog_manager.h
+index 35332c65db..a1153aa211 100644
+--- a/ent/src/yb/master/catalog_manager.h
++++ b/ent/src/yb/master/catalog_manager.h
+@@ -200,6 +200,8 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
+ 
+   Status ClearFailedUniverse();
+ 
++  void SetCDCServiceEnabled();
++
+  private:
+   friend class SnapshotLoader;
+   friend class yb::master::ClusterLoadBalancer;
+@@ -482,6 +484,9 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
+ 
+   MasterSnapshotCoordinator snapshot_coordinator_;
+ 
++  // True when the cluster is a producer of a valid replication stream.
++  std::atomic<bool> cdc_enabled_{false};
++
+   DISALLOW_COPY_AND_ASSIGN(CatalogManager);
+ };
+ 
+diff --git a/ent/src/yb/master/catalog_manager_ent.cc b/ent/src/yb/master/catalog_manager_ent.cc
+index 321ad5c5cd..353dcc1351 100644
+--- a/ent/src/yb/master/catalog_manager_ent.cc
++++ b/ent/src/yb/master/catalog_manager_ent.cc
+@@ -261,6 +261,9 @@ class CDCStreamLoader : public Visitor<PersistentCDCStreamInfo> {
+     DCHECK(!ContainsKey(catalog_manager_->cdc_stream_map_, stream_id))
+         << "CDC stream already exists: " << stream_id;
+ 
++    // If CDCStream entry exists, then the current cluster is a producer.
++    catalog_manager_->SetCDCServiceEnabled();
++
+     scoped_refptr<NamespaceInfo> ns;
+     scoped_refptr<TableInfo> table;
+ 
+@@ -2526,6 +2529,9 @@ Status CatalogManager::FillHeartbeatResponse(const TSHeartbeatRequestPB* req,
+ Status CatalogManager::FillHeartbeatResponseCDC(const SysClusterConfigEntryPB& cluster_config,
+                                                 const TSHeartbeatRequestPB* req,
+                                                 TSHeartbeatResponsePB* resp) {
++  if (cdc_enabled_.load(std::memory_order_acquire)) {
++    resp->set_xcluster_enabled_on_producer(true);
++  }
+   resp->set_cluster_config_version(cluster_config.version());
+   if (!cluster_config.has_consumer_registry() ||
+       req->cluster_config_version() >= cluster_config.version()) {
+@@ -2815,6 +2821,10 @@ Status CatalogManager::CreateCDCStream(const CreateCDCStreamRequestPB* req,
+     RETURN_NOT_OK(sys_catalog_->Upsert(leader_ready_term(), stream));
+     stream_lock.Commit();
+   }
++
++  // Now that the stream is set up, mark the entire cluster as a cdc enabled.
++  SetCDCServiceEnabled();
++
+   return Status::OK();
+ }
+ 
+@@ -5273,6 +5283,10 @@ std::shared_ptr<cdc::CDCServiceProxy> CatalogManager::GetCDCServiceProxy(RemoteT
+   return cdc_service;
+ }
+ 
++void CatalogManager::SetCDCServiceEnabled() {
++  cdc_enabled_.store(true, std::memory_order_release);
++}
++
+ }  // namespace enterprise
+ }  // namespace master
+ }  // namespace yb
+diff --git a/ent/src/yb/tserver/tablet_server.h b/ent/src/yb/tserver/tablet_server.h
+index d6306e3af4..93ecd455a3 100644
+--- a/ent/src/yb/tserver/tablet_server.h
++++ b/ent/src/yb/tserver/tablet_server.h
+@@ -19,6 +19,13 @@
+   #include "yb/rpc/rpc_fwd.h"
+ 
+ namespace yb {
++
++namespace cdc {
++
++class CDCServiceImpl;
++
++} // namespace cdc
++
+ namespace tserver {
+ namespace enterprise {
+ 
+@@ -48,6 +55,9 @@ class TabletServer : public yb::tserver::TabletServer {
+ 
+   void RegisterCertificateReloader(CertificateReloader reloader) override;
+ 
++  // Mark the CDC service as enabled via heartbeat.
++  Status SetCDCServiceEnabled();
++
+  protected:
+   Status RegisterServices() override;
+   Status SetupMessengerBuilder(rpc::MessengerBuilder* builder) override;
+@@ -62,6 +72,9 @@ class TabletServer : public yb::tserver::TabletServer {
+   // CDC consumer.
+   mutable std::mutex cdc_consumer_mutex_;
+   std::unique_ptr<CDCConsumer> cdc_consumer_ GUARDED_BY(cdc_consumer_mutex_);
++
++  // CDC service.
++  std::shared_ptr<cdc::CDCServiceImpl> cdc_service_;
+ };
+ 
+ } // namespace enterprise
+diff --git a/ent/src/yb/tserver/tablet_server_ent.cc b/ent/src/yb/tserver/tablet_server_ent.cc
+index 80bd5c09e8..6462586888 100644
+--- a/ent/src/yb/tserver/tablet_server_ent.cc
++++ b/ent/src/yb/tserver/tablet_server_ent.cc
+@@ -81,13 +81,16 @@ Status TabletServer::RegisterServices() {
+   });
+ #endif
+ 
++  cdc_service_ = std::make_shared<CDCServiceImpl>(
++      tablet_manager_.get(), metric_entity(), metric_registry());
++
+   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(
+       FLAGS_ts_backup_svc_queue_length,
+       std::make_unique<TabletServiceBackupImpl>(tablet_manager_.get(), metric_entity())));
+ 
+   RETURN_NOT_OK(RpcAndWebServerBase::RegisterService(
+       FLAGS_xcluster_svc_queue_length,
+-      std::make_unique<CDCServiceImpl>(tablet_manager_.get(), metric_entity(), metric_registry())));
++      cdc_service_));
+ 
+   return super::RegisterServices();
+ }
+@@ -187,6 +190,15 @@ void TabletServer::RegisterCertificateReloader(CertificateReloader reloader) {
+   certificate_reloaders_.push_back(std::move(reloader));
+ }
+ 
++Status TabletServer::SetCDCServiceEnabled() {
++  if (!cdc_service_) {
++    LOG(WARNING) << "CDC Service Not Registered";
++  } else {
++    cdc_service_->SetCDCServiceEnabled();
++  }
++  return Status::OK();
++}
++
+ } // namespace enterprise
+ } // namespace tserver
+ } // namespace yb
+diff --git a/src/yb/master/master_heartbeat.proto b/src/yb/master/master_heartbeat.proto
+index 5379763a96..8583335eb2 100644
+--- a/src/yb/master/master_heartbeat.proto
++++ b/src/yb/master/master_heartbeat.proto
+@@ -234,6 +234,9 @@ message TSHeartbeatResponsePB {
+   // Version of transaction tables and their placements, so that the TS knows when
+   // to update the cached list of status tablet ids in the transaction manager.
+   optional uint64 transaction_tables_version = 18;
++
++  // Specify whether or not the cluster is a producer of a valid replication stream.
++  optional bool xcluster_enabled_on_producer = 19;
+ }
+ 
+ service MasterHeartbeat {
+diff --git a/src/yb/tserver/heartbeater.cc b/src/yb/tserver/heartbeater.cc
+index e35ee681ab..2641bc0988 100644
+--- a/src/yb/tserver/heartbeater.cc
++++ b/src/yb/tserver/heartbeater.cc
+@@ -495,6 +495,12 @@ Status Heartbeater::Thread::TryHeartbeat() {
+           SetConfigVersionAndConsumerRegistry(resp.cluster_config_version(), nullptr));
+     }
+ 
++    // Check whether the cluster is a producer of a CDC stream.
++    if (resp.has_xcluster_enabled_on_producer() &&
++        resp.xcluster_enabled_on_producer()) {
++      RETURN_NOT_OK(static_cast<enterprise::TabletServer*>(server_)->SetCDCServiceEnabled());
++    }
++
+     // At this point we know resp is a successful heartbeat response from the master so set it as
+     // the last heartbeat response. This invalidates resp so we should use last_hb_response_ instead
+     // below (hence using the nested scope for resp until here).

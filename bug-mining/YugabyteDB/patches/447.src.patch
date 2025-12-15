@@ -1,0 +1,777 @@
+diff --git a/src/yb/client/async_rpc.cc b/src/yb/client/async_rpc.cc
+index a3b269ee30..2adef3e5ab 100644
+--- a/src/yb/client/async_rpc.cc
++++ b/src/yb/client/async_rpc.cc
+@@ -579,6 +579,10 @@ void WriteRpc::ProcessResponseFromTserver(const Status& status) {
+   SwapRequestsAndResponses(false);
+ }
+ 
++bool WriteRpc::ShouldRetryExpiredRequest() {
++  return req_.min_running_request_id() == kInitializeFromMinRunning;
++}
++
+ ReadRpc::ReadRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
+     : AsyncRpcBase(data, yb_consistency_level) {
+ 
+diff --git a/src/yb/client/async_rpc.h b/src/yb/client/async_rpc.h
+index ad3ed89c2c..fdc6c5bc6f 100644
+--- a/src/yb/client/async_rpc.h
++++ b/src/yb/client/async_rpc.h
+@@ -159,6 +159,7 @@ class WriteRpc : public AsyncRpcBase<tserver::WriteRequestPB, tserver::WriteResp
+   void SwapRequestsAndResponses(bool skip_responses);
+   void CallRemoteMethod() override;
+   void ProcessResponseFromTserver(const Status& status) override;
++  bool ShouldRetryExpiredRequest() override;
+ };
+ 
+ class ReadRpc : public AsyncRpcBase<tserver::ReadRequestPB, tserver::ReadResponsePB> {
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index b301cafa9d..6987a61348 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -1564,12 +1564,18 @@ std::pair<RetryableRequestId, RetryableRequestId> YBClient::NextRequestIdAndMinR
+     const TabletId& tablet_id) {
+   std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
+   auto& tablet = data_->tablet_requests_[tablet_id];
++  if (tablet.request_id_seq == kInitializeFromMinRunning) {
++    return std::make_pair(kInitializeFromMinRunning, kInitializeFromMinRunning);
++  }
+   auto id = tablet.request_id_seq++;
+   tablet.running_requests.insert(id);
+   return std::make_pair(id, *tablet.running_requests.begin());
+ }
+ 
+ void YBClient::RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id) {
++  if (request_id == kInitializeFromMinRunning) {
++    return;
++  }
+   std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
+   auto& tablet = data_->tablet_requests_[tablet_id];
+   auto it = tablet.running_requests.find(request_id);
+@@ -1581,6 +1587,16 @@ void YBClient::RequestFinished(const TabletId& tablet_id, RetryableRequestId req
+   }
+ }
+ 
++void YBClient::MaybeUpdateMinRunningRequestId(
++    const TabletId& tablet_id, RetryableRequestId min_running_request_id) {
++  std::lock_guard<simple_spinlock> lock(data_->tablet_requests_mutex_);
++  auto& tablet = data_->tablet_requests_[tablet_id];
++  if (tablet.request_id_seq == kInitializeFromMinRunning) {
++    tablet.request_id_seq = min_running_request_id + (1 << 24);
++    VLOG(1) << "Set request_id_seq for tablet " << tablet_id << " to " << tablet.request_id_seq;
++  }
++}
++
+ void YBClient::LookupTabletByKey(const YBTable* table,
+                                  const std::string& partition_key,
+                                  CoarseTimePoint deadline,
+diff --git a/src/yb/client/client.h b/src/yb/client/client.h
+index a0f0384193..4cd5ea3b11 100644
+--- a/src/yb/client/client.h
++++ b/src/yb/client/client.h
+@@ -699,6 +699,9 @@ class YBClient {
+       const TabletId& tablet_id);
+   void RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id);
+ 
++  void MaybeUpdateMinRunningRequestId(
++      const TabletId& tablet_id, RetryableRequestId min_running_request_id);
++
+   void Shutdown();
+ 
+  private:
+diff --git a/src/yb/client/meta_cache.cc b/src/yb/client/meta_cache.cc
+index 0396119670..cfd9ea90ab 100644
+--- a/src/yb/client/meta_cache.cc
++++ b/src/yb/client/meta_cache.cc
+@@ -877,7 +877,8 @@ Status MetaCache::ProcessTabletLocations(
+ 
+           Partition partition;
+           Partition::FromPB(loc.partition(), &partition);
+-          remote = new RemoteTablet(tablet_id, partition, loc.split_depth());
++          remote = new RemoteTablet(
++              tablet_id, partition, loc.split_depth(), loc.split_parent_tablet_id());
+ 
+           CHECK(tablets_by_id_.emplace(tablet_id, remote).second);
+           auto emplace_result = tablets_by_key.emplace(partition.partition_key_start(), remote);
+@@ -885,10 +886,6 @@ Status MetaCache::ProcessTabletLocations(
+             const auto& old_tablet = emplace_result.first->second;
+             if (old_tablet->split_depth() < remote->split_depth()) {
+               // Only replace with tablet of higher split_depth.
+-              // TODO(tsplit): add cleanup for table_data.split_tablets, we don't need to keep
+-              // pre-split tablet info after it has been fully covered by post-split tablets
+-              // in meta cache.
+-              table_data.split_tablets[partition.partition_key_start()].push_back(old_tablet);
+               emplace_result.first->second = remote;
+             } else {
+               // If split_depth is the same - it should be the same tablet.
+@@ -960,105 +957,36 @@ Status MetaCache::ProcessTabletLocations(
+   return Status::OK();
+ }
+ 
+-RemoteTabletPtr MetaCache::GetNearestSplitAncestorUnlocked(
+-    const TableData& table_data, const RemoteTablet& tablet) {
+-  VLOG_WITH_FUNC(3) << Format("tablet: $0", tablet);
+-  if (tablet.split_depth() == 0) {
+-    // Tablet is not a result of another tablet split, it couldn't have split ancestor.
+-    return nullptr;
+-  }
+-
+-  const auto& partition = tablet.partition();
+-  const auto& partition_key_start = partition.partition_key_start();
+-
+-  VLOG_WITH_FUNC(4) << "table_data.tablets_by_partition: "
+-                    << AsString(table_data.tablets_by_partition);
+-  VLOG_WITH_FUNC(4) << "table_data.split_tablets: " << AsString(table_data.split_tablets);
+-
+-  RemoteTabletPtr nearest_split_ancestor;
+-
+-  {
+-    // Try to find the deepest tablet X in table_data.tablets_by_partition whose partition strictly
+-    // contains tablet's (T) partition.
+-    //
+-    // If such tablet X exists it will have the maximum possible X.partition_key_start <=
+-    // T.partition_key_start.
+-    //
+-    // Proof: Lets assume there is another tablet Y != X in the map that strictly contains
+-    // T.partition, but it has Y.partition_key_start < X.partition_key_start.
+-    // That means:
+-    // Y.partition_key_end >= T.partition_key_end > T.partition_key_start >= X.partition_key_start
+-    //  => Y.partition_key_end > X.partition_key_start
+-    // So, Y.partition overlaps with X.partition and Y.partition_key_start < X.partition_key_start.
+-    // Due to the nature of tablet splitting, there could be no partial overlap of tablet partition
+-    // key ranges. Then Y should strictly contains X and that means Y is not the
+-    // deepest tablet available strictly containing T.partition.
+-    const auto it = GetLastLessOrEqual(table_data.tablets_by_partition, partition_key_start);
+-    if (it != table_data.tablets_by_partition.end()) {
+-      VLOG_WITH_FUNC(3) << Format(
+-          "Nearest_split_ancestor candidate: $0",
+-          it != table_data.tablets_by_partition.end() ? AsString(it->second) : "None");
+-      if (it->second->partition().ContainsPartitionStrict(partition)) {
+-        nearest_split_ancestor = it->second;
+-        VLOG_WITH_FUNC(3) << Format(
+-            "Found nearest split ancestor tablet: $0", nearest_split_ancestor);
+-      }
+-    }
+-  }
+-
+-  if (!nearest_split_ancestor) {
+-    // Nearest split ancestor could be already replaced and moved to table_data.split_tablets,
+-    // so try to find it there starting with largest depth.
+-    const auto it = GetLastLessOrEqual(table_data.split_tablets, partition_key_start);
+-    if (it != table_data.split_tablets.end()) {
+-      for (auto tablet_it = it->second.rbegin(); tablet_it != it->second.rend(); ++tablet_it) {
+-        VLOG_WITH_FUNC(3) << Format(
+-            "Nearest_split_ancestor candidate: $0", tablet_it->get());
+-        if (tablet_it->get()->partition().ContainsPartition(partition)) {
+-          nearest_split_ancestor = tablet_it->get();
+-          VLOG_WITH_FUNC(3) << Format(
+-              "Found nearest split ancestor tablet: $0", nearest_split_ancestor);
+-          break;
+-        }
+-      }
+-    }
+-  }
+-
+-  if (!nearest_split_ancestor) {
+-    VLOG_WITH_FUNC(3) << Format("No nearest split ancestor tablet for: $0", tablet);
+-    return nullptr;
+-  }
+-
+-  if (nearest_split_ancestor->split_depth() >= tablet.split_depth()) {
+-    LOG(DFATAL) << Format(
+-        "Nearest split ancestor $0 (split_depth: $1, partition: $2) should have smaller"
+-        " split depth than $3 (split_depth: $4, partition: $5)",
+-        nearest_split_ancestor->tablet_id(), nearest_split_ancestor->split_depth(),
+-        nearest_split_ancestor->partition(), tablet.tablet_id(), tablet.split_depth(),
+-        tablet.partition());
+-    return nullptr;
+-  }
+-
+-  return nearest_split_ancestor;
+-}
+-
+ void MetaCache::MaybeUpdateClientRequests(const TableData& table_data, const RemoteTablet& tablet) {
+-  const auto nearest_split_ancestor = GetNearestSplitAncestorUnlocked(table_data, tablet);
+-
+-  if (!nearest_split_ancestor) {
++  VLOG_WITH_FUNC(2) << "Tablet: " << tablet.tablet_id()
++                    << " split parent: " << tablet.split_parent_tablet_id();
++  if (tablet.split_parent_tablet_id().empty()) {
++    VLOG(2) << "Tablet " << tablet.tablet_id() << " is not a result of split";
+     return;
+   }
+-
+   // TODO: MetaCache is a friend of Client and tablet_requests_mutex_ with tablet_requests_ are
+   // public members of YBClient::Data. Consider refactoring that.
+   std::lock_guard<simple_spinlock> request_lock(client_->data_->tablet_requests_mutex_);
+   auto& tablet_requests = client_->data_->tablet_requests_;
+-  const auto requests_it = tablet_requests.find(nearest_split_ancestor->tablet_id());
++  const auto requests_it = tablet_requests.find(tablet.split_parent_tablet_id());
+   if (requests_it == tablet_requests.end()) {
+-    LOG(DFATAL) << "Not found tablet requests structure for tablet "
+-                << nearest_split_ancestor->tablet_id();
++    VLOG(2) << "Can't find request_id_seq for tablet " << tablet.split_parent_tablet_id();
++    // This can happen if client wasn't active (for example node was partitioned away) during
++    // sequence of splits that resulted in `tablet` creation, so we don't have info about `tablet`
++    // split parent.
++    // In this case we set request_id_seq to special value and will reset it on getting
++    // "request id is less than min" error. We will use min request ID plus 2^24 (there wouldn't be
++    // 2^24 client requests in progress from the same client to the same tablet, so it is safe to do
++    // this).
++    tablet_requests.emplace(
++        tablet.tablet_id(),
++        YBClient::Data::TabletRequests {
++            .request_id_seq = kInitializeFromMinRunning
++        });
+     return;
+   }
++  VLOG(2) << "Setting request_id_seq for tablet " << tablet.tablet_id() << " from tablet "
++          << tablet.split_parent_tablet_id() << " to " << requests_it->second.request_id_seq;
+   tablet_requests[tablet.tablet_id()].request_id_seq = requests_it->second.request_id_seq;
+ }
+ 
+diff --git a/src/yb/client/meta_cache.h b/src/yb/client/meta_cache.h
+index 5d387c3119..d61e2635ea 100644
+--- a/src/yb/client/meta_cache.h
++++ b/src/yb/client/meta_cache.h
+@@ -237,11 +237,13 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
+  public:
+   RemoteTablet(std::string tablet_id,
+                Partition partition,
+-               uint64 split_depth)
++               uint64 split_depth,
++               const TabletId& split_parent_tablet_id)
+       : tablet_id_(std::move(tablet_id)),
+         log_prefix_(Format("T $0: ", tablet_id_)),
+         partition_(std::move(partition)),
+         split_depth_(split_depth),
++        split_parent_tablet_id_(split_parent_tablet_id),
+         stale_(false) {
+   }
+ 
+@@ -336,6 +338,8 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
+   // See TabletLocationsPB::split_depth.
+   uint64 split_depth() const { return split_depth_; }
+ 
++  const TabletId& split_parent_tablet_id() const { return split_parent_tablet_id_; }
++
+   int64_t lookups_without_new_replicas() const { return lookups_without_new_replicas_; }
+ 
+  private:
+@@ -346,6 +350,7 @@ class RemoteTablet : public RefCountedThreadSafe<RemoteTablet> {
+   const std::string log_prefix_;
+   const Partition partition_;
+   const uint64 split_depth_;
++  const TabletId split_parent_tablet_id_;
+ 
+   // All non-const members are protected by 'mutex_'.
+   mutable rw_spinlock mutex_;
+@@ -492,10 +497,6 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+   struct TableData {
+     std::map<PartitionKey, RemoteTabletPtr> tablets_by_partition;
+     std::unordered_map<PartitionGroupKey, LookupDataGroup> tablet_lookups_by_group;
+-    // When replacing tablet which has been split with post-split tablet in tablets_by_partition
+-    // it is moved into split_tablets and added to the end of the chain corresponding to its
+-    // partition start key.
+-    std::map<PartitionKey, std::vector<RemoteTabletPtr>> split_tablets;
+     bool stale = false;
+   };
+ 
+@@ -549,14 +550,6 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
+   // pre-split tablet to post-split tablets.
+   void MaybeUpdateClientRequests(const TableData& table_data, const RemoteTablet& tablet);
+ 
+-  // Returns the nearest (known to MetaCache) split ancestor for the tablet, i.e. its partition
+-  // strictly contains tablet's partition. Nearest mean it has maximum split_dept possible.
+-  //
+-  // Uses TableData::split_tablets where we store pre-split tablets which have been replaced by
+-  // post-split tablets in addition to TableData::tablets_by_partition.
+-  RemoteTabletPtr GetNearestSplitAncestorUnlocked(
+-      const TableData& table_data, const RemoteTablet& tablet);
+-
+   template <class Lock>
+   bool DoLookupTabletByKey(
+       const YBTable* table, const std::string& partition_start, CoarseTimePoint deadline,
+diff --git a/src/yb/client/tablet_rpc-test.cc b/src/yb/client/tablet_rpc-test.cc
+index 250b693682..49f832e79f 100644
+--- a/src/yb/client/tablet_rpc-test.cc
++++ b/src/yb/client/tablet_rpc-test.cc
+@@ -72,7 +72,7 @@ TEST_F(TabletRpcTest, TabletInvokerSelectTabletServerRace) {
+   Partition partition;
+   Partition::FromPB(tablet_locations.partition(), &partition);
+   internal::RemoteTabletPtr remote_tablet = new internal::RemoteTablet(
+-      tablet_locations.tablet_id(), partition, 0 /* split_depth */);
++      tablet_locations.tablet_id(), partition, 0 /* split_depth */, "" /* split_parent_id */);
+ 
+   std::atomic<bool> stop_requested{false};
+   std::thread replicas_refresher(
+diff --git a/src/yb/client/tablet_rpc.cc b/src/yb/client/tablet_rpc.cc
+index b85f3d0176..375f571995 100644
+--- a/src/yb/client/tablet_rpc.cc
++++ b/src/yb/client/tablet_rpc.cc
+@@ -16,6 +16,7 @@
+ #include "yb/client/tablet_rpc.h"
+ 
+ #include "yb/consensus/consensus_error.h"
++#include "yb/consensus/retryable_requests.h"
+ 
+ #include "yb/common/wire_protocol.h"
+ 
+@@ -399,6 +400,11 @@ bool TabletInvoker::Done(Status* status) {
+         tablet_->MarkReplicaFailed(current_ts_, *status);
+       }
+     }
++    if (status->IsExpired() && rpc_->ShouldRetryExpiredRequest()) {
++      client_->MaybeUpdateMinRunningRequestId(
++          tablet_->tablet_id(), consensus::MinRunningRequestIdStatusData(*status).value());
++      *status = STATUS(TryAgain, status->message());
++    }
+     std::string current_ts_string;
+     if (current_ts_) {
+       current_ts_string = Format("on tablet server $0", *current_ts_);
+diff --git a/src/yb/client/tablet_rpc.h b/src/yb/client/tablet_rpc.h
+index d461c6a875..455b105927 100644
+--- a/src/yb/client/tablet_rpc.h
++++ b/src/yb/client/tablet_rpc.h
+@@ -47,6 +47,9 @@ class TabletRpc {
+ 
+   // attempt_num starts with 1.
+   virtual void SendRpcToTserver(int attempt_num) = 0;
++
++  virtual bool ShouldRetryExpiredRequest() { return false; }
++
+  protected:
+   ~TabletRpc() {}
+ };
+diff --git a/src/yb/common/wire_protocol.h b/src/yb/common/wire_protocol.h
+index 260effd998..b9d64a2c37 100644
+--- a/src/yb/common/wire_protocol.h
++++ b/src/yb/common/wire_protocol.h
+@@ -298,6 +298,10 @@ static inline uint8_t Load8(const void* p) {
+ YB_STRONGLY_TYPED_UUID(ClientId);
+ typedef int64_t RetryableRequestId;
+ 
++// Special value which is used to initialize starting RetryableRequestId for the client and tablet
++// based on min running at server side.
++constexpr RetryableRequestId kInitializeFromMinRunning = -1;
++
+ template <class Resp>
+ CHECKED_STATUS StatusFromResponse(const Resp& resp) {
+   return resp.has_error() ? StatusFromPB(resp.error().status()) : Status::OK();
+diff --git a/src/yb/consensus/retryable_requests.cc b/src/yb/consensus/retryable_requests.cc
+index 15c29a8efd..95d8ec471e 100644
+--- a/src/yb/consensus/retryable_requests.cc
++++ b/src/yb/consensus/retryable_requests.cc
+@@ -227,8 +227,10 @@ class RetryableRequests::Impl {
+ 
+     if (data.request_id() < client_retryable_requests.min_running_request_id) {
+       round->NotifyReplicationFinished(
+-          STATUS_FORMAT(
+-              Expired, "Request id $0 is less than min running $1", data.request_id(),
++          STATUS_EC_FORMAT(
++              Expired,
++              MinRunningRequestIdStatusData(client_retryable_requests.min_running_request_id),
++              "Request id $0 is less than min running $1", data.request_id(),
+               client_retryable_requests.min_running_request_id),
+           round->bound_term(), nullptr /* applied_op_ids */);
+       return false;
+@@ -383,6 +385,14 @@ class RetryableRequests::Impl {
+     return result;
+   }
+ 
++  Result<RetryableRequestId> MinRunningRequestId(const ClientId& client_id) const {
++    const auto it = clients_.find(client_id);
++    if (it == clients_.end()) {
++      return STATUS_FORMAT(NotFound, "Client requests data not found for client $0", client_id);
++    }
++    return it->second.min_running_request_id;
++  }
++
+  private:
+   void CleanupReplicatedRequests(
+       RetryableRequestId new_min_running_request_id,
+@@ -576,9 +586,19 @@ RetryableRequestsCounts RetryableRequests::TEST_Counts() {
+   return impl_->TEST_Counts();
+ }
+ 
++Result<RetryableRequestId> RetryableRequests::MinRunningRequestId(
++    const ClientId& client_id) const {
++  return impl_->MinRunningRequestId(client_id);
++}
++
+ void RetryableRequests::SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity) {
+   impl_->SetMetricEntity(metric_entity);
+ }
+ 
++const std::string kMinRunningRequestIdCategoryName = "min running request ID";
++
++StatusCategoryRegisterer min_running_request_id_category_registerer(
++    StatusCategoryDescription::Make<MinRunningRequestIdTag>(&kMinRunningRequestIdCategoryName));
++
+ } // namespace consensus
+ } // namespace yb
+diff --git a/src/yb/consensus/retryable_requests.h b/src/yb/consensus/retryable_requests.h
+index 43cc24f724..8639453a52 100644
+--- a/src/yb/consensus/retryable_requests.h
++++ b/src/yb/consensus/retryable_requests.h
+@@ -14,6 +14,7 @@
+ #ifndef YB_CONSENSUS_RETRYABLE_REQUESTS_H
+ #define YB_CONSENSUS_RETRYABLE_REQUESTS_H
+ 
++#include "yb/common/wire_protocol.h"
+ #include "yb/consensus/consensus_fwd.h"
+ 
+ #include "yb/util/restart_safe_clock.h"
+@@ -61,6 +62,8 @@ class RetryableRequests {
+   // Returns number or running requests and number of ranges of replicated requests.
+   RetryableRequestsCounts TEST_Counts();
+ 
++  Result<RetryableRequestId> MinRunningRequestId(const ClientId& client_id) const;
++
+   void SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity);
+ 
+  private:
+@@ -68,6 +71,17 @@ class RetryableRequests {
+   std::unique_ptr<Impl> impl_;
+ };
+ 
++struct MinRunningRequestIdTag : yb::IntegralErrorTag<int64_t> {
++  // It is part of the wire protocol and should not be changed once released.
++  static constexpr uint8_t kCategory = 13;
++
++  static std::string ToMessage(Value value) {
++    return Format("Min running request ID: $0", value);
++  }
++};
++
++typedef yb::StatusErrorCodeImpl<MinRunningRequestIdTag> MinRunningRequestIdStatusData;
++
+ } // namespace consensus
+ } // namespace yb
+ 
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 7721a9e1a5..2259779451 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -637,6 +637,17 @@ std::vector<tablet::TabletPeerPtr> ListTabletPeers(
+   return result;
+ }
+ 
++std::vector<tablet::TabletPeerPtr> ListTableTabletLeadersPeers(
++    MiniCluster* cluster, const TableId& table_id) {
++  return ListTabletPeers(cluster, [&table_id](const auto& peer) {
++    return peer->tablet_metadata() &&
++           peer->tablet_metadata()->table_id() == table_id &&
++           peer->tablet_metadata()->tablet_data_state() !=
++               tablet::TabletDataState::TABLET_DATA_SPLIT_COMPLETED &&
++           peer->consensus()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER;
++  });
++}
++
+ Status WaitUntilTabletHasLeader(
+     MiniCluster* cluster, const string& tablet_id, MonoTime deadline) {
+   return Wait([cluster, &tablet_id] {
+diff --git a/src/yb/integration-tests/mini_cluster.h b/src/yb/integration-tests/mini_cluster.h
+index 5cf8183ea5..ce28c1ce4f 100644
+--- a/src/yb/integration-tests/mini_cluster.h
++++ b/src/yb/integration-tests/mini_cluster.h
+@@ -269,6 +269,9 @@ std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
+     MiniCluster* cluster,
+     const std::function<bool(const std::shared_ptr<tablet::TabletPeer>&)>& filter);
+ 
++std::vector<tablet::TabletPeerPtr> ListTableTabletLeadersPeers(
++    MiniCluster* cluster, const TableId& table_id);
++
+ CHECKED_STATUS WaitUntilTabletHasLeader(
+     MiniCluster* cluster, const string& tablet_id, MonoTime deadline);
+ 
+diff --git a/src/yb/integration-tests/placement_info-itest.cc b/src/yb/integration-tests/placement_info-itest.cc
+index ac6e056daf..88b9869752 100644
+--- a/src/yb/integration-tests/placement_info-itest.cc
++++ b/src/yb/integration-tests/placement_info-itest.cc
+@@ -181,7 +181,7 @@ TEST_F(PlacementInfoTest, TestSelectTServer) {
+   Partition partition;
+   Partition::FromPB(tablet_locations.partition(), &partition);
+   internal::RemoteTabletPtr remote_tablet = new internal::RemoteTablet(
+-      tablet_locations.tablet_id(), partition, 0 /* split_depth */);
++      tablet_locations.tablet_id(), partition, 0 /* split_depth */, "" /* split_parent_id */);
+ 
+   // Build remote tserver map.
+   internal::TabletServerMap tserver_map;
+diff --git a/src/yb/integration-tests/tablet-split-itest.cc b/src/yb/integration-tests/tablet-split-itest.cc
+index 2cc2eca3a2..64b85c52cb 100644
+--- a/src/yb/integration-tests/tablet-split-itest.cc
++++ b/src/yb/integration-tests/tablet-split-itest.cc
+@@ -24,6 +24,7 @@
+ #include "yb/consensus/consensus.h"
+ #include "yb/consensus/consensus_util.h"
+ 
++#include "yb/integration-tests/mini_cluster.h"
+ #include "yb/integration-tests/test_workload.h"
+ 
+ #include "yb/master/catalog_manager.h"
+@@ -47,6 +48,7 @@
+ 
+ using namespace std::literals;  // NOLINT
+ 
++DECLARE_int64(db_block_size_bytes);
+ DECLARE_int64(db_write_buffer_size);
+ DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
+ DECLARE_bool(TEST_do_not_start_election_test_only);
+@@ -107,6 +109,10 @@ class TabletSplitITest : public client::TransactionTestBase {
+   // Make sure table contains only keys 1...num_keys without gaps.
+   void CheckTableKeysInRange(const size_t num_keys);
+ 
++  // Tests appropriate client requests structure update at YBClient side.
++  // split_depth specifies how deep should we split original tablet until trying to write again.
++  void SplitClientRequestsIds(int split_depth);
++
+  protected:
+   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
+ };
+@@ -170,7 +176,7 @@ Result<std::pair<docdb::DocKeyHash, docdb::DocKeyHash>> TabletSplitITest::WriteR
+   auto min_hash_code = std::numeric_limits<docdb::DocKeyHash>::max();
+   auto max_hash_code = std::numeric_limits<docdb::DocKeyHash>::min();
+ 
+-  LOG(INFO) << "Writing data...";
++  LOG(INFO) << "Writing " << num_rows << " rows...";
+ 
+   auto txn = CreateTransaction();
+   auto session = CreateSession();
+@@ -187,7 +193,7 @@ Result<std::pair<docdb::DocKeyHash, docdb::DocKeyHash>> TabletSplitITest::WriteR
+     LOG(INFO) << "Committed: " << txn->id();
+   }
+ 
+-  LOG(INFO) << "Data has been written";
++  LOG(INFO) << num_rows << " rows has been written";
+   LOG(INFO) << "min_hash_code = " << min_hash_code;
+   LOG(INFO) << "max_hash_code = " << max_hash_code;
+   return std::make_pair(min_hash_code, max_hash_code);
+@@ -534,6 +540,22 @@ void DumpWorkloadStats(const TestWorkload& workload) {
+   LOG(INFO) << "Rows read try again: " << workload.rows_read_try_again();
+ }
+ 
++CHECKED_STATUS SplitTablet(master::CatalogManager* catalog_mgr, const tablet::Tablet& tablet) {
++  const auto& tablet_id = tablet.tablet_id();
++  LOG(INFO) << "Tablet: " << tablet_id;
++  LOG(INFO) << "Number of SST files: " << tablet.TEST_db()->GetCurrentVersionNumSSTFiles();
++  std::string properties;
++  tablet.TEST_db()->GetProperty(rocksdb::DB::Properties::kAggregatedTableProperties, &properties);
++  LOG(INFO) << "DB properties: " << properties;
++
++  const auto encoded_split_key = VERIFY_RESULT(tablet.GetEncodedMiddleSplitKey());
++  const auto doc_key_hash = VERIFY_RESULT(docdb::DecodeDocKeyHash(encoded_split_key)).value();
++  LOG(INFO) << "Middle hash key: " << doc_key_hash;
++  const auto partition_split_key = PartitionSchema::EncodeMultiColumnHashValue(doc_key_hash);
++
++  return catalog_mgr->SplitTablet(tablet_id, encoded_split_key, partition_split_key);
++}
++
+ } // namespace
+ 
+ TEST_F(TabletSplitITest, SplitTabletDuringReadWriteLoad) {
+@@ -554,9 +576,11 @@ TEST_F(TabletSplitITest, SplitTabletDuringReadWriteLoad) {
+   workload.set_read_only_written_keys(true);
+   workload.Setup();
+ 
++  const auto test_table_id = ASSERT_RESULT(client_->GetYBTableInfo(client::kTableName)).table_id;
++
+   std::vector<tablet::TabletPeerPtr> peers;
+-  AssertLoggedWaitFor([this, &peers] {
+-    peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
++  AssertLoggedWaitFor([&] {
++    peers = ListTableTabletLeadersPeers(cluster_.get(), test_table_id);
+     return peers.size() == kNumTablets;
+   }, 60s, "Waiting for leaders ...");
+ 
+@@ -574,26 +598,16 @@ TEST_F(TabletSplitITest, SplitTabletDuringReadWriteLoad) {
+   DumpWorkloadStats(workload);
+ 
+   auto& leader_master = *ASSERT_NOTNULL(cluster_->leader_mini_master()->master());
+-  auto& catalog_mgr = *ASSERT_NOTNULL(leader_master.catalog_manager());
++  auto* catalog_mgr = ASSERT_NOTNULL(leader_master.catalog_manager());
+ 
+   for (const auto& peer : peers) {
+     const auto& source_tablet = *ASSERT_NOTNULL(peer->tablet());
+-    const auto& source_tablet_id = source_tablet.tablet_id();
+-
+-    LOG(INFO) << "Tablet: " << source_tablet_id;
+-    LOG(INFO) << "Number of SST files: " << source_tablet.TEST_db()->GetCurrentVersionNumSSTFiles();
+-
+-    const auto encoded_split_key = ASSERT_RESULT(source_tablet.GetEncodedMiddleSplitKey());
+-    const auto doc_key_hash = ASSERT_RESULT(docdb::DecodeDocKeyHash(encoded_split_key)).value();
+-    LOG(INFO) << "Middle hash key: " << doc_key_hash;
+-    const auto partition_split_key = PartitionSchema::EncodeMultiColumnHashValue(doc_key_hash);
+-
+-    ASSERT_OK(catalog_mgr.SplitTablet(source_tablet_id, encoded_split_key, partition_split_key));
++    ASSERT_OK(SplitTablet(catalog_mgr, source_tablet));
+   }
+ 
+   ASSERT_NO_FATALS(WaitForTabletSplitCompletion(kNumTablets, kNumTablets));
+ 
+-  DumpTableLocations(&catalog_mgr, client::kTableName);
++  DumpTableLocations(catalog_mgr, client::kTableName);
+ 
+   // Generate some more read/write traffic after tablets are split and after that we check data
+   // for consistency and that failures rates are acceptable.
+@@ -623,6 +637,55 @@ TEST_F(TabletSplitITest, SplitTabletDuringReadWriteLoad) {
+   ASSERT_OK(cluster_->RestartSync());
+ }
+ 
++void TabletSplitITest::SplitClientRequestsIds(int split_depth) {
++  // Set data block size low enough, so we have enough data blocks for middle key
++  // detection to work correctly.
++  FLAGS_db_block_size_bytes = 1_KB;
++  const auto kNumRows = 50 * (1 << split_depth);
++
++  SetNumTablets(1);
++  CreateTable();
++
++  ASSERT_OK(WriteRows(kNumRows));
++
++  auto rows_count = ASSERT_RESULT(SelectRowsCount(NewSession(), table_));
++  ASSERT_EQ(rows_count, kNumRows);
++
++  auto& leader_master = *ASSERT_NOTNULL(cluster_->leader_mini_master()->master());
++  auto* catalog_mgr = leader_master.catalog_manager();
++
++  for (int i = 0; i < split_depth; ++i) {
++    auto peers = ListTableTabletLeadersPeers(cluster_.get(), table_->id());
++    ASSERT_EQ(peers.size(), 1 << i);
++    for (const auto& peer : peers) {
++      ASSERT_OK(peer->tablet()->Flush(tablet::FlushMode::kSync));
++      peer->tablet()->ForceRocksDBCompactInTest();
++      ASSERT_OK(SplitTablet(catalog_mgr, *peer->tablet()));
++    }
++
++    ASSERT_NO_FATALS(WaitForTabletSplitCompletion());
++  }
++
++  Status s;
++  ASSERT_OK(WaitFor([&] {
++    s = ResultToStatus(WriteRows(1));
++    return !s.IsTryAgain();
++  }, 60s, "Waiting for successful write"));
++  ASSERT_OK(s);
++}
++
++// Test for https://github.com/yugabyte/yugabyte-db/issues/5415.
++// Client knows about split parent for final tablets.
++TEST_F(TabletSplitITest, SplitClientRequestsIdsDepth1) {
++  SplitClientRequestsIds(1);
++}
++
++// Test for https://github.com/yugabyte/yugabyte-db/issues/5415.
++// Client doesn't know about split parent for final tablets.
++TEST_F(TabletSplitITest, SplitClientRequestsIdsDepth2) {
++  SplitClientRequestsIds(2);
++}
++
+ namespace {
+ 
+ PB_ENUM_FORMATTERS(IsolationLevel);
+diff --git a/src/yb/master/catalog_manager.cc b/src/yb/master/catalog_manager.cc
+index 53f0832c33..e57876c4c4 100644
+--- a/src/yb/master/catalog_manager.cc
++++ b/src/yb/master/catalog_manager.cc
+@@ -1615,10 +1615,20 @@ Status CatalogManager::CreateCopartitionedTable(const CreateTableRequestPB& req,
+ 
+ namespace {
+ 
+-std::array<PartitionPB, 2> CreateNewTabletsPartition(
++Result<std::array<PartitionPB, 2>> CreateNewTabletsPartition(
+     const TabletInfo& tablet_info, const std::string& split_partition_key) {
+   const auto& source_partition = tablet_info.LockForRead()->data().pb.partition();
+ 
++  if (source_partition.partition_key_start() == split_partition_key ||
++      source_partition.partition_key_end() == split_partition_key) {
++    return STATUS_FORMAT(
++        InvalidArgument,
++        "Can't split tablet $0 (partition_key_start: $1 partition_key_end: $2) by partition "
++        "boundary (split_key: $3)",
++        tablet_info.tablet_id(), source_partition.partition_key_start(),
++        source_partition.partition_key_end(), split_partition_key);
++  }
++
+   std::array<PartitionPB, 2> new_tablets_partition;
+ 
+   new_tablets_partition.fill(source_partition);
+@@ -1648,8 +1658,8 @@ Status CatalogManager::DoSplitTablet(
+ 
+   constexpr auto kNumSplitParts = 2;
+ 
+-  std::array<PartitionPB, kNumSplitParts> new_tablets_partition = CreateNewTabletsPartition(
+-      *source_tablet_info, split_partition_key);
++  std::array<PartitionPB, kNumSplitParts> new_tablets_partition = VERIFY_RESULT(
++      CreateNewTabletsPartition(*source_tablet_info, split_partition_key));
+ 
+   std::array<TabletId, kNumSplitParts> new_tablet_ids;
+   for (int i = 0; i < kNumSplitParts; ++i) {
+@@ -3946,6 +3956,7 @@ Result<TabletInfo*> CatalogManager::RegisterNewTabletForSplit(
+   new_tablet_meta.mutable_committed_consensus_state()->CopyFrom(
+       source_tablet_meta.committed_consensus_state());
+   new_tablet_meta.set_split_depth(source_tablet_meta.split_depth() + 1);
++  new_tablet_meta.set_split_parent_tablet_id(source_tablet_info.tablet_id());
+   // TODO(tsplit): consider and handle failure scenarios, for example:
+   // - Crash or leader failover before sending out the split tasks.
+   // - Long enough partition while trying to send out the splits so that they timeout and
+@@ -7305,9 +7316,8 @@ Status CatalogManager::BuildLocationsForTablet(const scoped_refptr<TabletInfo>&
+ 
+     const auto& metadata = tablet->metadata().state().pb;
+     locs_pb->mutable_partition()->CopyFrom(metadata.partition());
+-    if (metadata.has_split_depth()) {
+-      locs_pb->set_split_depth(metadata.split_depth());
+-    }
++    locs_pb->set_split_depth(metadata.split_depth());
++    locs_pb->set_split_parent_tablet_id(metadata.split_parent_tablet_id());
+   }
+ 
+   locs_pb->set_tablet_id(tablet->tablet_id());
+diff --git a/src/yb/master/master.proto b/src/yb/master/master.proto
+index efe3109d34..8aecd81ac7 100644
+--- a/src/yb/master/master.proto
++++ b/src/yb/master/master.proto
+@@ -310,9 +310,11 @@ message SysTabletsEntryPB {
+   // Replaced by the map below.
+   optional bytes DEPRECATED_backfilled_until = 10;
+ 
+-  // For tablets which are results of splitting we set this to split parent split_depth + 1.
++  // For tablets that are results of splitting we set this to split parent split_depth + 1.
+   optional uint64 split_depth = 11;
+ 
++  optional bytes split_parent_tablet_id = 13;
++
+   // If the tablet is in the backfilling state, this is used to keep track
+   // of how far along backfill has completed.
+   // Key corresponds to the table_id for the index table. Value is encoded as
+@@ -805,8 +807,9 @@ message TabletLocationsPB {
+   // Table ids for all the tables on this tablet.
+   repeated bytes table_ids = 8;
+ 
+-  // See SysTabletsEntryPB for field with the same name.
++  // See SysTabletsEntryPB for fields with the same name.
+   optional uint64 split_depth = 9;
++  optional bytes split_parent_tablet_id = 12;
+ 
+   // Number of expected live replicas.
+   optional int32 expected_live_replicas = 10;
+diff --git a/src/yb/tablet/tablet.cc b/src/yb/tablet/tablet.cc
+index 6ddd5bd5d8..3df5dc6b46 100644
+--- a/src/yb/tablet/tablet.cc
++++ b/src/yb/tablet/tablet.cc
+@@ -3208,6 +3208,15 @@ Result<std::string> Tablet::GetEncodedMiddleSplitKey() const {
+                             : docdb::DocKeyPart::kWholeDocKey;
+   const auto split_key_size = VERIFY_RESULT(DocKey::EncodedSize(middle_key, key_part));
+   middle_key.resize(split_key_size);
++  const Slice middle_key_slice(middle_key);
++  if (middle_key_slice.compare(key_bounds_.lower) <= 0 ||
++      (!key_bounds_.upper.empty() && middle_key_slice.compare(key_bounds_.upper) >= 0)) {
++    return STATUS_FORMAT(
++        IllegalState,
++        "Failed to detect middle key (got \"$0\") for tablet $1 (key_bounds: $2 - $3), this can "
++        "happen if post-split tablet wasn't fully compacted after split",
++        middle_key, tablet_id(), key_bounds_.lower, key_bounds_.upper);
++  }
+   return middle_key;
+ }
+ 

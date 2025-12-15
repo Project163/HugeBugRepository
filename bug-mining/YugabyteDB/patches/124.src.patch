@@ -1,0 +1,861 @@
+diff --git a/src/yb/client/async_initializer.cc b/src/yb/client/async_initializer.cc
+index ad888efc47..16d286b1cd 100644
+--- a/src/yb/client/async_initializer.cc
++++ b/src/yb/client/async_initializer.cc
+@@ -56,13 +56,17 @@ AsyncClientInitialiser::AsyncClientInitialiser(
+   if (messenger) {
+     client_builder_.use_messenger(messenger);
+   }
+-
+-  init_client_thread_ = std::thread(std::bind(&AsyncClientInitialiser::InitClient, this));
+ }
+ 
+ AsyncClientInitialiser::~AsyncClientInitialiser() {
+   Shutdown();
+-  init_client_thread_.join();
++  if (init_client_thread_.joinable()) {
++    init_client_thread_.join();
++  }
++}
++
++void AsyncClientInitialiser::Start() {
++  init_client_thread_ = std::thread(std::bind(&AsyncClientInitialiser::InitClient, this));
+ }
+ 
+ const std::shared_ptr<client::YBClient>& AsyncClientInitialiser::client() const {
+diff --git a/src/yb/client/async_initializer.h b/src/yb/client/async_initializer.h
+index 86bf60bc14..fd6c6ae1d2 100644
+--- a/src/yb/client/async_initializer.h
++++ b/src/yb/client/async_initializer.h
+@@ -22,6 +22,8 @@
+ namespace yb {
+ namespace client {
+ 
++YB_STRONGLY_TYPED_BOOL(AutoStart);
++
+ class AsyncClientInitialiser {
+  public:
+   AsyncClientInitialiser(
+@@ -35,6 +37,8 @@ class AsyncClientInitialiser {
+ 
+   void Shutdown() { stopping_ = true; }
+ 
++  void Start();
++
+   const std::shared_ptr<client::YBClient>& client() const;
+   const std::shared_future<client::YBClientPtr>& get_client_future() const {
+     return client_future_;
+diff --git a/src/yb/client/async_rpc.cc b/src/yb/client/async_rpc.cc
+index 480e0eca3d..e8f3e50137 100644
+--- a/src/yb/client/async_rpc.cc
++++ b/src/yb/client/async_rpc.cc
+@@ -407,7 +407,7 @@ void WriteRpc::CallRemoteMethod() {
+   ADOPT_TRACE(trace.get());
+ 
+   tablet_invoker_.proxy()->WriteAsync(
+-      req_, &resp_, PrepareController(MonoDelta::kMax),
++      req_, &resp_, PrepareController(),
+       std::bind(&WriteRpc::Finished, this, Status::OK()));
+   TRACE_TO(trace, "RpcDispatched Asynchronously");
+ }
+diff --git a/src/yb/client/client.cc b/src/yb/client/client.cc
+index 0d53881166..59aa931d38 100644
+--- a/src/yb/client/client.cc
++++ b/src/yb/client/client.cc
+@@ -160,6 +160,8 @@ DEFINE_bool(client_suppress_created_logs, false,
+ TAG_FLAG(client_suppress_created_logs, advanced);
+ TAG_FLAG(client_suppress_created_logs, hidden);
+ 
++DECLARE_bool(running_test);
++
+ namespace yb {
+ namespace client {
+ 
+@@ -397,6 +399,10 @@ Status YBClientBuilder::Build(shared_ptr<YBClient>* client) {
+     builder.set_metric_entity(data_->metric_entity_);
+     builder.UseDefaultConnectionContextFactory(data_->parent_mem_tracker_);
+     c->data_->messenger_ = VERIFY_RESULT(builder.Build());
++
++    if (FLAGS_running_test) {
++      c->data_->messenger_->TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress("127.0.0.1")));
++    }
+   }
+   c->data_->proxy_cache_ = std::make_unique<rpc::ProxyCache>(c->data_->messenger_);
+   c->data_->metric_entity_ = data_->metric_entity_;
+diff --git a/src/yb/client/ql-stress-test.cc b/src/yb/client/ql-stress-test.cc
+index aa85311cef..3b0dccb466 100644
+--- a/src/yb/client/ql-stress-test.cc
++++ b/src/yb/client/ql-stress-test.cc
+@@ -39,6 +39,7 @@
+ DECLARE_double(respond_write_failed_probability);
+ DECLARE_bool(detect_duplicates_for_retryable_requests);
+ DECLARE_int32(raft_heartbeat_interval_ms);
++DECLARE_bool(combine_batcher_errors);
+ 
+ using namespace std::literals;
+ 
+@@ -481,5 +482,74 @@ TEST_F_EX(QLStressTest, FlushCompact, QLStressTestSingleTablet) {
+   ASSERT_GE(num_iter, 5);
+ }
+ 
++// The scenario of this test is the following:
++// We do writes in background.
++// Isolate leader for 10 seconds.
++// Restore connectivity.
++// Check that old leader was able to catch up after the partition is healed.
++TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingleTablet) {
++  FLAGS_combine_batcher_errors = true;
++
++  tablet::TabletPeer* leader_peer = nullptr;
++  std::atomic<int> key(0);
++  {
++    std::atomic<bool> stop(false);
++
++    std::thread writer([this, &stop, &key] {
++      auto session = NewSession();
++      std::string value_prefix = "value_";
++      while (!stop.load(std::memory_order_acquire)) {
++        ASSERT_OK(WriteRow(session, key, value_prefix + std::to_string(key)));
++        ++key;
++      }
++    });
++
++    BOOST_SCOPE_EXIT(&stop, &writer) {
++      stop.store(true);
++      writer.join();
++    } BOOST_SCOPE_EXIT_END;
++
++    tserver::MiniTabletServer* leader = nullptr;
++    for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
++      auto current = cluster_->mini_tablet_server(i);
++      auto peers = current->server()->tablet_manager()->GetTabletPeers();
++      ASSERT_EQ(peers.size(), 1);
++      if (peers.front()->LeaderStatus() != consensus::LeaderStatus::NOT_LEADER) {
++        leader = current;
++        leader_peer = peers.front().get();
++        break;
++      }
++    }
++
++    ASSERT_NE(leader, nullptr);
++
++    std::this_thread::sleep_for(5s * yb::kTimeMultiplier);
++
++    auto pre_isolate_op_id = leader_peer->GetLatestLogEntryOpId();
++    LOG(INFO) << "Isolate, last op id: " << pre_isolate_op_id << ", key: " << key;
++    ASSERT_EQ(pre_isolate_op_id.term, 1);
++    ASSERT_GT(pre_isolate_op_id.index, key);
++    leader->SetIsolated(true);
++    std::this_thread::sleep_for(10s * yb::kTimeMultiplier);
++
++    auto pre_restore_op_id = leader_peer->GetLatestLogEntryOpId();
++    LOG(INFO) << "Restore, last op id: " << pre_restore_op_id << ", key: " << key;
++    ASSERT_EQ(pre_restore_op_id.term, 1);
++    ASSERT_GE(pre_restore_op_id.index, pre_isolate_op_id.index);
++    ASSERT_LE(pre_restore_op_id.index, pre_isolate_op_id.index + 10);
++    leader->SetIsolated(false);
++    std::this_thread::sleep_for(5s * yb::kTimeMultiplier);
++  }
++
++  ASSERT_OK(WaitFor([leader_peer, &key] {
++    return leader_peer->GetLatestLogEntryOpId().index > key;
++  }, 5s, "Old leader has enough operations"));
++
++  auto finish_op_id = leader_peer->GetLatestLogEntryOpId();
++  LOG(INFO) << "Finish, last op id: " << finish_op_id << ", key: " << key;
++  ASSERT_GT(finish_op_id.term, 1);
++  ASSERT_GT(finish_op_id.index, key);
++}
++
+ } // namespace client
+ } // namespace yb
+diff --git a/src/yb/consensus/raft_consensus.cc b/src/yb/consensus/raft_consensus.cc
+index f2c421e2a9..a1af2373d9 100644
+--- a/src/yb/consensus/raft_consensus.cc
++++ b/src/yb/consensus/raft_consensus.cc
+@@ -2346,8 +2346,9 @@ MicrosTime RaftConsensus::MajorityReplicatedHtLeaseExpiration(
+   return state_->MajorityReplicatedHtLeaseExpiration(min_allowed, deadline);
+ }
+ 
+-std::string RaftConsensus::GetRequestVoteLogPrefix() const {
+-  return state_->LogPrefix() + "Leader election vote request";
++std::string RaftConsensus::GetRequestVoteLogPrefix(const VoteRequestPB& request) const {
++  return Format("$0 Leader $1election vote request",
++                state_->LogPrefix(), request.preelection() ? "pre-" : "");
+ }
+ 
+ void RaftConsensus::FillVoteResponseVoteGranted(
+@@ -2368,7 +2369,7 @@ Status RaftConsensus::RequestVoteRespondInvalidTerm(const VoteRequestPB* request
+   FillVoteResponseVoteDenied(ConsensusErrorPB::INVALID_TERM, response);
+   string msg = Substitute("$0: Denying vote to candidate $1 for earlier term $2. "
+                           "Current term is $3.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           request->candidate_term(),
+                           state_->GetCurrentTermUnlocked());
+@@ -2382,7 +2383,7 @@ Status RaftConsensus::RequestVoteRespondVoteAlreadyGranted(const VoteRequestPB*
+   FillVoteResponseVoteGranted(*request, response);
+   LOG(INFO) << Substitute("$0: Already granted yes vote for candidate $1 in term $2. "
+                           "Re-sending same reply.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           request->candidate_term());
+   return Status::OK();
+@@ -2393,7 +2394,7 @@ Status RaftConsensus::RequestVoteRespondAlreadyVotedForOther(const VoteRequestPB
+   FillVoteResponseVoteDenied(ConsensusErrorPB::ALREADY_VOTED, response);
+   string msg = Substitute("$0: Denying vote to candidate $1 in current term $2: "
+                           "Already voted for candidate $3 in this term.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           state_->GetCurrentTermUnlocked(),
+                           state_->GetVotedForCurrentTermUnlocked());
+@@ -2409,7 +2410,7 @@ Status RaftConsensus::RequestVoteRespondLastOpIdTooOld(const OpId& local_last_lo
+   string msg = Substitute("$0: Denying vote to candidate $1 for term $2 because "
+                           "replica has last-logged OpId of $3, which is greater than that of the "
+                           "candidate, which has last-logged OpId of $4.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           request->candidate_term(),
+                           local_last_logged_opid.ShortDebugString(),
+@@ -2425,7 +2426,7 @@ Status RaftConsensus::RequestVoteRespondLeaderIsAlive(const VoteRequestPB* reque
+   std::string msg = Format(
+       "$0: Denying vote to candidate $1 for term $2 because replica is either leader or believes a "
+       "valid leader to be alive. Time left: $3",
+-      GetRequestVoteLogPrefix(), request->candidate_uuid(), request->candidate_term(),
++      GetRequestVoteLogPrefix(*request), request->candidate_uuid(), request->candidate_term(),
+       withhold_votes_until_ - MonoTime::Now());
+   LOG(INFO) << msg;
+   StatusToPB(STATUS(InvalidArgument, msg), response->mutable_consensus_error()->mutable_status());
+@@ -2438,7 +2439,7 @@ Status RaftConsensus::RequestVoteRespondIsBusy(const VoteRequestPB* request,
+   string msg = Substitute("$0: Denying vote to candidate $1 for term $2 because "
+                           "replica is already servicing an update from a current leader "
+                           "or another vote.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           request->candidate_term());
+   LOG(INFO) << msg;
+@@ -2465,7 +2466,7 @@ Status RaftConsensus::RequestVoteRespondVoteGranted(const VoteRequestPB* request
+   SnoozeFailureDetector(DO_NOT_LOG, additional_backoff);
+ 
+   LOG(INFO) << Substitute("$0: Granting yes vote for candidate $1 in term $2.",
+-                          GetRequestVoteLogPrefix(),
++                          GetRequestVoteLogPrefix(*request),
+                           request->candidate_uuid(),
+                           state_->GetCurrentTermUnlocked());
+   return Status::OK();
+diff --git a/src/yb/consensus/raft_consensus.h b/src/yb/consensus/raft_consensus.h
+index 7b03b3f74a..732654375a 100644
+--- a/src/yb/consensus/raft_consensus.h
++++ b/src/yb/consensus/raft_consensus.h
+@@ -388,7 +388,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
+                                                HybridTime propagated_safe_time);
+ 
+   // Return header string for RequestVote log messages. The ReplicaState lock must be held.
+-  std::string GetRequestVoteLogPrefix() const;
++  std::string GetRequestVoteLogPrefix(const VoteRequestPB& request) const;
+ 
+   // Fills the response with the current status, if an update was successful.
+   void FillConsensusResponseOKUnlocked(ConsensusResponsePB* response);
+diff --git a/src/yb/integration-tests/kv_table_ts_failover_write_if-test.cc b/src/yb/integration-tests/kv_table_ts_failover_write_if-test.cc
+index ad0bb24e9c..022d400f0f 100644
+--- a/src/yb/integration-tests/kv_table_ts_failover_write_if-test.cc
++++ b/src/yb/integration-tests/kv_table_ts_failover_write_if-test.cc
+@@ -25,6 +25,8 @@
+ #include "yb/util/test_util.h"
+ #include "yb/yql/cql/ql/util/statement_result.h"
+ 
++DECLARE_bool(combine_batcher_errors);
++
+ namespace yb {
+ 
+ using client::YBSessionPtr;
+@@ -88,9 +90,12 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
+     LOG(INFO) << "Sending write: " << op_str;
+     ASSERT_OK(session->Apply(insert));
+     session->FlushAsync([insert, op_str](const Status& s){
+-      ASSERT_TRUE(s.ok()) << "Failed to flush write " << op_str << ". Error: " << s;
+-      ASSERT_EQ(insert->response().status(), QLResponsePB::YQL_STATUS_OK)
+-          << "Failed to write " << op_str;
++      ASSERT_TRUE(s.ok() || s.IsAlreadyPresent())
++          << "Failed to flush write " << op_str << ". Error: " << s;
++      if (s.ok()) {
++        ASSERT_EQ(insert->response().status(), QLResponsePB::YQL_STATUS_OK)
++            << "Failed to write " << op_str;
++      }
+       LOG(INFO) << "Written: " << op_str;
+     });
+   }
+@@ -207,6 +212,8 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
+ 
+ // Test for ENG-3471 - shouldn't run write-if when leader hasn't yet committed all pendings ops.
+ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
++  FLAGS_combine_batcher_errors = true;
++
+   const int32_t key = 0;
+   const int32_t initial_value = 10000;
+   const auto small_delay = 100ms;
+diff --git a/src/yb/integration-tests/mini_cluster.cc b/src/yb/integration-tests/mini_cluster.cc
+index 74f97d46d2..402ff08e37 100644
+--- a/src/yb/integration-tests/mini_cluster.cc
++++ b/src/yb/integration-tests/mini_cluster.cc
+@@ -476,7 +476,9 @@ Status MiniCluster::DoCreateClient(YBClientBuilder* builder,
+     CHECK(master);
+     builder->add_master_server_addr(master->bound_rpc_addr_str());
+   }
+-  return builder->Build(client);
++  RETURN_NOT_OK(builder->Build(client));
++
++  return Status::OK();
+ }
+ 
+ HostPort MiniCluster::DoGetLeaderMasterBoundRpcAddr() {
+diff --git a/src/yb/master/mini_master.cc b/src/yb/master/mini_master.cc
+index 6f4a0727b6..7ba456dbb3 100644
+--- a/src/yb/master/mini_master.cc
++++ b/src/yb/master/mini_master.cc
+@@ -135,7 +135,7 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
+ 
+   master_.swap(server);
+ 
+-  server::TEST_BreakConnectivity(master_->messenger().get(), index_);
++  server::TEST_SetupConnectivity(master_->messenger().get(), index_);
+ 
+   tunnel_ = std::make_unique<Tunnel>(&master_->messenger()->io_service());
+   std::vector<Endpoint> local;
+diff --git a/src/yb/rpc/messenger.cc b/src/yb/rpc/messenger.cc
+index 805279b227..dc6f5ebe93 100644
+--- a/src/yb/rpc/messenger.cc
++++ b/src/yb/rpc/messenger.cc
+@@ -272,7 +272,7 @@ void Messenger::BreakConnectivity(const IpAddress& address, bool incoming, bool
+   LOG(INFO) << "TEST: Break " << (incoming ? "incoming" : "") << "/" << (outgoing ? "outgoing" : "")
+             << " connectivity with: " << address;
+ 
+-  std::unique_ptr<CountDownLatch> latch;
++  boost::optional<CountDownLatch> latch;
+   {
+     std::lock_guard<percpu_rwlock> guard(lock_);
+     if (broken_connectivity_from_.empty() || broken_connectivity_to_.empty()) {
+@@ -287,7 +287,7 @@ void Messenger::BreakConnectivity(const IpAddress& address, bool incoming, bool
+       inserted_to = broken_connectivity_to_.insert(address).second;
+     }
+     if (inserted_from || inserted_to) {
+-      latch.reset(new CountDownLatch(reactors_.size()));
++      latch.emplace(reactors_.size());
+       for (auto* reactor : reactors_) {
+         auto scheduled = reactor->ScheduleReactorTask(MakeFunctorReactorTask(
+             [&latch, address, incoming, outgoing](Reactor* reactor) {
+@@ -340,7 +340,7 @@ void Messenger::RestoreConnectivity(const IpAddress& address, bool incoming, boo
+   }
+ }
+ 
+-bool Messenger::ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remote) {
++bool Messenger::TEST_ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remote) {
+   if (has_broken_connectivity_.load(std::memory_order_acquire)) {
+     shared_lock<rw_spinlock> guard(lock_.get_lock());
+     return broken_connectivity_from_.count(remote) != 0;
+@@ -348,7 +348,7 @@ bool Messenger::ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remot
+   return false;
+ }
+ 
+-bool Messenger::ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote) {
++bool Messenger::TEST_ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote) {
+   if (has_broken_connectivity_.load(std::memory_order_acquire)) {
+     shared_lock<rw_spinlock> guard(lock_.get_lock());
+     return broken_connectivity_to_.count(remote) != 0;
+@@ -456,7 +456,7 @@ void Messenger::QueueOutboundCall(OutboundCallPtr call) {
+   const auto& remote = call->conn_id().remote();
+   Reactor *reactor = RemoteToReactor(remote, call->conn_id().idx());
+ 
+-  if (ShouldArtificiallyRejectOutgoingCallsTo(remote.address())) {
++  if (TEST_ShouldArtificiallyRejectOutgoingCallsTo(remote.address())) {
+     VLOG(1) << "TEST: Rejected connection to " << remote;
+     auto scheduled = reactor->ScheduleReactorTask(std::make_shared<NotifyDisconnectedReactorTask>(
+         call, SOURCE_LOCATION()));
+@@ -502,7 +502,7 @@ void Messenger::Handle(InboundCallPtr call) {
+ 
+ void Messenger::RegisterInboundSocket(
+     const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote) {
+-  if (ShouldArtificiallyRejectIncomingCallsFrom(remote.address())) {
++  if (TEST_ShouldArtificiallyRejectIncomingCallsFrom(remote.address())) {
+     auto status = new_socket->Close();
+     VLOG(1) << "TEST: Rejected connection from " << remote
+             << ", close status: " << status.ToString();
+diff --git a/src/yb/rpc/messenger.h b/src/yb/rpc/messenger.h
+index 1b830f5e7e..33629bd3bc 100644
+--- a/src/yb/rpc/messenger.h
++++ b/src/yb/rpc/messenger.h
+@@ -265,6 +265,13 @@ class Messenger : public ProxyContext {
+     return *rpc_metrics_;
+   }
+ 
++  // Use specified IP address as base address for outbound connections from messenger.
++  void TEST_SetOutboundIpBase(const IpAddress& value) {
++    test_outbound_ip_base_ = value;
++  }
++
++  bool TEST_ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remote);
++
+  private:
+   FRIEND_TEST(TestRpc, TestConnectionKeepalive);
+   friend class DelayedTask;
+@@ -279,8 +286,6 @@ class Messenger : public ProxyContext {
+   // 'retain_self_' for more info.
+   void AllExternalReferencesDropped();
+ 
+-  bool ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remote);
+-  bool ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote);
+   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
+   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
+ 
+@@ -288,6 +293,8 @@ class Messenger : public ProxyContext {
+   void RegisterInboundSocket(
+       const ConnectionContextFactoryPtr& factory, Socket *new_socket, const Endpoint& remote);
+ 
++  bool TEST_ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote);
++
+   const std::string name_;
+ 
+   ConnectionContextFactoryPtr connection_context_factory_;
+@@ -384,6 +391,9 @@ class Messenger : public ProxyContext {
+ 
+   std::unique_ptr<RpcMetrics> rpc_metrics_;
+ 
++  // Use this IP address as base address for outbound connections from messenger.
++  IpAddress test_outbound_ip_base_;
++
+   #ifndef NDEBUG
+   // This is so we can log where exactly a Messenger was instantiated to better diagnose a CHECK
+   // failure in the destructor (ENG-2838). This can be removed when that is fixed.
+diff --git a/src/yb/rpc/reactor.cc b/src/yb/rpc/reactor.cc
+index 6135262024..2f0e60e427 100644
+--- a/src/yb/rpc/reactor.cc
++++ b/src/yb/rpc/reactor.cc
+@@ -534,15 +534,23 @@ Status Reactor::FindOrStartConnection(const ConnectionId &conn_id,
+ 
+   // Create a new socket and start connecting to the remote.
+   auto sock = VERIFY_RESULT(CreateClientSocket(conn_id.remote()));
+-  if (FLAGS_local_ip_for_outbound_sockets.empty()) {
++  if (!messenger_->test_outbound_ip_base_.is_unspecified()) {
++    auto address_bytes(messenger_->test_outbound_ip_base_.to_v4().to_bytes());
++    // Use different addresses for public/private endpoints.
++    // Private addresses are even, and public are odd.
++    // So if base address is "private" and destination address is "public" we will modify
++    // originating address to be "public" also.
++    address_bytes[3] |= conn_id.remote().address().to_v4().to_bytes()[3] & 1;
++    boost::asio::ip::address_v4 outbound_address(address_bytes);
++    auto status = sock.Bind(Endpoint(outbound_address, 0));
++    LOG_IF(WARNING, !status.ok()) << "Bind " << outbound_address << " failed: " << status;
++  } else if (FLAGS_local_ip_for_outbound_sockets.empty()) {
+     auto outbound_address = conn_id.remote().address().is_v6()
+         ? messenger_->outbound_address_v6()
+         : messenger_->outbound_address_v4();
+     if (!outbound_address.is_unspecified()) {
+-      auto status = sock.Bind(Endpoint(outbound_address, 0), /* explain_addr_in_use */ false);
+-      if (!status.ok()) {
+-        LOG(WARNING) << "Bind " << outbound_address << " failed: " << status.ToString();
+-      }
++      auto status = sock.Bind(Endpoint(outbound_address, 0));
++      LOG_IF(WARNING, !status.ok()) << "Bind " << outbound_address << " failed: " << status;
+     }
+   }
+ 
+diff --git a/src/yb/server/server_base.cc b/src/yb/server/server_base.cc
+index d0080f72c7..da928fda84 100644
+--- a/src/yb/server/server_base.cc
++++ b/src/yb/server/server_base.cc
+@@ -560,11 +560,18 @@ string TEST_RpcBindEndpoint(int index, uint16_t port) {
+   return Format("$0:$1", TEST_RpcAddress(index, Private::kTrue), port);
+ }
+ 
+-void TEST_BreakConnectivity(rpc::Messenger* messenger, int index) {
++constexpr int kMaxServers = 20;
++
++void TEST_SetupConnectivity(rpc::Messenger* messenger, int index) {
+   if (!FLAGS_TEST_check_broadcast_address) {
+     return;
+   }
+-  const int kMaxServers = 20;
++
++  CHECK_GE(index, 1);
++  CHECK_LE(index, kMaxServers);
++
++  messenger->TEST_SetOutboundIpBase(
++      CHECK_RESULT(HostToAddress(TEST_RpcAddress(index, Private::kTrue))));
+   for (int i = 1; i <= kMaxServers; ++i) {
+     // We group servers by 2. When servers belongs to the same group, they should use
+     // private ip for communication, otherwise public ip should be used.
+@@ -572,6 +579,17 @@ void TEST_BreakConnectivity(rpc::Messenger* messenger, int index) {
+     auto broken_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(!same_group))));
+     LOG(INFO) << "Break " << index << " => " << broken_address;
+     messenger->BreakConnectivityWith(broken_address);
++    auto working_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(same_group))));
++    messenger->RestoreConnectivityWith(working_address);
++  }
++}
++
++void TEST_Isolate(rpc::Messenger* messenger) {
++  for (int i = 1; i <= kMaxServers; ++i) {
++    messenger->BreakConnectivityWith(
++        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kFalse))));
++    messenger->BreakConnectivityWith(
++        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kTrue))));
+   }
+ }
+ 
+diff --git a/src/yb/server/server_base.h b/src/yb/server/server_base.h
+index f78ed2bfd6..a6ae91a502 100644
+--- a/src/yb/server/server_base.h
++++ b/src/yb/server/server_base.h
+@@ -214,8 +214,11 @@ YB_STRONGLY_TYPED_BOOL(Private);
+ std::string TEST_RpcAddress(int index, Private priv);
+ // Returns bind endpoint for test server with specified index and specified port.
+ std::string TEST_RpcBindEndpoint(int index, uint16_t port);
+-// Breaks connectivity in test for specified messenger of server with index.
+-void TEST_BreakConnectivity(rpc::Messenger* messenger, int index);
++
++// Sets up connectivity in test for specified messenger of server with index.
++void TEST_SetupConnectivity(rpc::Messenger* messenger, int index);
++// Isolates specific messenger, i.e. breaks connectivity with all other servers.
++void TEST_Isolate(rpc::Messenger* messenger);
+ 
+ } // namespace server
+ } // namespace yb
+diff --git a/src/yb/tools/ysck_remote.cc b/src/yb/tools/ysck_remote.cc
+index ec0d9f2474..8fc9633528 100644
+--- a/src/yb/tools/ysck_remote.cc
++++ b/src/yb/tools/ysck_remote.cc
+@@ -195,6 +195,7 @@ Status RemoteYsckMaster::Build(const HostPort& address, shared_ptr<YsckMaster>*
+   MessengerBuilder builder(kMessengerName);
+   auto messenger = builder.Build();
+   RETURN_NOT_OK(messenger);
++  (**messenger).TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress("127.0.0.1")));;
+   master->reset(new RemoteYsckMaster(address, *messenger));
+   return Status::OK();
+ }
+diff --git a/src/yb/tserver/mini_tablet_server.cc b/src/yb/tserver/mini_tablet_server.cc
+index 183f42de46..02efdc8ff2 100644
+--- a/src/yb/tserver/mini_tablet_server.cc
++++ b/src/yb/tserver/mini_tablet_server.cc
+@@ -118,12 +118,13 @@ Status MiniTabletServer::Start() {
+ 
+   gscoped_ptr<TabletServer> server(new YB_EDITION_NS_PREFIX TabletServer(opts_));
+   RETURN_NOT_OK(server->Init());
++
++  server::TEST_SetupConnectivity(server->messenger().get(), index_);
++
+   RETURN_NOT_OK(server->Start());
+ 
+   server_.swap(server);
+ 
+-  server::TEST_BreakConnectivity(server_->messenger().get(), index_);
+-
+   tunnel_ = std::make_unique<Tunnel>(&server_->messenger()->io_service());
+   BOOST_SCOPE_EXIT(this_) {
+     if (!this_->started_) {
+@@ -134,12 +135,23 @@ Status MiniTabletServer::Start() {
+   std::vector<Endpoint> local;
+   RETURN_NOT_OK(opts_.broadcast_addresses[0].ResolveAddresses(&local));
+   Endpoint remote = VERIFY_RESULT(ParseEndpoint(opts_.rpc_opts.rpc_bind_addresses, 0));
+-  RETURN_NOT_OK(tunnel_->Start(local.front(), remote));
++  RETURN_NOT_OK(tunnel_->Start(
++      local.front(), remote, [messenger = server_->messenger()](const IpAddress& address) {
++    return !messenger->TEST_ShouldArtificiallyRejectIncomingCallsFrom(address);
++  }));
+ 
+   started_ = true;
+   return Status::OK();
+ }
+ 
++void MiniTabletServer::SetIsolated(bool isolated) {
++  if (isolated) {
++    server::TEST_Isolate(server_->messenger().get());
++  } else {
++    server::TEST_SetupConnectivity(server_->messenger().get(), index_);
++  }
++}
++
+ Status MiniTabletServer::WaitStarted() {
+   return server_->WaitInited();
+ }
+diff --git a/src/yb/tserver/mini_tablet_server.h b/src/yb/tserver/mini_tablet_server.h
+index 0ee3c45099..b3526e43bc 100644
+--- a/src/yb/tserver/mini_tablet_server.h
++++ b/src/yb/tserver/mini_tablet_server.h
+@@ -122,6 +122,8 @@ class MiniTabletServer {
+ 
+   void FailHeartbeats();
+ 
++  void SetIsolated(bool isolated);
++
+  private:
+   bool started_;
+   TabletServerOptions opts_;
+diff --git a/src/yb/tserver/tablet_server.cc b/src/yb/tserver/tablet_server.cc
+index d6286750ec..49f0e50374 100644
+--- a/src/yb/tserver/tablet_server.cc
++++ b/src/yb/tserver/tablet_server.cc
+@@ -287,6 +287,8 @@ Status TabletServer::Start() {
+   CHECK(initted_.load(std::memory_order_acquire));
+ 
+   AutoInitServiceFlags();
++
++  RETURN_NOT_OK(tablet_manager_->Start());
+   RETURN_NOT_OK(RegisterServices());
+   RETURN_NOT_OK(RpcAndWebServerBase::Start());
+ 
+diff --git a/src/yb/tserver/tablet_service.cc b/src/yb/tserver/tablet_service.cc
+index 0c94c83e2f..1300dda8c8 100644
+--- a/src/yb/tserver/tablet_service.cc
++++ b/src/yb/tserver/tablet_service.cc
+@@ -259,6 +259,14 @@ class WriteOperationCompletionCallback : public OperationCompletionCallback {
+         include_trace_(trace) {}
+ 
+   void OperationCompleted() override {
++    // When we don't need to return any data, we could return success on duplicate request.
++    if (status_.IsAlreadyPresent() &&
++        state_->ql_write_ops()->empty() &&
++        state_->pgsql_write_ops()->empty() &&
++        state_->request()->redis_write_batch().empty()) {
++      status_ = Status::OK();
++    }
++
+     if (!status_.ok()) {
+       SetupErrorAndRespond(get_error(), status_, code_, context_.get());
+       return;
+diff --git a/src/yb/tserver/ts_tablet_manager.cc b/src/yb/tserver/ts_tablet_manager.cc
+index 82ba34d014..f6ddedbbfa 100644
+--- a/src/yb/tserver/ts_tablet_manager.cc
++++ b/src/yb/tserver/ts_tablet_manager.cc
+@@ -465,6 +465,12 @@ Status TSTabletManager::Init() {
+   return Status::OK();
+ }
+ 
++Status TSTabletManager::Start() {
++  async_client_init_->Start();
++
++  return Status::OK();
++}
++
+ Status TSTabletManager::WaitForAllBootstrapsToFinish() {
+   CHECK_EQ(state(), MANAGER_RUNNING);
+ 
+diff --git a/src/yb/tserver/ts_tablet_manager.h b/src/yb/tserver/ts_tablet_manager.h
+index 0c3ace9d56..048a5febfe 100644
+--- a/src/yb/tserver/ts_tablet_manager.h
++++ b/src/yb/tserver/ts_tablet_manager.h
+@@ -137,6 +137,7 @@ class TSTabletManager : public tserver::TabletPeerLookupIf {
+   // Upon return of this method all existing tablets are registered, but
+   // the bootstrap is performed asynchronously.
+   CHECKED_STATUS Init();
++  CHECKED_STATUS Start();
+ 
+   // Waits for all the bootstraps to complete.
+   // Returns Status::OK if all tablets bootstrapped successfully. If
+diff --git a/src/yb/util/flag_tags.cc b/src/yb/util/flag_tags.cc
+index 7e95a6200a..7e85171054 100644
+--- a/src/yb/util/flag_tags.cc
++++ b/src/yb/util/flag_tags.cc
+@@ -32,21 +32,23 @@
+ 
+ #include "yb/util/flag_tags.h"
+ 
+-#include "yb/gutil/map-util.h"
+-#include "yb/gutil/singleton.h"
+-
+ #include <map>
+ #include <string>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
++#include "yb/gutil/map-util.h"
++#include "yb/gutil/singleton.h"
++
+ using std::multimap;
+ using std::pair;
+ using std::string;
+ using std::unordered_set;
+ using std::vector;
+ 
++DEFINE_test_flag(bool, running_test, false, "Flag that is set to true when we running a test");
++
+ namespace yb {
+ namespace flag_tags_internal {
+ 
+diff --git a/src/yb/util/net/socket.cc b/src/yb/util/net/socket.cc
+index f0ece99cb5..da51dc487c 100644
+--- a/src/yb/util/net/socket.cc
++++ b/src/yb/util/net/socket.cc
+@@ -344,12 +344,10 @@ Status Socket::GetPeerAddress(Endpoint* out) const {
+ 
+ Status Socket::Bind(const Endpoint& endpoint, bool explain_addr_in_use) {
+   DCHECK_GE(fd_, 0);
+-  if (PREDICT_FALSE(::bind(fd_, endpoint.data(), endpoint.size()))) {
++  if (PREDICT_FALSE(::bind(fd_, endpoint.data(), endpoint.size()) != 0)) {
+     int err = errno;
+     Status s = STATUS(NetworkError,
+-                      strings::Substitute("Error binding socket to $0: $1",
+-                                          ToString(endpoint),
+-                                          ErrnoToString(err)),
++                      Format("Error binding socket to $0: $1", endpoint, ErrnoToString(err)),
+                       Slice(),
+                       err);
+ 
+diff --git a/src/yb/util/net/tunnel.cc b/src/yb/util/net/tunnel.cc
+index ba9174a470..1ba9e7376e 100644
+--- a/src/yb/util/net/tunnel.cc
++++ b/src/yb/util/net/tunnel.cc
+@@ -125,7 +125,8 @@ class Tunnel::Impl {
+         << "Tunnel shutdown has not been started";
+   }
+ 
+-  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote) {
++  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote,
++                       AddressChecker address_checker) {
+     auto acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(io_context_);
+     boost::system::error_code ec;
+ 
+@@ -147,9 +148,11 @@ class Tunnel::Impl {
+     if (ec) {
+       return STATUS_FORMAT(NetworkError, "Listen failed: $0", ec.message());
+     }
+-    strand_.dispatch([this, acceptor, local, remote]() {
++    strand_.dispatch([
++        this, acceptor, local, remote, address_checker]() {
+       local_ = local;
+       remote_ = remote;
++      address_checker_ = address_checker;
+       acceptor_.emplace(std::move(*acceptor));
+       StartAccept();
+     });
+@@ -191,6 +194,14 @@ class Tunnel::Impl {
+       return;
+     }
+ 
++    if (!CheckAddress()) {
++      boost::system::error_code ec;
++      socket_->close(ec);
++      LOG_IF(WARNING, ec) << "Close failed: " << ec.message();
++      StartAccept();
++      return;
++    }
++
+     auto connection = std::make_shared<TunnelConnection>(socket_.get_ptr());
+     connection->Start(remote_);
+     bool found = false;
+@@ -208,8 +219,25 @@ class Tunnel::Impl {
+     StartAccept();
+   }
+ 
++  bool CheckAddress() {
++    if (!address_checker_) {
++      return true;
++    }
++
++    boost::system::error_code ec;
++    auto endpoint = socket_->remote_endpoint(ec);
++
++    if (ec) {
++      LOG(WARNING) << "Cannot get remote endpoint: " << ec.message();
++      return true;
++    }
++
++    return address_checker_(endpoint.address());
++  }
++
+   boost::asio::io_context& io_context_;
+   boost::asio::io_context::strand strand_;
++  AddressChecker address_checker_;
+   Endpoint local_;
+   Endpoint remote_;
+   boost::optional<boost::asio::ip::tcp::acceptor> acceptor_;
+@@ -224,8 +252,9 @@ Tunnel::Tunnel(boost::asio::io_context* io_context) : impl_(new Impl(io_context)
+ Tunnel::~Tunnel() {
+ }
+ 
+-Status Tunnel::Start(const Endpoint& local, const Endpoint& remote) {
+-  return impl_->Start(local, remote);
++Status Tunnel::Start(const Endpoint& local, const Endpoint& remote,
++                     AddressChecker address_checker) {
++  return impl_->Start(local, remote, std::move(address_checker));
+ }
+ 
+ void Tunnel::Shutdown() {
+diff --git a/src/yb/util/net/tunnel.h b/src/yb/util/net/tunnel.h
+index beaad5ac66..24762ad98c 100644
+--- a/src/yb/util/net/tunnel.h
++++ b/src/yb/util/net/tunnel.h
+@@ -21,6 +21,9 @@
+ 
+ namespace yb {
+ 
++// Check that we should accept connections from specified address.
++typedef std::function<bool(const IpAddress&)> AddressChecker;
++
+ // Tunnel that accepts connections at local endpoints and transparently transfer traffic
+ // to remote endpoint.
+ class Tunnel {
+@@ -28,7 +31,11 @@ class Tunnel {
+   explicit Tunnel(boost::asio::io_context* io_context);
+   ~Tunnel();
+ 
+-  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote);
++  // Listen local and forward data to/from remote.
++  // If address_checker is specified, we use it to check whether we originating address of
++  // connection is acceptable.
++  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote,
++                       AddressChecker address_checker = AddressChecker());
+   void Shutdown();
+ 
+  private:
+diff --git a/src/yb/util/test_util.cc b/src/yb/util/test_util.cc
+index efa81d7a53..111dab5b5c 100644
+--- a/src/yb/util/test_util.cc
++++ b/src/yb/util/test_util.cc
+@@ -55,6 +55,7 @@ DEFINE_string(test_leave_files, "on_failure",
+ DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
+ DECLARE_int64(memory_limit_hard_bytes);
+ DECLARE_bool(enable_tracing);
++DECLARE_bool(running_test);
+ 
+ using std::string;
+ using strings::Substitute;
+@@ -105,6 +106,7 @@ void YBTest::SetUp() {
+   InitGoogleLoggingSafeBasic("yb_test");
+   FLAGS_enable_tracing = true;
+   FLAGS_memory_limit_hard_bytes = 8 * 1024 * 1024 * 1024L;
++  FLAGS_running_test = true;
+   for (const char* env_var_name : {
+       "ASAN_OPTIONS",
+       "LSAN_OPTIONS",
+diff --git a/src/yb/yql/cql/cqlserver/cql_service.cc b/src/yb/yql/cql/cqlserver/cql_service.cc
+index 5871803406..25facb465a 100644
+--- a/src/yb/yql/cql/cqlserver/cql_service.cc
++++ b/src/yb/yql/cql/cqlserver/cql_service.cc
+@@ -84,6 +84,8 @@ CQLServiceImpl::CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
+       "",
+       Substitute("SELECT $0, $1 FROM system_auth.roles WHERE role = ?",
+                  kRoleColumnNameSaltedHash, kRoleColumnNameCanLogin));
++
++  async_client_init_.Start();
+ }
+ 
+ CQLServiceImpl::~CQLServiceImpl() {
+diff --git a/src/yb/yql/pggate/pggate.cc b/src/yb/yql/pggate/pggate.cc
+index 0416b464a0..ea7a6f70f6 100644
+--- a/src/yb/yql/pggate/pggate.cc
++++ b/src/yb/yql/pggate/pggate.cc
+@@ -94,6 +94,8 @@ PgApiImpl::PgApiImpl(const YBCPgTypeEntity *YBCDataTypeArray, int count)
+     const YBCPgTypeEntity *type_entity = &YBCDataTypeArray[idx];
+     type_map_[type_entity->type_oid] = type_entity;
+   }
++
++  async_client_init_.Start();
+ }
+ 
+ PgApiImpl::~PgApiImpl() {
