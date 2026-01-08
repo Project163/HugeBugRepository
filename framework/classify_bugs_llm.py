@@ -18,19 +18,73 @@ client = OpenAI(
 
 # Labels to classify
 DEFAULT_LABELS = [
-    "Crash/UnhandledException", "Crash/NullPointer", "Crash/Memory", "Stability/Freeze",
-    "UI/Layout", "UI/Visual", "UI/Responsive", "UX/Navigation", "Accessibility",
-    "Logic/Calculation", "Logic/Workflow", "Data/Corruption", "Data/Format", "Network/Timeout", "Network/APIError", "Connectivity",
-    "Build/Dependency", "Env/Compatibility", "Dev/Test",
-    "Text/Typo", "Docs/Missing",
-    "Security/Auth", "Security/Vulnerability",
+    "Function :: Access Control (CWE-284)",
+    "Function :: Logic Mismatch (CWE-573)",
+
+    "Algorithm :: Calculation Error (CWE-682)",
+    "Algorithm :: Resource/Memory Leak (CWE-400)",
+
+    "Checking :: Input Validation (CWE-20)",
+    "Checking :: Boundary/Buffer (CWE-119)",
+    "Checking :: Missing Check (CWE-754)",
+
+    "Assignment :: Initialization (CWE-665)",
+    "Assignment :: Type/Cast Error (CWE-704)",
+
+    "Interface :: API Misuse (CWE-628)",
+    "Interface :: Data Encoding (CWE-707)",
+
+    "Timing :: Race Condition (CWE-362)",
+    "Timing :: Resource Lifecycle (CWE-664)",
+
+    "Build :: Configuration (CWE-16)",
+    "Build :: Dependency (CWE-1357)",
+
+    "Documentation :: Wrong Comments (CWE-1116)",
+
     "Other"
 ]
-LABELS_STRING = ", ".join(DEFAULT_LABELS)
+
+# DEFAULT_LABELS = [
+#     # 1. Assignment (赋值/初始化)
+#     "Assignment/Initialization", # 变量/对象未初始化或初始值错误
+#     "Assignment/Value",          # 简单的赋值错误（非算法计算）
+
+#     # 2. Checking (检查/校验)
+#     "Checking/Validation",       # 数据合法性检查缺失或错误 (Input, Null Check)
+#     "Checking/LoopCondition",    # 循环边界或条件分支逻辑错误 (If/While)
+
+#     # 3. Algorithm (算法/逻辑)
+#     "Algorithm/Calculation",     # 数学公式、位运算或复杂逻辑推导错误
+#     "Algorithm/Efficiency",      # 算法复杂度过高、性能问题
+
+#     # 4. Interface (接口/交互)
+#     "Interface/Parameter",       # 函数调用参数错误 (类型、顺序、缺失)
+#     "Interface/Protocol",        # 系统间通信协议、I/O 格式或 API 契约错误
+
+#     # 5. Timing/Serialization (时序/序列化)
+#     "Timing/RaceCondition",      # 竞态条件、线程冲突
+#     "Timing/Resource",           # 锁机制、死锁或资源生命周期管理
+
+#     # 6. Build/Package/Merge (构建/打包)
+#     "Build/Configuration",       # 配置文件、环境变量错误
+#     "Build/Dependency",          # 依赖库版本冲突或缺失
+
+#     # 7. Documentation (文档)
+#     "Documentation/Content",     # 文档内容错误或误导
+#     "Documentation/Missing",     # 缺少必要的文档或注释
+
+#     # 8. Function (功能/宏观)
+#     "Function/LogicFlow",        # 宏观业务流程错误 (无法归类为单行错误)
+    
+#     "Other"
+# ]
+
+LABELS_STRING = "\n".join(DEFAULT_LABELS)
 
 # Input and output files
-INPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-classification', 'parsed_data.jsonl'))
-OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-classification', 'classified_data_llm.jsonl'))
+INPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'parsed_data.jsonl'))
+OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'classified_data_llm.jsonl'))
 
 # Concurrency settings
 MAX_WORKERS = 10  # Adjust according to API limits
@@ -41,20 +95,25 @@ SYSTEM_PROMPT = f"""
 You are an expert software engineer specializing in bug triaging and classification.
 Your task is to classify bug reports into one of the following categories based on their content:
 {LABELS_STRING}
-When classifying, consider the main issue described in the bug report.
-Respond with only the exact label name from the list above.
-If the bug does not clearly fit into any category, classify it as 'Other'.
-Do not provide any explanations or additional text—only return the label.
-Example1:
-Bug Report: "The application crashes when I try to upload a large file."
-Classification: "Crash/Exception"
-Example2:
-Bug Report: "The UI freezes when loading the dashboard."
-Classification: "UI/UX"
-Example3:
-Bug Report: "There is a typo in the settings menu."
-Classification: "Typo"
-Remember to respond with only the label name.
+Instructions:
+1. Analyze the 'Title' and 'Description' of the bug report.
+2. Determine the *root cause* or the *nature* of the defect, not just the symptom.
+3. Select EXACTLY ONE category from the list above.
+4. If the bug is a generic crash/freeze without a clear cause, look for clues about "Checking" (null pointer) or "Resource" (memory).
+5. Output ONLY the category name exactly as listed. Do not add explanations.
+
+Examples:
+Bug Report: "User can access admin panel without logging in."
+Classification: Function :: Access Control (CWE-284)
+
+Bug Report: "The app crashes with NullPointerException when username is empty."
+Classification: Checking :: Missing Check (CWE-754)
+
+Bug Report: "Sorting a large list causes the UI to freeze forever."
+Classification: Algorithm :: Complexity/Resource (CWE-400)
+
+Bug Report: "Typo in the help message."
+Classification: Documentation :: Wrong Comments (CWE-1116)
 """
 
 # 3. API Call Function
@@ -64,7 +123,7 @@ def get_bug_classification(bug_text):
     """
     try:
         completion = client.chat.completions.create(
-            model="Qwen/Qwen2.5-7B-Instruct",  
+            model="Qwen/Qwen3-8B",  
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": bug_text}

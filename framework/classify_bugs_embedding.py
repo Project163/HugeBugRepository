@@ -15,7 +15,7 @@ if not API_KEY:
 API_URL = "https://api.siliconflow.cn/v1/embeddings"
 MODEL_NAME = "BAAI/bge-m3"
 
-WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-classification'))
+WORK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification'))
 
 os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(os.path.join(os.path.dirname(__file__), 'cache'), exist_ok=True)
@@ -36,47 +36,66 @@ MAX_CHARS = 20000
 
 # 2. Fine-grained Label Definitions
 LABEL_DESCRIPTIONS = {
-    # --- Crash & Stability ---
-    "Crash/UnhandledException": "The application crashed due to an unhandled exception or error.",
-    "Crash/NullPointer": "The application crashed specifically due to a null pointer or nil reference.",
-    "Crash/Memory": "The application crashed due to out of memory or memory leaks.",
-    "Stability/Freeze": "The application becomes unresponsive, freezes, or hangs indefinitely.",
-
-    # --- UI/UX ---
-    "UI/Layout": "Elements are misaligned, overlapping, or have incorrect spacing/margin.",
-    "UI/Visual": "Visual glitches, wrong colors, blurry images, or broken icons.",
-    "UI/Responsive": "The interface breaks or looks bad on different screen sizes or mobile devices.",
-    "UX/Navigation": "User flow is confusing, navigation links are broken, or buttons are hard to find.",
-    "Accessibility": "Issues with screen readers, keyboard navigation, or color contrast compliance.",
-
-    # --- Logic & Functional ---
-    "Logic/Calculation": "Mathematical errors, incorrect totals, or wrong data processing logic.",
-    "Logic/Workflow": "The business process flow is stuck or transitions to an incorrect state.",
-    "Data/Corruption": "Data is saved incorrectly, missing, or corrupted in the database.",
-    "Data/Format": "Dates, numbers, or currencies are displayed in the wrong format.",
-
-    # --- Network & API ---
-    "Network/Timeout": "The request timed out or the connection was refused.",
-    "Network/APIError": "The API returned a 500 error, 404 not found, or invalid JSON response.",
-    "Connectivity": "Issues related to internet connection, offline mode, or socket disconnections.",
-
-    # --- Environment & Build ---
-    "Build/Dependency": "Errors related to missing libraries, gems, npm packages, or version conflicts.",
-    "Env/Compatibility": "The issue only occurs on a specific OS (Windows/Linux) or Browser (IE/Firefox).",
-    "Dev/Test": "Issues related to failing unit tests, CI pipelines, or test configuration.",
-
-    # --- Text & Documentation ---
-    "Text/Typo": "Spelling mistakes, grammatical errors, or wrong labels in the UI.",
-    "Docs/Missing": "Documentation is outdated, missing, or misleading.",
+    # --- 1. Function (Design/Logic) ---
+    "Function :: Access Control (CWE-284)": 
+        "Security issues where the application fails to restrict access to authorized users. Includes privilege escalation, permission bypass, and unauthorized actions.",
     
-    # --- Security ---
-    "Security/Auth": "Issues with login, logout, password reset, or permissions.",
-    "Security/Vulnerability": "Potential security risks like XSS, SQL Injection, or sensitive data exposure.",
+    "Function :: Logic Mismatch (CWE-573)": 
+        "The implemented business logic does not match the requirements or specifications. Includes functional gaps, wrong workflows, or state transition errors.",
 
-    # --- Other ---
-    "Other": "A generic bug that does not fit into any other specific category."
+    # --- 2. Algorithm (Complexity/Math) ---
+    "Algorithm :: Calculation Error (CWE-682)": 
+        "Mathematical or arithmetic errors. Includes incorrect formulas, unit conversion mistakes, integer overflow results, or logic operator misuse.",
+    
+    "Algorithm :: Resource/Memory Leak (CWE-400)": 
+        "Performance issues caused by uncontrolled resource consumption. Includes memory leaks, infinite loops, CPU spikes, and inefficient algorithms.",
+
+    # --- 3. Checking (Validation/Bounds) ---
+    "Checking :: Input Validation (CWE-20)": 
+        "Failure to validate or sanitize input data. Includes injection attacks (SQLi, XSS), format string errors, and processing of malformed data.",
+    
+    "Checking :: Boundary/Buffer (CWE-119)": 
+        "Memory corruption or access issues. Includes buffer overflows, index out of bounds (IOOB), and accessing memory outside intended limits.",
+    
+    "Checking :: Missing Check (CWE-754)": 
+        "Failure to check for unusual or exceptional conditions. Specifically includes Null Pointer Dereference (NPE), uncaught exceptions, and missing return value checks.",
+
+    # --- 4. Assignment (Values/Types) ---
+    "Assignment :: Initialization (CWE-665)": 
+        "Variables, objects, or resources are not properly initialized before use. Includes using wrong default values or configuration loading failures.",
+    
+    "Assignment :: Type/Cast Error (CWE-704)": 
+        "Errors involving incorrect data type conversions. Includes casting failures (ClassCastException), integer truncation, or unexpected type mismatches.",
+
+    # --- 5. Interface (API/Data Flow) ---
+    "Interface :: API Misuse (CWE-628)": 
+        "Incorrect use of internal or external APIs. Includes passing arguments in the wrong order, wrong argument count, or calling methods incorrectly.",
+    
+    "Interface :: Data Encoding (CWE-707)": 
+        "Issues with data format translation between systems. Includes JSON/XML parsing errors, serialization failures, and improper character encoding/escaping.",
+
+    # --- 6. Timing (Concurrency) ---
+    "Timing :: Race Condition (CWE-362)": 
+        "Concurrency issues where the outcome depends on the timing of threads or processes. Includes race conditions, interference, and synchronization failures.",
+    
+    "Timing :: Resource Lifecycle (CWE-664)": 
+        "Improper management of a resource's lifecycle. Includes double-freeing memory, use-after-free, and failing to release locks or file handles (deadlocks).",
+
+    # --- 7. Build (Config/Deps) ---
+    "Build :: Configuration (CWE-16)": 
+        "Issues arising from improper environmental configuration. Includes wrong environment variables, hardcoded credentials, or deployment setting errors.",
+    
+    "Build :: Dependency (CWE-1357)": 
+        "Problems related to third-party libraries. Includes version conflicts, missing gems/npm packages, or vulnerable supply chain dependencies.",
+
+    # --- 8. Documentation ---
+    "Documentation :: Wrong Comments (CWE-1116)": 
+        "Discrepancies between the code and its comments or documentation. Includes typos in UI text, outdated API docs, or misleading instructions.",
+
+    # --- Fallback ---
+    "Other": 
+        "A generic defect that does not fit clearly into the standard ODC or CWE categories, or lacks sufficient information to classify."
 }
-
 
 # 3. Utility Functions
 def get_embedding(text):
