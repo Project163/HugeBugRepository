@@ -129,11 +129,9 @@ Converts raw bug reports from various sources (Jira, GitHub, Google Code) into a
 - **Output**: `bug-classification/parsed_data.jsonl`
 
 ### 3. Bug Classification
-Script: `framework/classify_bugs_llm.py` / `framework/classify_bugs_embedding.py`
+Script: `framework/classify_bugs_llm.py`
 
-Provides two methods for automatic bug classification (e.g., Crash, UI, Logic, etc.).
-- **LLM-based (`classify_bugs_llm.py`)**: Directly asks the LLM to classify the bug description. High accuracy but speed is limited by the API.
-- **Embedding-based (`classify_bugs_embedding.py`)**: Calculates vector similarity between bug descriptions and predefined categories. Fast and low cost.
+Provides an automated way to label bugs (e.g., Crash, UI, Logic, etc.) using an LLM-driven classifier. This path asks the model directly for a category, trading speed for accuracy.
 
 ### Output
 
@@ -151,4 +149,4 @@ bug-mining/
         └── ...
 ```
 
-Classification results will be stored in `bug-classification/classified_data_embedding.jsonl` or `bug-classification/classified_data_llm.jsonl`, depending on the classification method used.
+Classification results will be stored in `bug-classification/classified_data_llm.jsonl`, depending on the classification method used.

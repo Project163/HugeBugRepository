@@ -131,11 +131,9 @@ python framework/fast_bug_miner.py
 - **输出**: `bug-classification/parsed_data.jsonl`
 
 ### 3. 缺陷分类 (Bug Classification)
-脚本: `framework/classify_bugs_llm.py` / `framework/classify_bugs_embedding.py`
+脚本: `framework/classify_bugs_llm.py`
 
-提供两种方式对缺陷进行自动分类（如 Crash, UI, Logic 等）。
-- **基于 LLM (`classify_bugs_llm.py`)**: 直接询问 LLM 对缺陷描述进行分类，准确度高但速度受限于 API。
-- **基于 Embedding (`classify_bugs_embedding.py`)**: 计算缺陷描述与预定义类别的向量相似度，速度快且成本低。
+提供一种方式对缺陷进行自动分类（如 Crash、UI、Logic 等）。该流程直接询问 LLM 对缺陷描述进行分类，准确度高但速度受限于 API。
 
 ### 输出
 

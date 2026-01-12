@@ -116,6 +116,46 @@ Bug Report: "Typo in the help message."
 Classification: Documentation :: Wrong Comments (CWE-1116)
 """
 
+# SYSTEM_PROMPT = f"""
+# You are an expert in IBM Orthogonal Defect Classification (ODC).
+# Your task is to classify software defects based on the *nature of the fix* and the *root cause*.
+
+# The taxonomy is STRICTLY hierarchical (Level 1 / Level 2):
+# {LABELS_STRING}
+
+# Classification Rules:
+# 1. **Assignment**: The fix involves changing a value assignment or initialization.
+#    - Use 'Initialization' if a variable was used before being set.
+#    - Use 'Value' for simple wrong scalars/strings.
+# 2. **Checking**: The fix involves validation logic.
+#    - Use 'Validation' for missing null checks, input sanitization, or boundary guards.
+#    - Use 'LoopCondition' for errors in 'if', 'while', or 'for' logic expressions.
+# 3. **Algorithm**: The fix involves transforming data or complex calculations.
+#    - Use 'Efficiency' for performance optimizations.
+# 4. **Interface**: The fix involves function calls or external communication.
+#    - Use 'Parameter' for wrong arguments passed to a function.
+#    - Use 'Protocol' for API mismatches or file format errors.
+# 5. **Timing**: The fix involves concurrency or shared resources.
+# 6. **Build**: The fix is in config files, makefiles, or dependencies (not source code).
+
+# Instructions:
+# - Analyze the Bug Report carefully.
+# - Think: "What type of code needs to be written to fix this?"
+# - Output ONLY the exact label from the list above.
+
+# Example 1:
+# Bug: "Application crashes because 'user_id' can be null."
+# Classification: Checking/Validation
+
+# Example 2:
+# Bug: "The loop runs one extra time causing index out of bounds."
+# Classification: Checking/LoopCondition
+
+# Example 3:
+# Bug: "Sorting takes too long on large arrays."
+# Classification: Algorithm/Efficiency
+# """
+
 # 3. API Call Function
 def get_bug_classification(bug_text):
     """
