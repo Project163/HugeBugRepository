@@ -119,17 +119,19 @@ def is_useful_comment(text):
 def parse_jira_xml(xml_content):
     try:
         soup = BeautifulSoup(xml_content, 'xml')
-        title_node = soup.find('summary')
-        title = TextCleaner.clean(title_node.get_text()) if title_node else "No Title"
-        desc_node = soup.find('description')
-        description = TextCleaner.clean(desc_node.get_text()) if desc_node else ""
-        comments = []
-        for comment in soup.find_all('comment'):
-            raw_body = comment.get_text()
-            cleaned = TextCleaner.clean(raw_body)
-            if cleaned and is_useful_comment(cleaned):
-                comments.append(cleaned)
-        return format_for_llm(title, description, comments)
+        item_node = soup.find('item')
+        if item_node:
+            title_node = item_node.find('summary')
+            title = TextCleaner.clean(title_node.get_text()) if title_node else "No Title"
+            desc_node = item_node.find('description')
+            description = TextCleaner.clean(desc_node.get_text()) if desc_node else ""
+            comments = []
+            for comment in item_node.find_all('comment'):
+                raw_body = comment.get_text()
+                cleaned = TextCleaner.clean(raw_body)
+                if cleaned and is_useful_comment(cleaned):
+                    comments.append(cleaned)
+            return format_for_llm(title, description, comments)
     except Exception as e:
         print(f"[Warning]: Failed to parse Jira XML: {e}")
         return None
