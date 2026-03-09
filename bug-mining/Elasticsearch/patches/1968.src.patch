@@ -1,0 +1,605 @@
+diff --git a/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrail.java b/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrail.java
+index 74a2b792865..5e92e4ac751 100644
+--- a/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrail.java
++++ b/plugin/security/src/main/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrail.java
+@@ -20,7 +20,9 @@ import org.elasticsearch.client.Client;
+ import org.elasticsearch.client.transport.TransportClient;
+ import org.elasticsearch.cluster.ClusterChangedEvent;
+ import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.metadata.AliasOrIndex;
+ import org.elasticsearch.cluster.metadata.IndexMetaData;
++import org.elasticsearch.cluster.metadata.MappingMetaData;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.Nullable;
+@@ -72,13 +74,16 @@ import java.util.Collections;
+ import java.util.EnumSet;
+ import java.util.List;
+ import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.function.Consumer;
+ import java.util.function.Function;
++import java.util.stream.Collectors;
+ 
+ import static org.elasticsearch.xpack.core.ClientHelper.SECURITY_ORIGIN;
+ import static org.elasticsearch.xpack.core.ClientHelper.clientWithOrigin;
+@@ -99,6 +104,7 @@ import static org.elasticsearch.xpack.security.audit.AuditLevel.parse;
+ import static org.elasticsearch.xpack.security.audit.AuditUtil.indices;
+ import static org.elasticsearch.xpack.security.audit.AuditUtil.restRequestContent;
+ import static org.elasticsearch.xpack.security.audit.index.IndexNameResolver.resolve;
++import static org.elasticsearch.xpack.security.support.IndexLifecycleManager.SECURITY_VERSION_STRING;
+ 
+ /**
+  * Audit trail implementation that writes events into an index.
+@@ -178,7 +184,7 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+         super(settings);
+         this.threadPool = threadPool;
+         this.clusterService = clusterService;
+-        this.nodeName = settings.get("name");
++        this.nodeName = Node.NODE_NAME_SETTING.get(settings);
+         final int maxQueueSize = QUEUE_SIZE_SETTING.get(settings);
+         this.queueConsumer = new QueueConsumer(EsExecutors.threadName(settings, "audit-queue-consumer"), createQueue(maxQueueSize));
+         this.rollover = ROLLOVER_SETTING.get(settings);
+@@ -234,7 +240,7 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+             return false;
+         }
+ 
+-        if (TemplateUtils.checkTemplateExistsAndVersionMatches(INDEX_TEMPLATE_NAME, IndexLifecycleManager.SECURITY_VERSION_STRING,
++        if (TemplateUtils.checkTemplateExistsAndVersionMatches(INDEX_TEMPLATE_NAME, SECURITY_VERSION_STRING,
+                 clusterState, logger, Version.CURRENT::onOrAfter) == false) {
+             logger.debug("security audit index template [{}] is not up to date", INDEX_TEMPLATE_NAME);
+             return false;
+@@ -256,7 +262,14 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+     }
+ 
+     private String getIndexName() {
+-        return resolve(IndexAuditTrailField.INDEX_NAME_PREFIX, DateTime.now(DateTimeZone.UTC), rollover);
++        final Message first = peek();
++        final String index;
++        if (first == null) {
++            index = resolve(IndexAuditTrailField.INDEX_NAME_PREFIX, DateTime.now(DateTimeZone.UTC), rollover);
++        } else {
++            index = resolve(IndexAuditTrailField.INDEX_NAME_PREFIX, first.timestamp, rollover);
++        }
++        return index;
+     }
+ 
+     /**
+@@ -276,15 +289,15 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+                         logger.trace("remote cluster state is [{}] [{}]",
+                                 clusterStateResponse.getClusterName(), clusterStateResponse.getState());
+                         if (canStart(clusterStateResponse.getState())) {
+-                            innerStart();
++                            updateCurrentIndexMappingsIfNecessary(clusterStateResponse.getState());
+                         } else if (TemplateUtils.checkTemplateExistsAndVersionMatches(INDEX_TEMPLATE_NAME,
+-                                IndexLifecycleManager.SECURITY_VERSION_STRING, clusterStateResponse.getState(), logger,
++                                SECURITY_VERSION_STRING, clusterStateResponse.getState(), logger,
+                                 Version.CURRENT::onOrAfter) == false) {
+-                            putTemplate(customAuditIndexSettings(settings, logger), ActionListener.wrap((v) -> innerStart(),
+-                                    (e) -> {
++                            putTemplate(customAuditIndexSettings(settings, logger),
++                                    e -> {
+                                         logger.error("failed to put audit trail template", e);
+                                         transitionStartingToInitialized();
+-                                    }));
++                                    });
+                         } else {
+                             // for some reason we can't start up since the remote cluster is not fully setup. in this case
+                             // we try to wait for yellow status (all primaries started up) this will also wait for
+@@ -312,11 +325,71 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+                     }
+                 });
+             } else {
+-                innerStart();
++                updateCurrentIndexMappingsIfNecessary(clusterService.state());
+             }
+         }
+     }
+ 
++    // pkg private for tests
++    void updateCurrentIndexMappingsIfNecessary(ClusterState state) {
++        final String index = getIndexName();
++
++        AliasOrIndex aliasOrIndex = state.getMetaData().getAliasAndIndexLookup().get(index);
++        if (aliasOrIndex != null) {
++            // check mappings
++            final List<IndexMetaData> indices = aliasOrIndex.getIndices();
++            if (aliasOrIndex.isAlias() && indices.size() > 1) {
++                throw new IllegalStateException("Alias [" + index + "] points to more than one index: " +
++                        indices.stream().map(imd -> imd.getIndex().getName()).collect(Collectors.toList()));
++            }
++            IndexMetaData indexMetaData = indices.get(0);
++            MappingMetaData docMapping = indexMetaData.mapping("doc");
++            if (docMapping == null) {
++                if (indexToRemoteCluster || state.nodes().isLocalNodeElectedMaster()) {
++                    putAuditIndexMappingsAndStart(index);
++                } else {
++                    logger.trace("audit index [{}] is missing mapping for type [{}]", index, DOC_TYPE);
++                    transitionStartingToInitialized();
++                }
++            } else {
++                @SuppressWarnings("unchecked")
++                Map<String, Object> meta = (Map<String, Object>) docMapping.sourceAsMap().get("_meta");
++                if (meta == null) {
++                    logger.info("Missing _meta field in mapping [{}] of index [{}]", docMapping.type(), index);
++                    throw new IllegalStateException("Cannot read security-version string in index " + index);
++                }
++
++                final String versionString = (String) meta.get(SECURITY_VERSION_STRING);
++                if (versionString != null && Version.fromString(versionString).onOrAfter(Version.CURRENT)) {
++                    innerStart();
++                } else {
++                    if (indexToRemoteCluster || state.nodes().isLocalNodeElectedMaster()) {
++                        putAuditIndexMappingsAndStart(index);
++                    } else if (versionString == null) {
++                        logger.trace("audit index [{}] mapping is missing meta field [{}]", index, SECURITY_VERSION_STRING);
++                        transitionStartingToInitialized();
++                    } else {
++                        logger.trace("audit index [{}] has the incorrect version [{}]", index, versionString);
++                        transitionStartingToInitialized();
++                    }
++                }
++            }
++        } else {
++            innerStart();
++        }
++    }
++
++    private void putAuditIndexMappingsAndStart(String index) {
++        putAuditIndexMappings(index, getPutIndexTemplateRequest(Settings.EMPTY).mappings().get(DOC_TYPE),
++                ActionListener.wrap(ignore -> {
++                    logger.trace("updated mappings on audit index [{}]", index);
++                    innerStart();
++                }, e -> {
++                    logger.error(new ParameterizedMessage("failed to update mappings on audit index [{}]", index), e);
++                    transitionStartingToInitialized(); // reset to initialized so we can retry
++                }));
++    }
++
+     private void transitionStartingToInitialized() {
+         if (state.compareAndSet(State.STARTING, State.INITIALIZED) == false) {
+             final String message = "state transition from starting to initialized failed, current value: " + state.get();
+@@ -325,11 +398,11 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+         }
+     }
+ 
+-    private void innerStart() {
++    void innerStart() {
+         initializeBulkProcessor();
+         queueConsumer.start();
+         if (state.compareAndSet(State.STARTING, State.STARTED) == false) {
+-            final String message = "state transition from starting to start ed failed, current value: " + state.get();
++            final String message = "state transition from starting to started failed, current value: " + state.get();
+             assert false : message;
+             logger.error(message);
+         } else {
+@@ -874,55 +947,41 @@ public class IndexAuditTrail extends AbstractComponent implements AuditTrail {
+         return builder.build();
+     }
+ 
+-    void putTemplate(Settings customSettings, ActionListener<Void> listener) {
++    private void putTemplate(Settings customSettings, Consumer<Exception> consumer) {
+         try {
+-            final byte[] template = TemplateUtils.loadTemplate("/" + INDEX_TEMPLATE_NAME + ".json",
+-                    Version.CURRENT.toString(), IndexLifecycleManager.TEMPLATE_VERSION_PATTERN).getBytes(StandardCharsets.UTF_8);
+-            final PutIndexTemplateRequest request = new PutIndexTemplateRequest(INDEX_TEMPLATE_NAME).source(template, XContentType.JSON);
+-            if (customSettings != null && customSettings.names().size() > 0) {
+-                Settings updatedSettings = Settings.builder()
+-                        .put(request.settings())
+-                        .put(customSettings)
+-                        .build();
+-                request.settings(updatedSettings);
+-            }
++            final PutIndexTemplateRequest request = getPutIndexTemplateRequest(customSettings);
+ 
+             client.admin().indices().putTemplate(request, ActionListener.wrap((response) -> {
+                         if (response.isAcknowledged()) {
+                             // now we may need to update the mappings of the current index
+-                            final DateTime dateTime;
+-                            final Message message = queueConsumer.peek();
+-                            if (message != null) {
+-                                dateTime = message.timestamp;
+-                            } else {
+-                                dateTime = DateTime.now(DateTimeZone.UTC);
+-                            }
+-                            final String index = resolve(IndexAuditTrailField.INDEX_NAME_PREFIX, dateTime, rollover);
+-                            checkIfCurrentIndexExists(index, request, listener);
++                            client.admin().cluster().prepareState().execute(ActionListener.wrap(
++                                    stateResponse -> updateCurrentIndexMappingsIfNecessary(stateResponse.getState()),
++                                    consumer));
+                         } else {
+-                            listener.onFailure(new IllegalStateException("failed to put index template for audit logging"));
++                            consumer.accept(new IllegalStateException("failed to put index template for audit logging"));
+                         }
+-                    }, listener::onFailure));
++                    }, consumer));
+         } catch (Exception e) {
+             logger.debug("unexpected exception while putting index template", e);
+-            listener.onFailure(e);
++            consumer.accept(e);
+         }
+     }
+ 
+-    private void checkIfCurrentIndexExists(String index, PutIndexTemplateRequest indexTemplateRequest, ActionListener<Void> listener) {
+-        client.admin().indices().prepareExists(index).execute(ActionListener.wrap((response) -> {
+-            if (response.isExists()) {
+-                logger.debug("index [{}] exists so we need to update mappings", index);
+-                putAuditIndexMappings(index, indexTemplateRequest, listener);
+-            } else {
+-                logger.debug("index [{}] does not exist so we do not need to update mappings", index);
+-                listener.onResponse(null);
+-            }
+-        }, listener::onFailure));
++    private PutIndexTemplateRequest getPutIndexTemplateRequest(Settings customSettings) {
++        final byte[] template = TemplateUtils.loadTemplate("/" + INDEX_TEMPLATE_NAME + ".json",
++                Version.CURRENT.toString(), IndexLifecycleManager.TEMPLATE_VERSION_PATTERN).getBytes(StandardCharsets.UTF_8);
++        final PutIndexTemplateRequest request = new PutIndexTemplateRequest(INDEX_TEMPLATE_NAME).source(template, XContentType.JSON);
++        if (customSettings != null && customSettings.names().size() > 0) {
++            Settings updatedSettings = Settings.builder()
++                    .put(request.settings())
++                    .put(customSettings)
++                    .build();
++            request.settings(updatedSettings);
++        }
++        return request;
+     }
+ 
+-    private void putAuditIndexMappings(String index, PutIndexTemplateRequest request, ActionListener<Void> listener) {
+-        String mappings = request.mappings().get(DOC_TYPE);
++    private void putAuditIndexMappings(String index, String mappings, ActionListener<Void> listener) {
+         client.admin().indices().preparePutMapping(index)
+                 .setType(DOC_TYPE)
+                 .setSource(mappings, XContentType.JSON)
+diff --git a/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailMutedTests.java b/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailMutedTests.java
+index 44dfde6480a..863bd2229b3 100644
+--- a/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailMutedTests.java
++++ b/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailMutedTests.java
+@@ -13,6 +13,7 @@ import org.elasticsearch.action.ActionResponse;
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.client.FilterClient;
+ import org.elasticsearch.client.transport.TransportClient;
++import org.elasticsearch.cluster.ClusterState;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.settings.Settings;
+@@ -297,9 +298,9 @@ public class IndexAuditTrailMutedTests extends ESTestCase {
+         Settings settings = IndexAuditTrailTests.levelSettings(null, excludes);
+         auditTrail = new IndexAuditTrail(settings, client, threadPool, clusterService) {
+             @Override
+-            void putTemplate(Settings settings, ActionListener<Void> listener) {
+-                // make this a no-op so we don't have to stub out unnecessary client activities
+-                listener.onResponse(null);
++            void updateCurrentIndexMappingsIfNecessary(ClusterState state) {
++                // skip stuff so we don't have to stub out unnecessary client activities and cluster state
++                innerStart();
+             }
+ 
+             @Override
+diff --git a/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailTests.java b/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailTests.java
+index 364390bc12c..a91950dc765 100644
+--- a/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailTests.java
++++ b/plugin/security/src/test/java/org/elasticsearch/xpack/security/audit/index/IndexAuditTrailTests.java
+@@ -52,7 +52,6 @@ import org.elasticsearch.xpack.security.LocalStateSecurity;
+ import org.elasticsearch.xpack.security.audit.index.IndexAuditTrail.Message;
+ import org.elasticsearch.xpack.security.transport.filter.IPFilter;
+ import org.elasticsearch.xpack.security.transport.filter.SecurityIpFilterRule;
+-import org.hamcrest.Matchers;
+ import org.joda.time.DateTime;
+ import org.joda.time.DateTimeZone;
+ import org.joda.time.format.ISODateTimeFormat;
+@@ -338,7 +337,7 @@ public class IndexAuditTrailTests extends SecurityIntegTestCase {
+         ClusterState state = mock(ClusterState.class);
+         DiscoveryNodes nodes = mock(DiscoveryNodes.class);
+         when(clusterService.localNode()).thenReturn(localNode);
+-        when(clusterService.state()).thenReturn(state);
++        when(clusterService.state()).thenReturn(client().admin().cluster().prepareState().get().getState());
+         when(state.getNodes()).thenReturn(nodes);
+         when(nodes.isLocalNodeElectedMaster()).thenReturn(true);
+         threadPool = new TestThreadPool("index audit trail tests");
+diff --git a/qa/rolling-upgrade/build.gradle b/qa/rolling-upgrade/build.gradle
+index 7919fbb1420..df51c820a6a 100644
+--- a/qa/rolling-upgrade/build.gradle
++++ b/qa/rolling-upgrade/build.gradle
+@@ -139,6 +139,8 @@ subprojects {
+       setting 'xpack.license.self_generated.type', 'trial'
+       setting 'xpack.security.transport.ssl.enabled', 'true'
+       setting 'xpack.security.authc.token.enabled', 'true'
++      setting 'xpack.security.audit.enabled', 'true'
++      setting 'xpack.security.audit.outputs', 'index'
+       setting 'xpack.ssl.keystore.path', 'testnode.jks'
+       setting 'xpack.ssl.keystore.password', 'testnode'
+       dependsOn copyTestNodeKeystore
+@@ -186,6 +188,9 @@ subprojects {
+       keystoreSetting 'xpack.ssl.keystore.secure_password', 'testnode'
+       setting 'node.attr.upgraded', 'first'
+       setting 'xpack.security.authc.token.enabled', 'true'
++      setting 'xpack.security.audit.enabled', 'true'
++      setting 'xpack.security.audit.outputs', 'index'
++      setting 'node.name', 'mixed-node-0'
+       dependsOn copyTestNodeKeystore
+       extraConfigFile 'testnode.jks', new File(outputDir + '/testnode.jks')
+       if (withSystemKey) {
+@@ -224,6 +229,9 @@ subprojects {
+       setting 'xpack.ssl.keystore.path', 'testnode.jks'
+       keystoreSetting 'xpack.ssl.keystore.secure_password', 'testnode'
+       setting 'xpack.security.authc.token.enabled', 'true'
++      setting 'xpack.security.audit.enabled', 'true'
++      setting 'xpack.security.audit.outputs', 'index'
++      setting 'node.name', 'upgraded-node-0'
+       dependsOn copyTestNodeKeystore
+       extraConfigFile 'testnode.jks', new File(outputDir + '/testnode.jks')
+       if (withSystemKey) {
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractUpgradeTestCase.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractUpgradeTestCase.java
+new file mode 100644
+index 00000000000..a9e1ccba614
+--- /dev/null
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/AbstractUpgradeTestCase.java
+@@ -0,0 +1,90 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License;
++ * you may not use this file except in compliance with the Elastic License.
++ */
++package org.elasticsearch.upgrades;
++
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.util.concurrent.ThreadContext;
++import org.elasticsearch.test.SecuritySettingsSourceField;
++import org.elasticsearch.test.rest.ESRestTestCase;
++import org.elasticsearch.xpack.core.security.SecurityLifecycleServiceField;
++import org.junit.Before;
++
++import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
++
++import static org.elasticsearch.xpack.core.security.authc.support.UsernamePasswordToken.basicAuthHeaderValue;
++
++public abstract class AbstractUpgradeTestCase extends ESRestTestCase {
++
++    private static final String BASIC_AUTH_VALUE =
++            basicAuthHeaderValue("test_user", SecuritySettingsSourceField.TEST_PASSWORD_SECURE_STRING);
++
++    @Override
++    protected boolean preserveIndicesUponCompletion() {
++        return true;
++    }
++
++    @Override
++    protected boolean preserveReposUponCompletion() {
++        return true;
++    }
++
++    @Override
++    protected boolean preserveTemplatesUponCompletion() {
++        return true;
++    }
++
++    enum CLUSTER_TYPE {
++        OLD,
++        MIXED,
++        UPGRADED;
++
++        public static CLUSTER_TYPE parse(String value) {
++            switch (value) {
++                case "old_cluster":
++                    return OLD;
++                case "mixed_cluster":
++                    return MIXED;
++                case "upgraded_cluster":
++                    return UPGRADED;
++                default:
++                    throw new AssertionError("unknown cluster type: " + value);
++            }
++        }
++    }
++
++    protected final CLUSTER_TYPE clusterType = CLUSTER_TYPE.parse(System.getProperty("tests.rest.suite"));
++
++    @Override
++    protected Settings restClientSettings() {
++        return Settings.builder()
++                .put(ThreadContext.PREFIX + ".Authorization", BASIC_AUTH_VALUE)
++                .build();
++    }
++
++    protected Collection<String> templatesToWaitFor() {
++        return Collections.singletonList(SecurityLifecycleServiceField.SECURITY_TEMPLATE_NAME);
++    }
++
++    @Before
++    public void setupForTests() throws Exception {
++        awaitBusy(() -> {
++            boolean success = true;
++            for (String template : templatesToWaitFor()) {
++                try {
++                    final boolean exists =
++                            adminClient().performRequest("HEAD", "_template/" + template).getStatusLine().getStatusCode() == 200;
++                    success &= exists;
++                    logger.debug("template [{}] exists [{}]", template, exists);
++                } catch (IOException e) {
++                    logger.warn("error calling template api", e);
++                }
++            }
++            return success;
++        });
++    }
++}
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/IndexAuditUpgradeIT.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/IndexAuditUpgradeIT.java
+new file mode 100644
+index 00000000000..45d69f8296f
+--- /dev/null
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/IndexAuditUpgradeIT.java
+@@ -0,0 +1,78 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License;
++ * you may not use this file except in compliance with the Elastic License.
++ */
++package org.elasticsearch.upgrades;
++
++import org.apache.http.HttpEntity;
++import org.apache.http.entity.ContentType;
++import org.apache.http.entity.StringEntity;
++import org.elasticsearch.client.Response;
++import org.hamcrest.Matchers;
++
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++public class IndexAuditUpgradeIT extends AbstractUpgradeTestCase {
++
++    public void testDocsAuditedInOldCluster() throws Exception {
++        assumeTrue("only runs against old cluster", clusterType == CLUSTER_TYPE.OLD);
++        assertBusy(() -> {
++            assertAuditDocsExist();
++            assertNumUniqueNodeNameBuckets(0); // TODO update on backport. Will become 2
++        });
++    }
++
++    public void testDocsAuditedInMixedCluster() throws Exception {
++        assumeTrue("only runs against mixed cluster", clusterType == CLUSTER_TYPE.MIXED);
++        assertBusy(() -> {
++            assertAuditDocsExist();
++            // TODO update on backport. Will become 2 as new node won't index docs until a new version node is master
++            assertNumUniqueNodeNameBuckets(0);
++        });
++    }
++
++    public void testDocsAuditedInUpgradedCluster() throws Exception {
++        assumeTrue("only runs against upgraded cluster", clusterType == CLUSTER_TYPE.UPGRADED);
++        assertBusy(() -> {
++            assertAuditDocsExist();
++            // TODO update on backport. will become 4
++            assertNumUniqueNodeNameBuckets(2);
++        });
++    }
++
++    private void assertAuditDocsExist() throws Exception {
++        Response response = client().performRequest("GET", "/.security_audit_log*/doc/_count");
++        assertEquals(200, response.getStatusLine().getStatusCode());
++        Map<String, Object> responseMap = entityAsMap(response);
++        assertNotNull(responseMap.get("count"));
++        assertThat((Integer) responseMap.get("count"), Matchers.greaterThanOrEqualTo(1));
++    }
++
++    private void assertNumUniqueNodeNameBuckets(int numBuckets) throws Exception {
++        // call API that will hit all nodes
++        assertEquals(200, client().performRequest("GET", "/_nodes").getStatusLine().getStatusCode());
++
++        HttpEntity httpEntity = new StringEntity(
++                "{\n" +
++                        "    \"aggs\" : {\n" +
++                        "        \"nodes\" : {\n" +
++                        "            \"terms\" : { \"field\" : \"node_name\" }\n" +
++                        "        }\n" +
++                        "    }\n" +
++                        "}", ContentType.APPLICATION_JSON);
++        Response aggResponse = client().performRequest("GET", "/.security_audit_log*/_search",
++                Collections.singletonMap("pretty", "true"), httpEntity);
++        Map<String, Object> aggResponseMap = entityAsMap(aggResponse);
++        logger.debug("aggResponse {}", aggResponseMap);
++        Map<String, Object> aggregations = (Map<String, Object>) aggResponseMap.get("aggregations");
++        assertNotNull(aggregations);
++        Map<String, Object> nodesAgg = (Map<String, Object>) aggregations.get("nodes");
++        assertNotNull(nodesAgg);
++        List<Map<String, Object>> buckets = (List<Map<String, Object>>) nodesAgg.get("buckets");
++        assertNotNull(buckets);
++        assertEquals(numBuckets, buckets.size());
++    }
++}
+diff --git a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/TokenBackwardsCompatibilityIT.java b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/TokenBackwardsCompatibilityIT.java
+index 588e0557d81..4fa0c9a535f 100644
+--- a/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/TokenBackwardsCompatibilityIT.java
++++ b/qa/rolling-upgrade/src/test/java/org/elasticsearch/upgrades/TokenBackwardsCompatibilityIT.java
+@@ -14,13 +14,7 @@ import org.elasticsearch.Version;
+ import org.elasticsearch.client.Response;
+ import org.elasticsearch.client.ResponseException;
+ import org.elasticsearch.client.RestClient;
+-import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.common.util.concurrent.ThreadContext;
+-import org.elasticsearch.test.SecuritySettingsSourceField;
+-import org.elasticsearch.test.rest.ESRestTestCase;
+ import org.elasticsearch.test.rest.yaml.ObjectPath;
+-import org.elasticsearch.xpack.core.security.SecurityLifecycleServiceField;
+-import org.junit.Before;
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -28,68 +22,7 @@ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ 
+-import static org.elasticsearch.xpack.core.security.authc.support.UsernamePasswordToken.basicAuthHeaderValue;
+-
+-public class TokenBackwardsCompatibilityIT extends ESRestTestCase {
+-
+-    private static final String BASIC_AUTH_VALUE =
+-            basicAuthHeaderValue("test_user", SecuritySettingsSourceField.TEST_PASSWORD_SECURE_STRING);
+-
+-    @Override
+-    protected boolean preserveIndicesUponCompletion() {
+-        return true;
+-    }
+-
+-    @Override
+-    protected boolean preserveReposUponCompletion() {
+-        return true;
+-    }
+-
+-    @Override
+-    protected boolean preserveTemplatesUponCompletion() {
+-        return true;
+-    }
+-
+-    private enum CLUSTER_TYPE {
+-        OLD,
+-        MIXED,
+-        UPGRADED;
+-
+-        public static CLUSTER_TYPE parse(String value) {
+-            switch (value) {
+-                case "old_cluster":
+-                    return OLD;
+-                case "mixed_cluster":
+-                    return MIXED;
+-                case "upgraded_cluster":
+-                    return UPGRADED;
+-                default:
+-                    throw new AssertionError("unknown cluster type: " + value);
+-            }
+-        }
+-    }
+-
+-    private final CLUSTER_TYPE clusterType = CLUSTER_TYPE.parse(System.getProperty("tests.rest.suite"));
+-
+-    @Override
+-    protected Settings restClientSettings() {
+-        return Settings.builder()
+-                .put(ThreadContext.PREFIX + ".Authorization", BASIC_AUTH_VALUE)
+-                .build();
+-    }
+-
+-    @Before
+-    public void setupForTests() throws Exception {
+-        final String template = SecurityLifecycleServiceField.SECURITY_TEMPLATE_NAME;
+-        awaitBusy(() -> {
+-            try {
+-                return adminClient().performRequest("HEAD", "_template/" + template).getStatusLine().getStatusCode() == 200;
+-            } catch (IOException e) {
+-                logger.warn("error calling template api", e);
+-            }
+-            return false;
+-        });
+-    }
++public class TokenBackwardsCompatibilityIT extends AbstractUpgradeTestCase {
+ 
+     public void testGeneratingTokenInOldCluster() throws Exception {
+         assumeTrue("this test should only run against the old cluster", clusterType == CLUSTER_TYPE.OLD);

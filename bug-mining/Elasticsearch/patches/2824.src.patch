@@ -1,0 +1,399 @@
+diff --git a/docs/changelog/89318.yaml b/docs/changelog/89318.yaml
+new file mode 100644
+index 00000000000..86cbde6e5b5
+--- /dev/null
++++ b/docs/changelog/89318.yaml
+@@ -0,0 +1,6 @@
++pr: 89318
++summary: Check circuit breaker before sending join request
++area: Cluster Coordination
++type: bug
++issues:
++ - 85003
+diff --git a/server/src/internalClusterTest/java/org/elasticsearch/discovery/DiscoveryDisruptionIT.java b/server/src/internalClusterTest/java/org/elasticsearch/discovery/DiscoveryDisruptionIT.java
+index 9694a11eb4d..e85c70775fb 100644
+--- a/server/src/internalClusterTest/java/org/elasticsearch/discovery/DiscoveryDisruptionIT.java
++++ b/server/src/internalClusterTest/java/org/elasticsearch/discovery/DiscoveryDisruptionIT.java
+@@ -16,7 +16,10 @@ import org.elasticsearch.cluster.coordination.PublicationTransportHandler;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.node.DiscoveryNodes;
+ import org.elasticsearch.cluster.service.ClusterService;
++import org.elasticsearch.common.breaker.CircuitBreaker;
++import org.elasticsearch.common.breaker.CircuitBreakingException;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ import org.elasticsearch.test.ESIntegTestCase;
+ import org.elasticsearch.test.disruption.NetworkDisruption;
+ import org.elasticsearch.test.disruption.ServiceDisruptionScheme;
+@@ -257,4 +260,58 @@ public class DiscoveryDisruptionIT extends AbstractDisruptionTestCase {
+         logger.info("--> waiting for cluster to heal");
+         ensureStableCluster(3);
+     }
++
++    public void testJoinWaitsForCircuitBreaker() throws InterruptedException {
++        startCluster(3);
++
++        final var masterName = internalCluster().getMasterName();
++        final var victimName = randomValueOtherThan(masterName, () -> randomFrom(internalCluster().getNodeNames()));
++        logger.info("--> master [{}], victim [{}]", masterName, victimName);
++
++        // fill up the circuit breaker to breaking point
++        final var circuitBreaker = internalCluster().getInstance(CircuitBreakerService.class, victimName)
++            .getBreaker(CircuitBreaker.IN_FLIGHT_REQUESTS);
++        long allocationSize = 1;
++        while (true) {
++            try {
++                circuitBreaker.addEstimateBytesAndMaybeBreak(allocationSize, "test");
++            } catch (CircuitBreakingException e) {
++                circuitBreaker.addWithoutBreaking(allocationSize);
++                break;
++            }
++            allocationSize <<= 1;
++            assert 0 <= allocationSize;
++        }
++
++        // drop the victim from the cluster with a network disruption
++        final var masterTransportService = (MockTransportService) internalCluster().getInstance(TransportService.class, masterName);
++        masterTransportService.addFailToSendNoConnectRule(internalCluster().getInstance(TransportService.class, victimName));
++        logger.info("--> waiting for victim's departure");
++        ensureStableCluster(2, masterName);
++
++        // verify that the victim sends no joins while the circuit breaker is breaking
++        final var victimTransportService = (MockTransportService) internalCluster().getInstance(TransportService.class, victimName);
++        victimTransportService.addSendBehavior((connection, requestId, action, request, options) -> {
++            assertNotEquals(action, JoinHelper.JOIN_ACTION_NAME);
++            connection.sendRequest(requestId, action, request, options);
++        });
++
++        // fix the network disruption
++        logger.info("--> removing network disruption");
++        masterTransportService.clearAllRules();
++        ensureStableCluster(2, masterName);
++
++        // permit joins again
++        victimTransportService.addSendBehavior(null);
++
++        // release the breaker
++        logger.info("--> releasing allocations from circuit breaker");
++        while (0 < allocationSize) {
++            circuitBreaker.addWithoutBreaking(-allocationSize);
++            allocationSize >>= 1;
++        }
++
++        logger.info("--> waiting for cluster to heal");
++        ensureStableCluster(3);
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java b/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java
+index f583bf090d5..6c024ae879e 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java
++++ b/server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java
+@@ -61,6 +61,7 @@ import org.elasticsearch.discovery.PeerFinder;
+ import org.elasticsearch.discovery.SeedHostsProvider;
+ import org.elasticsearch.discovery.SeedHostsResolver;
+ import org.elasticsearch.discovery.TransportAddressConnector;
++import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ import org.elasticsearch.monitor.NodeHealthService;
+ import org.elasticsearch.monitor.StatusInfo;
+ import org.elasticsearch.threadpool.Scheduler;
+@@ -197,7 +198,8 @@ public class Coordinator extends AbstractLifecycleComponent implements ClusterSt
+         Random random,
+         RerouteService rerouteService,
+         ElectionStrategy electionStrategy,
+-        NodeHealthService nodeHealthService
++        NodeHealthService nodeHealthService,
++        CircuitBreakerService circuitBreakerService
+     ) {
+         this.settings = settings;
+         this.transportService = transportService;
+@@ -217,7 +219,8 @@ public class Coordinator extends AbstractLifecycleComponent implements ClusterSt
+             this::joinLeaderInTerm,
+             rerouteService,
+             nodeHealthService,
+-            joinReasonService
++            joinReasonService,
++            circuitBreakerService
+         );
+         this.joinValidationService = new JoinValidationService(
+             settings,
+diff --git a/server/src/main/java/org/elasticsearch/cluster/coordination/JoinHelper.java b/server/src/main/java/org/elasticsearch/cluster/coordination/JoinHelper.java
+index 937eded6f3a..48d6ba553cb 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/coordination/JoinHelper.java
++++ b/server/src/main/java/org/elasticsearch/cluster/coordination/JoinHelper.java
+@@ -10,6 +10,7 @@ package org.elasticsearch.cluster.coordination;
+ import org.apache.logging.log4j.Level;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
++import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.support.ChannelActionListener;
+ import org.elasticsearch.cluster.ClusterStateTaskConfig;
+@@ -21,11 +22,14 @@ import org.elasticsearch.cluster.service.ClusterApplier;
+ import org.elasticsearch.cluster.service.ClusterApplierService;
+ import org.elasticsearch.cluster.service.MasterService;
+ import org.elasticsearch.common.Priority;
++import org.elasticsearch.common.breaker.CircuitBreaker;
++import org.elasticsearch.common.breaker.CircuitBreakingException;
+ import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+ import org.elasticsearch.core.Releasable;
+ import org.elasticsearch.core.Releasables;
+ import org.elasticsearch.core.TimeValue;
+ import org.elasticsearch.core.Tuple;
++import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ import org.elasticsearch.monitor.NodeHealthService;
+ import org.elasticsearch.monitor.StatusInfo;
+ import org.elasticsearch.threadpool.ThreadPool;
+@@ -67,6 +71,7 @@ public class JoinHelper {
+     private final LongSupplier currentTermSupplier;
+     private final NodeHealthService nodeHealthService;
+     private final JoinReasonService joinReasonService;
++    private final CircuitBreakerService circuitBreakerService;
+ 
+     private final Map<Tuple<DiscoveryNode, JoinRequest>, PendingJoinInfo> pendingOutgoingJoins = ConcurrentCollections.newConcurrentMap();
+     private final AtomicReference<FailedJoinAttempt> lastFailedJoinAttempt = new AtomicReference<>();
+@@ -82,11 +87,13 @@ public class JoinHelper {
+         Function<StartJoinRequest, Join> joinLeaderInTerm,
+         RerouteService rerouteService,
+         NodeHealthService nodeHealthService,
+-        JoinReasonService joinReasonService
++        JoinReasonService joinReasonService,
++        CircuitBreakerService circuitBreakerService
+     ) {
+         this.masterService = masterService;
+         this.clusterApplier = clusterApplier;
+         this.transportService = transportService;
++        this.circuitBreakerService = circuitBreakerService;
+         this.joinTaskExecutor = new JoinTaskExecutor(allocationService, rerouteService);
+         this.currentTermSupplier = currentTermSupplier;
+         this.nodeHealthService = nodeHealthService;
+@@ -166,10 +173,10 @@ public class JoinHelper {
+     static class FailedJoinAttempt {
+         private final DiscoveryNode destination;
+         private final JoinRequest joinRequest;
+-        private final TransportException exception;
++        private final ElasticsearchException exception;
+         private final long timestamp;
+ 
+-        FailedJoinAttempt(DiscoveryNode destination, JoinRequest joinRequest, TransportException exception) {
++        FailedJoinAttempt(DiscoveryNode destination, JoinRequest joinRequest, ElasticsearchException exception) {
+             this.destination = destination;
+             this.joinRequest = joinRequest;
+             this.exception = exception;
+@@ -180,9 +187,10 @@ public class JoinHelper {
+             logger.log(getLogLevel(exception), () -> format("failed to join %s with %s", destination, joinRequest), exception);
+         }
+ 
+-        static Level getLogLevel(TransportException e) {
++        static Level getLogLevel(ElasticsearchException e) {
+             Throwable cause = e.unwrapCause();
+             if (cause instanceof CoordinationStateRejectedException
++                || cause instanceof CircuitBreakingException
+                 || (cause instanceof Exception causeException && MasterService.isPublishFailureException(causeException))) {
+                 return Level.DEBUG;
+             }
+@@ -221,6 +229,29 @@ public class JoinHelper {
+         final Tuple<DiscoveryNode, JoinRequest> dedupKey = Tuple.tuple(destination, joinRequest);
+         final var pendingJoinInfo = new PendingJoinInfo(transportService.getThreadPool().relativeTimeInMillis());
+         if (pendingOutgoingJoins.putIfAbsent(dedupKey, pendingJoinInfo) == null) {
++
++            // If this node is under excessive heap pressure then the state it receives for join validation will trip a circuit breaker and
++            // fail the join attempt, resulting in retrying in a loop which makes the master just send a constant stream of cluster states
++            // to this node. We try and keep the problem local to this node by checking that we can at least allocate one byte:
++            final var breaker = circuitBreakerService.getBreaker(CircuitBreaker.IN_FLIGHT_REQUESTS);
++            try {
++                breaker.addEstimateBytesAndMaybeBreak(1L, "pre-flight join request");
++            } catch (Exception e) {
++                pendingJoinInfo.message = PENDING_JOIN_FAILED;
++                pendingOutgoingJoins.remove(dedupKey);
++                if (e instanceof ElasticsearchException elasticsearchException) {
++                    final var attempt = new FailedJoinAttempt(destination, joinRequest, elasticsearchException);
++                    attempt.logNow();
++                    lastFailedJoinAttempt.set(attempt);
++                    assert elasticsearchException instanceof CircuitBreakingException : e; // others shouldn't happen, handle them anyway
++                } else {
++                    logger.error("join failed during pre-flight circuit breaker check", e);
++                    assert false : e; // shouldn't happen, handle it anyway
++                }
++                return;
++            }
++            breaker.addWithoutBreaking(-1L);
++
+             logger.debug("attempting to join {} with {}", destination, joinRequest);
+             pendingJoinInfo.message = PENDING_JOIN_CONNECTING;
+             // Typically we're already connected to the destination at this point, the PeerFinder holds a reference to this connection to
+@@ -279,7 +310,7 @@ public class JoinHelper {
+                             private void cleanUpOnFailure(TransportException exp) {
+                                 pendingJoinInfo.message = PENDING_JOIN_FAILED;
+                                 pendingOutgoingJoins.remove(dedupKey);
+-                                FailedJoinAttempt attempt = new FailedJoinAttempt(destination, joinRequest, exp);
++                                final var attempt = new FailedJoinAttempt(destination, joinRequest, exp);
+                                 attempt.logNow();
+                                 lastFailedJoinAttempt.set(attempt);
+                                 unregisterAndReleaseConnection(destination, connectionReference);
+@@ -292,7 +323,7 @@ public class JoinHelper {
+                 public void onFailure(Exception e) {
+                     pendingJoinInfo.message = PENDING_JOIN_CONNECT_FAILED;
+                     pendingOutgoingJoins.remove(dedupKey);
+-                    FailedJoinAttempt attempt = new FailedJoinAttempt(
++                    final var attempt = new FailedJoinAttempt(
+                         destination,
+                         joinRequest,
+                         new ConnectTransportException(destination, "failed to acquire connection", e)
+diff --git a/server/src/main/java/org/elasticsearch/discovery/DiscoveryModule.java b/server/src/main/java/org/elasticsearch/discovery/DiscoveryModule.java
+index c58e8e995b7..181c30136f1 100644
+--- a/server/src/main/java/org/elasticsearch/discovery/DiscoveryModule.java
++++ b/server/src/main/java/org/elasticsearch/discovery/DiscoveryModule.java
+@@ -31,6 +31,7 @@ import org.elasticsearch.common.settings.Setting.Property;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.transport.TransportAddress;
+ import org.elasticsearch.gateway.GatewayMetaState;
++import org.elasticsearch.indices.breaker.CircuitBreakerService;
+ import org.elasticsearch.monitor.NodeHealthService;
+ import org.elasticsearch.plugins.DiscoveryPlugin;
+ import org.elasticsearch.transport.TransportService;
+@@ -101,7 +102,8 @@ public class DiscoveryModule {
+         Path configFile,
+         GatewayMetaState gatewayMetaState,
+         RerouteService rerouteService,
+-        NodeHealthService nodeHealthService
++        NodeHealthService nodeHealthService,
++        CircuitBreakerService circuitBreakerService
+     ) {
+         final Collection<BiConsumer<DiscoveryNode, ClusterState>> joinValidators = new ArrayList<>();
+         final Map<String, Supplier<SeedHostsProvider>> hostProviders = new HashMap<>();
+@@ -191,7 +193,8 @@ public class DiscoveryModule {
+                 new Random(Randomness.get().nextLong()),
+                 rerouteService,
+                 electionStrategy,
+-                nodeHealthService
++                nodeHealthService,
++                circuitBreakerService
+             );
+         } else {
+             throw new IllegalArgumentException("Unknown discovery type [" + discoveryType + "]");
+diff --git a/server/src/main/java/org/elasticsearch/node/Node.java b/server/src/main/java/org/elasticsearch/node/Node.java
+index ff3d28bdce6..f89e3969e2e 100644
+--- a/server/src/main/java/org/elasticsearch/node/Node.java
++++ b/server/src/main/java/org/elasticsearch/node/Node.java
+@@ -857,7 +857,8 @@ public class Node implements Closeable {
+                 environment.configFile(),
+                 gatewayMetaState,
+                 rerouteService,
+-                fsHealthService
++                fsHealthService,
++                circuitBreakerService
+             );
+             this.nodeService = new NodeService(
+                 settings,
+diff --git a/server/src/test/java/org/elasticsearch/cluster/coordination/JoinHelperTests.java b/server/src/test/java/org/elasticsearch/cluster/coordination/JoinHelperTests.java
+index 7db99eec545..435fbc46f94 100644
+--- a/server/src/test/java/org/elasticsearch/cluster/coordination/JoinHelperTests.java
++++ b/server/src/test/java/org/elasticsearch/cluster/coordination/JoinHelperTests.java
+@@ -16,6 +16,7 @@ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
+ import org.elasticsearch.core.TimeValue;
++import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.monitor.StatusInfo;
+ import org.elasticsearch.tasks.TaskManager;
+ import org.elasticsearch.test.ESTestCase;
+@@ -74,7 +75,8 @@ public class JoinHelperTests extends ESTestCase {
+             startJoinRequest -> { throw new AssertionError(); },
+             (s, p, r) -> {},
+             () -> new StatusInfo(HEALTHY, "info"),
+-            new JoinReasonService(() -> 0L)
++            new JoinReasonService(() -> 0L),
++            new NoneCircuitBreakerService()
+         );
+         transportService.start();
+ 
+@@ -229,7 +231,8 @@ public class JoinHelperTests extends ESTestCase {
+             startJoinRequest -> { throw new AssertionError(); },
+             (s, p, r) -> {},
+             nodeHealthServiceStatus::get,
+-            new JoinReasonService(() -> 0L)
++            new JoinReasonService(() -> 0L),
++            new NoneCircuitBreakerService()
+         );
+         transportService.start();
+ 
+diff --git a/server/src/test/java/org/elasticsearch/cluster/coordination/NodeJoinTests.java b/server/src/test/java/org/elasticsearch/cluster/coordination/NodeJoinTests.java
+index 24d9d96ef94..01602deb53d 100644
+--- a/server/src/test/java/org/elasticsearch/cluster/coordination/NodeJoinTests.java
++++ b/server/src/test/java/org/elasticsearch/cluster/coordination/NodeJoinTests.java
+@@ -28,6 +28,7 @@ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.BaseFuture;
+ import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
+ import org.elasticsearch.common.util.concurrent.FutureUtils;
++import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.monitor.NodeHealthService;
+ import org.elasticsearch.monitor.StatusInfo;
+ import org.elasticsearch.node.Node;
+@@ -224,7 +225,8 @@ public class NodeJoinTests extends ESTestCase {
+             random,
+             (s, p, r) -> {},
+             ElectionStrategy.DEFAULT_INSTANCE,
+-            nodeHealthService
++            nodeHealthService,
++            new NoneCircuitBreakerService()
+         );
+         transportService.start();
+         transportService.acceptIncomingRequests();
+diff --git a/server/src/test/java/org/elasticsearch/discovery/DiscoveryModuleTests.java b/server/src/test/java/org/elasticsearch/discovery/DiscoveryModuleTests.java
+index c381333af0f..3af4cffda8c 100644
+--- a/server/src/test/java/org/elasticsearch/discovery/DiscoveryModuleTests.java
++++ b/server/src/test/java/org/elasticsearch/discovery/DiscoveryModuleTests.java
+@@ -20,6 +20,7 @@ import org.elasticsearch.common.settings.ClusterSettings;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.core.IOUtils;
+ import org.elasticsearch.gateway.GatewayMetaState;
++import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.plugins.DiscoveryPlugin;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.transport.MockTransportService;
+@@ -91,7 +92,8 @@ public class DiscoveryModuleTests extends ESTestCase {
+             createTempDir().toAbsolutePath(),
+             gatewayMetaState,
+             mock(RerouteService.class),
+-            null
++            null,
++            new NoneCircuitBreakerService()
+         );
+     }
+ 
+diff --git a/server/src/test/java/org/elasticsearch/snapshots/SnapshotResiliencyTests.java b/server/src/test/java/org/elasticsearch/snapshots/SnapshotResiliencyTests.java
+index 4448a26b5f1..838e383d245 100644
+--- a/server/src/test/java/org/elasticsearch/snapshots/SnapshotResiliencyTests.java
++++ b/server/src/test/java/org/elasticsearch/snapshots/SnapshotResiliencyTests.java
+@@ -2172,7 +2172,8 @@ public class SnapshotResiliencyTests extends ESTestCase {
+                     random(),
+                     rerouteService,
+                     ElectionStrategy.DEFAULT_INSTANCE,
+-                    () -> new StatusInfo(HEALTHY, "healthy-info")
++                    () -> new StatusInfo(HEALTHY, "healthy-info"),
++                    new NoneCircuitBreakerService()
+                 );
+                 masterService.setClusterStatePublisher(coordinator);
+                 coordinator.start();
+diff --git a/test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java b/test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java
+index 49664761f78..3f820e97725 100644
+--- a/test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/cluster/coordination/AbstractCoordinatorTestCase.java
+@@ -68,6 +68,7 @@ import org.elasticsearch.gateway.ClusterStateUpdaters;
+ import org.elasticsearch.gateway.GatewayService;
+ import org.elasticsearch.gateway.MockGatewayMetaState;
+ import org.elasticsearch.gateway.PersistedClusterStateService;
++import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+ import org.elasticsearch.monitor.NodeHealthService;
+ import org.elasticsearch.monitor.StatusInfo;
+ import org.elasticsearch.test.ESTestCase;
+@@ -1250,7 +1251,8 @@ public class AbstractCoordinatorTestCase extends ESTestCase {
+                     Randomness.get(),
+                     (s, p, r) -> {},
+                     getElectionStrategy(),
+-                    nodeHealthService
++                    nodeHealthService,
++                    new NoneCircuitBreakerService()
+                 );
+                 coordinationDiagnosticsService = new CoordinationDiagnosticsService(
+                     clusterService,

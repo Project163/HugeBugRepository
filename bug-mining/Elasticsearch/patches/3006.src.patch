@@ -1,0 +1,176 @@
+diff --git a/docs/changelog/104722.yaml b/docs/changelog/104722.yaml
+new file mode 100644
+index 00000000000..ed9f2d41ff9
+--- /dev/null
++++ b/docs/changelog/104722.yaml
+@@ -0,0 +1,6 @@
++pr: 104722
++summary: Avoid possible datafeed infinite loop with filtering aggregations
++area: Machine Learning
++type: bug
++issues:
++ - 104699
+diff --git a/x-pack/plugin/ml/qa/native-multi-node-tests/src/javaRestTest/java/org/elasticsearch/xpack/ml/integration/DatafeedJobsRestIT.java b/x-pack/plugin/ml/qa/native-multi-node-tests/src/javaRestTest/java/org/elasticsearch/xpack/ml/integration/DatafeedJobsRestIT.java
+index d12672fd4af..1f76fe97144 100644
+--- a/x-pack/plugin/ml/qa/native-multi-node-tests/src/javaRestTest/java/org/elasticsearch/xpack/ml/integration/DatafeedJobsRestIT.java
++++ b/x-pack/plugin/ml/qa/native-multi-node-tests/src/javaRestTest/java/org/elasticsearch/xpack/ml/integration/DatafeedJobsRestIT.java
+@@ -794,6 +794,91 @@ public class DatafeedJobsRestIT extends ESRestTestCase {
+         assertThat(jobStatsResponseAsString, containsString("\"missing_field_count\":0"));
+     }
+ 
++    /**
++     * This test confirms the fix for <a href="https://github.com/elastic/elasticsearch/issues/104699">the issue
++     * where a datafeed with aggregations that filter everything for a bucket can go into an infinite loop</a>.
++     * In this test the filter in the aggregation is crazy as it literally filters everything. Real users would
++     * have a filter that only occasionally results in no results from the aggregation while the query alone
++     * returns data. But the code path that's exercised is the same.
++     */
++    public void testLookbackOnlyGivenAggregationsWithHistogramAndBucketFilter() throws Exception {
++        String jobId = "aggs-histogram-filter-job";
++        Request createJobRequest = new Request("PUT", MachineLearning.BASE_PATH + "anomaly_detectors/" + jobId);
++        createJobRequest.setJsonEntity("""
++            {
++              "description": "Aggs job with dodgy filter",
++              "analysis_config": {
++                "bucket_span": "1h",
++                "summary_count_field_name": "doc_count",
++                "detectors": [
++                  {
++                    "function": "mean",
++                    "field_name": "responsetime",
++                    "by_field_name": "airline"
++                  }
++                ]
++              },
++              "data_description": {"time_field": "time stamp"}
++            }""");
++        client().performRequest(createJobRequest);
++
++        String datafeedId = "datafeed-" + jobId;
++        // The "filter_everything" aggregation in here means the output is always empty.
++        String aggregations = """
++            {
++              "buckets": {
++                "histogram": {
++                  "field": "time stamp",
++                  "interval": 3600000
++                },
++                "aggregations": {
++                  "time stamp": {
++                    "max": {
++                      "field": "time stamp"
++                    }
++                  },
++                  "filter_everything" : {
++                    "filter": {
++                      "term" : {
++                        "airline": "does not exist"
++                      }
++                    },
++                    "aggregations": {
++                      "airline": {
++                        "terms": {
++                          "field": "airline",
++                          "size": 10
++                        },
++                        "aggregations": {
++                          "responsetime": {
++                            "avg": {
++                              "field": "responsetime"
++                            }
++                          }
++                        }
++                      }
++                    }
++                  }
++                }
++              }
++            }""";
++        // The chunking timespan of 1 hour here must be less than the span of the data in order for the problem to be reproduced
++        new DatafeedBuilder(datafeedId, jobId, "airline-data-aggs").setChunkingTimespan("1h").setAggregations(aggregations).build();
++        openJob(client(), jobId);
++
++        startDatafeedAndWaitUntilStopped(datafeedId);
++        waitUntilJobIsClosed(jobId);
++        Response jobStatsResponse = client().performRequest(
++            new Request("GET", MachineLearning.BASE_PATH + "anomaly_detectors/" + jobId + "/_stats")
++        );
++        String jobStatsResponseAsString = EntityUtils.toString(jobStatsResponse.getEntity());
++        assertThat(jobStatsResponseAsString, containsString("\"input_record_count\":0"));
++        assertThat(jobStatsResponseAsString, containsString("\"processed_record_count\":0"));
++        assertThat(jobStatsResponseAsString, containsString("\"bucket_count\":0"));
++
++        // The most important thing this test is asserting is that we don't go into an infinite loop!
++    }
++
+     public void testLookbackOnlyGivenAggregationsWithDateHistogram() throws Exception {
+         String jobId = "aggs-date-histogram-job";
+         Request createJobRequest = new Request("PUT", MachineLearning.BASE_PATH + "anomaly_detectors/" + jobId);
+diff --git a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractor.java b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractor.java
+index 835e0086637..567aa688908 100644
+--- a/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractor.java
++++ b/x-pack/plugin/ml/src/main/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractor.java
+@@ -178,6 +178,22 @@ public class ChunkedDataExtractor implements DataExtractor {
+             if (isNewSearch && hasNext()) {
+                 // If it was a new search it means it returned 0 results. Thus,
+                 // we reconfigure and jump to the next time interval where there are data.
++                // In theory, if everything is consistent, it would be sufficient to call
++                // setUpChunkedSearch() here. However, the way that works is to take the
++                // query from the datafeed config and add on some simple aggregations.
++                // These aggregations are completely separate from any that might be defined
++                // in the datafeed config. It is possible that the aggregations in the
++                // datafeed config rather than the query are responsible for no data being
++                // found. For example, "filter" or "bucket_selector" aggregations can do this.
++                // Originally we thought this situation would never happen, with the query
++                // selecting data and the aggregations just grouping it, but recently we've
++                // seen cases of users filtering in the aggregations. Therefore, we
++                // unconditionally advance the start time by one chunk here. setUpChunkedSearch()
++                // might then advance substantially further, but in the pathological cases
++                // where setUpChunkedSearch() thinks data exists at the current start time
++                // while the datafeed's own aggregation doesn't, at least we'll step forward
++                // a little bit rather than go into an infinite loop.
++                currentStart += chunkSpan;
+                 setUpChunkedSearch();
+             }
+         }
+diff --git a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractorTests.java b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractorTests.java
+index 4bbaafa9db0..d1f1fdc1ddf 100644
+--- a/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractorTests.java
++++ b/x-pack/plugin/ml/src/test/java/org/elasticsearch/xpack/ml/datafeed/extractor/chunked/ChunkedDataExtractorTests.java
+@@ -431,12 +431,12 @@ public class ChunkedDataExtractorTests extends ESTestCase {
+ 
+         InputStream inputStream1 = mock(InputStream.class);
+ 
+-        DataExtractor subExtactor1 = new StubSubExtractor(new SearchInterval(100_000L, 200_000L), inputStream1);
+-        when(dataExtractorFactory.newExtractor(100000L, 200000L)).thenReturn(subExtactor1);
++        DataExtractor subExtractor1 = new StubSubExtractor(new SearchInterval(100_000L, 200_000L), inputStream1);
++        when(dataExtractorFactory.newExtractor(100000L, 200000L)).thenReturn(subExtractor1);
+ 
+         // This one is empty
+-        DataExtractor subExtactor2 = new StubSubExtractor(new SearchInterval(200_000L, 300_000L));
+-        when(dataExtractorFactory.newExtractor(200000, 300000L)).thenReturn(subExtactor2);
++        DataExtractor subExtractor2 = new StubSubExtractor(new SearchInterval(200_000L, 300_000L));
++        when(dataExtractorFactory.newExtractor(200000, 300000L)).thenReturn(subExtractor2);
+ 
+         assertThat(extractor.hasNext(), is(true));
+         assertEquals(inputStream1, extractor.next().data().get());
+@@ -447,8 +447,8 @@ public class ChunkedDataExtractorTests extends ESTestCase {
+ 
+         // This is the last one
+         InputStream inputStream2 = mock(InputStream.class);
+-        DataExtractor subExtactor3 = new StubSubExtractor(new SearchInterval(200_000L, 400_000L), inputStream2);
+-        when(dataExtractorFactory.newExtractor(200000, 400000)).thenReturn(subExtactor3);
++        DataExtractor subExtractor3 = new StubSubExtractor(new SearchInterval(200_000L, 400_000L), inputStream2);
++        when(dataExtractorFactory.newExtractor(200000, 400000)).thenReturn(subExtractor3);
+ 
+         assertEquals(inputStream2, extractor.next().data().get());
+         assertThat(extractor.next().data().isPresent(), is(false));
+@@ -464,7 +464,7 @@ public class ChunkedDataExtractorTests extends ESTestCase {
+         String searchRequest = capturedSearchRequests.get(0).toString().replaceAll("\\s", "");
+         assertThat(searchRequest, containsString("\"gte\":100000,\"lt\":400000"));
+         searchRequest = capturedSearchRequests.get(1).toString().replaceAll("\\s", "");
+-        assertThat(searchRequest, containsString("\"gte\":200000,\"lt\":400000"));
++        assertThat(searchRequest, containsString("\"gte\":300000,\"lt\":400000"));
+     }
+ 
+     public void testCancelGivenNextWasNeverCalled() {

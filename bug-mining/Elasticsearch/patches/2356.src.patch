@@ -1,0 +1,268 @@
+diff --git a/modules/reindex/src/test/java/org/elasticsearch/index/reindex/DeleteByQueryBasicTests.java b/modules/reindex/src/test/java/org/elasticsearch/index/reindex/DeleteByQueryBasicTests.java
+index 7de95cafda3..2fca3f53402 100644
+--- a/modules/reindex/src/test/java/org/elasticsearch/index/reindex/DeleteByQueryBasicTests.java
++++ b/modules/reindex/src/test/java/org/elasticsearch/index/reindex/DeleteByQueryBasicTests.java
+@@ -21,12 +21,18 @@ package org.elasticsearch.index.reindex;
+ 
+ import org.elasticsearch.action.admin.indices.alias.Alias;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
++import org.elasticsearch.cluster.ClusterInfoService;
++import org.elasticsearch.cluster.InternalClusterInfoService;
++import org.elasticsearch.cluster.routing.allocation.DiskThresholdSettings;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.index.IndexNotFoundException;
+ import org.elasticsearch.index.query.QueryBuilders;
+ import org.elasticsearch.plugins.Plugin;
+ import org.elasticsearch.search.sort.SortOrder;
+ import org.elasticsearch.test.InternalSettingsPlugin;
++import org.elasticsearch.test.InternalTestCluster;
++import org.elasticsearch.threadpool.ThreadPool;
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
+@@ -214,18 +220,65 @@ public class DeleteByQueryBasicTests extends ReindexTestCase {
+         }
+         indexRandom(true, true, true, builders);
+ 
+-        String block = randomFrom(SETTING_READ_ONLY, SETTING_READ_ONLY_ALLOW_DELETE);
+         try {
+-            enableIndexBlock("test", block);
++            enableIndexBlock("test", SETTING_READ_ONLY);
+             assertThat(deleteByQuery().source("test").filter(QueryBuilders.matchAllQuery()).refresh(true).get(),
+-                    matcher().deleted(0).failures(docs));
++                matcher().deleted(0).failures(docs));
+         } finally {
+-            disableIndexBlock("test", block);
++            disableIndexBlock("test", SETTING_READ_ONLY);
+         }
+ 
+         assertHitCount(client().prepareSearch("test").setSize(0).get(), docs);
+     }
+ 
++    public void testDeleteByQueryOnReadOnlyAllowDeleteIndex() throws Exception {
++        createIndex("test");
++
++        final int docs = randomIntBetween(1, 50);
++        List<IndexRequestBuilder> builders = new ArrayList<>();
++        for (int i = 0; i < docs; i++) {
++            builders.add(client().prepareIndex("test").setId(Integer.toString(i)).setSource("field", 1));
++        }
++        indexRandom(true, true, true, builders);
++
++        // Because the index level read_only_allow_delete block can be automatically released by disk allocation decider,
++        // so we should test both case of disk allocation decider is enabled and disabled
++        boolean diskAllocationDeciderEnabled = randomBoolean();
++        try {
++            // When a read_only_allow_delete block is set on the index,
++            // it will trigger a retry policy in the delete by query request because the rest status of the block is 429
++            enableIndexBlock("test", SETTING_READ_ONLY_ALLOW_DELETE);
++            if (diskAllocationDeciderEnabled) {
++                InternalTestCluster internalTestCluster = internalCluster();
++                InternalClusterInfoService infoService = (InternalClusterInfoService) internalTestCluster
++                    .getInstance(ClusterInfoService.class, internalTestCluster.getMasterName());
++                ThreadPool threadPool = internalTestCluster.getInstance(ThreadPool.class, internalTestCluster.getMasterName());
++                // Refresh the cluster info after a random delay to check the disk threshold and release the block on the index
++                threadPool.schedule(infoService::refresh, TimeValue.timeValueMillis(randomIntBetween(1, 100)), ThreadPool.Names.MANAGEMENT);
++                // The delete by query request will be executed successfully because the block will be released
++                assertThat(deleteByQuery().source("test").filter(QueryBuilders.matchAllQuery()).refresh(true).get(),
++                    matcher().deleted(docs));
++            } else {
++                // Disable the disk allocation decider to ensure the read_only_allow_delete block cannot be released
++                setDiskAllocationDeciderEnabled(false);
++                // The delete by query request will not be executed successfully because the block cannot be released
++                assertThat(deleteByQuery().source("test").filter(QueryBuilders.matchAllQuery()).refresh(true)
++                        .setMaxRetries(2).setRetryBackoffInitialTime(TimeValue.timeValueMillis(50)).get(),
++                    matcher().deleted(0).failures(docs));
++            }
++        } finally {
++            disableIndexBlock("test", SETTING_READ_ONLY_ALLOW_DELETE);
++            if (diskAllocationDeciderEnabled == false) {
++                setDiskAllocationDeciderEnabled(true);
++            }
++        }
++        if (diskAllocationDeciderEnabled) {
++            assertHitCount(client().prepareSearch("test").setSize(0).get(), 0);
++        } else {
++            assertHitCount(client().prepareSearch("test").setSize(0).get(), docs);
++        }
++    }
++
+     public void testSlices() throws Exception {
+         indexRandom(true,
+                 client().prepareIndex("test").setId("1").setSource("foo", "a"),
+@@ -315,4 +368,12 @@ public class DeleteByQueryBasicTests extends ReindexTestCase {
+         assertThat(response, matcher().deleted(0).slices(hasSize(0)));
+     }
+ 
++    /** Enables or disables the cluster disk allocation decider **/
++    private void setDiskAllocationDeciderEnabled(boolean value) {
++        Settings settings = value ? Settings.builder().putNull(
++            DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey()).build() :
++            Settings.builder().put(
++                DiskThresholdSettings.CLUSTER_ROUTING_ALLOCATION_DISK_THRESHOLD_ENABLED_SETTING.getKey(), value).build();
++        assertAcked(client().admin().cluster().prepareUpdateSettings().setTransientSettings(settings).get());
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/cluster/block/ClusterBlockException.java b/server/src/main/java/org/elasticsearch/cluster/block/ClusterBlockException.java
+index 3713fffe606..3fb2938474c 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/block/ClusterBlockException.java
++++ b/server/src/main/java/org/elasticsearch/cluster/block/ClusterBlockException.java
+@@ -110,13 +110,23 @@ public class ClusterBlockException extends ElasticsearchException {
+     @Override
+     public RestStatus status() {
+         RestStatus status = null;
++        boolean onlyRetryableBlocks = true;
+         for (ClusterBlock block : blocks) {
+-            if (status == null) {
+-                status = block.status();
+-            } else if (status.getStatus() < block.status().getStatus()) {
+-                status = block.status();
++            boolean isRetryableBlock = block.status() == RestStatus.TOO_MANY_REQUESTS;
++            if (isRetryableBlock == false) {
++                if (status == null) {
++                    status = block.status();
++                } else if (status.getStatus() < block.status().getStatus()) {
++                    status = block.status();
++                }
+             }
++            onlyRetryableBlocks = onlyRetryableBlocks && isRetryableBlock;
+         }
++        // return retryable status if there are only retryable blocks
++        if (onlyRetryableBlocks) {
++            return RestStatus.TOO_MANY_REQUESTS;
++        }
++        // return status which has the maximum code of all status except the retryable blocks'
+         return status;
+     }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/cluster/metadata/IndexMetaData.java b/server/src/main/java/org/elasticsearch/cluster/metadata/IndexMetaData.java
+index 6feff5a6b11..d5eec608b54 100644
+--- a/server/src/main/java/org/elasticsearch/cluster/metadata/IndexMetaData.java
++++ b/server/src/main/java/org/elasticsearch/cluster/metadata/IndexMetaData.java
+@@ -95,7 +95,7 @@ public class IndexMetaData implements Diffable<IndexMetaData>, ToXContentFragmen
+             RestStatus.FORBIDDEN, EnumSet.of(ClusterBlockLevel.METADATA_WRITE, ClusterBlockLevel.METADATA_READ));
+     public static final ClusterBlock INDEX_READ_ONLY_ALLOW_DELETE_BLOCK =
+         new ClusterBlock(12, "index read-only / allow delete (api)", false, false,
+-            true, RestStatus.FORBIDDEN, EnumSet.of(ClusterBlockLevel.METADATA_WRITE, ClusterBlockLevel.WRITE));
++            true, RestStatus.TOO_MANY_REQUESTS, EnumSet.of(ClusterBlockLevel.METADATA_WRITE, ClusterBlockLevel.WRITE));
+ 
+     public enum State {
+         OPEN((byte) 0),
+diff --git a/server/src/test/java/org/elasticsearch/action/admin/indices/delete/DeleteIndexBlocksIT.java b/server/src/test/java/org/elasticsearch/action/admin/indices/delete/DeleteIndexBlocksIT.java
+index e7a1133658c..d2915f8a79d 100644
+--- a/server/src/test/java/org/elasticsearch/action/admin/indices/delete/DeleteIndexBlocksIT.java
++++ b/server/src/test/java/org/elasticsearch/action/admin/indices/delete/DeleteIndexBlocksIT.java
+@@ -72,7 +72,7 @@ public class DeleteIndexBlocksIT extends ESIntegTestCase {
+             client().admin().indices().prepareUpdateSettings("test").setSettings(settings).get();
+             ClusterBlockException e = expectThrows(ClusterBlockException.class, () ->
+                 client().prepareIndex().setIndex("test").setId("1").setSource("foo", "bar").get());
+-            assertEquals("index [test] blocked by: [FORBIDDEN/12/index read-only / allow delete (api)];", e.getMessage());
++            assertEquals("index [test] blocked by: [TOO_MANY_REQUESTS/12/index read-only / allow delete (api)];", e.getMessage());
+         } finally {
+             assertAcked(client().admin().indices().prepareUpdateSettings("test")
+                 .setSettings(Settings.builder().putNull(IndexMetaData.SETTING_READ_ONLY_ALLOW_DELETE).build()).get());
+diff --git a/test/framework/src/main/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java b/test/framework/src/main/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
+index 7bb72795e8b..ff6ddfce10a 100644
+--- a/test/framework/src/main/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
++++ b/test/framework/src/main/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertions.java
+@@ -43,6 +43,7 @@ import org.elasticsearch.action.support.master.AcknowledgedRequestBuilder;
+ import org.elasticsearch.action.support.master.AcknowledgedResponse;
+ import org.elasticsearch.cluster.block.ClusterBlock;
+ import org.elasticsearch.cluster.block.ClusterBlockException;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.cluster.metadata.IndexTemplateMetaData;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.bytes.BytesReference;
+@@ -150,7 +151,9 @@ public class ElasticsearchAssertions {
+             assertNotNull("expected the cause of failure to be a ClusterBlockException but got " + exception.getCause().getMessage(),
+                     clusterBlockException);
+             assertThat(clusterBlockException.blocks().size(), greaterThan(0));
+-            assertThat(clusterBlockException.status(), CoreMatchers.equalTo(RestStatus.FORBIDDEN));
++
++            RestStatus status = checkRetryableBlock(clusterBlockException.blocks()) ? RestStatus.TOO_MANY_REQUESTS : RestStatus.FORBIDDEN;
++            assertThat(clusterBlockException.status(), CoreMatchers.equalTo(status));
+         }
+     }
+ 
+@@ -166,7 +169,8 @@ public class ElasticsearchAssertions {
+             fail("Request executed with success but a ClusterBlockException was expected");
+         } catch (ClusterBlockException e) {
+             assertThat(e.blocks().size(), greaterThan(0));
+-            assertThat(e.status(), equalTo(RestStatus.FORBIDDEN));
++            RestStatus status = checkRetryableBlock(e.blocks()) ? RestStatus.TOO_MANY_REQUESTS : RestStatus.FORBIDDEN;
++            assertThat(e.status(), equalTo(status));
+ 
+             if (expectedBlockId != null) {
+                 boolean found = false;
+@@ -191,6 +195,16 @@ public class ElasticsearchAssertions {
+         assertBlocked(builder, expectedBlock != null ? expectedBlock.id() : null);
+     }
+ 
++    private static boolean checkRetryableBlock(Set<ClusterBlock> clusterBlocks){
++        // check only retryable blocks exist in the set
++        for (ClusterBlock clusterBlock : clusterBlocks) {
++            if (clusterBlock.id() != IndexMetaData.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK.id()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
+     public static String formatShardStatus(BroadcastResponse response) {
+         StringBuilder msg = new StringBuilder();
+         msg.append(" Total shards: ").append(response.getTotalShards())
+diff --git a/test/framework/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertionsTests.java b/test/framework/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertionsTests.java
+index 814a3e9d2d3..f7ee251e119 100644
+--- a/test/framework/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertionsTests.java
++++ b/test/framework/src/test/java/org/elasticsearch/test/hamcrest/ElasticsearchAssertionsTests.java
+@@ -19,6 +19,11 @@
+ 
+ package org.elasticsearch.test.hamcrest;
+ 
++import org.elasticsearch.action.support.DefaultShardOperationFailedException;
++import org.elasticsearch.action.support.broadcast.BroadcastResponse;
++import org.elasticsearch.cluster.block.ClusterBlock;
++import org.elasticsearch.cluster.block.ClusterBlockException;
++import org.elasticsearch.cluster.metadata.IndexMetaData;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentParser;
+@@ -27,7 +32,12 @@ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.RandomObjects;
+ 
+ import java.io.IOException;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
++import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertBlocked;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertToXContentEquivalent;
+ import static org.hamcrest.Matchers.containsString;
+ 
+@@ -188,4 +198,24 @@ public class ElasticsearchAssertionsTests extends ESTestCase {
+             assertThat(error.getMessage(), containsString("expected [1] more entries"));
+         }
+     }
++
++    public void testAssertBlocked() {
++        Map<String, Set<ClusterBlock>> indexLevelBlocks = new HashMap<>();
++
++        indexLevelBlocks.put("test", Set.of(IndexMetaData.INDEX_READ_ONLY_BLOCK));
++        assertBlocked(new BroadcastResponse(1, 0, 1, List.of(new DefaultShardOperationFailedException("test", 0,
++            new ClusterBlockException(indexLevelBlocks)))));
++
++        indexLevelBlocks.put("test", Set.of(IndexMetaData.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK));
++        assertBlocked(new BroadcastResponse(1, 0, 1, List.of(new DefaultShardOperationFailedException("test", 0,
++            new ClusterBlockException(indexLevelBlocks)))));
++
++        indexLevelBlocks.put("test", Set.of(IndexMetaData.INDEX_READ_BLOCK, IndexMetaData.INDEX_METADATA_BLOCK));
++        assertBlocked(new BroadcastResponse(1, 0, 1, List.of(new DefaultShardOperationFailedException("test", 0,
++            new ClusterBlockException(indexLevelBlocks)))));
++
++        indexLevelBlocks.put("test", Set.of(IndexMetaData.INDEX_READ_ONLY_BLOCK, IndexMetaData.INDEX_READ_ONLY_ALLOW_DELETE_BLOCK));
++        assertBlocked(new BroadcastResponse(1, 0, 1, List.of(new DefaultShardOperationFailedException("test", 0,
++            new ClusterBlockException(indexLevelBlocks)))));
++    }
+ }

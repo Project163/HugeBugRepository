@@ -1,0 +1,724 @@
+diff --git a/server/src/internalClusterTest/java/org/elasticsearch/action/support/master/TransportMasterNodeActionIT.java b/server/src/internalClusterTest/java/org/elasticsearch/action/support/master/TransportMasterNodeActionIT.java
+new file mode 100644
+index 00000000000..7211585d766
+--- /dev/null
++++ b/server/src/internalClusterTest/java/org/elasticsearch/action/support/master/TransportMasterNodeActionIT.java
+@@ -0,0 +1,279 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0 and the Server Side Public License, v 1; you may not use this file except
++ * in compliance with, at your election, the Elastic License 2.0 or the Server
++ * Side Public License, v 1.
++ */
++
++package org.elasticsearch.action.support.master;
++
++import org.elasticsearch.ElasticsearchException;
++import org.elasticsearch.action.ActionListener;
++import org.elasticsearch.action.ActionRequest;
++import org.elasticsearch.action.ActionRequestValidationException;
++import org.elasticsearch.action.ActionResponse;
++import org.elasticsearch.action.ActionType;
++import org.elasticsearch.action.support.ActionFilters;
++import org.elasticsearch.action.support.PlainActionFuture;
++import org.elasticsearch.cluster.ClusterState;
++import org.elasticsearch.cluster.ClusterStateApplier;
++import org.elasticsearch.cluster.ClusterStateUpdateTask;
++import org.elasticsearch.cluster.block.ClusterBlockException;
++import org.elasticsearch.cluster.coordination.LeaderChecker;
++import org.elasticsearch.cluster.coordination.PublicationTransportHandler;
++import org.elasticsearch.cluster.coordination.StatefulPreVoteCollector;
++import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
++import org.elasticsearch.cluster.node.DiscoveryNode;
++import org.elasticsearch.cluster.service.ClusterService;
++import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.io.stream.StreamInput;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.util.CollectionUtils;
++import org.elasticsearch.core.Releasable;
++import org.elasticsearch.core.Releasables;
++import org.elasticsearch.plugins.ActionPlugin;
++import org.elasticsearch.plugins.Plugin;
++import org.elasticsearch.tasks.Task;
++import org.elasticsearch.test.ClusterServiceUtils;
++import org.elasticsearch.test.ESIntegTestCase;
++import org.elasticsearch.test.transport.MockTransportService;
++import org.elasticsearch.threadpool.ThreadPool;
++import org.elasticsearch.transport.TransportService;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.CyclicBarrier;
++
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.greaterThan;
++
++public class TransportMasterNodeActionIT extends ESIntegTestCase {
++
++    @SuppressWarnings("unchecked")
++    @Override
++    protected Collection<Class<? extends Plugin>> nodePlugins() {
++        return CollectionUtils.appendToCopyNoNullElements(
++            super.nodePlugins(),
++            MockTransportService.TestPlugin.class,
++            TestActionPlugin.class
++        );
++    }
++
++    @Override
++    protected Settings nodeSettings(int nodeOrdinal, Settings otherSettings) {
++        return Settings.builder()
++            .put(super.nodeSettings(nodeOrdinal, otherSettings))
++            // detect leader failover quickly
++            .put(LeaderChecker.LEADER_CHECK_RETRY_COUNT_SETTING.getKey(), 1)
++            .put(LeaderChecker.LEADER_CHECK_INTERVAL_SETTING.getKey(), "100ms")
++            .build();
++    }
++
++    public void testRoutingLoopProtection() {
++
++        final var cleanupTasks = new ArrayList<Releasable>();
++
++        try {
++            final var newMaster = ensureSufficientMasterEligibleNodes();
++            final long originalTerm = internalCluster().masterClient().admin().cluster().prepareState().get().getState().term();
++            final var previousMasterKnowsNewMasterIsElectedLatch = configureElectionLatch(newMaster, cleanupTasks);
++
++            final var newMasterReceivedReroutedMessageFuture = new PlainActionFuture<>();
++            final var newMasterReceivedReroutedMessageListener = ActionListener.assertOnce(newMasterReceivedReroutedMessageFuture);
++            final var reroutedMessageReceived = ActionListener.assertOnce(ActionListener.noop());
++            for (final var transportService : internalCluster().getInstances(TransportService.class)) {
++                final var mockTransportService = asInstanceOf(MockTransportService.class, transportService);
++                cleanupTasks.add(mockTransportService::clearAllRules);
++
++                if (mockTransportService.getLocalNode().getName().equals(newMaster)) {
++                    // Complete listener when the new master receives the re-routed message, ensure it only receives it once, and only from
++                    // a node in the newMaster term.
++                    mockTransportService.addRequestHandlingBehavior(TEST_ACTION_TYPE.name(), (handler, request, channel, task) -> {
++                        assertThat(asInstanceOf(MasterNodeRequest.class, request).masterTerm(), greaterThan(originalTerm));
++                        newMasterReceivedReroutedMessageListener.onResponse(null);
++                        handler.messageReceived(request, channel, task);
++                    });
++                } else {
++                    // Disable every other node's ability to send pre-vote and publish requests
++                    mockTransportService.addSendBehavior((connection, requestId, action, request, options) -> {
++                        if (action.equals(StatefulPreVoteCollector.REQUEST_PRE_VOTE_ACTION_NAME)
++                            || action.equals(PublicationTransportHandler.PUBLISH_STATE_ACTION_NAME)) {
++                            throw new ElasticsearchException("[{}] for [{}] denied", action, connection.getNode());
++                        } else {
++                            connection.sendRequest(requestId, action, request, options);
++                        }
++                    });
++
++                    // Assert that no other node receives the re-routed message more than once, and only from a node in the original term.
++                    mockTransportService.addRequestHandlingBehavior(TEST_ACTION_TYPE.name(), (handler, request, channel, task) -> {
++                        assertThat(asInstanceOf(MasterNodeRequest.class, request).masterTerm(), equalTo(originalTerm));
++                        reroutedMessageReceived.onResponse(null);
++                        handler.messageReceived(request, channel, task);
++                    });
++                }
++            }
++
++            final var newMasterStateApplierBlock = blockClusterStateApplier(newMaster, cleanupTasks);
++
++            // trigger a cluster state update, which fails, causing a master failover
++            internalCluster().getCurrentMasterNodeInstance(ClusterService.class)
++                .submitUnbatchedStateUpdateTask("failover", new ClusterStateUpdateTask() {
++                    @Override
++                    public ClusterState execute(ClusterState currentState) {
++                        return ClusterState.builder(currentState).build();
++                    }
++
++                    @Override
++                    public void onFailure(Exception e) {
++                        // expected
++                    }
++                });
++
++            // Wait until the old master has acknowledged the new master's election
++            safeAwait(previousMasterKnowsNewMasterIsElectedLatch);
++            logger.info("New master is elected");
++
++            // perform a TransportMasterNodeAction on the new master, which doesn't know it's the master yet
++            final var testActionFuture = client(newMaster).execute(TEST_ACTION_TYPE, new TestRequest());
++
++            // wait for the request to come back to the new master
++            safeGet(newMasterReceivedReroutedMessageFuture);
++
++            // Unblock state application on new master, allow it to know of its election win
++            safeAwait(newMasterStateApplierBlock);
++
++            safeGet(testActionFuture);
++        } finally {
++            Releasables.closeExpectNoException(Releasables.wrap(cleanupTasks));
++        }
++    }
++
++    /**
++     * Block the cluster state applier on a node. Returns only when applier is blocked.
++     *
++     * @param nodeName The name of the node on which to block the applier
++     * @param cleanupTasks The list of clean up tasks
++     * @return A cyclic barrier which when awaited on will un-block the applier
++     */
++    private static CyclicBarrier blockClusterStateApplier(String nodeName, ArrayList<Releasable> cleanupTasks) {
++        final var stateApplierBarrier = new CyclicBarrier(2);
++        internalCluster().getInstance(ClusterService.class, nodeName).getClusterApplierService().onNewClusterState("test", () -> {
++            // Meet to signify application is blocked
++            safeAwait(stateApplierBarrier);
++            // Wait for the signal to unblock
++            safeAwait(stateApplierBarrier);
++            return null;
++        }, ActionListener.noop());
++        cleanupTasks.add(stateApplierBarrier::reset);
++
++        // Wait until state application is blocked
++        safeAwait(stateApplierBarrier);
++        return stateApplierBarrier;
++    }
++
++    /**
++     * Configure a latch that will be released when the existing master knows of the new master's election
++     *
++     * @param newMaster The name of the newMaster node
++     * @param cleanupTasks The list of cleanup tasks
++     * @return A latch that will be released when the old master acknowledges the new master's election
++     */
++    private CountDownLatch configureElectionLatch(String newMaster, List<Releasable> cleanupTasks) {
++        final String originalMasterName = internalCluster().getMasterName();
++        logger.info("Original master was {}, new master will be {}", originalMasterName, newMaster);
++        final var previousMasterKnowsNewMasterIsElectedLatch = new CountDownLatch(1);
++        ClusterStateApplier newMasterMonitor = event -> {
++            DiscoveryNode masterNode = event.state().nodes().getMasterNode();
++            if (masterNode != null && masterNode.getName().equals(newMaster)) {
++                previousMasterKnowsNewMasterIsElectedLatch.countDown();
++            }
++        };
++        ClusterService originalMasterClusterService = internalCluster().getInstance(ClusterService.class, originalMasterName);
++        originalMasterClusterService.addStateApplier(newMasterMonitor);
++        cleanupTasks.add(() -> originalMasterClusterService.removeApplier(newMasterMonitor));
++        return previousMasterKnowsNewMasterIsElectedLatch;
++    }
++
++    /**
++     * Add some master-only nodes and block until they've joined the cluster
++     * <p>
++     * Ensure that we've got 5 voting nodes in the cluster, this means even if the original
++     * master accepts its own failed state update before standing down, we can still
++     * establish a quorum without its (or our own) join.
++     */
++    private static String ensureSufficientMasterEligibleNodes() {
++        final var votingConfigSizeListener = ClusterServiceUtils.addTemporaryStateListener(
++            internalCluster().getAnyMasterNodeInstance(ClusterService.class),
++            cs -> 5 <= cs.coordinationMetadata().getLastCommittedConfiguration().getNodeIds().size()
++        );
++
++        try {
++            final var newNodeNames = internalCluster().startMasterOnlyNodes(Math.max(1, 5 - internalCluster().numMasterNodes()));
++            safeAwait(votingConfigSizeListener);
++            return newNodeNames.get(0);
++        } finally {
++            votingConfigSizeListener.onResponse(null);
++        }
++    }
++
++    private static final ActionType<ActionResponse.Empty> TEST_ACTION_TYPE = new ActionType<>("internal:test");
++
++    public static final class TestActionPlugin extends Plugin implements ActionPlugin {
++        @Override
++        public Collection<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
++            return List.of(new ActionHandler<>(TEST_ACTION_TYPE, TestTransportAction.class));
++        }
++    }
++
++    public static final class TestRequest extends MasterNodeRequest<TestRequest> {
++        TestRequest() {
++            super(TEST_REQUEST_TIMEOUT);
++        }
++
++        TestRequest(StreamInput in) throws IOException {
++            super(in);
++        }
++
++        @Override
++        public ActionRequestValidationException validate() {
++            return null;
++        }
++    }
++
++    public static final class TestTransportAction extends TransportMasterNodeAction<TestRequest, ActionResponse.Empty> {
++        @Inject
++        public TestTransportAction(
++            TransportService transportService,
++            ClusterService clusterService,
++            ThreadPool threadPool,
++            ActionFilters actionFilters,
++            IndexNameExpressionResolver indexNameExpressionResolver
++        ) {
++            super(
++                TEST_ACTION_TYPE.name(),
++                transportService,
++                clusterService,
++                threadPool,
++                actionFilters,
++                TestRequest::new,
++                indexNameExpressionResolver,
++                in -> ActionResponse.Empty.INSTANCE,
++                threadPool.generic()
++            );
++        }
++
++        @Override
++        protected void masterOperation(Task task, TestRequest request, ClusterState state, ActionListener<ActionResponse.Empty> listener) {
++            listener.onResponse(ActionResponse.Empty.INSTANCE);
++        }
++
++        @Override
++        protected ClusterBlockException checkBlock(TestRequest request, ClusterState state) {
++            return null;
++        }
++    }
++}
+diff --git a/server/src/main/java/org/elasticsearch/TransportVersions.java b/server/src/main/java/org/elasticsearch/TransportVersions.java
+index 22094b7ec8b..2004c6fda8c 100644
+--- a/server/src/main/java/org/elasticsearch/TransportVersions.java
++++ b/server/src/main/java/org/elasticsearch/TransportVersions.java
+@@ -207,6 +207,7 @@ public class TransportVersions {
+     public static final TransportVersion K_FOR_KNN_QUERY_ADDED = def(8_698_00_0);
+     public static final TransportVersion TEXT_SIMILARITY_RERANKER_RETRIEVER = def(8_699_00_0);
+     public static final TransportVersion ML_INFERENCE_GOOGLE_VERTEX_AI_RERANKING_ADDED = def(8_700_00_0);
++    public static final TransportVersion VERSIONED_MASTER_NODE_REQUESTS = def(8_701_00_0);
+ 
+     /*
+      * STOP! READ THIS FIRST! No, really,
+diff --git a/server/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequest.java b/server/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequest.java
+index 1b3dca31689..269ebd80fb3 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequest.java
++++ b/server/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequest.java
+@@ -8,6 +8,7 @@
+ 
+ package org.elasticsearch.action.support.master;
+ 
++import org.elasticsearch.TransportVersions;
+ import org.elasticsearch.action.ActionRequest;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+@@ -41,6 +42,13 @@ public abstract class MasterNodeRequest<Request extends MasterNodeRequest<Reques
+ 
+     private TimeValue masterNodeTimeout;
+ 
++    /**
++     * The term of the cluster state version used to route this request to a different node, so that if two nodes disagree about which of
++     * them is the master then they don't just send these requests in a loop. {@code 0L} means this is the original request that hasn't been
++     * rerouted yet, or else it's a request received from an older version which doesn't have the routing loop protection.
++     */
++    private final long masterTerm;
++
+     /**
+      * @param masterNodeTimeout Specifies how long to wait when the master has not been discovered yet, or is disconnected, or is busy
+      *                          processing other tasks. The value {@link TimeValue#MINUS_ONE} means to wait forever in 8.15.0 onwards.
+@@ -54,18 +62,37 @@ public abstract class MasterNodeRequest<Request extends MasterNodeRequest<Reques
+      */
+     protected MasterNodeRequest(TimeValue masterNodeTimeout) {
+         this.masterNodeTimeout = Objects.requireNonNull(masterNodeTimeout);
++        this.masterTerm = 0L;
+     }
+ 
+     protected MasterNodeRequest(StreamInput in) throws IOException {
+         super(in);
+         masterNodeTimeout = in.readTimeValue();
++        if (in.getTransportVersion().onOrAfter(TransportVersions.VERSIONED_MASTER_NODE_REQUESTS)) {
++            masterTerm = in.readVLong();
++        } else {
++            masterTerm = 0L;
++        }
+     }
+ 
+     @Override
+     public void writeTo(StreamOutput out) throws IOException {
+-        super.writeTo(out);
++        final var newMasterTerm = getNewMasterTerm(out);
+         assert hasReferences();
++        assert masterTerm <= newMasterTerm : masterTerm + " vs " + newMasterTerm;
++        super.writeTo(out);
+         out.writeTimeValue(masterNodeTimeout);
++        if (out.getTransportVersion().onOrAfter(TransportVersions.VERSIONED_MASTER_NODE_REQUESTS)) {
++            out.writeVLong(newMasterTerm);
++        } // else no protection against routing loops in older versions
++    }
++
++    private long getNewMasterTerm(StreamOutput out) {
++        if (out instanceof TermOverridingStreamOutput termOverridingStreamOutput) {
++            return termOverridingStreamOutput.masterTerm;
++        } else {
++            return masterTerm;
++        }
+     }
+ 
+     /**
+@@ -92,4 +119,12 @@ public abstract class MasterNodeRequest<Request extends MasterNodeRequest<Reques
+     public final TimeValue masterNodeTimeout() {
+         return this.masterNodeTimeout;
+     }
++
++    /**
++     * @return the master term of the cluster state used to route this request, for protection against routing loops. May be {@code 0L} if
++     * this is the original request or it came from an older node that lacks routing loop protection
++     */
++    public final long masterTerm() {
++        return masterTerm;
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingMasterNodeRequest.java b/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingMasterNodeRequest.java
+new file mode 100644
+index 00000000000..5fee54f3eb2
+--- /dev/null
++++ b/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingMasterNodeRequest.java
+@@ -0,0 +1,128 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0 and the Server Side Public License, v 1; you may not use this file except
++ * in compliance with, at your election, the Elastic License 2.0 or the Server
++ * Side Public License, v 1.
++ */
++
++package org.elasticsearch.action.support.master;
++
++import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.io.stream.StreamOutput;
++import org.elasticsearch.logging.LogManager;
++import org.elasticsearch.logging.Logger;
++import org.elasticsearch.tasks.Task;
++import org.elasticsearch.tasks.TaskId;
++import org.elasticsearch.transport.TransportRequest;
++
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.util.Map;
++
++/**
++ * Wrapper around a {@link MasterNodeRequest} for use when sending the request to another node, overriding the {@link
++ * MasterNodeRequest#masterTerm()} sent out over the wire.
++ * <p>
++ * Note that in production this is <i>only</i> used for sending the request out, so there's no need to preserve other marker interfaces such
++ * as {@link org.elasticsearch.action.IndicesRequest} or {@link org.elasticsearch.action.IndicesRequest.Replaceable} on the wrapped request.
++ * The receiving node will deserialize a request without a wrapper, with the correct interfaces and the appropriate master term stored
++ * directly in {@link MasterNodeRequest#masterTerm()}. However in tests sometimes we want to intercept the request as it's being sent, for
++ * which it may be necessary to use the test utility {@code MasterNodeRequestHelper#unwrapTermOverride} to remove the wrapper and access the
++ * inner request.
++ */
++class TermOverridingMasterNodeRequest extends TransportRequest {
++
++    private static final Logger logger = LogManager.getLogger(TermOverridingMasterNodeRequest.class);
++
++    final MasterNodeRequest<?> request;
++    final long newMasterTerm;
++
++    TermOverridingMasterNodeRequest(MasterNodeRequest<?> request, long newMasterTerm) {
++        assert request.masterTerm() <= newMasterTerm;
++        this.request = request;
++        this.newMasterTerm = newMasterTerm;
++    }
++
++    @Override
++    public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
++        return unsupported();
++    }
++
++    @Override
++    public String getDescription() {
++        return request.getDescription();
++    }
++
++    @Override
++    public void remoteAddress(InetSocketAddress remoteAddress) {
++        unsupported();
++    }
++
++    @Override
++    public InetSocketAddress remoteAddress() {
++        return unsupported();
++    }
++
++    @Override
++    public void incRef() {
++        request.incRef();
++    }
++
++    @Override
++    public boolean tryIncRef() {
++        return request.tryIncRef();
++    }
++
++    @Override
++    public boolean decRef() {
++        return request.decRef();
++    }
++
++    @Override
++    public boolean hasReferences() {
++        return request.hasReferences();
++    }
++
++    @Override
++    public void setParentTask(String parentTaskNode, long parentTaskId) {
++        unsupported();
++    }
++
++    @Override
++    public void setParentTask(TaskId taskId) {
++        unsupported();
++    }
++
++    @Override
++    public TaskId getParentTask() {
++        return request.getParentTask();
++    }
++
++    @Override
++    public void setRequestId(long requestId) {
++        request.setRequestId(requestId);
++    }
++
++    @Override
++    public long getRequestId() {
++        return request.getRequestId();
++    }
++
++    @Override
++    public final void writeTo(StreamOutput out) throws IOException {
++        request.writeTo(new TermOverridingStreamOutput(out, newMasterTerm));
++    }
++
++    @Override
++    public String toString() {
++        return Strings.format("TermOverridingMasterNodeRequest[newMasterTerm=%d in %s]", newMasterTerm, request);
++    }
++
++    private static <T> T unsupported() {
++        final var exception = new UnsupportedOperationException("TermOverridingMasterNodeRequest is only for outbound requests");
++        logger.error("TermOverridingMasterNodeRequest is only for outbound requests", exception);
++        assert false : exception;
++        throw exception;
++    }
++}
+diff --git a/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingStreamOutput.java b/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingStreamOutput.java
+new file mode 100644
+index 00000000000..45cf52bfbe2
+--- /dev/null
++++ b/server/src/main/java/org/elasticsearch/action/support/master/TermOverridingStreamOutput.java
+@@ -0,0 +1,60 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0 and the Server Side Public License, v 1; you may not use this file except
++ * in compliance with, at your election, the Elastic License 2.0 or the Server
++ * Side Public License, v 1.
++ */
++
++package org.elasticsearch.action.support.master;
++
++import org.elasticsearch.TransportVersion;
++import org.elasticsearch.common.io.stream.StreamOutput;
++
++import java.io.IOException;
++
++/**
++ * Wrapper around a {@link StreamOutput} for use when sending a {@link MasterNodeRequest} to another node, exposing the {@link
++ * MasterNodeRequest#masterTerm()} to send out over the wire.
++ */
++class TermOverridingStreamOutput extends StreamOutput {
++
++    private final StreamOutput delegate;
++    final long masterTerm;
++
++    TermOverridingStreamOutput(StreamOutput delegate, long masterTerm) {
++        this.delegate = delegate;
++        this.masterTerm = masterTerm;
++    }
++
++    @Override
++    public void writeByte(byte b) throws IOException {
++        delegate.writeByte(b);
++    }
++
++    @Override
++    public void writeBytes(byte[] b, int offset, int length) throws IOException {
++        delegate.writeBytes(b, offset, length);
++    }
++
++    @Override
++    public void flush() throws IOException {
++        delegate.flush();
++    }
++
++    @Override
++    public void close() throws IOException {
++        delegate.close();
++    }
++
++    @Override
++    public TransportVersion getTransportVersion() {
++        return delegate.getTransportVersion();
++    }
++
++    @Override
++    public void setTransportVersion(TransportVersion version) {
++        assert false : version;
++        delegate.setTransportVersion(version);
++    }
++}
+diff --git a/server/src/main/java/org/elasticsearch/action/support/master/TransportMasterNodeAction.java b/server/src/main/java/org/elasticsearch/action/support/master/TransportMasterNodeAction.java
+index e88ebbdc076..0cbbdb07928 100644
+--- a/server/src/main/java/org/elasticsearch/action/support/master/TransportMasterNodeAction.java
++++ b/server/src/main/java/org/elasticsearch/action/support/master/TransportMasterNodeAction.java
+@@ -240,13 +240,20 @@ public abstract class TransportMasterNodeAction<Request extends MasterNodeReques
+                     if (nodes.getMasterNode() == null) {
+                         logger.debug("no known master node, scheduling a retry");
+                         retryOnNextState(currentStateVersion, null);
++                    } else if (clusterState.term() < request.masterTerm()) {
++                        logger.debug(
++                            "request routed to master in term [{}] but local term is [{}], waiting for local term bump",
++                            request.masterTerm(),
++                            clusterState.term()
++                        );
++                        retry(currentStateVersion, null, cs -> request.masterTerm() <= cs.term());
+                     } else {
+                         DiscoveryNode masterNode = nodes.getMasterNode();
+                         logger.trace("forwarding request [{}] to master [{}]", actionName, masterNode);
+                         transportService.sendRequest(
+                             masterNode,
+                             actionName,
+-                            request,
++                            new TermOverridingMasterNodeRequest(request, clusterState.term()),
+                             new ActionListenerResponseHandler<>(listener, responseReader, executor) {
+                                 @Override
+                                 public void handleException(final TransportException exp) {
+diff --git a/server/src/test/java/org/elasticsearch/action/admin/cluster/node/tasks/TestTaskPlugin.java b/server/src/test/java/org/elasticsearch/action/admin/cluster/node/tasks/TestTaskPlugin.java
+index 859ee68a784..6f2af841418 100644
+--- a/server/src/test/java/org/elasticsearch/action/admin/cluster/node/tasks/TestTaskPlugin.java
++++ b/server/src/test/java/org/elasticsearch/action/admin/cluster/node/tasks/TestTaskPlugin.java
+@@ -17,6 +17,7 @@ import org.elasticsearch.action.FailedNodeException;
+ import org.elasticsearch.action.IndicesRequest;
+ import org.elasticsearch.action.TaskOperationFailure;
+ import org.elasticsearch.action.support.ActionFilters;
++import org.elasticsearch.action.support.master.MasterNodeRequestHelper;
+ import org.elasticsearch.action.support.nodes.BaseNodeResponse;
+ import org.elasticsearch.action.support.nodes.BaseNodesRequest;
+ import org.elasticsearch.action.support.nodes.BaseNodesResponse;
+@@ -470,15 +471,16 @@ public class TestTaskPlugin extends Plugin implements ActionPlugin, NetworkPlugi
+                  */
+                 return false;
+             }
+-            if (false == (request instanceof IndicesRequest)) {
++
++            if (MasterNodeRequestHelper.unwrapTermOverride(request) instanceof IndicesRequest indicesRequest) {
++                /*
++                 * When the API Tasks API makes an indices request it only every
++                 * targets the .tasks index. Other requests come from the tests.
++                 */
++                return Arrays.equals(new String[] { ".tasks" }, indicesRequest.indices());
++            } else {
+                 return false;
+             }
+-            IndicesRequest ir = (IndicesRequest) request;
+-            /*
+-             * When the API Tasks API makes an indices request it only every
+-             * targets the .tasks index. Other requests come from the tests.
+-             */
+-            return Arrays.equals(new String[] { ".tasks" }, ir.indices());
+         }
+     }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/action/support/master/TransportMasterNodeActionTests.java b/server/src/test/java/org/elasticsearch/action/support/master/TransportMasterNodeActionTests.java
+index a4838f568e1..6568464705d 100644
+--- a/server/src/test/java/org/elasticsearch/action/support/master/TransportMasterNodeActionTests.java
++++ b/server/src/test/java/org/elasticsearch/action/support/master/TransportMasterNodeActionTests.java
+@@ -524,7 +524,7 @@ public class TransportMasterNodeActionTests extends ESTestCase {
+         assertThat(transport.capturedRequests().length, equalTo(1));
+         CapturingTransport.CapturedRequest capturedRequest = transport.capturedRequests()[0];
+         assertTrue(capturedRequest.node().isMasterNode());
+-        assertThat(capturedRequest.request(), equalTo(request));
++        assertThat(asInstanceOf(TermOverridingMasterNodeRequest.class, capturedRequest.request()).request, equalTo(request));
+         assertThat(capturedRequest.action(), equalTo("internal:testAction"));
+ 
+         Response response = new Response();
+@@ -552,7 +552,7 @@ public class TransportMasterNodeActionTests extends ESTestCase {
+         assertThat(capturedRequests.length, equalTo(1));
+         CapturingTransport.CapturedRequest capturedRequest = capturedRequests[0];
+         assertTrue(capturedRequest.node().isMasterNode());
+-        assertThat(capturedRequest.request(), equalTo(request));
++        assertThat(asInstanceOf(TermOverridingMasterNodeRequest.class, capturedRequest.request()).request, equalTo(request));
+         assertThat(capturedRequest.action(), equalTo("internal:testAction"));
+ 
+         if (rejoinSameMaster) {
+@@ -586,7 +586,7 @@ public class TransportMasterNodeActionTests extends ESTestCase {
+             assertThat(capturedRequests.length, equalTo(1));
+             capturedRequest = capturedRequests[0];
+             assertTrue(capturedRequest.node().isMasterNode());
+-            assertThat(capturedRequest.request(), equalTo(request));
++            assertThat(asInstanceOf(TermOverridingMasterNodeRequest.class, capturedRequest.request()).request, equalTo(request));
+             assertThat(capturedRequest.action(), equalTo("internal:testAction"));
+         } else if (failsWithConnectTransportException) {
+             transport.handleRemoteError(capturedRequest.requestId(), new ConnectTransportException(masterNode, "Fake error"));
+@@ -639,7 +639,7 @@ public class TransportMasterNodeActionTests extends ESTestCase {
+         assertThat(transport.capturedRequests().length, equalTo(1));
+         CapturingTransport.CapturedRequest capturedRequest = transport.capturedRequests()[0];
+         assertTrue(capturedRequest.node().isMasterNode());
+-        assertThat(capturedRequest.request(), equalTo(request));
++        assertThat(asInstanceOf(TermOverridingMasterNodeRequest.class, capturedRequest.request()).request, equalTo(request));
+         assertThat(capturedRequest.action(), equalTo("internal:testAction"));
+ 
+         transport.handleResponse(capturedRequest.requestId(), response);
+diff --git a/test/framework/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequestHelper.java b/test/framework/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequestHelper.java
+new file mode 100644
+index 00000000000..217b7addeb2
+--- /dev/null
++++ b/test/framework/src/main/java/org/elasticsearch/action/support/master/MasterNodeRequestHelper.java
+@@ -0,0 +1,19 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0 and the Server Side Public License, v 1; you may not use this file except
++ * in compliance with, at your election, the Elastic License 2.0 or the Server
++ * Side Public License, v 1.
++ */
++
++package org.elasticsearch.action.support.master;
++
++import org.elasticsearch.transport.TransportRequest;
++
++public class MasterNodeRequestHelper {
++    public static TransportRequest unwrapTermOverride(TransportRequest transportRequest) {
++        return transportRequest instanceof TermOverridingMasterNodeRequest termOverridingMasterNodeRequest
++            ? termOverridingMasterNodeRequest.request
++            : transportRequest;
++    }
++}
+diff --git a/test/framework/src/main/java/org/elasticsearch/test/transport/MockTransportService.java b/test/framework/src/main/java/org/elasticsearch/test/transport/MockTransportService.java
+index 51893e551ba..da478cbf1cb 100644
+--- a/test/framework/src/main/java/org/elasticsearch/test/transport/MockTransportService.java
++++ b/test/framework/src/main/java/org/elasticsearch/test/transport/MockTransportService.java
+@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ import org.elasticsearch.TransportVersion;
+ import org.elasticsearch.action.ActionListener;
++import org.elasticsearch.action.support.master.MasterNodeRequestHelper;
+ import org.elasticsearch.cluster.ClusterModule;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
+ import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
+@@ -574,7 +575,8 @@ public class MockTransportService extends TransportService {
+                     RequestHandlerRegistry<?> reg = MockTransportService.this.getRequestHandler(action);
+                     clonedRequest = reg.newRequest(bStream.bytes().streamInput());
+                 }
+-                assert clonedRequest.getClass().equals(request.getClass()) : clonedRequest + " vs " + request;
++                assert clonedRequest.getClass().equals(MasterNodeRequestHelper.unwrapTermOverride(request).getClass())
++                    : clonedRequest + " vs " + request;
+ 
+                 final RunOnce runnable = new RunOnce(new AbstractRunnable() {
+                     @Override
