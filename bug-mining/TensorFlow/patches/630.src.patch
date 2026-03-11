@@ -1,0 +1,510 @@
+diff --git a/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter.cc b/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter.cc
+index 2dabde612b3..20b711ea38b 100644
+--- a/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter.cc
++++ b/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter.cc
+@@ -616,11 +616,30 @@ MatchFwdResult MatchBmm1UnfusedBiasSoftmaxBmm2(MatchFwdResult previous_result,
+     // bmm1 - (scale) - bias - softmax
+     match_result.matched_bmm_1 = bmm_1;
+     match_result.matched_scale = scale;
+-    match_result.matched_bias = bias;
+     match_result.matched_custom_call_name =
+         has_dropout ? kCudnnfMHAScaleBiasSoftmaxDropoutCallTarget
+                     : kCudnnfMHAScaleBiasSoftmaxCallTarget;
+     match_result.is_causal_mask |= IsCausalMaskPattern(bias);
++    if (!match_result.is_causal_mask &&
++        bias->opcode() == HloOpcode::kBroadcast) {
++      // we can take the bias before broadcast
++      auto dims = Cast<HloBroadcastInstruction>(bias)->dimensions();
++      if (dims == std::vector<int64_t>{2, 3} ||
++          dims == std::vector<int64_t>{0, 2, 3} ||
++          dims == std::vector<int64_t>{1, 2, 3}) {
++        // shapes [1, 1, s, s], [b, 1, s, s], [1, h, s, s] are supported
++        HloInstruction* bias_bc = bias->mutable_operand(0);
++        // bitcast bias_before_broadcast to be 4D
++        std::vector<int64_t> bitcast_dims(bias->shape().rank(), 1);
++        for (int dim : dims) {
++          bitcast_dims[dim] = bias->shape().dimensions()[dim];
++        }
++        bias = bias_bc->AddInstruction(HloInstruction::CreateBitcast(
++            ShapeUtil::MakeShape(bias->shape().element_type(), bitcast_dims),
++            bias_bc));
++      }
++    }
++    match_result.matched_bias = bias;
+     match_result.has_match = true;
+   } else {
+     match_result.has_match = false;
+@@ -804,7 +823,16 @@ MatchBwdResult MatchDbias(MatchBwdResult previous_result,
+       user_count == 1 &&
+       Match(dbias_user, m::Reduce(&dbias, m::Op(), m::Op()).WithOneUse()) &&
+       dbias->shape().rank() == 3 && ConsumeExtraConvert(dbias);
+-  match_result.matched_dbias = dbias;
++  if (match_result.has_match) {
++    // cuDNN only supports dbias for [1, h, s, s]
++    // make sure reduce dimension is on batch dim
++    auto reduce_dim = dbias->dimensions();
++    if (reduce_dim.size() == 1 && reduce_dim[0] == 0) {
++      match_result.matched_dbias = dbias;
++    } else {
++      match_result.has_match = false;
++    }
++  }
+   return match_result;
+ }
+ 
+@@ -882,9 +910,10 @@ MatchBwdResult MatchBwdBmmSoftmaxDropoutBmm(MatchBwdResult previous_result,
+ 
+   // Backward scale input pattern
+   HloInstruction* bwd_scale_input = nullptr;
++  HloInstruction* bwd_scale = nullptr;
+ 
+   auto bwd_scale_pattern =
+-      m::MultiplyAnyOrder(m::Op(&bwd_scale_input),
++      m::MultiplyAnyOrder(&bwd_scale, m::Op(&bwd_scale_input),
+                           m::Broadcast(m::Constant().WithPredicate(IsScalar)))
+           .WithNumUser(2);
+   int intermediate_input_pos = is_bmm1_grad1_canonicalized ? 1 : 0;
+@@ -947,7 +976,7 @@ MatchBwdResult MatchBwdBmmSoftmaxDropoutBmm(MatchBwdResult previous_result,
+       // no dbias
+       match_result.has_match = true;
+     } else if (dS->user_count() == 2) {
+-      match_result = MatchDbias(match_result, dS, {bwd_scale_input});
++      match_result = MatchDbias(match_result, dS, {bwd_scale});
+     } else {
+       match_result.has_match = false;
+     }
+@@ -1486,7 +1515,7 @@ absl::StatusOr<bool> FuseBwdMultiHeadedAttentionBlock(
+ 
+   // Output order:
+   // {dQ(bmm_1_grad_2), dK(bmm_1_grad_1), dV(bmm_2_grad_1),
+-  // d_intermediate_tensor*, scratch, dbias*}
++  // scratch, dbias*}
+   std::vector<Shape> output_shapes = {
+       bmm_1_grad_2->shape(), bmm_1_grad_1->shape(), bmm_2_grad_1->shape()};
+   // Reserved placeholder for workspace
+@@ -1533,7 +1562,7 @@ absl::StatusOr<bool> FuseBwdMultiHeadedAttentionBlock(
+     HloInstruction* dbias_user = dbias->users()[0];
+     HloInstruction* cudnn_dbias_output =
+         comp->AddInstruction(HloInstruction::CreateGetTupleElement(
+-            output_shapes.back(), fmha_bwd_call, 5));
++            output_shapes.back(), fmha_bwd_call, 4));
+     HloInstruction* reshape_dbias = comp->AddInstruction(
+         HloInstruction::CreateReshape(original_shape, cudnn_dbias_output));
+     TF_RETURN_IF_ERROR(dbias_user->ReplaceOperandWith(
+@@ -1691,21 +1720,6 @@ absl::StatusOr<bool> CudnnFusedMHARewriter::Run(
+                               matched_result.need_canonicalization));
+           continue;
+         }
+-        // check if dbias exist and the cudnn version is > 8.9.1. We
+-        // won't lower bwd if this condition is not met as we won't deal with
+-        // unswizzling now
+-        if (matched_bwd_result.matched_dbias &&
+-            !IsComputeCapabilityAndCudnnSupported(
+-                compute_capability_, cudnn_version,
+-                stream_executor::dnn::VersionInfo(8, 9, 1))) {
+-          // restore fwd graph if bwd pattern match failed
+-          TF_RETURN_IF_ERROR(
+-              RestoreFwdGraph(comp, fwd_fmha_call, original_bmm2, activation,
+-                              original_bmm2_producer0, original_bmm2_producer1,
+-                              original_activation_producers,
+-                              matched_result.need_canonicalization));
+-          continue;
+-        }
+         // Canonicalize gemms
+         if (matched_bwd_result.bmm_1_grad_1_need_canonicalization) {
+           TF_ASSIGN_OR_RETURN(
+diff --git a/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter_test.cc b/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter_test.cc
+index c3bf936902a..2b7bc3992f0 100644
+--- a/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter_test.cc
++++ b/third_party/xla/xla/service/gpu/cudnn_fused_mha_rewriter_test.cc
+@@ -3070,6 +3070,135 @@ TEST_F(CudnnFusedMhaRewriterTestHloTest, HeadDimNotMultipleOf64) {
+   EXPECT_EQ(config.fmha_scale(), 0.5);
+   EXPECT_EQ(config.dropout_rate(), 0.0);
+ }
++
++constexpr absl::string_view hlo_BF16Bmm1BiasSoftmaxBmm2Pattern_dbias = R"(
++HloModule jit__unnamed_wrapped_function_, entry_computation_layout={(bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0})->(bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0})}, allow_spmd_sharding_propagation_to_parameters={true,true,true,true,true}, allow_spmd_sharding_propagation_to_output={true,true,true,true,true}
++
++region_0.14 {
++  Arg_0.15 = bf16[] parameter(0)
++  Arg_1.16 = bf16[] parameter(1)
++  ROOT maximum = bf16[] maximum(Arg_0.15, Arg_1.16)
++}
++
++region_1.27 {
++  Arg_0.28 = f32[] parameter(0)
++  Arg_1.29 = f32[] parameter(1)
++  ROOT add = f32[] add(Arg_0.28, Arg_1.29)
++}
++
++region_2.56 {
++  Arg_0.57 = bf16[] parameter(0)
++  Arg_1.58 = bf16[] parameter(1)
++  ROOT add.1 = bf16[] add(Arg_0.57, Arg_1.58)
++}
++
++ENTRY main.87 {
++  Arg_2.3 = bf16[2,1024,4,64]{3,2,1,0} parameter(2)
++  transpose.12 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_2.3), dimensions={0,2,3,1}
++  Arg_0.1 = bf16[2,1024,4,64]{3,2,1,0} parameter(0)
++  transpose.13 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_0.1), dimensions={0,2,1,3}
++  Arg_1.2 = bf16[2,1024,4,64]{3,2,1,0} parameter(1)
++  transpose.15 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_1.2), dimensions={0,2,3,1}
++  dot = bf16[2,4,1024,1024]{3,2,1,0} dot(transpose.13, transpose.15), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  Arg_4.5 = bf16[4,1024,1024]{2,1,0} parameter(4)
++  broadcast.9 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(Arg_4.5), dimensions={1,2,3}
++  add.2 = bf16[2,4,1024,1024]{3,2,1,0} add(dot, broadcast.9)
++  constant.10 = bf16[] constant(-inf)
++  reduce.18 = bf16[2,4,1024]{2,1,0} reduce(add.2, constant.10), dimensions={3}, to_apply=region_0.14
++  broadcast.10 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(reduce.18), dimensions={0,1,2}
++  subtract = bf16[2,4,1024,1024]{3,2,1,0} subtract(add.2, broadcast.10)
++  exponential = bf16[2,4,1024,1024]{3,2,1,0} exponential(subtract)
++  convert.5 = f32[2,4,1024,1024]{3,2,1,0} convert(exponential)
++  constant.9 = f32[] constant(0)
++  reduce.31 = f32[2,4,1024]{2,1,0} reduce(convert.5, constant.9), dimensions={3}, to_apply=region_1.27
++  convert.6 = bf16[2,4,1024]{2,1,0} convert(reduce.31)
++  broadcast.11 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(convert.6), dimensions={0,1,2}
++  divide.2 = bf16[2,4,1024,1024]{3,2,1,0} divide(exponential, broadcast.11)
++  dot.1 = bf16[2,4,64,1024]{3,2,1,0} dot(transpose.12, divide.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={3}
++  transpose.22 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.1), dimensions={0,3,1,2}
++  Arg_3.4 = bf16[2,1024,4,64]{3,2,1,0} parameter(3)
++  transpose.17 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_3.4), dimensions={0,2,1,3}
++  dot.2 = bf16[2,4,1024,1024]{3,2,1,0} dot(transpose.17, transpose.12), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  divide.3 = bf16[2,4,1024,1024]{3,2,1,0} divide(dot.2, broadcast.11)
++  constant.0 = bf16[] constant(1)
++  broadcast.13 = bf16[2,4,1024]{2,1,0} broadcast(constant.0), dimensions={}
++  multiply.2 = bf16[2,4,1024]{2,1,0} multiply(convert.6, convert.6)
++  divide.4 = bf16[2,4,1024]{2,1,0} divide(broadcast.13, multiply.2)
++  broadcast.14 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(divide.4), dimensions={0,1,2}
++  multiply.3 = bf16[2,4,1024,1024]{3,2,1,0} multiply(dot.2, broadcast.14)
++  multiply.4 = bf16[2,4,1024,1024]{3,2,1,0} multiply(multiply.3, exponential)
++  constant.8 = bf16[] constant(0)
++  reduce.60 = bf16[2,4,1024]{2,1,0} reduce(multiply.4, constant.8), dimensions={3}, to_apply=region_2.56
++  negate.1 = bf16[2,4,1024]{2,1,0} negate(reduce.60)
++  broadcast.15 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(negate.1), dimensions={0,1,2}
++  add.3 = bf16[2,4,1024,1024]{3,2,1,0} add(divide.3, broadcast.15)
++  multiply.5 = bf16[2,4,1024,1024]{3,2,1,0} multiply(add.3, exponential)
++  transpose.18 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_1.2), dimensions={0,2,1,3}
++  dot.4 = bf16[2,4,1024,64]{3,2,1,0} dot(multiply.5, transpose.18), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  transpose.23 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.4), dimensions={0,2,1,3}
++  dot.3 = bf16[2,4,1024,64]{3,2,1,0} dot(multiply.5, transpose.13), lhs_batch_dims={0,1}, lhs_contracting_dims={2}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  transpose.24 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.3), dimensions={0,2,1,3}
++  transpose.20 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_3.4), dimensions={0,2,3,1}
++  dot.49 = bf16[2,4,64,1024]{3,2,1,0} dot(transpose.20, divide.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++  transpose.25 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.49), dimensions={0,3,1,2}
++  reduce.81 = bf16[4,1024,1024]{2,1,0} reduce(multiply.5, constant.8), dimensions={0}, to_apply=region_2.56
++  ROOT tuple = (bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0}) tuple(transpose.22, transpose.23, transpose.24, transpose.25, reduce.81)
++} // main.87
++)";
++
++TEST_F(CudnnFusedMhaRewriterTestHloTest, BF16Bmm1BiasSoftmaxBmm2PatternDbias) {
++  if (skip_reason_) GTEST_SKIP() << *skip_reason_;
++  TF_ASSERT_OK_AND_ASSIGN(
++      auto m,
++      ParseAndReturnVerifiedModule(hlo_BF16Bmm1BiasSoftmaxBmm2Pattern_dbias));
++  CudnnFusedMHARewriter fusedMhaRewriter{GetCudaComputeCapability(),
++                                         GetCudnnVersion()};
++  TF_ASSERT_OK(RunHloPass(&fusedMhaRewriter, m.get()).status());
++
++  ComputationLayout computation_layout(
++      m->entry_computation()->ComputeProgramShape());
++
++  const HloInstruction* fmha;
++
++  SCOPED_TRACE(m->ToString());
++  EXPECT_THAT(
++      m->entry_computation()->root_instruction(),
++      GmockMatch(m::Tuple(
++          m::Transpose(
++              m::Transpose(m::GetTupleElement(
++                  m::CustomCall(&fmha, {kCudnnfMHAScaleBiasSoftmaxCallTarget}),
++                  0)))
++              .WithShape(BF16, {2, 1024, 4, 64}),
++          m::Transpose(
++              m::GetTupleElement(
++                  m::CustomCall({kCudnnfMHAScaleBiasSoftmaxBackwardCallTarget}),
++                  0))
++              .WithShape(BF16, {2, 1024, 4, 64}),
++          m::Transpose(
++              m::GetTupleElement(
++                  m::CustomCall({kCudnnfMHAScaleBiasSoftmaxBackwardCallTarget}),
++                  1))
++              .WithShape(BF16, {2, 1024, 4, 64}),
++          m::Transpose(
++              m::Transpose(m::GetTupleElement(
++                  m::CustomCall({kCudnnfMHAScaleBiasSoftmaxBackwardCallTarget}),
++                  2)))
++              .WithShape(BF16, {2, 1024, 4, 64}),
++          m::Reshape(
++              m::GetTupleElement(
++                  m::CustomCall({kCudnnfMHAScaleBiasSoftmaxBackwardCallTarget}),
++                  4))
++              .WithShape(BF16, {4, 1024, 1024}))));
++  TF_ASSERT_OK_AND_ASSIGN(auto gpu_config,
++                          fmha->backend_config<GpuBackendConfig>());
++  const CudnnfMHABackendConfig& config = gpu_config.cudnn_fmha_backend_config();
++  EXPECT_EQ(fmha->operands().size(), 4);
++  EXPECT_EQ(fmha->operand(3)->shape(),
++            ShapeUtil::MakeShape(BF16, {1, 4, 1024, 1024}));
++  EXPECT_EQ(config.fmha_scale(), 1.0);
++  EXPECT_EQ(config.dropout_rate(), 0.0);
++  EXPECT_EQ(config.mask_type(), CudnnfMHABackendConfig::NO_MASK);
++}
+ }  // anonymous namespace
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/third_party/xla/xla/service/gpu/cudnn_workspace_rewriter.cc b/third_party/xla/xla/service/gpu/cudnn_workspace_rewriter.cc
+index e672abddf8a..38e9e31ff9c 100644
+--- a/third_party/xla/xla/service/gpu/cudnn_workspace_rewriter.cc
++++ b/third_party/xla/xla/service/gpu/cudnn_workspace_rewriter.cc
+@@ -168,6 +168,11 @@ absl::StatusOr<se::gpu::CudnnGraph> HloCustomCallToCuDnnGraph(
+     output_index++;
+     std::optional<Shape> d_s_shape;
+     std::optional<Shape> d_bias_shape;
++    bool has_dbias = custom_call->shape().tuple_shapes().size() == 5;
++    if (has_dbias) {
++      d_bias_shape =
++          ShapeUtil::GetSubshape(custom_call->shape(), {output_index++});
++    }
+     TF_RET_CHECK(output_index == custom_call->shape().tuple_shapes().size());
+     TF_ASSIGN_OR_RETURN(CudnnfMHAMaskKind cudnn_mask_type,
+                         AsCudnnFmhaMaskKind(config.mask_type()));
+diff --git a/third_party/xla/xla/service/gpu/ir_emitter_unnested.cc b/third_party/xla/xla/service/gpu/ir_emitter_unnested.cc
+index 53766aea9de..4dc4a24670a 100644
+--- a/third_party/xla/xla/service/gpu/ir_emitter_unnested.cc
++++ b/third_party/xla/xla/service/gpu/ir_emitter_unnested.cc
+@@ -1130,8 +1130,14 @@ absl::Status IrEmitterUnnested::EmitFusedMHABackwardThunk(
+   TF_ASSIGN_OR_RETURN(BufferAllocation::Slice scratch_slice,
+                       GetAllocationSliceForHlo(instr, {output_index++}));
+ 
++  bool has_dbias = instr->shape().tuple_shapes().size() == 5;
+   BufferAllocation::Slice d_bias_slice;
+   std::optional<Shape> d_bias_shape;
++  if (has_dbias) {
++    TF_ASSIGN_OR_RETURN(d_bias_slice,
++                        GetAllocationSliceForHlo(instr, {output_index}));
++    d_bias_shape = ShapeUtil::GetSubshape(instr->shape(), {output_index++});
++  }
+   TF_RET_CHECK(output_index == instr->shape().tuple_shapes().size());
+   TF_ASSIGN_OR_RETURN(const auto mask_type,
+                       AsCudnnFmhaMaskKind(config.mask_type()));
+diff --git a/third_party/xla/xla/service/gpu/tests/gpu_fused_mha_test.cc b/third_party/xla/xla/service/gpu/tests/gpu_fused_mha_test.cc
+index 585c72a71ca..be51526542d 100644
+--- a/third_party/xla/xla/service/gpu/tests/gpu_fused_mha_test.cc
++++ b/third_party/xla/xla/service/gpu/tests/gpu_fused_mha_test.cc
+@@ -153,6 +153,16 @@ class MultiHeadedAttentionTest : public GpuCodegenTest {
+         input_data, LayoutUtil::MakeLayout(minor_to_major));
+   }
+ 
++  template <typename T>
++  Literal GetInput3DLiteral(std::vector<int64_t> dimensions,
++                            std::vector<int64_t> minor_to_major) {
++    Array3D<T> input_data(dimensions[0], dimensions[1], dimensions[2]);
++    input_data.FillRandom(/*stddev=*/static_cast<T>(0.023), 0.001);
++
++    return LiteralUtil::CreateR3FromArray3DWithLayout(
++        input_data, LayoutUtil::MakeLayout(minor_to_major));
++  }
++
+   Literal GetMask4DLiteral(std::vector<int64_t> dimensions,
+                            std::vector<int64_t> minor_to_major) {
+     Array4D<bool> input_data(dimensions[0], dimensions[1], dimensions[2],
+@@ -584,6 +594,85 @@ class FlashAttentionBMMScaleBiasSoftmaxBMM : public MultiHeadedAttentionTest {
+   )";
+     return hlo_text;
+   }
++
++  const std::string  // NOLINT
++  GetModuleFlash_Attention_BMM1_Bias_Softmax_BMM2_Dbias_HloString_BF16() {  // NOLINT
++    const std::string hlo_text = R"(
++      HloModule jit__unnamed_wrapped_function_, entry_computation_layout={(bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0})->(bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0})}, allow_spmd_sharding_propagation_to_parameters={true,true,true,true,true}, allow_spmd_sharding_propagation_to_output={true,true,true,true,true}
++
++      region_0.14 {
++        Arg_0.15 = bf16[] parameter(0)
++        Arg_1.16 = bf16[] parameter(1)
++        ROOT maximum = bf16[] maximum(Arg_0.15, Arg_1.16)
++      }
++
++      region_1.27 {
++        Arg_0.28 = f32[] parameter(0)
++        Arg_1.29 = f32[] parameter(1)
++        ROOT add = f32[] add(Arg_0.28, Arg_1.29)
++      }
++
++      region_2.56 {
++        Arg_0.57 = bf16[] parameter(0)
++        Arg_1.58 = bf16[] parameter(1)
++        ROOT add.1 = bf16[] add(Arg_0.57, Arg_1.58)
++      }
++
++      ENTRY main.87 {
++        Arg_2.3 = bf16[2,1024,4,64]{3,2,1,0} parameter(2)
++        transpose.12 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_2.3), dimensions={0,2,3,1}
++        Arg_0.1 = bf16[2,1024,4,64]{3,2,1,0} parameter(0)
++        transpose.13 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_0.1), dimensions={0,2,1,3}
++        Arg_1.2 = bf16[2,1024,4,64]{3,2,1,0} parameter(1)
++        transpose.15 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_1.2), dimensions={0,2,3,1}
++        dot = bf16[2,4,1024,1024]{3,2,1,0} dot(transpose.13, transpose.15), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++        Arg_4.5 = bf16[4,1024,1024]{2,1,0} parameter(4)
++        broadcast.9 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(Arg_4.5), dimensions={1,2,3}
++        add.2 = bf16[2,4,1024,1024]{3,2,1,0} add(dot, broadcast.9)
++        constant.10 = bf16[] constant(-inf)
++        reduce.18 = bf16[2,4,1024]{2,1,0} reduce(add.2, constant.10), dimensions={3}, to_apply=region_0.14
++        broadcast.10 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(reduce.18), dimensions={0,1,2}
++        subtract = bf16[2,4,1024,1024]{3,2,1,0} subtract(add.2, broadcast.10)
++        exponential = bf16[2,4,1024,1024]{3,2,1,0} exponential(subtract)
++        convert.5 = f32[2,4,1024,1024]{3,2,1,0} convert(exponential)
++        constant.9 = f32[] constant(0)
++        reduce.31 = f32[2,4,1024]{2,1,0} reduce(convert.5, constant.9), dimensions={3}, to_apply=region_1.27
++        convert.6 = bf16[2,4,1024]{2,1,0} convert(reduce.31)
++        broadcast.11 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(convert.6), dimensions={0,1,2}
++        divide.2 = bf16[2,4,1024,1024]{3,2,1,0} divide(exponential, broadcast.11)
++        dot.1 = bf16[2,4,64,1024]{3,2,1,0} dot(transpose.12, divide.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={3}
++        transpose.22 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.1), dimensions={0,3,1,2}
++        Arg_3.4 = bf16[2,1024,4,64]{3,2,1,0} parameter(3)
++        transpose.17 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_3.4), dimensions={0,2,1,3}
++        dot.2 = bf16[2,4,1024,1024]{3,2,1,0} dot(transpose.17, transpose.12), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++        divide.3 = bf16[2,4,1024,1024]{3,2,1,0} divide(dot.2, broadcast.11)
++        constant.0 = bf16[] constant(1)
++        broadcast.13 = bf16[2,4,1024]{2,1,0} broadcast(constant.0), dimensions={}
++        multiply.2 = bf16[2,4,1024]{2,1,0} multiply(convert.6, convert.6)
++        divide.4 = bf16[2,4,1024]{2,1,0} divide(broadcast.13, multiply.2)
++        broadcast.14 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(divide.4), dimensions={0,1,2}
++        multiply.3 = bf16[2,4,1024,1024]{3,2,1,0} multiply(dot.2, broadcast.14)
++        multiply.4 = bf16[2,4,1024,1024]{3,2,1,0} multiply(multiply.3, exponential)
++        constant.8 = bf16[] constant(0)
++        reduce.60 = bf16[2,4,1024]{2,1,0} reduce(multiply.4, constant.8), dimensions={3}, to_apply=region_2.56
++        negate.1 = bf16[2,4,1024]{2,1,0} negate(reduce.60)
++        broadcast.15 = bf16[2,4,1024,1024]{3,2,1,0} broadcast(negate.1), dimensions={0,1,2}
++        add.3 = bf16[2,4,1024,1024]{3,2,1,0} add(divide.3, broadcast.15)
++        multiply.5 = bf16[2,4,1024,1024]{3,2,1,0} multiply(add.3, exponential)
++        transpose.18 = bf16[2,4,1024,64]{3,2,1,0} transpose(Arg_1.2), dimensions={0,2,1,3}
++        dot.4 = bf16[2,4,1024,64]{3,2,1,0} dot(multiply.5, transpose.18), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++        transpose.23 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.4), dimensions={0,2,1,3}
++        dot.3 = bf16[2,4,1024,64]{3,2,1,0} dot(multiply.5, transpose.13), lhs_batch_dims={0,1}, lhs_contracting_dims={2}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++        transpose.24 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.3), dimensions={0,2,1,3}
++        transpose.20 = bf16[2,4,64,1024]{3,2,1,0} transpose(Arg_3.4), dimensions={0,2,3,1}
++        dot.49 = bf16[2,4,64,1024]{3,2,1,0} dot(transpose.20, divide.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++        transpose.25 = bf16[2,1024,4,64]{3,2,1,0} transpose(dot.49), dimensions={0,3,1,2}
++        reduce.81 = bf16[4,1024,1024]{2,1,0} reduce(multiply.5, constant.8), dimensions={0}, to_apply=region_2.56
++        ROOT tuple = (bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[2,1024,4,64]{3,2,1,0}, bf16[4,1024,1024]{2,1,0}) tuple(transpose.22, transpose.23, transpose.24, transpose.25, reduce.81)
++      } // main.87
++  )";
++    return hlo_text;
++  }
+   template <typename T>
+   void TestImpl_Flash_Attention_BMM1_Bias_Softmax_BMM2() {
+     if (skip_reason_) GTEST_SKIP() << *skip_reason_;
+@@ -653,6 +742,30 @@ class FlashAttentionBMMScaleBiasSoftmaxBMM : public MultiHeadedAttentionTest {
+     ExecuteAndCompare(hlo_string, {&lhs_bmm1_literal, &rhs_bmm1_literal,
+                                    &rhs_bmm2_literal, &bias_literal});
+   }
++
++  template <typename T>
++  void TestImpl_Flash_Attention_BMM1_Bias_Softmax_BMM2_Dbias() {
++    if (skip_reason_) GTEST_SKIP() << *skip_reason_;
++    if (GetDnnVersionInfo(backend().default_stream_executor()) <
++        se::dnn::VersionInfo(8, 9, 4)) {
++      GTEST_SKIP() << "Flash Attention requires cuDNN >= 8.9.4.";
++    }
++    XlaBuilder builder(TestName());
++    auto lhs_bmm1_literal =
++        GetInput4DLiteral<T>({2, 1024, 4, 64}, {3, 2, 1, 0});
++    auto rhs_bmm1_literal =
++        GetInput4DLiteral<T>({2, 1024, 4, 64}, {3, 2, 1, 0});
++    auto rhs_bmm2_literal =
++        GetInput4DLiteral<T>({2, 1024, 4, 64}, {3, 2, 1, 0});
++    auto bias_literal = GetInput3DLiteral<T>({4, 1024, 1024}, {2, 1, 0});
++    auto do_literal = GetInput4DLiteral<T>({2, 1024, 4, 64}, {3, 2, 1, 0});
++    std::string hlo_string =
++        GetModuleFlash_Attention_BMM1_Bias_Softmax_BMM2_Dbias_HloString_BF16();  // NOLINT
++    ExecuteAndCompare(hlo_string,
++                      {&lhs_bmm1_literal, &rhs_bmm1_literal, &rhs_bmm2_literal,
++                       &do_literal, &bias_literal},
++                      /*expected_num_fmha_calls=*/2);
++  }
+ };
+ 
+ class FlashAttentionBMMScaleSoftmaxBMM : public MultiHeadedAttentionTest {
+@@ -951,6 +1064,11 @@ XLA_TEST_F(FlashAttentionBMMScaleBiasSoftmaxBMM,
+   TestImpl_Flash_Attention_BMM1_Bias_Softmax_BMM2_Cross_Attention<bfloat16>();
+ }
+ 
++XLA_TEST_F(FlashAttentionBMMScaleBiasSoftmaxBMM,
++           Flash_Attention_BMM1_Bias_Softmax_BMM2_BF16_Dbias) {
++  TestImpl_Flash_Attention_BMM1_Bias_Softmax_BMM2_Dbias<bfloat16>();
++}
++
+ // BMM1 - Scale - Softmax - BMM2
+ XLA_TEST_F(FlashAttentionBMMScaleSoftmaxBMM,
+            Flash_Attention_Training_BMM1_Softmax_BMM2_BF16) {
+diff --git a/third_party/xla/xla/stream_executor/cuda/cuda_dnn.cc b/third_party/xla/xla/stream_executor/cuda/cuda_dnn.cc
+index 6ca1c67196f..6e1337dbeaa 100644
+--- a/third_party/xla/xla/stream_executor/cuda/cuda_dnn.cc
++++ b/third_party/xla/xla/stream_executor/cuda/cuda_dnn.cc
+@@ -5324,6 +5324,11 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
+   // Setting bias
+   if (use_bias) {
+     DCHECK(bias_descriptor != std::nullopt);
++    auto bias_dim = bias_descriptor->dimensions();
++    auto q_dim = q_desc.GetCudnnCompatibleDimensions(false);
++    auto b = bias_dim[0];
++    auto n = bias_dim[1];
++    auto q_n = q_dim[1];
+     auto bias_tensor =
+         graph.tensor(Tensor_attributes()
+                          .set_name("bias")
+@@ -5331,6 +5336,18 @@ absl::StatusOr<CudnnGraph> GetCudnnFlashAttentionBackwardOperationGraph(
+                          .set_stride(bias_descriptor->GetLogicalStrides())
+                          .set_uid(CudnnfMHAUid::BIAS_ID));
+     sdpa_backward_options.set_bias(bias_tensor);
++
++    // shapes [1, 1, s, s], [b, 1, s, s], [b, h, s, s] are not supported for
++    // dbias calculation but they are supported for forward bias calculation
++    if (b == 1 && n == q_n) {
++      auto d_bias_tensor =
++          graph.tensor(Tensor_attributes()
++                           .set_name("dBias")
++                           .set_dim(bias_descriptor->dimensions())
++                           .set_stride(bias_descriptor->GetLogicalStrides())
++                           .set_uid(CudnnfMHAUid::dBIAS_ID));
++      sdpa_backward_options.set_dbias(d_bias_tensor);
++    }
+   }
+   // Setting actual seqlen
+   bool is_padding = mask_type == dnn::FMHAMaskKind::PADDING ||
+@@ -7267,8 +7284,7 @@ CudnnSupport::FusedMHABackwardRunnerFromDesc(
+           bmm2_grad_gemm1_lhs_descriptor, bmm2_grad_gemm2_rhs_descriptor,
+           d_output_descriptor, d_bmm1_lhs_descriptor, d_bmm1_rhs_descriptor,
+           d_bmm2_rhs_descriptor, bias_descriptor, dropout_rate, seed, scale,
+-          use_dropout,
+-          /*use_bias*/ bias_descriptor != std::nullopt, mask_type));
++          use_dropout, bias_descriptor != std::nullopt, mask_type));
+ 
+   std::vector<int64_t> p_dims =
+       bmm2_grad_gemm1_lhs_descriptor.GetCudnnCompatibleDimensions(false);
+@@ -7279,11 +7295,22 @@ CudnnSupport::FusedMHABackwardRunnerFromDesc(
+   std::vector<std::optional<int64_t>> uids;
+   uids = {CudnnfMHAUid::Q_ID,  CudnnfMHAUid::K_ID,  CudnnfMHAUid::P_ID,
+           CudnnfMHAUid::V_ID,  CudnnfMHAUid::dO_ID, CudnnfMHAUid::dQ_ID,
+-          CudnnfMHAUid::dK_ID, CudnnfMHAUid::dV_ID, std::nullopt,
+-          std::nullopt,        CudnnfMHAUid::O_ID};
++          CudnnfMHAUid::dK_ID, CudnnfMHAUid::dV_ID, std::nullopt};
++  uids.emplace_back(d_bias_descriptor.has_value()
++                        ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::dBIAS_ID)
++                        : std::nullopt);
++  uids.push_back(CudnnfMHAUid::O_ID);
+   uids.emplace_back(bias_descriptor.has_value()
+                         ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::BIAS_ID)
+                         : std::nullopt);
++  bool is_padding = mask_type == dnn::FMHAMaskKind::PADDING ||
++                    mask_type == dnn::FMHAMaskKind::PADDING_CAUSAL;
++  uids.emplace_back(is_padding
++                        ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::Q_SEQLEN_ID)
++                        : std::nullopt);
++  uids.emplace_back(is_padding
++                        ? std::optional<CudnnfMHAUid>(CudnnfMHAUid::K_SEQLEN_ID)
++                        : std::nullopt);
+   TF_ASSIGN_OR_RETURN(auto runner,
+                       CudnnGraphRunner<dnn::FusedMHABackwardSignature>::Create(
+                           parent_, cudnn_.get(), graph, dropout_rng_seed,

@@ -1,0 +1,285 @@
+diff --git a/third_party/xla/xla/service/gpu/runtime/BUILD b/third_party/xla/xla/service/gpu/runtime/BUILD
+index 9427f585206..336df650200 100644
+--- a/third_party/xla/xla/service/gpu/runtime/BUILD
++++ b/third_party/xla/xla/service/gpu/runtime/BUILD
+@@ -58,6 +58,7 @@ cc_library(
+         ":custom_call_thunk",
+         ":nccl_all_gather_thunk",
+         ":nccl_all_reduce_thunk",
++        ":nccl_all_to_all_thunk",
+         ":nccl_api",
+         ":nccl_clique_key",
+         ":nccl_collective_broadcast_thunk",
+@@ -126,6 +127,7 @@ cc_library(
+         ":memset_thunk",
+         ":nccl_all_gather_thunk",
+         ":nccl_all_reduce_thunk",
++        ":nccl_all_to_all_thunk",
+         ":nccl_collective_thunk",
+         ":replica_id_thunk",
+         ":sequential_thunk",
+diff --git a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.cc b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.cc
+index abfa6eb465c..3bdea089ff4 100644
+--- a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.cc
++++ b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.cc
+@@ -53,6 +53,7 @@ limitations under the License.
+ #include "xla/service/gpu/runtime/annotation.h"
+ #include "xla/service/gpu/runtime/nccl_all_gather_thunk.h"
+ #include "xla/service/gpu/runtime/nccl_all_reduce_thunk.h"
++#include "xla/service/gpu/runtime/nccl_all_to_all_thunk.h"
+ #include "xla/service/gpu/runtime/nccl_api.h"
+ #include "xla/service/gpu/runtime/nccl_clique_key.h"
+ #include "xla/service/gpu/runtime/nccl_collective_broadcast_thunk.h"
+@@ -1780,6 +1781,76 @@ CommandBufferCmd::BufferUsageVector ReduceScatterCmd::buffers() {
+   return buffer_usage;
+ }
+ 
++//===----------------------------------------------------------------------===//
++// AllToAllCmd
++//===----------------------------------------------------------------------===//
++
++AllToAllCmd::AllToAllCmd(ExecutionStreamId execution_stream_id,
++                         ExecutionStreamId async_from_stream_id,
++                         NcclApi* nccl_api, NcclCollectiveConfig config,
++                         bool has_split_dimension,
++                         absl::Span<const NcclCollectiveThunk::Buffer> buffers)
++    : CollectiveCmd(CommandBufferCmdType::kAllToAll, execution_stream_id,
++                    async_from_stream_id, nccl_api, std::move(config)),
++      has_split_dimension_(has_split_dimension),
++      buffers_(buffers.begin(), buffers.end()) {}
++
++absl::Status AllToAllCmd::Record(const Thunk::ExecuteParams& execute_params,
++                                 const RecordParams& record_params,
++                                 se::CommandBuffer* command_buffer) {
++  TF_RETURN_IF_ERROR(BarrierIfAsync(
++      command_buffer, execute_params.stream->parent(), record_params));
++
++  TF_ASSIGN_OR_RETURN(
++      std::vector<DeviceBufferPair> device_buffers,
++      ConvertToDeviceBuffers(execute_params.buffer_allocations, buffers_,
++                             config().operand_element_type));
++
++  ExecutionScopeId execution_scope_id = GetExecutionScope(record_params);
++  VLOG(5) << "AllToAllCmd, has_split_dimension=" << has_split_dimension_
++          << ", execution_scope_id=" << execution_scope_id.value();
++
++  for (size_t i = 0; i < device_buffers.size(); ++i) {
++    VLOG(5) << "  Src: " << buffers_[i].source_buffer << " ("
++            << device_buffers[i].source_buffer.opaque() << ")";
++    VLOG(5) << "  Dst: " << buffers_[i].destination_buffer << " ("
++            << device_buffers[i].destination_buffer.opaque() << ")";
++  }
++
++  if (!execute_params.collective_params || !execute_params.collective_cliques) {
++    return absl::InvalidArgumentError(
++        "ReduceScatterCmd requires collective parameters and cliques");
++  }
++
++  TF_ASSIGN_OR_RETURN(
++      NcclCommHandleWrapper comm_handle,
++      GetNcclComm(*execute_params.collective_params,
++                  *execute_params.collective_cliques, config().replica_groups,
++                  config().group_mode, nccl_stream_id(), GetAsyncStreamKind()));
++  NcclApi::NcclCommHandle comm = comm_handle.comm_handle;
++  // Use custom allocator for persistent execution plans.
++  NcclApi::ScopedPersistentPlanAllocator scoped_allocator(
++      comm, tsl::MakeRef<NcclApi::PersistentPlanAllocator>(
++                execute_params.buffer_allocations->device_ordinal(),
++                execute_params.buffer_allocations->memory_allocator(),
++                execute_params.stream));
++
++  return AddTracedCommandBuffer(
++      execute_params, record_params, command_buffer, [&](se::Stream* stream) {
++        return RunAllToAll(nccl_api(), has_split_dimension_, device_buffers,
++                           *stream, comm);
++      });
++}
++
++CommandBufferCmd::BufferUsageVector AllToAllCmd::buffers() {
++  BufferUsageVector buffer_usage;
++  for (auto& buffer : buffers_) {
++    buffer_usage.emplace_back(buffer.source_buffer, MemoryAccess::kRead);
++    buffer_usage.emplace_back(buffer.destination_buffer, MemoryAccess::kWrite);
++  }
++  return buffer_usage;
++}
++
+ //===----------------------------------------------------------------------===//
+ // AllGatherCmd
+ //===----------------------------------------------------------------------===//
+diff --git a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.h b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.h
+index 27e8fea0d86..04b34e99102 100644
+--- a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.h
++++ b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd.h
+@@ -78,6 +78,7 @@ namespace xla::gpu {
+   V(kCollectiveCmd, "CollectiveCmd")                     \
+   V(kAllReduceCmd, "AllReduceCmd")                       \
+   V(kReduceScatter, "ReduceScatterCmd")                  \
++  V(kAllToAll, "AllToAllCmd")                  \
+   V(kAllGatherCmd, "AllGatherCmd")                       \
+   V(kCollectiveBroadcastCmd, "CollectiveBroadcastCmd")   \
+   V(kUnknownCmd, "UnknownCmd") \
+@@ -1073,6 +1074,32 @@ class ReduceScatterCmd : public CollectiveCmd {
+   std::vector<NcclCollectiveThunk::Buffer> buffers_;
+ };
+ 
++//===----------------------------------------------------------------------===//
++// AllToAllCmd
++//===----------------------------------------------------------------------===//
++
++class AllToAllCmd : public CollectiveCmd {
++ public:
++  AllToAllCmd(ExecutionStreamId execution_stream_id,
++              ExecutionStreamId async_from_stream_id, NcclApi* nccl_api,
++              NcclCollectiveConfig config, bool has_split_dimension,
++              absl::Span<const NcclCollectiveThunk::Buffer> buffers);
++
++  absl::Status Record(const Thunk::ExecuteParams& execute_params,
++                      const RecordParams& record_params,
++                      se::CommandBuffer* command_buffer) override;
++
++  BufferUsageVector buffers() override;
++
++  AsyncStreamKind GetAsyncStreamKind() override {
++    return AsyncStreamKind::kCollective;
++  };
++
++ private:
++  bool has_split_dimension_;
++  std::vector<NcclCollectiveThunk::Buffer> buffers_;
++};
++
+ //===----------------------------------------------------------------------===//
+ // AllGatherCmd
+ //===----------------------------------------------------------------------===//
+diff --git a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd_emitter.cc b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd_emitter.cc
+index cb3801ef13c..d7e7b45fb38 100644
+--- a/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd_emitter.cc
++++ b/third_party/xla/xla/service/gpu/runtime/command_buffer_cmd_emitter.cc
+@@ -35,6 +35,7 @@ limitations under the License.
+ #include "xla/service/gpu/runtime/memset_thunk.h"
+ #include "xla/service/gpu/runtime/nccl_all_gather_thunk.h"
+ #include "xla/service/gpu/runtime/nccl_all_reduce_thunk.h"
++#include "xla/service/gpu/runtime/nccl_all_to_all_thunk.h"
+ #include "xla/service/gpu/runtime/nccl_collective_thunk.h"
+ #include "xla/service/gpu/runtime/replica_id_thunk.h"
+ #include "xla/service/gpu/runtime/sequential_thunk.h"
+@@ -173,6 +174,13 @@ static absl::StatusOr<Command> Convert(
+       thunk.buffers());
+ }
+ 
++static absl::StatusOr<Command> Convert(const NcclAllToAllStartThunk& thunk) {
++  return std::make_unique<AllToAllCmd>(
++      thunk.nccl_execution_stream_id(), thunk.execution_stream_id(),
++      thunk.nccl_api(), thunk.config(), thunk.has_split_dimension(),
++      thunk.buffers());
++}
++
+ static absl::StatusOr<Command> Convert(const NcclAllGatherStartThunk& thunk) {
+   return std::make_unique<AllGatherCmd>(
+       thunk.nccl_execution_stream_id(), thunk.execution_stream_id(),
+@@ -270,6 +278,8 @@ static absl::Status AppendCommands(
+       return append(Convert<NcclAllReduceStartThunk>(thunk));
+     case Thunk::Kind::kNcclReduceScatterStart:
+       return append(Convert<NcclReduceScatterStartThunk>(thunk));
++    case Thunk::Kind::kNcclAllToAllStart:
++      return append(Convert<NcclAllToAllStartThunk>(thunk));
+     case Thunk::Kind::kPartitionId:
+       return append(Convert<PartitionIdThunk>(thunk));
+     case Thunk::Kind::kReplicaId:
+@@ -289,6 +299,7 @@ static absl::Status AppendCommands(
+     case Thunk::Kind::kNcclAllGatherDone:
+     case Thunk::Kind::kNcclAllReduceDone:
+     case Thunk::Kind::kNcclReduceScatterDone:
++    case Thunk::Kind::kNcclAllToAllDone:
+       return append(Convert<NcclCollectiveDoneThunk>(thunk));
+ 
+     case Thunk::Kind::kWaitForStreams:
+diff --git a/third_party/xla/xla/service/gpu/runtime/nccl_all_to_all_thunk.h b/third_party/xla/xla/service/gpu/runtime/nccl_all_to_all_thunk.h
+index ed3056ec646..e7bb099fb74 100644
+--- a/third_party/xla/xla/service/gpu/runtime/nccl_all_to_all_thunk.h
++++ b/third_party/xla/xla/service/gpu/runtime/nccl_all_to_all_thunk.h
+@@ -59,8 +59,11 @@ class NcclAllToAllStartThunk : public NcclCollectiveThunk {
+   static CollectiveOpGroupMode GetGroupMode(
+       const HloAllToAllInstruction* instr);
+ 
+- protected:
+   const NcclCollectiveConfig& config() const override { return config_.config; }
++  bool has_split_dimension() const { return config_.has_split_dimension; }
++  absl::Span<const Buffer> buffers() const { return buffers_; }
++
++ protected:
+   absl::Status RunNcclCollective(const ExecuteParams& params,
+                                  se::Stream& stream,
+                                  NcclCommHandleWrapper comm_wrapper) override;
+diff --git a/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling.cc b/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling.cc
+index 641a37a9659..79e77022b0a 100644
+--- a/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling.cc
++++ b/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling.cc
+@@ -112,12 +112,14 @@ static bool IsAsyncStartCommand(const HloInstruction* hlo,
+     if (hlo->async_wrapped_opcode() == HloOpcode::kFusion) {
+       return config.enabled_commands.contains(DebugOptions::FUSION);
+     }
+-    if (hlo->async_wrapped_opcode() == HloOpcode::kReduceScatter) {
++    if (hlo->async_wrapped_opcode() == HloOpcode::kReduceScatter ||
++        hlo->async_wrapped_opcode() == HloOpcode::kAllToAll) {
+       return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
+     }
+   }
+ 
+-  if (hlo->opcode() == HloOpcode::kReduceScatter) {
++  if (hlo->opcode() == HloOpcode::kReduceScatter ||
++      hlo->opcode() == HloOpcode::kAllToAll) {
+     return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
+   }
+ 
+@@ -138,7 +140,8 @@ static bool IsAsyncDoneCommand(const HloInstruction* hlo,
+     if (hlo->async_wrapped_opcode() == HloOpcode::kFusion) {
+       return config.enabled_commands.contains(DebugOptions::FUSION);
+     }
+-    if (hlo->async_wrapped_opcode() == HloOpcode::kReduceScatter) {
++    if (hlo->async_wrapped_opcode() == HloOpcode::kReduceScatter ||
++        hlo->async_wrapped_opcode() == HloOpcode::kAllToAll) {
+       return config.enabled_commands.contains(DebugOptions::COLLECTIVES);
+     }
+   }
+diff --git a/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling_test.cc b/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling_test.cc
+index be29a09897b..383a4f7e479 100644
+--- a/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling_test.cc
++++ b/third_party/xla/xla/service/gpu/transforms/command_buffer_scheduling_test.cc
+@@ -1072,6 +1072,35 @@ TEST_F(CommandBufferSchedulingTest, AsyncFusion) {
+                             });
+ }
+ 
++TEST_F(CommandBufferSchedulingTest, AsyncAlltoAll) {
++  const char* hlo = R"(
++    HloModule m, is_scheduled=true
++    
++    async_computation.1 {
++    param.1 = f32[4,8,128]{2,1,0} parameter(0)
++    ROOT all-to-all.1 = f32[4,8,128]{2,1,0} all-to-all(param.1), channel_id=1, dimensions={1}
++    }
++
++    ENTRY main {
++    param.0 = f32[4,8,128]{2,1,0} parameter(0)
++    all-to-all-start = ((f32[4,8,128]{2,1,0}), f32[4,8,128]{2,1,0}) async-start(param.0), calls=async_computation.1 
++    ROOT all-to-all-done = f32[4,8,128]{2,1,0} async-done(all-to-all-start)
++    })";
++
++  const char* expected = R"(
++    CHECK: %command_buffer ([[P:.+]]: f32[4,8,128]) -> f32[4,8,128] {
++    CHECK:   %[[P]] = f32[4,8,128]{2,1,0} parameter(0)
++    CHECK:   %[[S1:.+]] = ((f32[4,8,128]{2,1,0}), f32[4,8,128]{2,1,0}) all-to-all-start(%[[P]]), channel_id=1, replica_groups={}, dimensions={1}
++    CHECK:   ROOT {{.*}} = f32[4,8,128]{2,1,0} all-to-all-done(%[[S1]])
++    CHECK: })";
++
++  RunAndFilecheckHloRewrite(hlo, CommandBufferScheduling(device_desc()),
++                            expected, [](HloModule* module) {
++                              EXPECT_TRUE(module->has_schedule());
++                              TF_CHECK_OK(module->schedule().Verify());
++                            });
++}
++
+ TEST_F(CommandBufferSchedulingTest, DynamicSliceFusionDynamicSlicing) {
+   if (backend().platform()->Name() == "Host") {
+     GTEST_SKIP() << "GPU support required for this test";

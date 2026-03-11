@@ -1,0 +1,707 @@
+diff --git a/third_party/xla/xla/service/cpu/BUILD b/third_party/xla/xla/service/cpu/BUILD
+index 1d0defbdcce..3f2bdc0f211 100644
+--- a/third_party/xla/xla/service/cpu/BUILD
++++ b/third_party/xla/xla/service/cpu/BUILD
+@@ -1658,6 +1658,15 @@ cc_library(
+     ] + mkl_deps(),
+ )
+ 
++cc_library(
++    name = "onednn_pattern_utils",
++    hdrs = ["onednn_pattern_utils.h"],
++    visibility = ["//visibility:public"],
++    deps = [
++        ":onednn_util",
++    ] + mkl_deps(),
++)
++
+ cc_library(
+     name = "onednn_matmul_rewriter",
+     srcs = ["onednn_matmul_rewriter.cc"],
+@@ -1671,6 +1680,7 @@ cc_library(
+         ":backend_config_proto_cc",
+         ":onednn_matmul",
+         ":onednn_memory_util",
++        ":onednn_pattern_utils",
+         ":onednn_util",
+         "//xla:executable_run_options",
+         "//xla:shape_util",
+@@ -1699,6 +1709,7 @@ cc_library(
+     deps = [
+         ":backend_config_proto_cc",
+         ":onednn_memory_util",
++        ":onednn_pattern_utils",
+         ":onednn_util",
+         "//xla:status_macros",
+         "//xla:xla_data_proto_cc",
+diff --git a/third_party/xla/xla/service/cpu/backend_config.proto b/third_party/xla/xla/service/cpu/backend_config.proto
+index d5ce59285e5..b63bcd5c376 100644
+--- a/third_party/xla/xla/service/cpu/backend_config.proto
++++ b/third_party/xla/xla/service/cpu/backend_config.proto
+@@ -27,6 +27,8 @@ message OneDnnMatMulConfig {
+     GELU_TANH = 5;
+     BINARY_ADD = 6;
+     LINEAR = 7;
++    ELU = 8;
++    RELU6 = 9;
+   }
+   repeated FusionKind fused_ops = 3;
+   bool bias_broadcast = 4;
+diff --git a/third_party/xla/xla/service/cpu/onednn_matmul.cc b/third_party/xla/xla/service/cpu/onednn_matmul.cc
+index 04e0bd47a2f..4a6484ec07d 100644
+--- a/third_party/xla/xla/service/cpu/onednn_matmul.cc
++++ b/third_party/xla/xla/service/cpu/onednn_matmul.cc
+@@ -138,6 +138,9 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+       case OneDnnMatMulConfig::GELU_ERF:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_gelu_erf, 0.f, 0.f);
+         break;
++      case OneDnnMatMulConfig::RELU6:
++        post_ops.append_eltwise(dnnl::algorithm::eltwise_clip_v2, 0.f, 6.0f);
++        break;
+       case OneDnnMatMulConfig::BIAS: {
+         bias_md = fused_mds.at(fused_operand_idx);
+         // Extend bias rank to match result rank.
+@@ -156,6 +159,9 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+         }
+         fused_operand_idx++;
+       } break;
++      case OneDnnMatMulConfig::ELU:
++        post_ops.append_eltwise(dnnl::algorithm::eltwise_elu, 1.0f, 0.0f);
++        break;
+       case OneDnnMatMulConfig::BINARY_ADD: {
+         auto binary_md = fused_mds.at(fused_operand_idx);
+         if (fused_operands_ref) {
+diff --git a/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc b/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
+index cc97076a509..a792a5ba521 100644
+--- a/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
++++ b/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
+@@ -28,6 +28,7 @@ limitations under the License.
+ #include "xla/service/cpu/backend_config.pb.h"
+ #include "xla/service/cpu/onednn_matmul.h"
+ #include "xla/service/cpu/onednn_memory_util.h"
++#include "xla/service/cpu/onednn_pattern_utils.h"
+ #include "xla/service/cpu/onednn_util.h"
+ #include "xla/service/hlo_cost_analysis.h"
+ #include "xla/service/pattern_matcher.h"
+@@ -40,6 +41,7 @@ namespace cpu {
+ 
+ namespace {
+ namespace m = match;
++namespace pu = ::xla::cpu::onednn_pattern_utils_internal;
+ 
+ inline Status ValidateDotDimensionNumbers(
+     const DotDimensionNumbers& dim_numbers) {
+@@ -63,26 +65,6 @@ inline bool CompatibleElementType(const HloInstruction* instr) {
+   return element_type == BF16 || element_type == F32 || element_type == F16;
+ }
+ 
+-// Type conversion from and to any of BF16 and FP32.
+-// TODO(intel-tf): Support more types when enabled.
+-template <typename Pattern>
+-inline auto SupportedConvert(Pattern pattern) {
+-  auto supported_convert = [](const HloInstruction* instr) -> bool {
+-    return CompatibleElementType(instr) &&
+-           CompatibleElementType(instr->operand(0));
+-  };
+-  return m::Convert(pattern).WithPredicate(supported_convert);
+-}
+-
+-template <typename Pattern>
+-inline auto SupportedConvert(HloInstruction** convert, Pattern pattern) {
+-  auto supported_convert = [](const HloInstruction* instr) -> bool {
+-    return CompatibleElementType(instr) &&
+-           CompatibleElementType(instr->operand(0));
+-  };
+-  return m::Convert(convert, pattern).WithPredicate(supported_convert);
+-}
+-
+ inline bool IsRowMajor(const Shape& shape) {
+   return LayoutUtil::IsMonotonicWithDim0Major(shape.layout());
+ }
+@@ -117,9 +99,9 @@ auto ElementwiseSafeIntermediates(HloInstruction** instr,
+       m::Slice(instr, pattern.WithOneUser()),
+       m::Bitcast(instr, pattern.WithOneUser()),
+       m::Reshape(instr, pattern.WithOneUser()),
+-      SupportedConvert(instr, pattern.WithOneUser()),
+-      SupportedConvert(instr, BitcastWithReshapeSemantics(
+-                                  optional_bitcast, pattern.WithOneUser())),
++      pu::SupportedConvert(instr, pattern.WithOneUser()),
++      pu::SupportedConvert(instr, BitcastWithReshapeSemantics(
++                                      optional_bitcast, pattern.WithOneUser())),
+       pattern);
+ }
+ 
+@@ -140,6 +122,10 @@ inline auto BcastConstScalar(double value) {
+   return BcastConstScalar(nullptr, value);
+ }
+ 
++inline auto BcastConvertConstScalar(double value) {
++  return m::Broadcast(pu::OptionalConvert(m::ConstantScalar(value)));
++}
++
+ inline bool IsBatchDot(const HloInstruction& instr) {
+   if (auto* dot_instr = DynCast<HloDotInstruction>(&instr)) {
+     return dot_instr->dot_dimension_numbers().lhs_batch_dimensions_size() > 0;
+@@ -368,7 +354,7 @@ inline auto OptionalConvertAndBitcast(HloInstruction** optional_convert,
+   //   3. pattern-root -> bitcast
+   //   4. pattern-root
+   auto common = m::AnyOf<HloInstruction>(
+-      SupportedConvert(optional_convert, std::move(pattern).WithOneUser())
++      pu::SupportedConvert(optional_convert, std::move(pattern).WithOneUser())
+           .WithOperand(0, m::Op().WithElementType(PrimitiveType::BF16))
+           .WithElementType(PrimitiveType::F32),
+       std::move(pattern).WithOneUser());
+@@ -562,7 +548,8 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+       }
+ 
+       // Validate addend for fusion.
+-      if (CompatibleElementType(addend) && IsOperandFusible(addend, dot)) {
++      if (IsSupportedType(addend->shape().element_type()) &&
++          IsOperandFusible(addend, dot)) {
+         new_operands.push_back(addend);
+       } else {
+         return OkStatus();
+@@ -647,6 +634,71 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+     return OkStatus();
+   }
+ 
++  auto ELUActivation(HloInstruction* instr, HloInstruction** src) {
++    //  Reference: tensorflow/compiler/tf2xla/kernels/elu_op.cc
++    //  const auto zero = ScalarLike(x, 0);
++    //  const auto pred = Gt(x, zero);
++    //  const auto expm1 = Expm1(x);
++    //  return Select(pred, x, expm1);
++    auto pattern = m::Select(
++        m::Gt(pu::OptionalConvert(m::Op(src)), BcastConvertConstScalar(0)),
++        m::Op(src),
++        pu::OptionalConvert(m::Expm1(pu::OptionalConvert(m::Op(src)))));
++    return Match(instr, pattern);
++  }
++
++  Status HandleSelect(HloInstruction* instr) override {
++    HloInstruction* matmul_call;
++    HloInstruction* intermediate_instr = nullptr;
++    HloInstruction* optional_bitcast = nullptr;
++    HloInstruction* src;
++    // Attempt to elide ELU subgraph and fuse ELU activation into GEMM,
++    // including when slicing or bitcasting is applied to the result.
++    if (ELUActivation(instr, &src)) {
++      if (Match(src, ElementwiseSafeIntermediates(
++                         &intermediate_instr, &optional_bitcast,
++                         OneDnnMatmulInstr(&matmul_call)))) {
++        return FuseActivation(OneDnnMatMulConfig::ELU, instr, matmul_call,
++                              intermediate_instr);
++      }
++    }
++    return OkStatus();
++  }
++
++  Status HandleTanh(HloInstruction* instr) override {
++    HloInstruction* matmul_call;
++    HloInstruction* intermediate_instr = nullptr;
++    HloInstruction* optional_bitcast = nullptr;
++    // Attempt to elide Tanh and fuse Tanh activation into GEMM, including
++    // when slicing or bitcasting is applied to the result.
++    if (Match(instr, m::Tanh(ElementwiseSafeIntermediates(
++                                 &intermediate_instr, &optional_bitcast,
++                                 OneDnnMatmulInstr(&matmul_call))
++                                 .WithOneUser()))) {
++      return FuseActivation(OneDnnMatMulConfig::TANH, instr, matmul_call,
++                            intermediate_instr);
++    }
++    return OkStatus();
++  }
++
++  Status HandleClamp(HloInstruction* instr) override {
++    HloInstruction* matmul_call;
++    HloInstruction* intermediate_instr = nullptr;
++    HloInstruction* optional_bitcast = nullptr;
++    // Attempt to elide RELU6 and fuse RELU6 activation into GEMM, including
++    // when slicing or bitcasting is applied to the result.
++    if (Match(instr, m::Clamp(BcastConstScalar(0),
++                              ElementwiseSafeIntermediates(
++                                  &intermediate_instr, &optional_bitcast,
++                                  OneDnnMatmulInstr(&matmul_call))
++                                  .WithOneUser(),
++                              BcastConstScalar(6)))) {
++      return FuseActivation(OneDnnMatMulConfig::RELU6, instr, matmul_call,
++                            intermediate_instr);
++    }
++    return OkStatus();
++  }
++
+   Status HandleMultiply(HloInstruction* instr) override {
+     HloInstruction* matmul_call;
+     HloInstruction* intermediate_instr = nullptr;
+@@ -664,16 +716,16 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+ 
+     HloInstruction *dot, *constant;
+     HloInstruction* optional_convert = nullptr;
+-    auto pattern =
+-        m::Op(&instr)
+-            .WithOpcode(HloOpcode::kMultiply)
+-            .WithBinaryOperandsAnyOrder(
+-                m::AnyOf<HloInstruction>(
+-                    SupportedConvert(&optional_convert, OneDnnMatmulInstr(&dot))
+-                        .WithElementType(PrimitiveType::F32),
+-                    OneDnnMatmulInstr(&dot))
+-                    .WithOneUser(),
+-                m::Broadcast(m::Constant(&constant)));
++    auto pattern = m::Op(&instr)
++                       .WithOpcode(HloOpcode::kMultiply)
++                       .WithBinaryOperandsAnyOrder(
++                           m::AnyOf<HloInstruction>(
++                               pu::SupportedConvert(&optional_convert,
++                                                    OneDnnMatmulInstr(&dot))
++                                   .WithElementType(PrimitiveType::F32),
++                               OneDnnMatmulInstr(&dot))
++                               .WithOneUser(),
++                           m::Broadcast(m::Constant(&constant)));
+ 
+     if (Match(instr, pattern)) {
+       std::vector<HloInstruction*> new_operands;
+diff --git a/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc b/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
+index 058355223cd..06c2137a782 100644
+--- a/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
++++ b/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
+@@ -19,6 +19,7 @@ limitations under the License.
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/service/cpu/backend_config.pb.h"
+ #include "xla/service/cpu/onednn_memory_util.h"
++#include "xla/service/cpu/onednn_pattern_utils.h"
+ #include "xla/service/cpu/onednn_util.h"
+ #include "xla/service/pattern_matcher.h"
+ #include "xla/status_macros.h"
+@@ -28,11 +29,7 @@ namespace cpu {
+ 
+ namespace {
+ namespace m = match;
+-
+-template <typename Pattern>
+-auto OptionalConvert(Pattern pattern) {
+-  return m::AnyOf<HloInstruction>(m::Convert(pattern), std::move(pattern));
+-}
++namespace pu = ::xla::cpu::onednn_pattern_utils_internal;
+ 
+ inline auto OneDnnConvertibleInstr(HloInstruction** instr) {
+   return m::AnyOf<HloInstruction>(m::CustomCall(instr, {"__onednn$layernorm"}),
+@@ -101,9 +98,9 @@ std::optional<HloInstruction*> MatchSoftmax(HloInstruction* instr) {
+   if (!Match(instr,
+              m::Divide(
+                  m::Exp(&left_exponential, m::Op()),
+-                 m::Broadcast(m::Reshape(
+-                     m::Broadcast(OptionalConvert(m::Reshape(OptionalConvert(
+-                         m::Reduce(OptionalConvert(
++                 m::Broadcast(m::Reshape(m::Broadcast(
++                     pu::OptionalConvert(m::Reshape(pu::OptionalConvert(
++                         m::Reduce(pu::OptionalConvert(
+                                        m::Exp(&right_exponential, m::Op())),
+                                    m::Op())
+                              .WithPredicate([](const HloInstruction* reduce) {
+@@ -256,7 +253,7 @@ bool MatchFlaxLayerNorm(HloInstruction* instr, HloInstruction** src,
+           .WithBinaryOperandsAnyOrder(
+               m::Op(&hinge).WithOneUser(),
+               m::Subtract(
+-                  OptionalConvert(m::Op(&prod_s)),
++                  pu::OptionalConvert(m::Op(&prod_s)),
+                   m::Broadcast(
+                       m::Reshape(
+                           m::Broadcast(m::Reshape(m::Op(&div_red).WithOpcode(
+@@ -326,8 +323,8 @@ bool MatchFlaxLayerNorm(HloInstruction* instr, HloInstruction** src,
+   auto div_red_mul_src =
+       m::Divide()
+           .WithOperand(0, m::Reduce(m::Multiply().WithBinaryOperandsAnyOrder(
+-                                        OptionalConvert(m::Op(&mul_in0)),
+-                                        OptionalConvert(m::Op(&mul_in1))),
++                                        pu::OptionalConvert(m::Op(&mul_in0)),
++                                        pu::OptionalConvert(m::Op(&mul_in1))),
+                                     m::Constant())
+                               .WithPredicate([](const HloInstruction* reduce) {
+                                 HloComputation* reducer = reduce->to_apply();
+@@ -348,7 +345,7 @@ bool MatchFlaxLayerNorm(HloInstruction* instr, HloInstruction** src,
+       m::Divide()
+           .WithOperand(
+               0,
+-              m::Reduce(OptionalConvert(m::Op(&reduce_in0)), m::Constant())
++              m::Reduce(pu::OptionalConvert(m::Op(&reduce_in0)), m::Constant())
+                   .WithPredicate([](const HloInstruction* reduce) {
+                     HloComputation* reducer = reduce->to_apply();
+                     return (reducer->root_instruction()->opcode() ==
+diff --git a/third_party/xla/xla/service/cpu/onednn_pattern_utils.h b/third_party/xla/xla/service/cpu/onednn_pattern_utils.h
+new file mode 100644
+index 00000000000..6635d79d115
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_pattern_utils.h
+@@ -0,0 +1,60 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_SERVICE_CPU_ONEDNN_PATTERN_UTILS_H_
++#define XLA_SERVICE_CPU_ONEDNN_PATTERN_UTILS_H_
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_instructions.h"
++#include "xla/service/cpu/onednn_util.h"
++#include "xla/service/pattern_matcher.h"
++
++namespace xla {
++namespace cpu {
++
++namespace onednn_pattern_utils_internal {
++namespace m = match;
++
++template <typename Pattern>
++auto OptionalConvert(Pattern pattern) {
++  return m::AnyOf<HloInstruction>(m::Convert(pattern), std::move(pattern));
++}
++
++// Type conversion from and to any of BF16 and FP32.
++// TODO(intel-tf): Support more types when enabled.
++template <typename Pattern>
++inline auto SupportedConvert(Pattern pattern) {
++  auto supported_convert = [](const HloInstruction* instr) -> bool {
++    return IsSupportedType(instr->shape().element_type()) &&
++           IsSupportedType(instr->operand(0)->shape().element_type());
++  };
++  return m::Convert(pattern).WithPredicate(supported_convert);
++}
++
++template <typename Pattern>
++inline auto SupportedConvert(HloInstruction** convert, Pattern pattern) {
++  auto supported_convert = [](const HloInstruction* instr) -> bool {
++    return IsSupportedType(instr->shape().element_type()) &&
++           IsSupportedType(instr->operand(0)->shape().element_type());
++  };
++  return m::Convert(convert, pattern).WithPredicate(supported_convert);
++}
++}  // namespace onednn_pattern_utils_internal
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
++#endif  // XLA_SERVICE_CPU_ONEDNN_PATTERN_UTILS_H_
+diff --git a/third_party/xla/xla/service/pattern_matcher.h b/third_party/xla/xla/service/pattern_matcher.h
+index 477a63e2a6f..b17c53a9baf 100644
+--- a/third_party/xla/xla/service/pattern_matcher.h
++++ b/third_party/xla/xla/service/pattern_matcher.h
+@@ -2687,6 +2687,7 @@ XLA_UNOP_PATTERN(CollectivePermuteStart)
+ XLA_UNOP_PATTERN(CollectivePermuteDone)
+ XLA_UNOP_PATTERN(Domain)
+ XLA_UNOP_PATTERN(Exp)
++XLA_UNOP_PATTERN(Expm1)
+ XLA_UNOP_PATTERN(Fft)
+ XLA_UNOP_PATTERN(Floor)
+ XLA_UNOP_PATTERN(GetTupleElement)
+diff --git a/third_party/xla/xla/tests/onednn_matmul_test.cc b/third_party/xla/xla/tests/onednn_matmul_test.cc
+index 22089f177e3..2248b05f5dd 100644
+--- a/third_party/xla/xla/tests/onednn_matmul_test.cc
++++ b/third_party/xla/xla/tests/onednn_matmul_test.cc
+@@ -81,6 +81,34 @@ class MatmulTest : public HloTestBase {
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
++
++  const char* fused_matmul_bias_elu_rewrite_str_ = R"(
++    ; CHECK:     custom_call_target="__onednn$matmul",
++    ; CHECK:       backend_config={
++    ; CHECK-DAG:     "outer_dimension_partitions":[],
++    ; CHECK-DAG:     "onednn_matmul_config":{
++    ; CHECK-DAG:       "fused_ops":["BIAS","ELU"]
++    ; CHECK-DAG:   }
++    ; CHECK:     }
++    )";
++  const char* fused_matmul_bias_tanh_rewrite_str_ = R"(
++    ; CHECK:     custom_call_target="__onednn$matmul",
++    ; CHECK:       backend_config={
++    ; CHECK-DAG:     "outer_dimension_partitions":[],
++    ; CHECK-DAG:     "onednn_matmul_config":{
++    ; CHECK-DAG:       "fused_ops":["BIAS","TANH"]
++    ; CHECK-DAG:   }
++    ; CHECK:     }
++    )";
++  const char* fused_matmul_bias_relu6_rewrite_str_ = R"(
++    ; CHECK:     custom_call_target="__onednn$matmul",
++    ; CHECK:       backend_config={
++    ; CHECK-DAG:     "outer_dimension_partitions":[],
++    ; CHECK-DAG:     "onednn_matmul_config":{
++    ; CHECK-DAG:       "fused_ops":["BIAS","RELU6"]
++    ; CHECK-DAG:   }
++    ; CHECK:     }
++    )";
+ };
+ 
+ TEST_F(MatmulTest, SimpleTestF32) {
+@@ -923,6 +951,117 @@ TEST_F(MatmulTest, TestF32ConstantWeights) {
+   )");
+ }
+ 
++// MM + BiasAdd + Elu : FP32
++TEST_F(MatmulTest, BiasAddELUFusion_F32) {
++  const char* matmul_module_str = R"(
++  HloModule matmul.test.f32
++
++  ENTRY matmul.test.f32 {
++    arg0.1 = f32[1024,1024] parameter(0)
++    arg1.2 = f32[1024,1024] parameter(1)
++    dot.3 = f32[1024,1024] dot(arg1.2, arg0.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg2.4 = f32[1024] parameter(2)
++    broadcast.5 = f32[1024,1024] broadcast(arg2.4), dimensions={1}
++    add.6 = f32[1024,1024] add(dot.3, broadcast.5)
++    constant.7 = f32[] constant(0)
++    broadcast.8 = f32[1024,1024] broadcast(constant.7), dimensions={}
++    compare.9 = pred[1024,1024] compare(add.6, broadcast.8), direction=GT
++    exponential-minus-one.10 = f32[1024,1024] exponential-minus-one(add.6)
++    ROOT select.11 = f32[1024,1024] select(compare.9, add.6, exponential-minus-one.10)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_elu_rewrite_str_);
++}
++
++// MM + BiasAdd + Elu : BF16
++TEST_F(MatmulTest, BiasAddELUFusion_BF16) {
++  if (!IsSupportedType(PrimitiveType::BF16)) {
++    GTEST_SKIP() << "CPU does not support BF16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.test.bf16
++  ENTRY matmul.test.bf16 {
++    arg0.1 = f32[1024,512] parameter(0)
++    convert.2 = bf16[1024,512] convert(arg0.1)
++    arg1.3 = f32[256,512] parameter(1)
++    convert.4 = bf16[256,512] convert(arg1.3)
++    dot.5 = bf16[1024,256] dot(convert.2, convert.4), lhs_contracting_dims={1}, rhs_contracting_dims={1}
++    convert.6 = f32[1024,256] convert(dot.5)
++    arg2.7 = f32[256] parameter(2)
++    broadcast.8 = f32[1024,256] broadcast(arg2.7), dimensions={1}
++    add.9 = f32[1024,256] add(convert.6, broadcast.8)
++    constant.10 = f32[] constant(0)
++    broadcast.11 = f32[1024,256] broadcast(constant.10), dimensions={}
++    compare.12 = pred[1024,256] compare(add.9, broadcast.11), direction=GT
++    convert.13 = bf16[1024,256] convert(add.9)
++    exponential-minus-one.14 = f32[1024,256] exponential-minus-one(add.9)
++    convert.15 = bf16[1024,256] convert(exponential-minus-one.14)
++    select.16 = bf16[1024,256] select(compare.12, convert.13, convert.15)
++    ROOT convert.17 = f32[1024,256] convert(select.16)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_elu_rewrite_str_);
++}
++
++// MM + BiasAdd + Elu : F16
++TEST_F(MatmulTest, BiasAddELUFusion_F16) {
++  if (!IsSupportedType(PrimitiveType::F16)) {
++    GTEST_SKIP() << "CPU does not support F16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.test.f16
++
++  ENTRY matmul.test.f16 {
++    arg0.1 = f16[1024,1024] parameter(0)
++    arg1.2 = f16[1024,1024] parameter(1)
++    dot.3 = f16[1024,1024] dot(arg1.2, arg0.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg2.4 = f16[1024] parameter(2)
++    broadcast.5 = f16[1024,1024] broadcast(arg2.4), dimensions={1}
++    add.6 = f16[1024,1024] add(dot.3, broadcast.5)
++    constant.7 = f16[] constant(0)
++    broadcast.8 = f16[1024,1024] broadcast(constant.7), dimensions={}
++    compare.9 = pred[1024,1024] compare(add.6, broadcast.8), direction=GT
++    exponential-minus-one.10 = f16[1024,1024] exponential-minus-one(add.6)
++    ROOT select.11 = f16[1024,1024] select(compare.9, add.6, exponential-minus-one.10)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_elu_rewrite_str_);
++}
++
++// MM + BiasAdd + Elu + MM : FP16_2
++TEST_F(MatmulTest, BiasAddELUFusion_F16_2) {
++  if (!IsSupportedType(PrimitiveType::F16)) {
++    GTEST_SKIP() << "CPU does not support F16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.test.f16
++
++  ENTRY matmul.test.f16 {
++    arg0.1 = f32[1024,1024] parameter(0)
++    convert.2 = f16[1024,1024] convert(arg0.1)
++    arg1.3 = f32[1024,1024] parameter(2)
++    convert.4 = f16[1024,1024] convert(arg1.3)
++    dot.5 = f16[1024,1024] dot(convert.2, convert.4), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg2.6 = f32[1024] parameter(1)
++    convert.7 = f16[1024] convert(arg2.6)
++    broadcast.8 = f16[1024,1024] broadcast(convert.7), dimensions={1}
++    add.9 = f16[1024,1024] add(dot.5, broadcast.8)
++    constant.10 = f16[] constant(0)
++    broadcast.11 = f16[1024,1024] broadcast(constant.10), dimensions={}
++    compare.12 = pred[1024,1024] compare(add.9, broadcast.11), direction=GT
++    exponential-minus-one.13 = f16[1024,1024] exponential-minus-one(add.9)
++    select.14 = f16[1024,1024] select(compare.12, add.9, exponential-minus-one.13)
++    dot.15 = f16[1024,1024] dot(select.14, convert.4), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    ROOT convert.16 = f32[1024,1024] convert(dot.15)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_elu_rewrite_str_);
++}
++
+ TEST_F(MatmulTest, SimpleTestBF16Gemv1) {
+   if (!IsSupportedType(PrimitiveType::BF16)) {
+     GTEST_SKIP() << "CPU does not support BF16.";
+@@ -1010,6 +1149,142 @@ TEST_F(MatmulTest, SimpleTestF32WithMulAndAddFusion) {
+     )");
+ }
+ 
++TEST_F(MatmulTest, BiasAddTanhFusionTest_F32) {
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.tanh.test.f32
++  ENTRY matmul.bias.tanh.test.f32 {
++    arg.0 = f32[32,32,40,30] parameter(0)
++    arg.1 = f32[32,32,30,40] parameter(1)
++    dot.2 = f32[32,32,40,40] dot(arg.0, arg.1), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
++    const.3 = f32[40] constant(15)
++    bcast.4 = f32[32,32,40,40] broadcast(const.3), dimensions={3}
++    add.5 = f32[32,32,40,40] add(dot.2, bcast.4)
++    tanh.6 = f32[32,32,40,40] tanh(add.5)
++    tuple.7 = (f32[32,32,40,40]) tuple(tanh.6)
++    ROOT get-tuple-element.8 = f32[32,32,40,40] get-tuple-element(tuple.7), index=0
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_tanh_rewrite_str_);
++}
++
++TEST_F(MatmulTest, BiasAddTanhFusionTest_BF16) {
++  if (!IsSupportedType(PrimitiveType::BF16)) {
++    GTEST_SKIP() << "CPU does not support BF16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.tanh.test.f32
++  ENTRY matmul.bias.tanh.test.f32 {
++    arg0.1 = f32[1024,512] parameter(0)
++    convert.2 = bf16[1024,512] convert(arg0.1)
++    arg1.3 = f32[256,512] parameter(1)
++    convert.4 = bf16[256,512] convert(arg1.3)
++    dot.5 = bf16[1024,256] dot(convert.2, convert.4), lhs_contracting_dims={1}, rhs_contracting_dims={1}
++    convert.6 = f32[1024,256] convert(dot.5)
++    arg2.7 = f32[256] parameter(2)
++    broadcast.8 = f32[1024,256] broadcast(arg2.7), dimensions={1}
++    add.9 = f32[1024,256] add(convert.6, broadcast.8)
++    ROOT tanh.10 = f32[1024,256] tanh(add.9)
++  })";
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_tanh_rewrite_str_);
++}
++
++TEST_F(MatmulTest, BiasAddTanhFusionTest_F16) {
++  if (!IsSupportedType(PrimitiveType::F16)) {
++    GTEST_SKIP() << "CPU does not support F16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.tanh.test.f16
++  ENTRY matmul.bias.tanh.test.f16 {
++    arg0.1 = f16[1024,1024] parameter(0)
++    arg1.2 = f16[1024,1024] parameter(1)
++    dot.3 = f16[1024,1024] dot(arg1.2, arg0.1), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg2.4 = f16[1024] parameter(2)
++    broadcast.5 = f16[1024,1024] broadcast(arg2.4), dimensions={1}
++    add.6 = f16[1024,1024] add(dot.3, broadcast.5)
++    ROOT tanh.7 = f16[1024,1024] tanh(add.6)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_tanh_rewrite_str_);
++}
++
++// Test MM + BiasAdd + Relu6 fusion : F32
++TEST_F(MatmulTest, BiasAddRelu6Fusion_F32) {
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.relu6.test.f32
++  ENTRY matmul.bias.relu6.test.f32 {
++    constant.1 = f32[] constant(0)
++    broadcast.2 = f32[1024,1024] broadcast(constant.1), dimensions={}
++    arg1.3 = f32[1024,1024] parameter(1)
++    arg2.4 = f32[1024,1024] parameter(0)
++    dot.5 = f32[1024,1024] dot(arg1.3, arg2.4), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg3.6 = f32[1024] parameter(2)
++    broadcast.7 = f32[1024,1024] broadcast(arg3.6), dimensions={1}
++    add.8 = f32[1024,1024] add(dot.5, broadcast.7)
++    constant.9 = f32[] constant(6)
++    broadcast.10 = f32[1024,1024] broadcast(constant.9), dimensions={}
++    ROOT clamp.11 = f32[1024,1024] clamp(broadcast.2, add.8, broadcast.10)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_relu6_rewrite_str_);
++}
++
++// Test MM + BiasAdd + Relu6 fusion : BF16
++TEST_F(MatmulTest, BiasAddRelu6Fusion_BF16) {
++  if (!IsSupportedType(PrimitiveType::BF16)) {
++    GTEST_SKIP() << "CPU does not support BF16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.relu6.test.bf16
++  ENTRY matmul.bias.relu6.test.bf16 {
++    constant.1 = f32[] constant(0)
++    broadcast.2 = f32[1024,256] broadcast(constant.1), dimensions={}
++    arg0.3 = f32[1024,512] parameter(0)
++    convert.4 = bf16[1024,512] convert(arg0.3)
++    arg1.5 = f32[256,512] parameter(1)
++    convert.6 = bf16[256,512] convert(arg1.5)
++    dot.7 = bf16[1024,256] dot(convert.4, convert.6), lhs_contracting_dims={1}, rhs_contracting_dims={1}
++    convert.8 = f32[1024,256] convert(dot.7)
++    arg2.9 = f32[256] parameter(2)
++    broadcast.10 = f32[1024,256] broadcast(arg2.9), dimensions={1}
++    add.11 = f32[1024,256] add(convert.8, broadcast.10)
++    constant.12 = f32[] constant(6)
++    broadcast.13 = f32[1024,256] broadcast(constant.12), dimensions={}
++    ROOT clamp.14 = f32[1024,256] clamp(broadcast.2, add.11, broadcast.13)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_relu6_rewrite_str_);
++}
++
++// Test MM + BiasAdd + Relu6 fusion : F16
++TEST_F(MatmulTest, BiasAddRelu6Fusion_F16) {
++  if (!IsSupportedType(PrimitiveType::F16)) {
++    GTEST_SKIP() << "CPU does not support F16.";
++  }
++  const char* matmul_module_str = R"(
++  HloModule matmul.bias.relu6.test.f16
++  ENTRY matmul.bias.relu6.test.f16 {
++    constant.1 = f16[] constant(0)
++    broadcast.2 = f16[1024,1024] broadcast(constant.7), dimensions={}
++    arg0.3 = f16[1024,1024] parameter(0)
++    arg1.4 = f16[1024,1024] parameter(1)
++    dot.5 = f16[1024,1024] dot(arg1.4, arg0.3), lhs_contracting_dims={1}, rhs_contracting_dims={0}
++    arg2.6 = f16[1024] parameter(2)
++    broadcast.7 = f16[1024,1024] broadcast(arg2.6), dimensions={1}
++    add.8 = f16[1024,1024] add(dot.5, broadcast.7)
++    constant.9 = f16[] constant(6)
++    broadcast.10 = f16[1024,1024] broadcast(constant.9), dimensions={}
++    ROOT clamp.11 = f16[1024,1024] clamp(broadcast.2, add.8, broadcast.10)
++  })";
++
++  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_relu6_rewrite_str_);
++}
++
+ TEST_F(MatmulTest, SimpleTestBF16WithMulAndAddFusion) {
+   if (!IsSupportedType(PrimitiveType::BF16)) {
+     GTEST_SKIP() << "CPU does not support BF16.";

@@ -141,7 +141,7 @@ def get_llm_suggested_bug_labels(all_labels):
 
     try:
         response = client.chat.completions.create(
-            model="Qwen/Qwen2.5-7B-Instruct",
+            model="Qwen/Qwen3-8B",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}

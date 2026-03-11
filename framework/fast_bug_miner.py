@@ -147,8 +147,8 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
             print(f"Regex for bug-fixing commits: {bug_fix_regex!r}")
             cmd_xref_list = [
                 PYTHON_EXECUTABLE,
-                os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'), # <-- 旧脚本
-                '-e', bug_fix_regex, # <-- 传统 regex
+                os.path.join(config.SCRIPT_DIR, 'vcs_log_xref.py'),
+                '-e', bug_fix_regex,
                 '-l', cache_gitlog_file,
                 '-r', cache_repo_dir,
                 '-i', cache_issues_file,
@@ -222,7 +222,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                                 data = json.load(f)
 
                             if 'api.github.com' in data.get('url', ''):
-                                timeline_url = data.get('timeline_url') # 获取 timeline_url
+                                timeline_url = data.get('timeline_url')
                                 # print(f"  -> Found timeline URL in GitHub API response: {timeline_url}")
                                 
                         except json.JSONDecodeError:
@@ -258,7 +258,7 @@ def process_project(project_id, project_name, repository_url, issue_tracker_name
                 ]
                 
                 git_env = os.environ.copy()
-                git_env['GIT_TERMINAL_PROMPT'] = '0'  # Disable git prompts
+                git_env['GIT_TERMINAL_PROMPT'] = '0'
                 
                 try:
                     result = subprocess.run(

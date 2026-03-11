@@ -94,7 +94,7 @@ def get_fixed_bug_ids(commit_message, relevant_bug_ids_list):
     
     try:
         completion = client.chat.completions.create(
-            model="Qwen/Qwen2.5-7B-Instruct",
+            model="Qwen/Qwen3-8B",
             messages=[
                 {"role": "system", "content": RELATIONSHIP_PROMPT_TEMPLATE_V3},
                 {"role": "user", "content": json.dumps(llm_input, ensure_ascii=False)}
