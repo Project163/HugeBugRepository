@@ -1,0 +1,925 @@
+diff --git a/.github/workflows/python-package.yml b/.github/workflows/python-package.yml
+index 2e50d500b..6aa881023 100644
+--- a/.github/workflows/python-package.yml
++++ b/.github/workflows/python-package.yml
+@@ -94,6 +94,7 @@ jobs:
+           'test_backend.py',
+           'test_canvas.py',
+           'test_database_backend.py',
++          'test_dedup_chain_dispatch.py',
+           'test_inspect.py',
+           'test_loader.py',
+           'test_mem_leak_in_exception_handling.py',
+diff --git a/celery/app/trace.py b/celery/app/trace.py
+index b62897093..ecd269942 100644
+--- a/celery/app/trace.py
++++ b/celery/app/trace.py
+@@ -409,6 +409,55 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+         )
+         return I, R, I.state, I.retval
+ 
++    def _dispatch_callbacks_and_chain(
++        retval, callbacks, chain, parent_id, root_id, priority,
++    ):
++        """Dispatch callbacks and chain for a completed task.
++
++        Dispatches link callbacks and then the next chain step.
++        Does NOT fire task lifecycle signals (on_success, task_postrun)
++        or call mark_as_done — callers handle those separately.
++
++        Note: dispatch is not atomic.  If callbacks succeed but the
++        chain step fails (or vice-versa), a Reject + redeliver may
++        re-dispatch the already-sent callbacks.  This is acceptable
++        under Celery's at-least-once delivery model.
++        """
++        if callbacks:
++            if len(callbacks) > 1:
++                sigs, groups = [], []
++                for sig in callbacks:
++                    sig = signature(sig, app=app)
++                    if isinstance(sig, group):
++                        groups.append(sig)
++                    else:
++                        sigs.append(sig)
++                for group_ in groups:
++                    group_.apply_async(
++                        (retval,),
++                        parent_id=parent_id, root_id=root_id,
++                        priority=priority,
++                    )
++                if sigs:
++                    group(sigs, app=app).apply_async(
++                        (retval,),
++                        parent_id=parent_id, root_id=root_id,
++                        priority=priority,
++                    )
++            else:
++                signature(callbacks[0], app=app).apply_async(
++                    (retval,),
++                    parent_id=parent_id, root_id=root_id,
++                    priority=priority,
++                )
++        if chain:
++            _chsig = signature(chain[-1], app=app)
++            _chsig.apply_async(
++                (retval,), chain=chain[:-1],
++                parent_id=parent_id, root_id=root_id,
++                priority=priority,
++            )
++
+     def trace_task(uuid, args, kwargs, request=None):
+         # R      - is the possibly prepared return value.
+         # I      - is the Info object.
+@@ -452,6 +501,41 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+                             'name': get_task_name(task_request, name),
+                             'description': 'Task already completed successfully.'
+                         })
++                        _root_id = task_request.root_id or uuid
++                        _priority = task_request.delivery_info.get('priority') if \
++                            inherit_parent_priority else None
++                        try:
++                            _meta = r._get_task_meta()
++                            stored_retval = _meta.get('result')
++                            # Children are populated by mark_as_done on the
++                            # original execution.  If present, callbacks were
++                            # already dispatched — skip to avoid duplicates.
++                            # Requires the backend to persist extended result
++                            # metadata (result_extended=True).
++                            _children = _meta.get('children')
++                            _callbacks = task_request.callbacks
++                            _chain = task_request.chain
++                            if (_callbacks or _chain) and not _children:
++                                _dispatch_callbacks_and_chain(
++                                    stored_retval, _callbacks, _chain,
++                                    parent_id=uuid, root_id=_root_id,
++                                    priority=_priority,
++                                )
++                            successful_requests.add(task_request.id)
++                        except MemoryError:
++                            raise
++                        except Exception as exc:
++                            # Permanent failures (malformed signature, etc.)
++                            # will requeue indefinitely.  Broker-level
++                            # dead-letter / max-delivery-count policies are
++                            # the intended circuit-breaker.
++                            logger.error(
++                                'Failed to dispatch chain/callbacks for '
++                                'deduplicated task %s',
++                                task_request.id,
++                                exc_info=True,
++                            )
++                            raise Reject(exc, requeue=True)
+                         return trace_ok_t(R, I, T, Rstr)
+ 
+             push_task(task)
+@@ -510,43 +594,12 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+                         # separately, so need to call them separately
+                         # so that the trail's not added multiple times :(
+                         # (Issue #1936)
+-                        callbacks = task.request.callbacks
+-                        if callbacks:
+-                            if len(task.request.callbacks) > 1:
+-                                sigs, groups = [], []
+-                                for sig in callbacks:
+-                                    sig = signature(sig, app=app)
+-                                    if isinstance(sig, group):
+-                                        groups.append(sig)
+-                                    else:
+-                                        sigs.append(sig)
+-                                for group_ in groups:
+-                                    group_.apply_async(
+-                                        (retval,),
+-                                        parent_id=uuid, root_id=root_id,
+-                                        priority=task_priority
+-                                    )
+-                                if sigs:
+-                                    group(sigs, app=app).apply_async(
+-                                        (retval,),
+-                                        parent_id=uuid, root_id=root_id,
+-                                        priority=task_priority
+-                                    )
+-                            else:
+-                                signature(callbacks[0], app=app).apply_async(
+-                                    (retval,), parent_id=uuid, root_id=root_id,
+-                                    priority=task_priority
+-                                )
+-
+-                        # execute first task in chain
+-                        chain = task_request.chain
+-                        if chain:
+-                            _chsig = signature(chain.pop(), app=app)
+-                            _chsig.apply_async(
+-                                (retval,), chain=chain,
+-                                parent_id=uuid, root_id=root_id,
+-                                priority=task_priority
+-                            )
++                        _dispatch_callbacks_and_chain(
++                            retval, task.request.callbacks,
++                            task_request.chain,
++                            parent_id=uuid, root_id=root_id,
++                            priority=task_priority,
++                        )
+                         task.backend.mark_as_done(
+                             uuid, retval, task_request, publish_result,
+                         )
+@@ -597,6 +650,8 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
+                                          exc_info=True)
+         except MemoryError:
+             raise
++        except Reject:
++            raise
+         except Exception as exc:
+             _signal_internal_error(task, uuid, args, kwargs, request, exc)
+             if eager:
+@@ -616,6 +671,8 @@ def trace_task(task, uuid, args, kwargs, request=None, **opts):
+         if task.__trace__ is None:
+             task.__trace__ = build_tracer(task.name, task, **opts)
+         return task.__trace__(uuid, args, kwargs, request)
++    except Reject:
++        raise
+     except Exception as exc:
+         _signal_internal_error(task, uuid, args, kwargs, request, exc)
+         return trace_ok_t(report_internal_error(task, exc), TraceInfo(FAILURE, exc), 0.0, None)
+diff --git a/t/integration/conftest.py b/t/integration/conftest.py
+index 2383cb2d9..1e05302b7 100644
+--- a/t/integration/conftest.py
++++ b/t/integration/conftest.py
+@@ -8,6 +8,7 @@ import pytest
+ 
+ from celery.contrib.pytest import celery_app, celery_session_worker
+ from celery.contrib.testing.manager import Manager
++from celery.exceptions import TimeoutError
+ from t.integration.tasks import get_redis_connection
+ 
+ # we have to import the pytest plugin fixtures here,
+@@ -20,9 +21,25 @@ logger = logging.getLogger(__name__)
+ TEST_BROKER = os.environ.get('TEST_BROKER', 'pyamqp://')
+ TEST_BACKEND = os.environ.get('TEST_BACKEND', 'redis://')
+ 
++RETRYABLE_EXCEPTIONS = (OSError, ConnectionError, TimeoutError)
++
++
++def is_retryable_exception(exc):
++    return isinstance(exc, RETRYABLE_EXCEPTIONS)
++
++
++_flaky = pytest.mark.flaky(reruns=5, reruns_delay=1, cause=is_retryable_exception)
++_timeout = pytest.mark.timeout(timeout=300)
++
++
++def flaky(fn):
++    return _timeout(_flaky(fn))
++
++
+ __all__ = (
+     'celery_app',
+     'celery_session_worker',
++    'flaky',
+     'get_active_redis_channels',
+ )
+ 
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index ff823b96c..4bd874a88 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -6,7 +6,7 @@ from pydantic import BaseModel
+ 
+ from celery import Signature, Task, chain, chord, group, shared_task
+ from celery.canvas import signature
+-from celery.exceptions import SoftTimeLimitExceeded
++from celery.exceptions import Reject, SoftTimeLimitExceeded
+ from celery.utils.log import get_task_logger
+ 
+ LEGACY_TASKS_DISABLED = True
+@@ -522,6 +522,27 @@ if LEGACY_TASKS_DISABLED:
+         self.replace(signature(replace_with))
+ 
+ 
++@shared_task(bind=True, acks_late=True)
++def store_success_then_reject(self):
++    """First delivery: store SUCCESS manually, then Reject to trigger redelivery.
++    Second delivery: dedup finds SUCCESS, dispatches chain."""
++    from celery.backends.base import states
++    if not self.request.delivery_info.get('redelivered'):
++        self.backend.store_result(self.request.id, 'first-pass', states.SUCCESS)
++        raise Reject(requeue=True)
++    # When dedup is enabled the fast-path intercepts before reaching here,
++    # so 'dedup-pass' is only returned when dedup is disabled.
++    return 'dedup-pass'
++
++
++@shared_task(bind=True, acks_late=True)
++def reject_then_succeed(self):
++    """First delivery: Reject(requeue=True). Second delivery: succeed normally."""
++    if not self.request.delivery_info.get('redelivered'):
++        raise Reject(requeue=True)
++    return 'second-pass'
++
++
+ @shared_task(soft_time_limit=2, time_limit=1)
+ def soft_time_limit_must_exceed_time_limit():
+     pass
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index 729c94e5d..b1daaae86 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -15,7 +15,7 @@ from celery.result import AsyncResult, GroupResult, ResultSet
+ from celery.signals import before_task_publish, task_received
+ 
+ from . import tasks
+-from .conftest import TEST_BACKEND, check_for_logs, get_active_redis_channels, get_redis_connection
++from .conftest import TEST_BACKEND, check_for_logs, flaky, get_active_redis_channels, get_redis_connection
+ from .tasks import (ExpectedException, StampOnReplace, add, add_chord_to_chord, add_replaced, add_to_all,
+                     add_to_all_to_chord, build_chain_inside_task, collect_ids, delayed_sum,
+                     delayed_sum_with_soft_guard, errback_new_style, errback_old_style, fail, fail_replaced, identity,
+@@ -24,22 +24,8 @@ from .tasks import (ExpectedException, StampOnReplace, add, add_chord_to_chord,
+                     replace_with_stamped_task, retry_once, return_exception, return_priority, second_order_replace1,
+                     tsum, write_to_file_and_return_int, xsum)
+ 
+-RETRYABLE_EXCEPTIONS = (OSError, ConnectionError, TimeoutError)
+-
+-
+-def is_retryable_exception(exc):
+-    return isinstance(exc, RETRYABLE_EXCEPTIONS)
+-
+-
+ TIMEOUT = 60
+ 
+-_flaky = pytest.mark.flaky(reruns=5, reruns_delay=1, cause=is_retryable_exception)
+-_timeout = pytest.mark.timeout(timeout=300)
+-
+-
+-def flaky(fn):
+-    return _timeout(_flaky(fn))
+-
+ 
+ def await_redis_echo(expected_msgs, redis_key="redis-echo", timeout=TIMEOUT):
+     """
+diff --git a/t/integration/test_dedup_chain_dispatch.py b/t/integration/test_dedup_chain_dispatch.py
+new file mode 100644
+index 000000000..013288cc5
+--- /dev/null
++++ b/t/integration/test_dedup_chain_dispatch.py
+@@ -0,0 +1,87 @@
++"""Integration tests for chain/callback dispatch on the dedup fast-path.
++
++When ``worker_deduplicate_successful_tasks=True`` and
++``task_acks_late=True``, a redelivered task that hits the dedup
++fast-path in ``trace.py`` must still dispatch its chain and link
++callbacks.
++
++See https://github.com/celery/celery/issues/9835
++"""
++
++import pytest
++
++from celery import chain
++from celery.contrib.testing.worker import start_worker
++from celery.result import AsyncResult
++
++from .conftest import flaky
++from .tasks import add, identity, reject_then_succeed, store_success_then_reject
++
++TIMEOUT = 60
++
++
++@pytest.fixture()
++def dedup_worker(celery_session_app):
++    """Solo worker with dedup enabled.
++
++    Temporarily enables ``worker_deduplicate_successful_tasks`` on the
++    session app, starts a solo worker, and restores the original
++    setting on teardown.
++    """
++    if not celery_session_app.backend.persistent:
++        raise pytest.skip('Requires a persistent result backend.')
++
++    orig_dedup = celery_session_app.conf.worker_deduplicate_successful_tasks
++    orig_acks_late = celery_session_app.conf.task_acks_late
++    celery_session_app.conf.worker_deduplicate_successful_tasks = True
++    celery_session_app.conf.task_acks_late = True
++
++    try:
++        with start_worker(
++            celery_session_app,
++            pool='solo',
++            concurrency=1,
++            perform_ping_check=False,
++            shutdown_timeout=TIMEOUT,
++        ) as worker:
++            yield worker
++    finally:
++        celery_session_app.conf.worker_deduplicate_successful_tasks = orig_dedup
++        celery_session_app.conf.task_acks_late = orig_acks_late
++
++
++class test_dedup_chain_dispatch:
++    """Test chain/callback dispatch on the dedup fast-path."""
++
++    @flaky
++    @pytest.mark.usefixtures('dedup_worker')
++    def test_chain_completes_with_dedup_enabled(self):
++        """Smoke test: a normal chain works when dedup is on."""
++        c = chain(add.s(2, 3), add.s(5))
++        assert c().get(timeout=TIMEOUT) == 10
++
++    @flaky
++    @pytest.mark.usefixtures('dedup_worker')
++    def test_reject_requeue_completes_chain(self):
++        """Reject passthrough: chain completes after rejection + redelivery."""
++        c = chain(reject_then_succeed.s(), identity.s())
++        assert c().get(timeout=TIMEOUT) == 'second-pass'
++
++    @flaky
++    @pytest.mark.usefixtures('dedup_worker')
++    def test_dedup_dispatches_chain_on_redelivery(self):
++        """Core test: dedup fast-path dispatches the chain."""
++        c = chain(store_success_then_reject.s(), identity.s())
++        assert c().get(timeout=TIMEOUT) == 'first-pass'
++
++    @flaky
++    @pytest.mark.usefixtures('dedup_worker')
++    def test_dedup_dispatches_callback_on_redelivery(self, celery_session_app):
++        """Dedup fast-path dispatches link callbacks."""
++        import uuid as _uuid
++        cb_id = _uuid.uuid4().hex
++        sig = store_success_then_reject.s()
++        sig.link(identity.s().set(task_id=cb_id))
++        sig.apply_async()
++        cb_result = AsyncResult(cb_id, app=celery_session_app)
++        assert cb_result.get(timeout=TIMEOUT) == 'first-pass'
+diff --git a/t/unit/tasks/test_trace.py b/t/unit/tasks/test_trace.py
+index cd0c8c690..641fe25d7 100644
+--- a/t/unit/tasks/test_trace.py
++++ b/t/unit/tasks/test_trace.py
+@@ -14,6 +14,7 @@ from celery.app.trace import (TraceInfo, build_tracer, fast_trace_task, get_log_
+ from celery.backends.base import BaseDictBackend
+ from celery.backends.cache import CacheBackend
+ from celery.exceptions import BackendGetMetaError, Ignore, Reject, Retry
++from celery.result import AsyncResult
+ from celery.states import PENDING
+ from celery.worker.state import successful_requests
+ 
+@@ -564,6 +565,522 @@ class test_trace(TraceCase):
+         successful_requests.clear()
+         self.app.conf.worker_deduplicate_successful_tasks = False
+ 
++    def test_deduplicate_successful_tasks__backend_dedup_dispatches_chain(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++            mock_apply.assert_called_once()
++            call_args = mock_apply.call_args
++            assert call_args[0] == ((2,),)
++            assert call_args[1]['parent_id'] == task_id
++            assert call_args[1]['root_id'] == task_id
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_multi_element_chain(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        step2 = self.add.s(20)
++        step3 = self.add.s(30)
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [step3, step2],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++            mock_apply.assert_called_once()
++            call_args = mock_apply.call_args
++            assert call_args[1]['chain'] == [step3]
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_adds_to_successful_requests(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        successful_requests.discard(task_id)
++
++        request_dedup = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++        }
++        with patch('celery.canvas.maybe_signature'):
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_dedup)
++
++        assert task_id in successful_requests
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_dispatch_failure_skips_successful_requests(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        successful_requests.discard(task_id)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
++            with patch('celery.app.trace.logger'):
++                with pytest.raises(Reject):
++                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++
++        assert task_id not in successful_requests
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__inmemory_dedup_skips_chain(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++
++        task_id = str(uuid4())
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        successful_requests.add(task_id)
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++            mock_apply.assert_not_called()
++
++        successful_requests.clear()
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_chain_dispatch_does_not_mutate_request_chain(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++
++        chain_list = [self.add.s(10), self.add.s(20)]
++        original_length = len(chain_list)
++        task_id = str(uuid4())
++        request = {
++            'id': task_id,
++            'delivery_info': {'redelivered': False},
++            'chain': chain_list,
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_signature.return_value.apply_async = Mock()
++            trace(self.app, add, (1, 1), task_id=task_id, request=request)
++            call_args = mock_signature.return_value.apply_async.call_args
++            assert call_args[1]['chain'] == chain_list[:-1]
++        assert len(chain_list) == original_length
++
++    def test_deduplicate_successful_tasks__backend_dedup_dispatches_callbacks(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_callbacks = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'callbacks': [self.add.s(99)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_with_callbacks)
++            mock_apply.assert_called_once()
++            call_args = mock_apply.call_args
++            assert call_args[0] == ((2,),)
++            assert call_args[1]['parent_id'] == task_id
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_chain_and_callbacks(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_both = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++            'callbacks': [self.add.s(99)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_both)
++            assert mock_apply.call_count == 2
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_skips_when_children_present(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++            'callbacks': [self.add.s(99)],
++        }
++
++        meta_with_children = {
++            'status': 'SUCCESS', 'result': 2,
++            'children': [('some-child-id', None)],
++        }
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            with patch('celery.result.AsyncResult._get_task_meta',
++                       return_value=meta_with_children):
++                trace(self.app, add, (1, 1), task_id=task_id,
++                      request=request_with_chain)
++            mock_apply.assert_not_called()
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_dispatch_failure_logged(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
++            with patch('celery.app.trace.logger') as mock_logger:
++                with pytest.raises(Reject):
++                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++                mock_logger.error.assert_called_once()
++                assert 'deduplicated task' in mock_logger.error.call_args[0][0]
++
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_dedup_memory_error_propagates(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_signature.return_value.apply_async.side_effect = MemoryError()
++            with pytest.raises(MemoryError):
++                trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__reject_propagates_through_trace_task(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        add.__trace__ = None
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_signature.return_value.apply_async.side_effect = RuntimeError('broker down')
++            with patch('celery.app.trace.logger'):
++                with pytest.raises(Reject):
++                    trace_task(add, task_id, (1, 1), {}, request=request_with_chain, app=self.app)
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__root_id_fallback(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_no_root_id = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_no_root_id)
++            call_args = mock_apply.call_args
++            assert call_args[1]['root_id'] == task_id
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__empty_chain_skips_dispatch(self):
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        request_empty_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [],
++            'callbacks': [],
++        }
++
++        with patch('celery.canvas.maybe_signature') as mock_signature:
++            mock_apply = Mock()
++            mock_signature.return_value.apply_async = mock_apply
++            trace(self.app, add, (1, 1), task_id=task_id, request=request_empty_chain)
++            mock_apply.assert_not_called()
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
++    def test_deduplicate_successful_tasks__backend_read_failure_rejects(self):
++        """When _get_task_meta() fails after state==SUCCESS, the exception
++        is caught and re-raised as Reject(requeue=True)."""
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        backend = CacheBackend(app=self.app, backend='memory')
++        add.backend = backend
++        add.store_eager_result = True
++        add.ignore_result = False
++        add.acks_late = True
++
++        self.app.conf.worker_deduplicate_successful_tasks = True
++        task_id = str(uuid4())
++        request = {'id': task_id, 'delivery_info': {'redelivered': True}}
++
++        trace(self.app, add, (1, 1), task_id=task_id, request=request)
++
++        successful_requests.discard(task_id)
++
++        request_with_chain = {
++            'id': task_id,
++            'delivery_info': {'redelivered': True},
++            'chain': [self.add.s(10)],
++        }
++
++        # First call to _get_task_meta (from r.state) returns normally;
++        # second call (line 508 in trace.py) raises to simulate a
++        # transient backend failure during dispatch.
++        original = AsyncResult._get_task_meta
++        call_count = 0
++
++        def fail_on_second_call(self_):
++            nonlocal call_count
++            call_count += 1
++            if call_count >= 2:
++                raise ConnectionError('redis gone')
++            return original(self_)
++
++        with patch.object(AsyncResult, '_get_task_meta', fail_on_second_call):
++            with patch('celery.app.trace.logger'):
++                with pytest.raises(Reject):
++                    trace(self.app, add, (1, 1), task_id=task_id, request=request_with_chain)
++
++        assert task_id not in successful_requests
++
++        successful_requests.discard(task_id)
++        self.app.conf.worker_deduplicate_successful_tasks = False
++
+ 
+ class test_TraceInfo(TraceCase):
+     class TI(TraceInfo):

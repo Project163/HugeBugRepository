@@ -1,0 +1,3239 @@
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ConnectionManager.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ConnectionManager.java
+index b7a45801bc..5c45b22bfc 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ConnectionManager.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ConnectionManager.java
+@@ -17,6 +17,15 @@
+ 
+ package org.apache.ignite.internal.processors.query.h2;
+ 
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import org.apache.ignite.IgniteCheckedException;
+ import org.apache.ignite.IgniteLogger;
+ import org.apache.ignite.internal.GridKernalContext;
+@@ -27,24 +36,12 @@ import org.apache.ignite.internal.processors.query.h2.opt.GridH2PlainRowFactory;
+ import org.apache.ignite.internal.processors.query.h2.opt.GridH2Table;
+ import org.apache.ignite.internal.processors.query.h2.sql.GridSqlQueryParser;
+ import org.apache.ignite.internal.processors.timeout.GridTimeoutProcessor;
+-import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.h2.jdbc.JdbcStatement;
+ import org.h2.server.web.WebServer;
+ import org.h2.tools.Server;
+ import org.jetbrains.annotations.Nullable;
+ 
+-import java.sql.Connection;
+-import java.sql.DriverManager;
+-import java.sql.PreparedStatement;
+-import java.sql.ResultSet;
+-import java.sql.SQLException;
+-import java.sql.Statement;
+-import java.util.Iterator;
+-import java.util.Map;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.ConcurrentMap;
+-
+ import static org.apache.ignite.IgniteSystemProperties.IGNITE_H2_DEBUG_CONSOLE;
+ import static org.apache.ignite.IgniteSystemProperties.IGNITE_H2_DEBUG_CONSOLE_PORT;
+ import static org.apache.ignite.IgniteSystemProperties.IGNITE_H2_INDEXING_CACHE_CLEANUP_PERIOD;
+@@ -86,16 +83,23 @@ public class ConnectionManager {
+ 
+     /** Shared connection pool. */
+     private final ThreadLocalObjectPool<H2ConnectionWrapper> connPool =
+-        new ThreadLocalObjectPool<>(this::newConnectionWrapper, 5);
++        new ThreadLocalObjectPool<>(
++            5,
++            this::newConnectionWrapper,
++            this::closeDetachedConnection,
++            this::addConnectionToThreaded);
+ 
+     /** Per-thread connections. */
+-    private final ConcurrentMap<Thread, H2ConnectionWrapper> threadConns = new ConcurrentHashMap<>();
++    private final ConcurrentMap<Thread, ConcurrentMap<H2ConnectionWrapper, Boolean>> threadConns = new ConcurrentHashMap<>();
++
++    /** Track detached connections to close on node stop. */
++    private final ConcurrentMap<H2ConnectionWrapper, Boolean> detachedConns = new ConcurrentHashMap<>();
+ 
+     /** Connection cache. */
+-    private final ThreadLocal<ThreadLocalObjectPool.Reusable<H2ConnectionWrapper>> threadConn =
+-        new ThreadLocal<ThreadLocalObjectPool.Reusable<H2ConnectionWrapper>>() {
+-        @Override public ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> get() {
+-            ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> reusable = super.get();
++    private final ThreadLocal<ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable> threadConn =
++        new ThreadLocal<ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable>() {
++        @Override public ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable get() {
++            ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable reusable = super.get();
+ 
+             boolean reconnect = true;
+ 
+@@ -115,10 +119,10 @@ public class ConnectionManager {
+             return reusable;
+         }
+ 
+-        @Override protected ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> initialValue() {
+-            ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> reusableConnection = connPool.borrow();
++        @Override protected ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable initialValue() {
++            ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable reusableConnection = connPool.borrow();
+ 
+-            threadConns.put(Thread.currentThread(), reusableConnection.object());
++            addConnectionToThreaded(reusableConnection.object());
+ 
+             return reusableConnection;
+         }
+@@ -143,6 +147,7 @@ public class ConnectionManager {
+      * Constructor.
+      *
+      * @param ctx Context.
++     * @throws IgniteCheckedException On error.
+      */
+     public ConnectionManager(GridKernalContext ctx) throws IgniteCheckedException {
+         dbUrl = "jdbc:h2:mem:" + ctx.localNodeId() + DB_OPTIONS;
+@@ -160,38 +165,16 @@ public class ConnectionManager {
+     }
+ 
+     /**
+-     * Gets DB connection.
+-     *
+-     * @param schema Whether to set schema for connection or not.
+-     * @return DB connection.
++     * @return H2 connection wrapper.
+      */
+-    public Connection connectionForThread(@Nullable String schema) {
+-        H2ConnectionWrapper c = threadConn.get().object();
+-
+-        if (c == null)
+-            throw new IgniteSQLException("Failed to get DB connection for thread (check log for details).");
+-
+-        if (schema != null && !F.eq(c.schema(), schema)) {
+-            try {
+-                c.connection().setSchema(schema);
+-                c.schema(schema);
+-
+-                if (log.isDebugEnabled())
+-                    log.debug("Set schema: " + schema);
+-            }
+-            catch (SQLException e) {
+-                throw new IgniteSQLException("Failed to set schema for DB connection for thread [schema=" +
+-                    schema + "]", e);
+-            }
+-        }
+-
+-        return c.connection();
++    public H2ConnectionWrapper connectionForThread() {
++        return threadConn.get().object();
+     }
+ 
+     /**
+      * @return Per-thread connections (for testing purposes only).
+      */
+-    public Map<Thread, H2ConnectionWrapper> connectionsForThread() {
++    public Map<Thread, ConcurrentMap<H2ConnectionWrapper, Boolean>> connectionsForThread() {
+         return threadConns;
+     }
+ 
+@@ -200,18 +183,24 @@ public class ConnectionManager {
+      *
+      * @return Connection associated with current thread.
+      */
+-    public ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> detachThreadConnection() {
++    public ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable detachThreadConnection() {
+         Thread key = Thread.currentThread();
+ 
+-        ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> reusableConnection = threadConn.get();
++        ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable reusableConn = threadConn.get();
++
++        ConcurrentMap<H2ConnectionWrapper, Boolean> connSet = threadConns.get(key);
+ 
+-        H2ConnectionWrapper connection = threadConns.remove(key);
++        assert connSet != null;
++
++        Boolean rmv = connSet.remove(reusableConn.object());
++
++        assert rmv != null;
+ 
+         threadConn.remove();
+ 
+-        assert reusableConnection.object().connection() == connection.connection();
++        detachedConns.putIfAbsent(reusableConn.object(), false);
+ 
+-        return reusableConnection;
++        return reusableConn;
+     }
+ 
+     /**
+@@ -219,6 +208,7 @@ public class ConnectionManager {
+      *
+      * @param schema Schema name.
+      * @return Connection.
++     * @throws IgniteSQLException On error.
+      */
+     public Connection connectionNoCache(String schema) throws IgniteSQLException {
+         try {
+@@ -254,15 +244,17 @@ public class ConnectionManager {
+     public void executeStatement(String schema, String sql) throws IgniteCheckedException {
+         Statement stmt = null;
+ 
++        Connection c = null;
++
+         try {
+-            Connection c = connectionForThread(schema);
++            c = connectionForThread().connection(schema);
+ 
+             stmt = c.createStatement();
+ 
+             stmt.executeUpdate(sql);
+         }
+         catch (SQLException e) {
+-            onSqlException();
++            onSqlException(c);
+ 
+             throw new IgniteCheckedException("Failed to execute statement: " + sql, e);
+         }
+@@ -275,6 +267,7 @@ public class ConnectionManager {
+      * Execute statement on H2 INFORMATION_SCHEMA.
+      *
+      * @param sql SQL statement.
++     * @throws IgniteCheckedException On error.
+      */
+     public void executeSystemStatement(String sql) throws IgniteCheckedException {
+         Statement stmt = null;
+@@ -285,7 +278,7 @@ public class ConnectionManager {
+             stmt.executeUpdate(sql);
+         }
+         catch (SQLException e) {
+-            onSqlException();
++            U.close(sysConn, log);
+ 
+             throw new IgniteCheckedException("Failed to execute system statement: " + sql, e);
+         }
+@@ -300,6 +293,7 @@ public class ConnectionManager {
+      * @param c Connection.
+      * @param sql SQL.
+      * @return Prepared statement or {@code null}.
++     * @throws SQLException On error.
+      */
+     @Nullable public PreparedStatement cachedPreparedStatement(Connection c, String sql) throws SQLException {
+         H2StatementCache cache = statementCacheForThread();
+@@ -371,25 +365,36 @@ public class ConnectionManager {
+      * Clear statement cache when cache is unregistered..
+      */
+     public void onCacheUnregistered() {
+-        threadConns.values().forEach(H2ConnectionWrapper::clearStatementCache);
++        threadConns.values().forEach(set -> set.keySet().forEach(H2ConnectionWrapper::clearStatementCache));
++    }
++
++    /**
++     * Close all connections.
++     */
++    private void closeConnections() {
++        threadConns.values().forEach(set -> set.keySet().forEach(U::closeQuiet));
++        detachedConns.keySet().forEach(U::closeQuiet);
++
++        threadConns.clear();
++        detachedConns.clear();
+     }
+ 
+     /**
+      * Cancel all queries.
+      */
+     public void onKernalStop() {
+-        for (H2ConnectionWrapper c : threadConns.values())
+-            U.close(c, log);
++        closeConnections();
+     }
+ 
+     /**
+      * Close executor.
+      */
+     public void stop() {
+-        for (H2ConnectionWrapper c : threadConns.values())
+-            U.close(c, log);
++        if (stmtCleanupTask != null)
++            stmtCleanupTask.close();
+ 
+-        threadConns.clear();
++        if (connCleanupTask != null)
++            connCleanupTask.close();
+ 
+         try (Connection c = connectionNoCache(QueryUtils.SCHEMA_INFORMATION); Statement s = c.createStatement()) {
+             s.execute("SHUTDOWN");
+@@ -398,32 +403,31 @@ public class ConnectionManager {
+             U.error(log, "Failed to shutdown database.", e);
+         }
+ 
+-        if (stmtCleanupTask != null)
+-            stmtCleanupTask.close();
+-
+-        if (connCleanupTask != null)
+-            connCleanupTask.close();
+-
+         if (sysConn != null) {
+             U.close(sysConn, log);
+ 
+             sysConn = null;
+         }
++
++        closeConnections();
+     }
+ 
+     /**
+      * Handles SQL exception.
++     * @param c Connection to close.
+      */
+-    public void onSqlException() {
+-        Connection conn = threadConn.get().object().connection();
++    public void onSqlException(Connection c) {
++        H2ConnectionWrapper conn = threadConn.get().object();
+ 
+-        threadConn.set(null);
++        // Clear thread local cache if connection not detached.
++        if (conn.connection() == c)
++            threadConn.remove();
+ 
+-        if (conn != null) {
++        if (c != null) {
+             threadConns.remove(Thread.currentThread());
+ 
+             // Reset connection to receive new one at next call.
+-            U.close(conn, log);
++            U.close(c, log);
+         }
+     }
+ 
+@@ -474,40 +478,61 @@ public class ConnectionManager {
+     }
+ 
+     /**
+-     * Called periodically to cleanup connections.
++     * Called by connection bool on connection recycle.
++     *
++     * @param conn recycled connection.
+      */
+-    private void cleanupConnections() {
+-        for (Iterator<Map.Entry<Thread, H2ConnectionWrapper>> it = threadConns.entrySet().iterator(); it.hasNext(); ) {
+-            Map.Entry<Thread, H2ConnectionWrapper> entry = it.next();
++    private void addConnectionToThreaded(H2ConnectionWrapper conn) {
++        Thread cur = Thread.currentThread();
+ 
+-            Thread t = entry.getKey();
++        ConcurrentMap<H2ConnectionWrapper, Boolean> setConn = threadConns.get(cur);
+ 
+-            if (t.getState() == Thread.State.TERMINATED) {
+-                U.close(entry.getValue(), log);
++        if (setConn == null) {
++            setConn = new ConcurrentHashMap<>();
+ 
+-                it.remove();
+-            }
++            threadConns.putIfAbsent(cur, setConn);
+         }
++
++        setConn.put(conn, false);
+     }
+ 
+     /**
+-     * Called periodically to clean up the statement cache.
++     * Called by connection bool on connection close.
++     *
++     * @param conn closed connection.
+      */
+-    private void cleanupStatements() {
+-        long now = U.currentTimeMillis();
++    private void closeDetachedConnection(H2ConnectionWrapper conn) {
++        U.close(conn, log);
+ 
+-        for (Iterator<Map.Entry<Thread, H2ConnectionWrapper>> it = threadConns.entrySet().iterator(); it.hasNext(); ) {
+-            Map.Entry<Thread, H2ConnectionWrapper> entry = it.next();
++        detachedConns.remove(conn);
++    }
+ 
+-            Thread t = entry.getKey();
++    /**
++     * Called periodically to cleanup connections.
++     */
++    private void cleanupConnections() {
++        threadConns.entrySet().removeIf(e -> {
++            Thread t = e.getKey();
+ 
+             if (t.getState() == Thread.State.TERMINATED) {
+-                U.close(entry.getValue(), log);
++                e.getValue().keySet().forEach(c -> U.close(c, log));
+ 
+-                it.remove();
++                return true;
+             }
+-            else if (now - entry.getValue().statementCache().lastUsage() > stmtTimeout)
+-                entry.getValue().clearStatementCache();
+-        }
++
++            return false;
++        });
++    }
++
++    /**
++     * Called periodically to clean up the statement cache.
++     */
++    private void cleanupStatements() {
++        long now = U.currentTimeMillis();
++
++        threadConns.values().forEach(set -> set.keySet().forEach(c ->{
++            if (now - c.statementCache().lastUsage() > stmtTimeout)
++                c.clearStatementCache();
++        }));
+     }
+ }
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2ConnectionWrapper.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2ConnectionWrapper.java
+index 425015a574..9803b5d726 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2ConnectionWrapper.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2ConnectionWrapper.java
+@@ -18,6 +18,9 @@
+ package org.apache.ignite.internal.processors.query.h2;
+ 
+ import java.sql.Connection;
++import java.sql.SQLException;
++import org.apache.ignite.internal.processors.query.IgniteSQLException;
++import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.internal.S;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.jetbrains.annotations.Nullable;
+@@ -61,6 +64,28 @@ public class H2ConnectionWrapper implements AutoCloseable {
+         this.schema = schema;
+     }
+ 
++    /**
++     * Connection for schema.
++     *
++     * @param schema Schema name.
++     * @return Connection.
++     */
++    public Connection connection(@Nullable String schema) {
++        if (schema != null && !F.eq(this.schema, schema)) {
++            try {
++                conn.setSchema(schema);
++
++                this.schema = schema;
++            }
++            catch (SQLException e) {
++                throw new IgniteSQLException("Failed to set schema for DB connection for thread [schema=" +
++                    schema + "]", e);
++            }
++        }
++
++        return conn;
++    }
++
+     /**
+      * @return Connection.
+      */
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2FieldsIterator.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2FieldsIterator.java
+index e9f293c789..64647cbbbf 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2FieldsIterator.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/H2FieldsIterator.java
+@@ -34,17 +34,23 @@ public class H2FieldsIterator extends H2ResultSetIterator<List<?>> {
+     /** */
+     private transient MvccQueryTracker mvccTracker;
+ 
++    /** Detached connection. */
++    private final ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable detachedConn;
++
+     /**
+      * @param data Data.
+      * @param mvccTracker Mvcc tracker.
+      * @param forUpdate {@code SELECT FOR UPDATE} flag.
++     * @param detachedConn Detached connection.
+      * @throws IgniteCheckedException If failed.
+      */
+-    public H2FieldsIterator(ResultSet data, MvccQueryTracker mvccTracker, boolean forUpdate)
++    public H2FieldsIterator(ResultSet data, MvccQueryTracker mvccTracker, boolean forUpdate,
++        ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable detachedConn)
+         throws IgniteCheckedException {
+         super(data, forUpdate);
+ 
+         this.mvccTracker = mvccTracker;
++        this.detachedConn = detachedConn;
+     }
+ 
+     /** {@inheritDoc} */
+@@ -62,6 +68,9 @@ public class H2FieldsIterator extends H2ResultSetIterator<List<?>> {
+             super.onClose();
+         }
+         finally {
++            if (detachedConn != null)
++                detachedConn.recycle();
++
+             if (mvccTracker != null)
+                 mvccTracker.onDone();
+         }
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/IgniteH2Indexing.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/IgniteH2Indexing.java
+index 4c26e357c9..0c1b1d6b57 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/IgniteH2Indexing.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/IgniteH2Indexing.java
+@@ -298,7 +298,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+ 
+     /** {@inheritDoc} */
+     @Override public PreparedStatement prepareNativeStatement(String schemaName, String sql) {
+-        Connection conn = connMgr.connectionForThread(schemaName);
++        Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+         return prepareStatementAndCaches(conn, sql);
+     }
+@@ -518,7 +518,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+         assert mvccEnabled || mvccTracker == null;
+ 
+         try {
+-            final Connection conn = connMgr.connectionForThread(schemaName);
++            final Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+             H2Utils.setupConnection(conn, false, enforceJoinOrder);
+ 
+@@ -635,6 +635,8 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+ 
+                     GridH2QueryContext.set(ctx);
+ 
++                    ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable detachedConn = connMgr.detachThreadConnection();
++
+                     try {
+                         ResultSet rs = executeSqlQueryWithTimer(stmt0, conn, qry0, params, timeout0, cancel);
+ 
+@@ -657,10 +659,20 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+ 
+                             enlistFut.listen(new IgniteInClosure<IgniteInternalFuture<Long>>() {
+                                 @Override public void apply(IgniteInternalFuture<Long> fut) {
+-                                    if (fut.error() != null)
+-                                        sfuFut0.onResult(IgniteH2Indexing.this.ctx.localNodeId(), 0L, false, fut.error());
+-                                    else
+-                                        sfuFut0.onResult(IgniteH2Indexing.this.ctx.localNodeId(), fut.result(), false, null);
++                                    if (fut.error() != null) {
++                                        sfuFut0.onResult(
++                                            IgniteH2Indexing.this.ctx.localNodeId(),
++                                            0L,
++                                            false,
++                                            fut.error());
++                                    }
++                                    else {
++                                        sfuFut0.onResult(
++                                            IgniteH2Indexing.this.ctx.localNodeId(),
++                                            fut.result(),
++                                            false,
++                                            null);
++                                    }
+                                 }
+                             });
+ 
+@@ -679,9 +691,12 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+                             }
+                         }
+ 
+-                        return new H2FieldsIterator(rs, mvccTracker0, sfuFut0 != null);
++                        return new H2FieldsIterator(rs, mvccTracker0, sfuFut0 != null,
++                            detachedConn);
+                     }
+                     catch (IgniteCheckedException | RuntimeException | Error e) {
++                        detachedConn.recycle();
++
+                         try {
+                             if (mvccTracker0 != null)
+                                 mvccTracker0.onDone();
+@@ -724,7 +739,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+     /** {@inheritDoc} */
+     @Override public long streamUpdateQuery(String schemaName, String qry,
+         @Nullable Object[] params, IgniteDataStreamer<?, ?> streamer) throws IgniteCheckedException {
+-        final Connection conn = connMgr.connectionForThread(schemaName);
++        final Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+         final PreparedStatement stmt;
+ 
+@@ -748,7 +763,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+             return zeroBatchedStreamedUpdateResult(params.size());
+         }
+ 
+-        final Connection conn = connMgr.connectionForThread(schemaName);
++        final Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+         final PreparedStatement stmt = prepareStatementAndCaches(conn, qry);
+ 
+@@ -941,7 +956,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+             return rs;
+         }
+         catch (SQLException e) {
+-            connMgr.onSqlException();
++            connMgr.onSqlException(conn);
+ 
+             throw new IgniteCheckedException(e);
+         }
+@@ -1490,7 +1505,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+                 // Second, let's check if we already have a parsed statement...
+                 PreparedStatement cachedStmt;
+ 
+-                if ((cachedStmt = cachedStatement(connMgr.connectionForThread(schemaName), qry.getSql())) != null) {
++                if ((cachedStmt = cachedStatement(connMgr.connectionForThread().connection(schemaName), qry.getSql())) != null) {
+                     Prepared prepared = GridSqlQueryParser.prepared(cachedStmt);
+ 
+                     // We may use this cached statement only for local queries and non queries.
+@@ -1587,7 +1602,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+             try {
+                 if (DmlStatementsProcessor.isDmlStatement(prepared)) {
+                     try {
+-                        Connection conn = connMgr.connectionForThread(schemaName);
++                        Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+                         if (!loc)
+                             return dmlProc.updateSqlFieldsDistributed(schemaName, conn, prepared, qry, cancel);
+@@ -1708,7 +1723,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+      *     metadata for two-step query (if needed), evaluated query local execution flag.
+      */
+     private ParsingResult parseAndSplit(String schemaName, SqlFieldsQuery qry, int firstArg) {
+-        Connection c = connMgr.connectionForThread(schemaName);
++        Connection c = connMgr.connectionForThread().connection(schemaName);
+ 
+         // For queries that are explicitly local, we rely on the flag specified in the query
+         // because this parsing result will be cached and used for queries directly.
+@@ -1869,8 +1884,14 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+      */
+     private GridCacheTwoStepQuery split(Prepared prepared, SqlFieldsQuery qry) throws IgniteCheckedException,
+         SQLException {
+-        GridCacheTwoStepQuery res = GridSqlQuerySplitter.split(connMgr.connectionForThread(qry.getSchema()), prepared,
+-            qry.getArgs(), qry.isCollocated(), qry.isDistributedJoins(), qry.isEnforceJoinOrder(), this);
++        GridCacheTwoStepQuery res = GridSqlQuerySplitter.split(
++            connMgr.connectionForThread().connection(qry.getSchema()),
++            prepared,
++            qry.getArgs(),
++            qry.isCollocated(),
++            qry.isDistributedJoins(),
++            qry.isEnforceJoinOrder(),
++            this);
+ 
+         List<Integer> cacheIds = collectCacheIds(null, res);
+ 
+@@ -1934,7 +1955,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+             loc = false;
+         }
+ 
+-        Connection conn = connMgr.connectionForThread(schema);
++        Connection conn = connMgr.connectionForThread().connection(schema);
+ 
+         H2Utils.setupConnection(conn, false, fldsQry.isEnforceJoinOrder());
+ 
+@@ -2086,7 +2107,7 @@ public class IgniteH2Indexing implements GridQueryIndexing {
+      */
+     public UpdateResult mapDistributedUpdate(String schemaName, SqlFieldsQuery fldsQry, IndexingQueryFilter filter,
+         GridQueryCancel cancel, boolean local) throws IgniteCheckedException {
+-        Connection conn = connMgr.connectionForThread(schemaName);
++        Connection conn = connMgr.connectionForThread().connection(schemaName);
+ 
+         H2Utils.setupConnection(conn, false, fldsQry.isEnforceJoinOrder());
+ 
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/SchemaManager.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/SchemaManager.java
+index f641a5bfd5..42d1680c65 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/SchemaManager.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/SchemaManager.java
+@@ -231,8 +231,9 @@ public class SchemaManager {
+ 
+         H2Schema schema = schema(schemaName);
+ 
++        Connection conn = null;
+         try {
+-            Connection conn = connMgr.connectionForThread(schema.schemaName());
++            conn = connMgr.connectionForThread().connection(schema.schemaName());
+ 
+             GridH2Table h2tbl = createTable(schema.schemaName(), schema, tblDesc, conn);
+ 
+@@ -242,7 +243,7 @@ public class SchemaManager {
+                 throw new IllegalStateException("Table already exists: " + h2tbl.identifierString());
+         }
+         catch (SQLException e) {
+-            connMgr.onSqlException();
++            connMgr.onSqlException(conn);
+ 
+             throw new IgniteCheckedException("Failed to register query type: " + tblDesc, e);
+         }
+@@ -461,7 +462,7 @@ public class SchemaManager {
+         if (log.isDebugEnabled())
+             log.debug("Removing query index table: " + tbl.fullTableName());
+ 
+-        Connection c = connMgr.connectionForThread(tbl.schemaName());
++        Connection c = connMgr.connectionForThread().connection(tbl.schemaName());
+ 
+         Statement stmt = null;
+ 
+@@ -476,7 +477,7 @@ public class SchemaManager {
+             stmt.executeUpdate(sql);
+         }
+         catch (SQLException e) {
+-            connMgr.onSqlException();
++            connMgr.onSqlException(c);
+ 
+             throw new IgniteSQLException("Failed to drop database index table [type=" + tbl.type().name() +
+                 ", table=" + tbl.fullTableName() + "]", IgniteQueryErrorCode.TABLE_DROP_FAILED, e);
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPool.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPool.java
+index 25daa23e38..34e8b8e2f3 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPool.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPool.java
+@@ -19,6 +19,7 @@ package org.apache.ignite.internal.processors.query.h2;
+ 
+ import java.util.LinkedList;
+ import java.util.Queue;
++import java.util.function.Consumer;
+ import java.util.function.Supplier;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ 
+@@ -33,71 +34,99 @@ import org.apache.ignite.internal.util.typedef.internal.U;
+  * @param <E> pooled objects type
+  */
+ public final class ThreadLocalObjectPool<E extends AutoCloseable> {
+-    /**
+-     * Wrapper for a pooled object with capability to return the object to a pool.
+-     *
+-     * @param <T> enclosed object type
+-     */
+-    public static class Reusable<T extends AutoCloseable> {
+-        /** */
+-        private final ThreadLocalObjectPool<T> pool;
+-        /** */
+-        private final T object;
+-
+-        /** */
+-        private Reusable(ThreadLocalObjectPool<T> pool, T object) {
+-            this.pool = pool;
+-            this.object = object;
+-        }
+-
+-        /**
+-         * @return enclosed object
+-         */
+-        public T object() {
+-            return object;
+-        }
++    /** */
++    private final ThreadLocal<Queue<E>> bag = ThreadLocal.withInitial(LinkedList::new);
+ 
+-        /**
+-         * Returns an object to a pool or closes it if the pool is already full.
+-         */
+-        public void recycle() {
+-            Queue<Reusable<T>> bag = pool.bag.get();
+-            if (bag.size() < pool.poolSize)
+-                bag.add(this);
+-            else
+-                U.closeQuiet(object);
+-        }
+-    }
++    /** */
++    private final int poolSize;
+ 
+     /** */
+-    private final Supplier<E> objectFactory;
++    private final Supplier<E> objFactory;
++
+     /** */
+-    private final ThreadLocal<Queue<Reusable<E>>> bag = ThreadLocal.withInitial(LinkedList::new);
++    private final Consumer<E> closer;
++
+     /** */
+-    private final int poolSize;
++    private final Consumer<E> recycler;
+ 
+     /**
+-     * @param objectFactory factory used for new objects creation
+-     * @param poolSize number of objects which pool can contain
++     * @param poolSize number of objects which pool can contain.
++     * @param objFactory factory used for new objects creation.
++     * @param closer close callback.
++     * @param recycler recycle callback.
+      */
+-    public ThreadLocalObjectPool(Supplier<E> objectFactory, int poolSize) {
+-        this.objectFactory = objectFactory;
++    public ThreadLocalObjectPool(int poolSize, Supplier<E> objFactory, Consumer<E> closer, Consumer<E> recycler) {
+         this.poolSize = poolSize;
++        this.objFactory = objFactory;
++        this.closer = closer;
++        this.recycler = recycler;
+     }
+ 
+     /**
+      * Picks an object from the pool if one is present or creates new one otherwise.
+      * Returns an object wrapper which could be returned to the pool.
+      *
+-     * @return reusable object wrapper
++     * @return reusable object wrapper.
+      */
+-    public Reusable<E> borrow() {
+-        Reusable<E> pooled = bag.get().poll();
+-        return pooled != null ? pooled : new Reusable<>(this, objectFactory.get());
++    public Reusable borrow() {
++        E obj = bag.get().poll();
++
++        if (obj == null)
++            obj = objFactory.get();
++
++        return new Reusable(obj);
+     }
+ 
+-    /** Visible for test */
++    /**
++     * Visible for test.
++     *
++     * @return pool size.
++     */
+     int bagSize() {
+         return bag.get().size();
+     }
++
++    /**
++     * Wrapper for a pooled object with capability to return the object to a pool.
++     */
++    public class Reusable {
++        /** */
++        private E object;
++
++        /**
++         * @param object Object to detach.
++         */
++        private Reusable(E object) {
++            this.object = object;
++        }
++
++        /**
++         * @return enclosed object.
++         */
++        public E object() {
++            return object;
++        }
++
++        /**
++         * Returns an object to a pool or closes it if the pool is already full.
++         */
++        public void recycle() {
++            assert object != null : "The object is already recycled";
++
++            if (bag.get().size() < poolSize) {
++                if (recycler != null)
++                    recycler.accept(object);
++
++                bag.get().add(object);
++            }
++            else {
++                if (closer != null)
++                    closer.accept(object);
++                else
++                    U.closeQuiet(object);
++            }
++
++            object = null;
++        }
++    }
+ }
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/dml/UpdatePlan.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/dml/UpdatePlan.java
+index df67420182..2c6d7850a4 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/dml/UpdatePlan.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/dml/UpdatePlan.java
+@@ -623,7 +623,7 @@ public final class UpdatePlan {
+         private final EnlistOperation op;
+ 
+         /** */
+-        private volatile ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> conn;
++        private volatile ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable conn;
+ 
+         /**
+          * @param connMgr Connection manager.
+@@ -648,7 +648,7 @@ public final class UpdatePlan {
+ 
+         /** {@inheritDoc} */
+         @Override public void beforeDetach() {
+-            ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> conn0 = conn = connMgr.detachThreadConnection();
++            ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable conn0 = conn = connMgr.detachThreadConnection();
+ 
+             if (isClosed())
+                 conn0.recycle();
+@@ -658,7 +658,7 @@ public final class UpdatePlan {
+         @Override protected void onClose() {
+             cur.close();
+ 
+-            ThreadLocalObjectPool.Reusable<H2ConnectionWrapper> conn0 = conn;
++            ThreadLocalObjectPool<H2ConnectionWrapper>.Reusable conn0 = conn;
+ 
+             if (conn0 != null)
+                 conn0.recycle();
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridMapQueryExecutor.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridMapQueryExecutor.java
+index 2e611dec38..907152a35e 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridMapQueryExecutor.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridMapQueryExecutor.java
+@@ -875,7 +875,7 @@ public class GridMapQueryExecutor {
+                 .mvccSnapshot(mvccSnapshot)
+                 .lazyWorker(worker);
+ 
+-            Connection conn = h2.connections().connectionForThread(schemaName);
++            Connection conn = h2.connections().connectionForThread().connection(schemaName);
+ 
+             H2Utils.setupConnection(conn, distributedJoinMode != OFF, enforceJoinOrder);
+ 
+diff --git a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridReduceQueryExecutor.java b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridReduceQueryExecutor.java
+index 841f2d10be..62953ec54e 100644
+--- a/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridReduceQueryExecutor.java
++++ b/modules/indexing/src/main/java/org/apache/ignite/internal/processors/query/h2/twostep/GridReduceQueryExecutor.java
+@@ -476,7 +476,7 @@ public class GridReduceQueryExecutor {
+ 
+             long qryReqId = qryIdGen.incrementAndGet();
+ 
+-            final ReduceQueryRun r = new ReduceQueryRun(h2.connections().connectionForThread(schemaName),
++            final ReduceQueryRun r = new ReduceQueryRun(h2.connections().connectionForThread().connection(schemaName),
+                 qry.mapQueries().size(), qry.pageSize(), sfuFut);
+ 
+             Collection<ClusterNode> nodes;
+@@ -760,7 +760,7 @@ public class GridReduceQueryExecutor {
+                                 timeoutMillis,
+                                 cancel);
+ 
+-                            resIter = new H2FieldsIterator(res, mvccTracker, false);
++                            resIter = new H2FieldsIterator(res, mvccTracker, false, null);
+ 
+                             mvccTracker = null; // To prevent callback inside finally block;
+                         }
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/GridCacheDynamicLoadOnClientTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/GridCacheDynamicLoadOnClientTest.java
+index 601e90b71d..e6c6f759bb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/GridCacheDynamicLoadOnClientTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/GridCacheDynamicLoadOnClientTest.java
+@@ -98,9 +98,9 @@ public class GridCacheDynamicLoadOnClientTest extends GridCommonAbstractTest {
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         stopAllGrids();
++
++        super.afterTestsStopped();
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheLockPartitionOnAffinityRunAbstractTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheLockPartitionOnAffinityRunAbstractTest.java
+index 1a1c287efa..300f0fe0a4 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheLockPartitionOnAffinityRunAbstractTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheLockPartitionOnAffinityRunAbstractTest.java
+@@ -161,6 +161,7 @@ public class IgniteCacheLockPartitionOnAffinityRunAbstractTest extends GridCache
+         grid(0).destroyCache(Organization.class.getSimpleName());
+         grid(0).destroyCache(Person.class.getSimpleName());
+         grid(0).destroyCache(OTHER_CACHE_NAME);
++
+         super.afterTestsStopped();
+     }
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueriesLoadTest1.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueriesLoadTest1.java
+index 329b29fcb8..2dcc770aeb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueriesLoadTest1.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueriesLoadTest1.java
+@@ -46,11 +46,11 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.lang.IgniteCallable;
+ import org.apache.ignite.lang.IgniteRunnable;
+ import org.apache.ignite.resources.IgniteInstanceResource;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -66,7 +66,7 @@ import static org.apache.ignite.transactions.TransactionIsolation.REPEATABLE_REA
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteCacheQueriesLoadTest1 extends GridCommonAbstractTest {
++public class IgniteCacheQueriesLoadTest1 extends AbstractIndexingCommonTest {
+     /** Operation. */
+     private static final String OPERATION = "Operation";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryH2IndexingLeakTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryH2IndexingLeakTest.java
+index db4c4f4a93..30ed4e04ae 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryH2IndexingLeakTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryH2IndexingLeakTest.java
+@@ -18,6 +18,7 @@
+ package org.apache.ignite.internal.processors.cache;
+ 
+ import java.util.Map;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import org.apache.ignite.IgniteCache;
+@@ -123,17 +124,14 @@ public class IgniteCacheQueryH2IndexingLeakTest extends GridCommonAbstractTest {
+      * @return size of statement cache.
+      */
+     private static int getStatementCacheSize(GridQueryProcessor qryProcessor) {
+-
+         IgniteH2Indexing h2Idx = (IgniteH2Indexing)qryProcessor.getIndexing();
+ 
+-        Map<Thread, H2ConnectionWrapper> conns = h2Idx.connections().connectionsForThread();
+-
+-        int cntr = 0;
+-
+-        for (H2ConnectionWrapper w : conns.values())
+-            cntr += w.statementCacheSize();
++        Map<Thread, ConcurrentMap<H2ConnectionWrapper, Boolean>> conns = h2Idx.connections().connectionsForThread();
+ 
+-        return cntr;
++        return conns.values().stream()
++            .mapToInt(set ->
++                set.keySet().stream()
++                    .mapToInt(H2ConnectionWrapper::statementCacheSize).sum()).sum();
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryMultiThreadedSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryMultiThreadedSelfTest.java
+index d3d53972e4..c5e8b967cc 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryMultiThreadedSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/IgniteCacheQueryMultiThreadedSelfTest.java
+@@ -41,10 +41,10 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteInternalFuture;
+ import org.apache.ignite.internal.IgniteKernal;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.query.GridCacheQueryManager;
+ import org.apache.ignite.internal.util.typedef.CAX;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -57,7 +57,7 @@ import static org.apache.ignite.cache.CacheWriteSynchronizationMode.FULL_SYNC;
+  * Multi-threaded tests for cache queries.
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteCacheQueryMultiThreadedSelfTest extends GridCommonAbstractTest {
++public class IgniteCacheQueryMultiThreadedSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final boolean TEST_INFO = true;
+ 
+@@ -73,11 +73,6 @@ public class IgniteCacheQueryMultiThreadedSelfTest extends GridCommonAbstractTes
+     /** */
+     private static final long DURATION = 30 * 1000;
+ 
+-    /** Don't start grid by default. */
+-    public IgniteCacheQueryMultiThreadedSelfTest() {
+-        super(false);
+-    }
+-
+     /** {@inheritDoc} */
+     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
+         IgniteConfiguration cfg = super.getConfiguration(igniteInstanceName);
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/QueryJoinWithDifferentNodeFiltersTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/QueryJoinWithDifferentNodeFiltersTest.java
+index 4702995be4..c8fed9a8d3 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/QueryJoinWithDifferentNodeFiltersTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/QueryJoinWithDifferentNodeFiltersTest.java
+@@ -25,11 +25,12 @@ import org.apache.ignite.cache.CacheWriteSynchronizationMode;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.cluster.ClusterNode;
+-import org.apache.ignite.configuration.*;
++import org.apache.ignite.configuration.CacheConfiguration;
++import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.lang.IgnitePredicate;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -38,7 +39,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class QueryJoinWithDifferentNodeFiltersTest extends GridCommonAbstractTest {
++public class QueryJoinWithDifferentNodeFiltersTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final String CACHE_NAME = "cache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/distributed/near/IgniteCacheQueryAbstractDistributedJoinSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/distributed/near/IgniteCacheQueryAbstractDistributedJoinSelfTest.java
+index bcb3841e45..b3a1a53604 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/distributed/near/IgniteCacheQueryAbstractDistributedJoinSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/distributed/near/IgniteCacheQueryAbstractDistributedJoinSelfTest.java
+@@ -26,10 +26,10 @@ import org.apache.ignite.cache.query.annotations.QuerySqlFunction;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteInterruptedCheckedException;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.GridRandom;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ 
+ import static org.apache.ignite.cache.CacheAtomicityMode.TRANSACTIONAL;
+ import static org.apache.ignite.cache.CacheMode.PARTITIONED;
+@@ -39,7 +39,7 @@ import static org.apache.ignite.cache.CacheWriteSynchronizationMode.FULL_SYNC;
+ /**
+  * Test for distributed queries with node restarts.
+  */
+-public class IgniteCacheQueryAbstractDistributedJoinSelfTest extends GridCommonAbstractTest {
++public class IgniteCacheQueryAbstractDistributedJoinSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     protected static final String QRY_0 = "select co._key, count(*) cnt\n" +
+         "from \"pe\".Person pe, \"pr\".Product pr, \"co\".Company co, \"pu\".Purchase pu\n" +
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractIndexingCommonTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractIndexingCommonTest.java
+new file mode 100644
+index 0000000000..4bc45b771c
+--- /dev/null
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractIndexingCommonTest.java
+@@ -0,0 +1,64 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.ignite.internal.processors.cache.index;
++
++import java.util.Set;
++import org.apache.ignite.testframework.GridTestUtils;
++import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.h2.engine.Session;
++import org.h2.util.CloseWatcher;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++/**
++ * Base class for all indexing tests to check H2 connection management.
++ */
++@RunWith(JUnit4.class)
++public class AbstractIndexingCommonTest extends GridCommonAbstractTest {
++    /** {@inheritDoc} */
++    @Override protected void afterTestsStopped() throws Exception {
++        stopAllGrids();
++
++        checkAllConnectionAreClosed();
++
++        super.afterTestsStopped();
++    }
++
++    /**
++     * Checks all H2 connection are closed.
++     */
++    void checkAllConnectionAreClosed() {
++        Set<Object> refs = GridTestUtils.getFieldValue(CloseWatcher.class, "refs");
++
++        if (!refs.isEmpty()) {
++            for (Object o : refs) {
++                if (o instanceof CloseWatcher
++                    && ((CloseWatcher)o).getCloseable() instanceof Session) {
++                    log.error("Session: " + ((CloseWatcher)o).getCloseable()
++                        + ", open=" + !((Session)((CloseWatcher)o).getCloseable()).isClosed());
++                }
++            }
++
++            // Uncomment and use heap dump to investigate the problem if the test failed.
++            // GridDebug.dumpHeap("h2_conn_heap_dmp.hprof", true);
++
++            fail("There are not closed connections. See the log above.");
++        }
++    }
++
++}
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractSchemaSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractSchemaSelfTest.java
+index e7ab35d9d6..fdda9068a5 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractSchemaSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/AbstractSchemaSelfTest.java
+@@ -59,14 +59,13 @@ import org.apache.ignite.internal.util.typedef.T2;
+ import org.apache.ignite.internal.util.typedef.internal.SB;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.lang.IgniteBiTuple;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+ 
+ /**
+  * Tests for dynamic schema changes.
+  */
+ @SuppressWarnings("unchecked")
+-public abstract class AbstractSchemaSelfTest extends GridCommonAbstractTest {
++public abstract class AbstractSchemaSelfTest extends AbstractIndexingCommonTest {
+     /** Cache. */
+     protected static final String CACHE_NAME = "cache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/BasicIndexTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/BasicIndexTest.java
+index 3590d1d158..1e1c61c13f 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/BasicIndexTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/BasicIndexTest.java
+@@ -40,7 +40,6 @@ import org.apache.ignite.internal.processors.cache.persistence.file.FilePageStor
+ import org.apache.ignite.internal.util.typedef.G;
+ import org.apache.ignite.internal.util.typedef.internal.S;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -49,7 +48,7 @@ import org.junit.runners.JUnit4;
+  * A set of basic tests for caches with indexes.
+  */
+ @RunWith(JUnit4.class)
+-public class BasicIndexTest extends GridCommonAbstractTest {
++public class BasicIndexTest extends AbstractIndexingCommonTest {
+     /** */
+     private Collection<QueryIndex> indexes = Collections.emptyList();
+ 
+@@ -62,9 +61,7 @@ public class BasicIndexTest extends GridCommonAbstractTest {
+     /** */
+     private int gridCount = 1;
+ 
+-    /**
+-     * {@inheritDoc}
+-     */
++    /** {@inheritDoc} */
+     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
+         assertNotNull(inlineSize);
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexPrimaryKeyUnwrapSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexPrimaryKeyUnwrapSelfTest.java
+index b17ea33f33..78c93ec5f7 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexPrimaryKeyUnwrapSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexPrimaryKeyUnwrapSelfTest.java
+@@ -26,7 +26,6 @@ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.util.typedef.F;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -36,8 +35,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings({"unchecked", "ThrowableResultOfMethodCallIgnored"})
+ @RunWith(JUnit4.class)
+-public class ComplexPrimaryKeyUnwrapSelfTest extends GridCommonAbstractTest {
+-
++public class ComplexPrimaryKeyUnwrapSelfTest extends AbstractIndexingCommonTest {
+     /** Counter to generate unique table names. */
+     private static int tblCnt = 0;
+ 
+@@ -50,9 +48,9 @@ public class ComplexPrimaryKeyUnwrapSelfTest extends GridCommonAbstractTest {
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         stopAllGrids();
++
++        super.afterTestsStopped();
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexSecondaryKeyUnwrapSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexSecondaryKeyUnwrapSelfTest.java
+index e54c514d43..889a626c6a 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexSecondaryKeyUnwrapSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/ComplexSecondaryKeyUnwrapSelfTest.java
+@@ -24,7 +24,6 @@ import java.util.Map;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.internal.IgniteEx;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -34,8 +33,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings({"unchecked", "ThrowableResultOfMethodCallIgnored"})
+ @RunWith(JUnit4.class)
+-public class ComplexSecondaryKeyUnwrapSelfTest extends GridCommonAbstractTest {
+-
++public class ComplexSecondaryKeyUnwrapSelfTest extends AbstractIndexingCommonTest {
+     /** Counter to generate unique table names. */
+     private static int tblCnt = 0;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DuplicateKeyValueClassesSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DuplicateKeyValueClassesSelfTest.java
+index 2b67214b90..e6af0b3fbb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DuplicateKeyValueClassesSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DuplicateKeyValueClassesSelfTest.java
+@@ -17,11 +17,9 @@
+ 
+ package org.apache.ignite.internal.processors.cache.index;
+ 
++import java.util.UUID;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.UUID;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -31,7 +29,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class DuplicateKeyValueClassesSelfTest extends GridCommonAbstractTest {
++public class DuplicateKeyValueClassesSelfTest extends AbstractIndexingCommonTest {
+     /** Cache name. */
+     private static final String CACHE_NAME = "cache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DynamicColumnsAbstractTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DynamicColumnsAbstractTest.java
+index 1c48e3ba1f..2507601a85 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DynamicColumnsAbstractTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/DynamicColumnsAbstractTest.java
+@@ -39,7 +39,6 @@ import org.apache.ignite.internal.processors.query.IgniteSQLException;
+ import org.apache.ignite.internal.processors.query.QueryField;
+ import org.apache.ignite.internal.processors.query.QueryUtils;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.h2.value.DataType;
+ 
+ import static org.apache.ignite.internal.processors.cache.index.AbstractSchemaSelfTest.connect;
+@@ -47,7 +46,7 @@ import static org.apache.ignite.internal.processors.cache.index.AbstractSchemaSe
+ /**
+  * Common stuff for dynamic columns tests.
+  */
+-public abstract class DynamicColumnsAbstractTest extends GridCommonAbstractTest {
++public abstract class DynamicColumnsAbstractTest extends AbstractIndexingCommonTest {
+     /** SQL to create test table. */
+     static final String CREATE_SQL = "CREATE TABLE IF NOT EXISTS Person (id int primary key, name varchar)";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2ConnectionLeaksSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2ConnectionLeaksSelfTest.java
+index 8dc0b62ae9..ec76a8b2e3 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2ConnectionLeaksSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2ConnectionLeaksSelfTest.java
+@@ -19,15 +19,14 @@ package org.apache.ignite.internal.processors.cache.index;
+ 
+ import java.util.Map;
+ import java.util.concurrent.CountDownLatch;
+-import org.apache.ignite.Ignite;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.util.lang.GridAbsPredicate;
++import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -36,13 +35,16 @@ import org.junit.runners.JUnit4;
+  * Test for leaks JdbcConnection on SqlFieldsQuery execute.
+  */
+ @RunWith(JUnit4.class)
+-public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
++public class H2ConnectionLeaksSelfTest extends AbstractIndexingCommonTest {
+     /** Cache name. */
+     private static final String CACHE_NAME = "cache";
+ 
+     /** Nodes count. */
+     private static final int NODE_CNT = 2;
+ 
++    /** Iterations count. */
++    private static final int ITERS = 10;
++
+     /** Keys count. */
+     private static final int KEY_CNT = 100;
+ 
+@@ -50,13 +52,10 @@ public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
+     private static final int THREAD_CNT = 100;
+ 
+     /** {@inheritDoc} */
+-    @Override protected void beforeTestsStarted() throws Exception {
+-        Ignite node = startGrids(NODE_CNT);
+-
+-        IgniteCache<Long, String> cache = node.cache(CACHE_NAME);
++    @Override protected void afterTest() throws Exception {
++        stopAllGrids();
+ 
+-        for (int i = 0; i < KEY_CNT; i++)
+-            cache.put((long)i, String.valueOf(i));
++        super.afterTest();
+     }
+ 
+     /** {@inheritDoc} */
+@@ -79,6 +78,8 @@ public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testConnectionLeaks() throws Exception {
++        startGridAndPopulateCache(NODE_CNT);
++
+         final IgniteCache cache = grid(1).cache(CACHE_NAME);
+ 
+         final CountDownLatch latch = new CountDownLatch(THREAD_CNT);
+@@ -105,6 +106,8 @@ public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testConnectionLeaksOnSqlException() throws Exception {
++        startGridAndPopulateCache(NODE_CNT);
++
+         final CountDownLatch latch = new CountDownLatch(THREAD_CNT);
+         final CountDownLatch latch2 = new CountDownLatch(1);
+ 
+@@ -142,6 +145,31 @@ public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
+         }
+     }
+ 
++    /**
++     * @throws Exception On failed.
++     */
++    @Test
++    public void testDetachedConnectionOfLocalQueryOnNodeRestart() throws Exception {
++        for (int i = 0; i < ITERS; ++i) {
++            startGridAndPopulateCache(1);
++
++            IgniteCache cache = grid(0).cache(CACHE_NAME);
++
++            // Execute unfinished & finished queries.
++            cache.query(new SqlFieldsQuery("select * from String").setLocal(true)).iterator().next();
++            cache.query(new SqlFieldsQuery("select * from String").setLocal(true)).getAll();
++            cache.query(new SqlFieldsQuery("select * from String").setLocal(true)).iterator().next();
++
++            stopAllGrids();
++
++            U.sleep(50);
++        }
++
++        stopAllGrids();
++
++        checkAllConnectionAreClosed();
++    }
++
+     /**
+      * @throws Exception On error.
+      */
+@@ -180,4 +208,18 @@ public class H2ConnectionLeaksSelfTest extends GridCommonAbstractTest {
+     private Map<Thread, ?> perThreadConnections(int nodeIdx) {
+         return ((IgniteH2Indexing)grid(nodeIdx).context().query().getIndexing()).connections().connectionsForThread();
+     }
++
++    /**
++     * @param nodes Nodes count.
++     * @throws Exception On error.
++     */
++    private void startGridAndPopulateCache(int nodes) throws Exception {
++        startGrids(NODE_CNT);
++
++        IgniteCache<Long, String> cache = grid(0).cache(CACHE_NAME);
++
++        for (int i = 0; i < KEY_CNT; i++)
++            cache.put((long)i, String.valueOf(i));
++
++    }
+ }
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCachePageEvictionTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCachePageEvictionTest.java
+index 85769ef52a..600eeefdff 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCachePageEvictionTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCachePageEvictionTest.java
+@@ -35,7 +35,6 @@ import org.apache.ignite.internal.processors.query.h2.H2RowCacheRegistry;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -44,7 +43,7 @@ import org.junit.runners.JUnit4;
+  * Tests for H2RowCacheRegistry with page eviction.
+  */
+ @RunWith(JUnit4.class)
+-public class H2RowCachePageEvictionTest extends GridCommonAbstractTest {
++public class H2RowCachePageEvictionTest extends AbstractIndexingCommonTest {
+     /** Entries count. */
+     private static final int ENTRIES = 10_000;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCacheSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCacheSelfTest.java
+index 6a177f022f..26ff6d04bc 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCacheSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/H2RowCacheSelfTest.java
+@@ -24,7 +24,6 @@ import java.util.Map;
+ import java.util.Random;
+ import java.util.Set;
+ import javax.cache.Cache;
+-
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.IgniteCheckedException;
+ import org.apache.ignite.IgniteDataStreamer;
+@@ -37,7 +36,6 @@ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.processors.query.h2.H2RowCache;
+ import org.apache.ignite.internal.processors.query.h2.opt.GridH2KeyValueRowOnheap;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jsr166.ConcurrentLinkedHashMap;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -48,7 +46,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings({"unchecked", "ConstantConditions"})
+ @RunWith(JUnit4.class)
+-public class H2RowCacheSelfTest extends GridCommonAbstractTest {
++public class H2RowCacheSelfTest extends AbstractIndexingCommonTest {
+     /** Keys count. */
+     private static final int ENTRIES = 1_000;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/IoStatisticsBasicIndexSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/IoStatisticsBasicIndexSelfTest.java
+index c0ec65c027..d02f4518d9 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/IoStatisticsBasicIndexSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/IoStatisticsBasicIndexSelfTest.java
+@@ -37,13 +37,12 @@ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.stat.IoStatisticsManager;
+ import org.apache.ignite.internal.stat.IoStatisticsType;
+ import org.apache.ignite.internal.util.typedef.internal.S;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Assert;
+ 
+ /**
+  * A set of basic tests for caches with indexes.
+  */
+-public class IoStatisticsBasicIndexSelfTest extends GridCommonAbstractTest {
++public class IoStatisticsBasicIndexSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NUMBER_OF_PK_SORTED_INDEXES = 1;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/LongIndexNameTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/LongIndexNameTest.java
+index c1d6eea83c..991f9107cb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/LongIndexNameTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/LongIndexNameTest.java
+@@ -17,6 +17,9 @@
+ 
+ package org.apache.ignite.internal.processors.cache.index;
+ 
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
+ import org.apache.ignite.Ignite;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.QueryEntity;
+@@ -25,13 +28,9 @@ import org.apache.ignite.cache.affinity.rendezvous.RendezvousAffinityFunction;
+ import org.apache.ignite.cache.query.QueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.configuration.DataStorageConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.jetbrains.annotations.NotNull;
+-import java.util.ArrayList;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -40,7 +39,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class LongIndexNameTest extends GridCommonAbstractTest {
++public class LongIndexNameTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
+         return super.getConfiguration(igniteInstanceName)
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/MvccEmptyTransactionSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/MvccEmptyTransactionSelfTest.java
+index 0db97fcb20..2d809e6126 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/MvccEmptyTransactionSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/MvccEmptyTransactionSelfTest.java
+@@ -17,18 +17,16 @@
+ 
+ package org.apache.ignite.internal.processors.cache.index;
+ 
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.Statement;
++import java.util.List;
+ import org.apache.ignite.Ignite;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.Ignition;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.apache.ignite.transactions.Transaction;
+-
+-import java.sql.Connection;
+-import java.sql.DriverManager;
+-import java.sql.Statement;
+-import java.util.List;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -37,7 +35,7 @@ import org.junit.runners.JUnit4;
+  * Test for empty transaction while is then enlisted with real value.
+  */
+ @RunWith(JUnit4.class)
+-public class MvccEmptyTransactionSelfTest extends GridCommonAbstractTest {
++public class MvccEmptyTransactionSelfTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected void afterTest() throws Exception {
+         stopAllGrids();
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/OptimizedMarshallerIndexNameTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/OptimizedMarshallerIndexNameTest.java
+index fb5e2d0a01..a89237f602 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/OptimizedMarshallerIndexNameTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/OptimizedMarshallerIndexNameTest.java
+@@ -17,6 +17,12 @@
+ 
+ package org.apache.ignite.internal.processors.cache.index;
+ 
++import java.io.Externalizable;
++import java.io.IOException;
++import java.io.ObjectInput;
++import java.io.ObjectOutput;
++import java.util.List;
++import java.util.UUID;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+@@ -31,15 +37,7 @@ import org.apache.ignite.internal.processors.cache.query.SqlFieldsQueryEx;
+ import org.apache.ignite.internal.processors.query.QueryUtils;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.testframework.junits.IgniteTestResources;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.NotNull;
+-
+-import java.io.Externalizable;
+-import java.io.IOException;
+-import java.io.ObjectInput;
+-import java.io.ObjectOutput;
+-import java.util.List;
+-import java.util.UUID;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -54,7 +52,7 @@ import static org.apache.ignite.cache.CacheWriteSynchronizationMode.FULL_SYNC;
+  */
+ 
+ @RunWith(JUnit4.class)
+-public class OptimizedMarshallerIndexNameTest extends GridCommonAbstractTest {
++public class OptimizedMarshallerIndexNameTest extends AbstractIndexingCommonTest {
+     /** Test name 1 */
+     private static final String TEST_NAME1 = "Name1";
+     /** Test name 2 */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/QueryEntityValidationSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/QueryEntityValidationSelfTest.java
+index ace76354f1..4029f0bec6 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/QueryEntityValidationSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/cache/index/QueryEntityValidationSelfTest.java
+@@ -17,18 +17,16 @@
+ 
+ package org.apache.ignite.internal.processors.cache.index;
+ 
+-import org.apache.ignite.IgniteCheckedException;
+-import org.apache.ignite.cache.QueryEntity;
+-import org.apache.ignite.cache.QueryIndex;
+-import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.concurrent.Callable;
++import org.apache.ignite.IgniteCheckedException;
++import org.apache.ignite.cache.QueryEntity;
++import org.apache.ignite.cache.QueryIndex;
++import org.apache.ignite.configuration.CacheConfiguration;
++import org.apache.ignite.testframework.GridTestUtils;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -37,7 +35,7 @@ import org.junit.runners.JUnit4;
+  * Tests for query entity validation.
+  */
+ @RunWith(JUnit4.class)
+-public class QueryEntityValidationSelfTest extends GridCommonAbstractTest {
++public class QueryEntityValidationSelfTest extends AbstractIndexingCommonTest {
+     /** Cache name. */
+     private static final String CACHE_NAME = "cache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/database/baseline/IgniteStableBaselineBinObjFieldsQuerySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/database/baseline/IgniteStableBaselineBinObjFieldsQuerySelfTest.java
+index 4b2d5781ce..fd90868196 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/database/baseline/IgniteStableBaselineBinObjFieldsQuerySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/database/baseline/IgniteStableBaselineBinObjFieldsQuerySelfTest.java
+@@ -70,8 +70,8 @@ public class IgniteStableBaselineBinObjFieldsQuerySelfTest extends IgniteBinaryO
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         cleanPersistenceDir();
++
++        super.afterTestsStopped();
+     }
+ }
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlDistributedJoinSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlDistributedJoinSelfTest.java
+index f3968ad49f..fdc0071745 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlDistributedJoinSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlDistributedJoinSelfTest.java
+@@ -25,7 +25,7 @@ import org.apache.ignite.cache.query.SqlQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -34,7 +34,7 @@ import org.junit.runners.JUnit4;
+  * Tests for correct distributed sql joins.
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlDistributedJoinSelfTest extends GridCommonAbstractTest {
++public class IgniteSqlDistributedJoinSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlEntryCacheModeAgnosticTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlEntryCacheModeAgnosticTest.java
+index e87e72345d..71d31682da 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlEntryCacheModeAgnosticTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlEntryCacheModeAgnosticTest.java
+@@ -16,16 +16,15 @@
+  */
+ package org.apache.ignite.internal.processors.query;
+ 
++import java.util.List;
+ import org.apache.ignite.Ignite;
+ import org.apache.ignite.cache.affinity.rendezvous.RendezvousAffinityFunction;
+ import org.apache.ignite.cache.query.QueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.F;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.List;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -39,7 +38,7 @@ import static org.apache.ignite.cache.CacheMode.REPLICATED;
+  * Test different cache modes for query entry
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlEntryCacheModeAgnosticTest extends GridCommonAbstractTest {
++public class IgniteSqlEntryCacheModeAgnosticTest extends AbstractIndexingCommonTest {
+     /** Host. */
+     public static final String HOST = "127.0.0.1";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatCollocatedTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatCollocatedTest.java
+index 36250e9044..cb525433fb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatCollocatedTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatCollocatedTest.java
+@@ -30,7 +30,7 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -40,7 +40,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteSqlGroupConcatCollocatedTest extends GridCommonAbstractTest {
++public class IgniteSqlGroupConcatCollocatedTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int CLIENT = 7;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatNotCollocatedTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatNotCollocatedTest.java
+index af40c76392..13d8c3670f 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatNotCollocatedTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlGroupConcatNotCollocatedTest.java
+@@ -28,8 +28,8 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -39,7 +39,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteSqlGroupConcatNotCollocatedTest extends GridCommonAbstractTest {
++public class IgniteSqlGroupConcatNotCollocatedTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int CLIENT = 7;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlKeyValueFieldsTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlKeyValueFieldsTest.java
+index 36a1cc0137..9cfc960e58 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlKeyValueFieldsTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlKeyValueFieldsTest.java
+@@ -17,6 +17,11 @@
+ 
+ package org.apache.ignite.internal.processors.query;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.concurrent.Callable;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.IgniteCheckedException;
+ import org.apache.ignite.cache.QueryEntity;
+@@ -26,16 +31,10 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.binary.BinaryMarshaller;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.version.GridCacheVersion;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+-import java.util.concurrent.Callable;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -44,7 +43,7 @@ import org.junit.runners.JUnit4;
+  * Test hidden _key, _val, _ver columns
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlKeyValueFieldsTest  extends GridCommonAbstractTest {
++public class IgniteSqlKeyValueFieldsTest  extends AbstractIndexingCommonTest {
+     /** */
+     private static String NODE_BAD_CONF_MISS_KEY_FIELD = "badConf1";
+     /** */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlNotNullConstraintTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlNotNullConstraintTest.java
+index 33660b24c1..23e852d141 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlNotNullConstraintTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlNotNullConstraintTest.java
+@@ -46,12 +46,12 @@ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.configuration.NearCacheConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.processors.cache.DynamicCacheDescriptor;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.X;
+ import org.apache.ignite.lang.IgniteBiInClosure;
+ import org.apache.ignite.lang.IgniteBiTuple;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.apache.ignite.transactions.Transaction;
+ import org.apache.ignite.transactions.TransactionConcurrency;
+ import org.apache.ignite.transactions.TransactionIsolation;
+@@ -62,7 +62,7 @@ import org.junit.runners.JUnit4;
+ 
+ /** */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlNotNullConstraintTest extends GridCommonAbstractTest {
++public class IgniteSqlNotNullConstraintTest extends AbstractIndexingCommonTest {
+     /** Name of client node. */
+     private static String NODE_CLIENT = "client";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlParameterizedQueryTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlParameterizedQueryTest.java
+index 2c1416ba64..acb51b9189 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlParameterizedQueryTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlParameterizedQueryTest.java
+@@ -30,7 +30,7 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -43,7 +43,7 @@ import org.junit.runners.JUnit4;
+  * @see <a href="https://issues.apache.org/jira/browse/IGNITE-6286">IGNITE-6286</a>
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlParameterizedQueryTest extends GridCommonAbstractTest {
++public class IgniteSqlParameterizedQueryTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final String CACHE_BOOKMARK = "Bookmark";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlQueryParallelismTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlQueryParallelismTest.java
+index a342716218..33671c1342 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlQueryParallelismTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlQueryParallelismTest.java
+@@ -27,8 +27,8 @@ import org.apache.ignite.cache.CacheMode;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -38,7 +38,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteSqlQueryParallelismTest extends GridCommonAbstractTest {
++public class IgniteSqlQueryParallelismTest extends AbstractIndexingCommonTest {
+     /** */
+     private boolean isClient = false;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlRoutingTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlRoutingTest.java
+index 7a70d7fc80..a0caaf5abb 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlRoutingTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlRoutingTest.java
+@@ -17,20 +17,6 @@
+ 
+ package org.apache.ignite.internal.processors.query;
+ 
+-import org.apache.ignite.IgniteCache;
+-import org.apache.ignite.cache.CacheKeyConfiguration;
+-import org.apache.ignite.cache.CacheMode;
+-import org.apache.ignite.cache.QueryEntity;
+-import org.apache.ignite.cache.affinity.AffinityKeyMapped;
+-import org.apache.ignite.cache.query.SqlFieldsQuery;
+-import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.events.CacheQueryExecutedEvent;
+-import org.apache.ignite.events.Event;
+-import org.apache.ignite.internal.binary.BinaryMarshaller;
+-import org.apache.ignite.lang.IgnitePredicate;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+ import java.nio.ByteBuffer;
+ import java.sql.Timestamp;
+ import java.text.DateFormat;
+@@ -46,6 +32,19 @@ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.atomic.AtomicInteger;
++import org.apache.ignite.IgniteCache;
++import org.apache.ignite.cache.CacheKeyConfiguration;
++import org.apache.ignite.cache.CacheMode;
++import org.apache.ignite.cache.QueryEntity;
++import org.apache.ignite.cache.affinity.AffinityKeyMapped;
++import org.apache.ignite.cache.query.SqlFieldsQuery;
++import org.apache.ignite.configuration.CacheConfiguration;
++import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.events.CacheQueryExecutedEvent;
++import org.apache.ignite.events.Event;
++import org.apache.ignite.internal.binary.BinaryMarshaller;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
++import org.apache.ignite.lang.IgnitePredicate;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -55,7 +54,7 @@ import static org.apache.ignite.events.EventType.EVT_CACHE_QUERY_EXECUTED;
+ 
+ /** Tests for query partitions derivation. */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlRoutingTest extends GridCommonAbstractTest {
++public class IgniteSqlRoutingTest extends AbstractIndexingCommonTest {
+     /** */
+     private static String NODE_CLIENT = "client";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSchemaIndexingTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSchemaIndexingTest.java
+index ae608dc781..c700b70d68 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSchemaIndexingTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSchemaIndexingTest.java
+@@ -30,9 +30,9 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Ignore;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -43,7 +43,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteSqlSchemaIndexingTest extends GridCommonAbstractTest {
++public class IgniteSqlSchemaIndexingTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected IgniteConfiguration getConfiguration() throws Exception {
+         IgniteConfiguration cfg = super.getConfiguration();
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSegmentedIndexSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSegmentedIndexSelfTest.java
+index 4d786e4ce3..d9d46ebdde 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSegmentedIndexSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSegmentedIndexSelfTest.java
+@@ -34,7 +34,7 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -43,7 +43,7 @@ import org.junit.runners.JUnit4;
+  * Tests for correct distributed queries with index consisted of many segments.
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlSegmentedIndexSelfTest extends GridCommonAbstractTest {
++public class IgniteSqlSegmentedIndexSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final String ORG_CACHE_NAME = "org";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest.java
+index 42cfc1be5a..d1be29d3e2 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest.java
+@@ -30,9 +30,9 @@ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.query.SqlFieldsQueryEx;
+ import org.apache.ignite.internal.util.typedef.F;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -41,7 +41,7 @@ import org.junit.runners.JUnit4;
+  * Tests for {@link SqlFieldsQueryEx#skipReducerOnUpdate} flag.
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest extends GridCommonAbstractTest {
++public class IgniteSqlSkipReducerOnUpdateDmlFlagSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODE_COUNT = 4;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlSelfTest.java
+index ad4102d50c..b8015d35f7 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSkipReducerOnUpdateDmlSelfTest.java
+@@ -43,6 +43,7 @@ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.events.CacheQueryExecutedEvent;
+ import org.apache.ignite.events.Event;
+ import org.apache.ignite.internal.IgniteInternalFuture;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.query.SqlFieldsQueryEx;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.processors.query.h2.twostep.GridMapQueryExecutor;
+@@ -51,7 +52,6 @@ import org.apache.ignite.internal.util.lang.GridAbsPredicate;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.lang.IgnitePredicate;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -64,7 +64,7 @@ import static org.apache.ignite.events.EventType.EVT_CACHE_QUERY_EXECUTED;
+  */
+ @SuppressWarnings({"unchecked"})
+ @RunWith(JUnit4.class)
+-public class IgniteSqlSkipReducerOnUpdateDmlSelfTest extends GridCommonAbstractTest {
++public class IgniteSqlSkipReducerOnUpdateDmlSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static int NODE_COUNT = 4;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSplitterSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSplitterSelfTest.java
+index 49ae546625..5d7a338c71 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSplitterSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/IgniteSqlSplitterSelfTest.java
+@@ -46,13 +46,13 @@ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.GridMergeIndex;
+ import org.apache.ignite.internal.util.GridRandom;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.X;
+ import org.apache.ignite.internal.util.typedef.internal.SB;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.apache.ignite.testsuites.IgniteIgnore;
+ import org.junit.Ignore;
+ import org.junit.Test;
+@@ -65,7 +65,7 @@ import org.springframework.util.StringUtils;
+  */
+ @SuppressWarnings("unchecked")
+ @RunWith(JUnit4.class)
+-public class IgniteSqlSplitterSelfTest extends GridCommonAbstractTest {
++public class IgniteSqlSplitterSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int CLIENT = 7;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/LazyQuerySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/LazyQuerySelfTest.java
+index 49b6d55684..cb827da601 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/LazyQuerySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/LazyQuerySelfTest.java
+@@ -17,6 +17,10 @@
+ 
+ package org.apache.ignite.internal.processors.query;
+ 
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.concurrent.ThreadLocalRandom;
+ import org.apache.ignite.Ignite;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.Ignition;
+@@ -25,16 +29,11 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.internal.IgniteKernal;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.processors.query.h2.twostep.MapQueryLazyWorker;
+ import org.apache.ignite.internal.util.lang.GridAbsPredicate;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.ArrayList;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.concurrent.ThreadLocalRandom;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -43,7 +42,7 @@ import org.junit.runners.JUnit4;
+  * Tests for lazy query execution.
+  */
+ @RunWith(JUnit4.class)
+-public class LazyQuerySelfTest extends GridCommonAbstractTest {
++public class LazyQuerySelfTest extends AbstractIndexingCommonTest {
+     /** Keys ocunt. */
+     private static final int KEY_CNT = 200;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/MultipleStatementsSqlQuerySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/MultipleStatementsSqlQuerySelfTest.java
+index 2c07349d8a..cc5bec3994 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/MultipleStatementsSqlQuerySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/MultipleStatementsSqlQuerySelfTest.java
+@@ -23,8 +23,8 @@ import org.apache.ignite.cache.query.FieldsQueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.processors.cache.QueryCursorImpl;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -33,7 +33,7 @@ import org.junit.runners.JUnit4;
+  * Tests for schemas.
+  */
+ @RunWith(JUnit4.class)
+-public class MultipleStatementsSqlQuerySelfTest extends GridCommonAbstractTest {
++public class MultipleStatementsSqlQuerySelfTest extends AbstractIndexingCommonTest {
+     /** Node. */
+     private IgniteEx node;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/RunningQueriesTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/RunningQueriesTest.java
+index 810f41893e..f1f02a34b0 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/RunningQueriesTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/RunningQueriesTest.java
+@@ -53,6 +53,7 @@ import org.apache.ignite.internal.managers.discovery.DiscoveryCustomMessage;
+ import org.apache.ignite.internal.processors.cache.DynamicCacheChangeBatch;
+ import org.apache.ignite.internal.processors.cache.distributed.dht.atomic.GridNearAtomicFullUpdateRequest;
+ import org.apache.ignite.internal.processors.cache.distributed.dht.atomic.GridNearAtomicSingleUpdateFilterRequest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.mvcc.MvccQueryTracker;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.processors.query.schema.message.SchemaProposeDiscoveryMessage;
+@@ -63,7 +64,6 @@ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+ import org.apache.ignite.spi.discovery.DiscoverySpiCustomMessage;
+ import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+ import org.junit.Assert;
+ import org.junit.Test;
+@@ -76,7 +76,7 @@ import static org.apache.ignite.internal.util.IgniteUtils.resolveIgnitePath;
+  * Tests for running queries.
+  */
+ @RunWith(JUnit4.class)
+-public class RunningQueriesTest extends GridCommonAbstractTest {
++public class RunningQueriesTest extends AbstractIndexingCommonTest {
+     /** Timeout in sec. */
+     private static final long TIMEOUT_IN_SEC = 5;
+ 
+@@ -119,11 +119,11 @@ public class RunningQueriesTest extends GridCommonAbstractTest {
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         stopAllGrids();
+ 
+         ignite = null;
++
++        super.afterTestsStopped();
+     }
+ 
+     /** {@inheritDoc} */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlIllegalSchemaSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlIllegalSchemaSelfTest.java
+index 51dc4dc46a..4787014195 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlIllegalSchemaSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlIllegalSchemaSelfTest.java
+@@ -26,9 +26,9 @@ import org.apache.ignite.IgniteException;
+ import org.apache.ignite.Ignition;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -39,7 +39,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings({"ThrowableNotThrown", "unchecked"})
+ @RunWith(JUnit4.class)
+-public class SqlIllegalSchemaSelfTest extends GridCommonAbstractTest {
++public class SqlIllegalSchemaSelfTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected void afterTest() throws Exception {
+         stopAllGrids();
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlLocalQueryConnectionAndStatementTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlLocalQueryConnectionAndStatementTest.java
+new file mode 100644
+index 0000000000..e12cc6a437
+--- /dev/null
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlLocalQueryConnectionAndStatementTest.java
+@@ -0,0 +1,114 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ignite.internal.processors.query;
++
++import java.util.Iterator;
++import java.util.List;
++import org.apache.ignite.cache.query.FieldsQueryCursor;
++import org.apache.ignite.cache.query.SqlFieldsQuery;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.junit.runners.JUnit4;
++
++/**
++ * Test for statement reuse.
++ */
++@RunWith(JUnit4.class)
++public class SqlLocalQueryConnectionAndStatementTest extends AbstractIndexingCommonTest {
++    /** {@inheritDoc} */
++    public void beforeTestsStarted() throws Exception {
++        super.beforeTestsStarted();
++
++        startGrids(1);
++    }
++
++    /** {@inheritDoc} */
++    @Override protected void afterTestsStopped() throws Exception {
++        stopAllGrids();
++
++        super.afterTestsStopped();
++    }
++
++    /**
++     */
++    @Test
++    public void testReplicated() {
++        sql("CREATE TABLE repl_tbl (id LONG PRIMARY KEY, val LONG) WITH \"template=replicated\"").getAll();
++
++        try {
++            for (int i = 0; i < 10; i++)
++                sql("insert into repl_tbl(id,val) VALUES(" + i + "," + i + ")").getAll();
++
++            Iterator<List<?>> it0 = sql(new SqlFieldsQuery("SELECT * FROM repl_tbl where id > ?").setArgs(1)).iterator();
++
++            it0.next();
++
++            sql(new SqlFieldsQuery("SELECT * FROM repl_tbl where id > ?").setArgs(1)).getAll();
++
++            it0.next();
++        }
++        finally {
++            sql("DROP TABLE repl_tbl").getAll();
++        }
++    }
++
++    /**
++     */
++    @Test
++    public void testLocalQuery() {
++        sql("CREATE TABLE tbl (id LONG PRIMARY KEY, val LONG)").getAll();
++
++        try {
++            for (int i = 0; i < 10; i++)
++                sql("insert into tbl(id,val) VALUES(" + i + "," + i + ")").getAll();
++
++            Iterator<List<?>> it0 = sql(
++                new SqlFieldsQuery("SELECT * FROM tbl where id > ?")
++                    .setArgs(1)
++                    .setLocal(true))
++                .iterator();
++
++            it0.next();
++
++            sql(new SqlFieldsQuery("SELECT * FROM tbl where id > ?").setArgs(1).setLocal(true)).getAll();
++
++            it0.next();
++        }
++        finally {
++            sql("DROP TABLE tbl").getAll();
++        }
++    }
++
++    /**
++     * @param sql SQL query.
++     * @return Results.
++     */
++    private FieldsQueryCursor<List<?>> sql(String sql) {
++        return sql(new SqlFieldsQuery(sql));
++    }
++
++    /**
++     * @param qry SQL query.
++     * @return Results.
++     */
++    private FieldsQueryCursor<List<?>> sql(SqlFieldsQuery qry) {
++        GridQueryProcessor qryProc = grid(0).context().query();
++
++        return qryProc.querySqlFields(qry, true);
++    }
++}
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlNestedQuerySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlNestedQuerySelfTest.java
+index c21b1dc008..eaf4ee4eba 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlNestedQuerySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlNestedQuerySelfTest.java
+@@ -20,7 +20,7 @@ package org.apache.ignite.internal.processors.query;
+ import java.util.List;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.internal.IgniteEx;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -29,7 +29,7 @@ import org.junit.runners.JUnit4;
+  * Tests for schemas.
+  */
+ @RunWith(JUnit4.class)
+-public class SqlNestedQuerySelfTest extends GridCommonAbstractTest {
++public class SqlNestedQuerySelfTest extends AbstractIndexingCommonTest {
+     /** Node. */
+     private IgniteEx node;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlPushDownFunctionTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlPushDownFunctionTest.java
+index a36b4796f7..6df8274a13 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlPushDownFunctionTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlPushDownFunctionTest.java
+@@ -20,7 +20,7 @@ package org.apache.ignite.internal.processors.query;
+ import java.util.List;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.internal.IgniteEx;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -29,7 +29,7 @@ import org.junit.runners.JUnit4;
+  * Tests for schemas.
+  */
+ @RunWith(JUnit4.class)
+-public class SqlPushDownFunctionTest extends GridCommonAbstractTest {
++public class SqlPushDownFunctionTest extends AbstractIndexingCommonTest {
+     /** Node. */
+     private IgniteEx node;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSchemaSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSchemaSelfTest.java
+index 19aa991fff..0a60c22ea1 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSchemaSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSchemaSelfTest.java
+@@ -29,11 +29,11 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.schema.SchemaOperationException;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.X;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -42,7 +42,7 @@ import org.junit.runners.JUnit4;
+  * Tests for schemas.
+  */
+ @RunWith(JUnit4.class)
+-public class SqlSchemaSelfTest extends GridCommonAbstractTest {
++public class SqlSchemaSelfTest extends AbstractIndexingCommonTest {
+     /** Person cache name. */
+     private static final String CACHE_PERSON = "PersonCache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSystemViewsSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSystemViewsSelfTest.java
+index 5be574c354..2d277623d4 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSystemViewsSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/SqlSystemViewsSelfTest.java
+@@ -47,6 +47,7 @@ import org.apache.ignite.configuration.TopologyValidator;
+ import org.apache.ignite.internal.ClusterMetricsSnapshot;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.IgniteNodeAttributes;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.query.IgniteQueryErrorCode;
+ import org.apache.ignite.internal.util.lang.GridNodePredicate;
+ import org.apache.ignite.internal.util.typedef.F;
+@@ -55,7 +56,6 @@ import org.apache.ignite.internal.util.typedef.X;
+ import org.apache.ignite.lang.IgniteFuture;
+ import org.apache.ignite.lang.IgniteRunnable;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -64,7 +64,7 @@ import org.junit.runners.JUnit4;
+  * Tests for ignite SQL system views.
+  */
+ @RunWith(JUnit4.class)
+-public class SqlSystemViewsSelfTest extends GridCommonAbstractTest {
++public class SqlSystemViewsSelfTest extends AbstractIndexingCommonTest {
+     /** Metrics check attempts. */
+     private static final int METRICS_CHECK_ATTEMPTS = 10;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/CacheQueryEntityWithDateTimeApiFieldsTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/CacheQueryEntityWithDateTimeApiFieldsTest.java
+index d340b02be0..b84f035ddc 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/CacheQueryEntityWithDateTimeApiFieldsTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/CacheQueryEntityWithDateTimeApiFieldsTest.java
+@@ -34,16 +34,16 @@ import org.apache.ignite.cache.CacheWriteSynchronizationMode;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ 
+ /**
+  * Tests queries against entities with Java 8 Date and Time API fields.
+  */
+ @RunWith(JUnit4.class)
+-public class CacheQueryEntityWithDateTimeApiFieldsTest extends GridCommonAbstractTest {
++public class CacheQueryEntityWithDateTimeApiFieldsTest extends AbstractIndexingCommonTest {
+     /**
+      *  The number of days subtracted from the current time when constructing
+      *  {@link LocalDate} and {@link LocalDateTime}
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexRebuildSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexRebuildSelfTest.java
+index 5bbb4e28ad..92f1d0315f 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexRebuildSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexRebuildSelfTest.java
+@@ -87,9 +87,9 @@ public class GridIndexRebuildSelfTest extends DynamicIndexAbstractSelfTest {
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         cleanPersistenceDir();
++
++        super.afterTestsStopped();
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexingSpiAbstractSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexingSpiAbstractSelfTest.java
+index 716cd029da..2c7eb62943 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexingSpiAbstractSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/GridIndexingSpiAbstractSelfTest.java
+@@ -17,6 +17,11 @@
+ 
+ package org.apache.ignite.internal.processors.query.h2;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
+ import org.apache.ignite.IgniteLogger;
+ import org.apache.ignite.cache.QueryEntity;
+ import org.apache.ignite.cache.QueryIndex;
+@@ -25,17 +30,11 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
+ import org.apache.ignite.internal.binary.BinaryMarshaller;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.GridQueryFieldsResult;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.testframework.GridStringLogger;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.LinkedHashMap;
+-import java.util.List;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -44,7 +43,7 @@ import org.junit.runners.JUnit4;
+  * Tests for all SQL based indexing SPI implementations.
+  */
+ @RunWith(JUnit4.class)
+-public abstract class GridIndexingSpiAbstractSelfTest extends GridCommonAbstractTest {
++public abstract class GridIndexingSpiAbstractSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final LinkedHashMap<String, String> fieldsAA = new LinkedHashMap<>();
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2ResultSetIteratorNullifyOnEndSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2ResultSetIteratorNullifyOnEndSelfTest.java
+index 02c5cba88a..25474b2c7d 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2ResultSetIteratorNullifyOnEndSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2ResultSetIteratorNullifyOnEndSelfTest.java
+@@ -26,9 +26,9 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.internal.processors.cache.QueryCursorImpl;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.GridQueryCacheObjectsIterator;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -37,7 +37,7 @@ import org.junit.runners.JUnit4;
+  * Test for iterator data link erasure after closing or completing
+  */
+ @RunWith(JUnit4.class)
+-public class H2ResultSetIteratorNullifyOnEndSelfTest extends GridCommonAbstractTest {
++public class H2ResultSetIteratorNullifyOnEndSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2StatementCacheSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2StatementCacheSelfTest.java
+index f3bd8d7f7a..b34da2d67d 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2StatementCacheSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/H2StatementCacheSelfTest.java
+@@ -18,7 +18,7 @@
+ package org.apache.ignite.internal.processors.query.h2;
+ 
+ import java.sql.PreparedStatement;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -27,8 +27,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class H2StatementCacheSelfTest extends GridCommonAbstractTest {
+-
++public class H2StatementCacheSelfTest extends AbstractIndexingCommonTest {
+     /**
+      * @throws Exception If failed.
+      */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlBigIntegerKeyTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlBigIntegerKeyTest.java
+index 262beabeb1..8ecc0a927e 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlBigIntegerKeyTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlBigIntegerKeyTest.java
+@@ -25,7 +25,7 @@ import org.apache.ignite.cache.query.QueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -34,7 +34,7 @@ import org.junit.runners.JUnit4;
+  * Ensures that BigInteger can be used as key
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlBigIntegerKeyTest extends GridCommonAbstractTest {
++public class IgniteSqlBigIntegerKeyTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final String CACHE_NAME = "Mycache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlQueryMinMaxTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlQueryMinMaxTest.java
+index 2d1409a304..584097df6c 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlQueryMinMaxTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/IgniteSqlQueryMinMaxTest.java
+@@ -17,6 +17,7 @@
+ 
+ package org.apache.ignite.internal.processors.query.h2;
+ 
++import java.util.List;
+ import org.apache.ignite.Ignite;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.QueryCursor;
+@@ -24,16 +25,14 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+-
+-import java.util.List;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+ 
+ /** Test for SQL min() and max() optimization */
+ @RunWith(JUnit4.class)
+-public class IgniteSqlQueryMinMaxTest extends GridCommonAbstractTest {
++public class IgniteSqlQueryMinMaxTest extends AbstractIndexingCommonTest {
+     /** Name of the cache for test */
+     private static final String CACHE_NAME = "intCache";
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/PreparedStatementExSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/PreparedStatementExSelfTest.java
+index 808413bce6..25ad2a416f 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/PreparedStatementExSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/PreparedStatementExSelfTest.java
+@@ -18,7 +18,7 @@
+ package org.apache.ignite.internal.processors.query.h2;
+ 
+ import java.sql.PreparedStatement;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -27,7 +27,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class PreparedStatementExSelfTest extends GridCommonAbstractTest {
++public class PreparedStatementExSelfTest extends AbstractIndexingCommonTest {
+     /**
+      * @throws Exception If failed.
+      */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPoolSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPoolSelfTest.java
+index 7a11261a2f..05edd4181d 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPoolSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/ThreadLocalObjectPoolSelfTest.java
+@@ -18,7 +18,7 @@
+ package org.apache.ignite.internal.processors.query.h2;
+ 
+ import java.util.concurrent.CompletableFuture;
+-import org.apache.ignite.internal.processors.query.h2.ThreadLocalObjectPool.Reusable;
++import org.apache.ignite.testframework.GridTestUtils;
+ import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -30,19 +30,23 @@ import org.junit.runners.JUnit4;
+ @RunWith(JUnit4.class)
+ public class ThreadLocalObjectPoolSelfTest extends GridCommonAbstractTest {
+     /** */
+-    private ThreadLocalObjectPool<Obj> pool = new ThreadLocalObjectPool<>(Obj::new, 1);
++    private ThreadLocalObjectPool<Obj> pool = new ThreadLocalObjectPool<>(1, Obj::new, null, null);
+ 
+     /**
+      * @throws Exception If failed.
+      */
+     @Test
+     public void testObjectIsReusedAfterRecycling() throws Exception {
+-        Reusable<Obj> o1 = pool.borrow();
+-        o1.recycle();
+-        Reusable<Obj> o2 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable r1 = pool.borrow();
++
++        Obj o1 = r1.object();
++
++        r1.recycle();
+ 
+-        assertSame(o1.object(), o2.object());
+-        assertFalse(o1.object().isClosed());
++        ThreadLocalObjectPool<Obj>.Reusable r2 = pool.borrow();
++
++        assertSame(o1, r2.object());
++        assertFalse(o1.isClosed());
+     }
+ 
+     /**
+@@ -50,8 +54,8 @@ public class ThreadLocalObjectPoolSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testBorrowedObjectIsNotReturnedTwice() throws Exception {
+-        Reusable<Obj> o1 = pool.borrow();
+-        Reusable<Obj> o2 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable o1 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable o2 = pool.borrow();
+ 
+         assertNotSame(o1.object(), o2.object());
+     }
+@@ -61,12 +65,33 @@ public class ThreadLocalObjectPoolSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testObjectShouldBeClosedOnRecycleIfPoolIsFull() throws Exception {
+-        Reusable<Obj> o1 = pool.borrow();
+-        Reusable<Obj> o2 = pool.borrow();
+-        o1.recycle();
+-        o2.recycle();
++        ThreadLocalObjectPool<Obj>.Reusable r1 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable r2 = pool.borrow();
++
++        Obj o1 = r1.object();
++        Obj o2 = r2.object();
++
++        r1.recycle();
++        r2.recycle();
++
++        assertFalse(o1.isClosed());
++        assertTrue(o2.isClosed());
++    }
++
++    /**
++     * @throws Exception If failed.
++     */
++    @Test
++    public void testObjectShouldNotBeRecycledTwice() throws Exception {
++        final ThreadLocalObjectPool<Obj>.Reusable r1 = pool.borrow();
++
++        r1.recycle();
++
++        GridTestUtils.assertThrows(log, () -> {
++            r1.recycle();
+ 
+-        assertTrue(o2.object().isClosed());
++            return null;
++        }, AssertionError.class, null);
+     }
+ 
+     /**
+@@ -74,8 +99,8 @@ public class ThreadLocalObjectPoolSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testObjectShouldNotBeReturnedIfPoolIsFull() throws Exception {
+-        Reusable<Obj> o1 = pool.borrow();
+-        Reusable<Obj> o2 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable o1 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable o2 = pool.borrow();
+ 
+         o1.recycle();
+ 
+@@ -91,7 +116,7 @@ public class ThreadLocalObjectPoolSelfTest extends GridCommonAbstractTest {
+      */
+     @Test
+     public void testObjectShouldReturnedToRecyclingThreadBag() throws Exception {
+-        Reusable<Obj> o1 = pool.borrow();
++        ThreadLocalObjectPool<Obj>.Reusable o1 = pool.borrow();
+ 
+         CompletableFuture.runAsync(() -> {
+             o1.recycle();
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/database/InlineIndexHelperTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/database/InlineIndexHelperTest.java
+index 3604248215..71e0d778f8 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/database/InlineIndexHelperTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/database/InlineIndexHelperTest.java
+@@ -31,8 +31,8 @@ import org.apache.ignite.internal.mem.unsafe.UnsafeMemoryProvider;
+ import org.apache.ignite.internal.pagemem.PageIdAllocator;
+ import org.apache.ignite.internal.pagemem.PageMemory;
+ import org.apache.ignite.internal.pagemem.impl.PageMemoryNoStoreImpl;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.persistence.DataRegionMetricsImpl;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.h2.result.SortOrder;
+ import org.h2.value.CompareMode;
+ import org.h2.value.Value;
+@@ -62,7 +62,7 @@ import static org.apache.ignite.internal.processors.query.h2.database.InlineInde
+  * Simple tests for {@link InlineIndexHelper}.
+  */
+ @RunWith(JUnit4.class)
+-public class InlineIndexHelperTest extends GridCommonAbstractTest {
++public class InlineIndexHelperTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int CACHE_ID = 42;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/AbstractH2CompareQueryTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/AbstractH2CompareQueryTest.java
+index 71cb8460bd..82af63965c 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/AbstractH2CompareQueryTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/AbstractH2CompareQueryTest.java
+@@ -40,15 +40,15 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.binary.BinaryMarshaller;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+ 
+ /**
+  * Abstract test framework to compare query results from h2 database instance and mixed ignite caches (replicated and
+  * partitioned) which have the same data models and data content.
+  */
+-public abstract class AbstractH2CompareQueryTest extends GridCommonAbstractTest {
++public abstract class AbstractH2CompareQueryTest extends AbstractIndexingCommonTest {
+     /** */
+     protected static Ignite ignite;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/ExplainSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/ExplainSelfTest.java
+index 53a68ddeab..350ba6a378 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/ExplainSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/ExplainSelfTest.java
+@@ -21,10 +21,10 @@ import java.util.List;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.cache.query.IgniteQueryErrorCode;
+ import org.apache.ignite.internal.processors.query.IgniteSQLException;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -33,7 +33,7 @@ import org.junit.runners.JUnit4;
+  * Smoke checks for explain operations.
+  */
+ @RunWith(JUnit4.class)
+-public class ExplainSelfTest extends GridCommonAbstractTest {
++public class ExplainSelfTest extends AbstractIndexingCommonTest {
+     /** Ignite instance. */
+     private static IgniteEx ignite;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/GridQueryParsingTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/GridQueryParsingTest.java
+index a496580101..869c2d4289 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/GridQueryParsingTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/GridQueryParsingTest.java
+@@ -42,6 +42,7 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.GridKernalContext;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.GridQueryProcessor;
+ import org.apache.ignite.internal.processors.query.IgniteSQLException;
+ import org.apache.ignite.internal.processors.query.QueryUtils;
+@@ -49,7 +50,6 @@ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.h2.command.Prepared;
+ import org.h2.engine.Session;
+ import org.h2.jdbc.JdbcConnection;
+@@ -68,7 +68,7 @@ import static org.apache.ignite.cache.CacheWriteSynchronizationMode.FULL_SYNC;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class GridQueryParsingTest extends GridCommonAbstractTest {
++public class GridQueryParsingTest extends AbstractIndexingCommonTest {
+     /** */
+     private static Ignite ignite;
+ 
+@@ -1029,7 +1029,7 @@ public class GridQueryParsingTest extends GridCommonAbstractTest {
+ 
+         String schemaName = idx.schema(DEFAULT_CACHE_NAME);
+ 
+-        return (JdbcConnection)idx.connections().connectionForThread(schemaName);
++        return (JdbcConnection)idx.connections().connectionForThread().connection(schemaName);
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/H2CompareBigQueryTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/H2CompareBigQueryTest.java
+index f2ecfa560a..ad1f4146f8 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/H2CompareBigQueryTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/sql/H2CompareBigQueryTest.java
+@@ -117,13 +117,13 @@ public class H2CompareBigQueryTest extends AbstractH2CompareQueryTest {
+ 
+     /** {@inheritDoc} */
+     @Override protected void afterTestsStopped() throws Exception {
+-        super.afterTestsStopped();
+-
+         cacheCustOrd = null;
+         cacheReplOrd = null;
+         cacheOrdParam = null;
+         cacheCancel = null;
+         cacheExec = null;
++
++        super.afterTestsStopped();
+     }
+ 
+     /**
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/AndOperationExtractPartitionSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/AndOperationExtractPartitionSelfTest.java
+index fab61c8981..58f64e7a62 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/AndOperationExtractPartitionSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/AndOperationExtractPartitionSelfTest.java
+@@ -30,11 +30,11 @@ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.managers.communication.GridIoMessage;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.msg.GridH2QueryRequest;
+ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ 
+ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTestHelper.ORG;
+@@ -43,7 +43,7 @@ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTest
+ /**
+  * Partition pruning tests for AND operation.
+  */
+-public class AndOperationExtractPartitionSelfTest extends GridCommonAbstractTest {
++public class AndOperationExtractPartitionSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 8;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CacheQueryMemoryLeakTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CacheQueryMemoryLeakTest.java
+index 8d801e768c..38d103b219 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CacheQueryMemoryLeakTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CacheQueryMemoryLeakTest.java
+@@ -31,16 +31,16 @@ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+ 
+ /** */
+ @RunWith(JUnit4.class)
+-public class CacheQueryMemoryLeakTest extends GridCommonAbstractTest {
++public class CacheQueryMemoryLeakTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected IgniteConfiguration getConfiguration(String igniteInstanceName) throws Exception {
+         IgniteConfiguration igniteCfg = super.getConfiguration(igniteInstanceName);
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CreateTableWithDateKeySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CreateTableWithDateKeySelfTest.java
+index be22af5ed8..189f6812bf 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CreateTableWithDateKeySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/CreateTableWithDateKeySelfTest.java
+@@ -29,7 +29,7 @@ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.FieldsQueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -38,7 +38,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class CreateTableWithDateKeySelfTest extends GridCommonAbstractTest {
++public class CreateTableWithDateKeySelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 1;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheCauseRetryMessageSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheCauseRetryMessageSelfTest.java
+index 7d13503eb9..f189dbe3ef 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheCauseRetryMessageSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheCauseRetryMessageSelfTest.java
+@@ -26,12 +26,12 @@ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.managers.communication.GridIoMessage;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.messages.GridQueryCancelRequest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.msg.GridH2QueryRequest;
+ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -44,7 +44,7 @@ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTest
+  * Failed to reserve partitions for query (cache is not found on local node) Root cause test
+  */
+ @RunWith(JUnit4.class)
+-public class DisappearedCacheCauseRetryMessageSelfTest extends GridCommonAbstractTest {
++public class DisappearedCacheCauseRetryMessageSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+     /** */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheWasNotFoundMessageSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheWasNotFoundMessageSelfTest.java
+index dfc8bb6f12..efcf5e9e91 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheWasNotFoundMessageSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/DisappearedCacheWasNotFoundMessageSelfTest.java
+@@ -26,12 +26,12 @@ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.managers.communication.GridIoMessage;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.msg.GridH2QueryRequest;
+ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+ import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -44,7 +44,7 @@ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTest
+  * Grid cache context is not registered for cache id root cause message test
+  */
+ @RunWith(JUnit4.class)
+-public class DisappearedCacheWasNotFoundMessageSelfTest extends GridCommonAbstractTest {
++public class DisappearedCacheWasNotFoundMessageSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+     /** */
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/InOperationExtractPartitionSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/InOperationExtractPartitionSelfTest.java
+index c3222de3ae..bac017e714 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/InOperationExtractPartitionSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/InOperationExtractPartitionSelfTest.java
+@@ -24,18 +24,17 @@ import java.util.concurrent.atomic.LongAdder;
+ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.IgniteException;
+ import org.apache.ignite.cache.CacheMode;
+-import org.apache.ignite.cache.QueryEntity;
+ import org.apache.ignite.cache.query.FieldsQueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.cluster.ClusterNode;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.managers.communication.GridIoMessage;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.msg.GridH2QueryRequest;
+ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -45,7 +44,7 @@ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTest
+ 
+ /** */
+ @RunWith(JUnit4.class)
+-public class InOperationExtractPartitionSelfTest extends GridCommonAbstractTest {
++public class InOperationExtractPartitionSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 8;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/NonCollocatedRetryMessageSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/NonCollocatedRetryMessageSelfTest.java
+index fb64c7fa42..df0ec3a0c7 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/NonCollocatedRetryMessageSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/NonCollocatedRetryMessageSelfTest.java
+@@ -28,13 +28,13 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteInterruptedCheckedException;
+ import org.apache.ignite.internal.managers.communication.GridIoMessage;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.msg.GridH2IndexRangeRequest;
+ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.IgniteSpiException;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -45,7 +45,7 @@ import static org.apache.ignite.IgniteSystemProperties.IGNITE_SQL_RETRY_TIMEOUT;
+  * Failed to execute non-collocated query root cause message test
+  */
+ @RunWith(JUnit4.class)
+-public class NonCollocatedRetryMessageSelfTest extends GridCommonAbstractTest {
++public class NonCollocatedRetryMessageSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/RetryCauseMessageSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/RetryCauseMessageSelfTest.java
+index 69230f7c74..ccd3c105cd 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/RetryCauseMessageSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/RetryCauseMessageSelfTest.java
+@@ -31,8 +31,9 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.GridKernalContext;
+ import org.apache.ignite.internal.processors.cache.GridCacheContext;
+-import org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition;
+ import org.apache.ignite.internal.processors.cache.distributed.dht.GridReservable;
++import org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.GridQueryProcessor;
+ import org.apache.ignite.internal.processors.query.h2.H2Utils;
+ import org.apache.ignite.internal.processors.query.h2.IgniteH2Indexing;
+@@ -42,7 +43,6 @@ import org.apache.ignite.lang.IgniteInClosure;
+ import org.apache.ignite.plugin.extensions.communication.Message;
+ import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Ignore;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -58,7 +58,7 @@ import static org.apache.ignite.internal.processors.query.h2.twostep.JoinSqlTest
+  * Test for 6 retry cases
+  */
+ @RunWith(JUnit4.class)
+-public class RetryCauseMessageSelfTest extends GridCommonAbstractTest {
++public class RetryCauseMessageSelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 2;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/TableViewSubquerySelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/TableViewSubquerySelfTest.java
+index d29f9ee1ed..f323bcedac 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/TableViewSubquerySelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/query/h2/twostep/TableViewSubquerySelfTest.java
+@@ -23,7 +23,7 @@ import org.apache.ignite.IgniteCache;
+ import org.apache.ignite.cache.query.FieldsQueryCursor;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -32,7 +32,7 @@ import org.junit.runners.JUnit4;
+  *
+  */
+ @RunWith(JUnit4.class)
+-public class TableViewSubquerySelfTest extends GridCommonAbstractTest {
++public class TableViewSubquerySelfTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final int NODES_COUNT = 1;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteCachePartitionedAtomicColumnConstraintsTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteCachePartitionedAtomicColumnConstraintsTest.java
+index 2e7effef66..9c5db971db 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteCachePartitionedAtomicColumnConstraintsTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteCachePartitionedAtomicColumnConstraintsTest.java
+@@ -35,8 +35,8 @@ import org.apache.ignite.cache.CacheEntryProcessor;
+ import org.apache.ignite.cache.CacheMode;
+ import org.apache.ignite.cache.QueryEntity;
+ import org.apache.ignite.configuration.CacheConfiguration;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.util.typedef.T2;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.NotNull;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -52,7 +52,7 @@ import static org.apache.ignite.testframework.GridTestUtils.assertThrowsWithCaus
+ 
+ /** */
+ @RunWith(JUnit4.class)
+-public class IgniteCachePartitionedAtomicColumnConstraintsTest extends GridCommonAbstractTest {
++public class IgniteCachePartitionedAtomicColumnConstraintsTest extends AbstractIndexingCommonTest {
+     /** */
+     private static final long FUT_TIMEOUT = 10_000L;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteSQLColumnConstraintsTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteSQLColumnConstraintsTest.java
+index 0080bf0171..ebbeb5c1b1 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteSQLColumnConstraintsTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/IgniteSQLColumnConstraintsTest.java
+@@ -21,9 +21,9 @@ import java.math.BigDecimal;
+ import java.util.List;
+ import java.util.Objects;
+ import org.apache.ignite.cache.query.SqlFieldsQuery;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.IgniteSQLException;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -34,7 +34,7 @@ import static org.apache.ignite.internal.processors.odbc.SqlStateCode.INTERNAL_E
+ /**
+  */
+ @RunWith(JUnit4.class)
+-public class IgniteSQLColumnConstraintsTest extends GridCommonAbstractTest {
++public class IgniteSQLColumnConstraintsTest extends AbstractIndexingCommonTest {
+     /** {@inheritDoc} */
+     @Override protected void beforeTestsStarted() throws Exception {
+         startGrid(0);
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/SqlConnectorConfigurationValidationSelfTest.java b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/SqlConnectorConfigurationValidationSelfTest.java
+index cb3307e9f4..5d7b30afb8 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/SqlConnectorConfigurationValidationSelfTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/internal/processors/sql/SqlConnectorConfigurationValidationSelfTest.java
+@@ -17,6 +17,12 @@
+ 
+ package org.apache.ignite.internal.processors.sql;
+ 
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.ResultSet;
++import java.sql.Statement;
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicInteger;
+ import junit.framework.TestCase;
+ import org.apache.ignite.IgniteException;
+ import org.apache.ignite.cache.query.annotations.QuerySqlField;
+@@ -24,18 +30,11 @@ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.configuration.SqlConnectorConfiguration;
+ import org.apache.ignite.internal.binary.BinaryMarshaller;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
+ import org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+-
+-import java.sql.Connection;
+-import java.sql.DriverManager;
+-import java.sql.ResultSet;
+-import java.sql.Statement;
+-import java.util.concurrent.Callable;
+-import java.util.concurrent.atomic.AtomicInteger;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.junit.runners.JUnit4;
+@@ -45,7 +44,7 @@ import org.junit.runners.JUnit4;
+  */
+ @SuppressWarnings("deprecation")
+ @RunWith(JUnit4.class)
+-public class SqlConnectorConfigurationValidationSelfTest extends GridCommonAbstractTest {
++public class SqlConnectorConfigurationValidationSelfTest extends AbstractIndexingCommonTest {
+     /** Node index generator. */
+     private static final AtomicInteger NODE_IDX_GEN = new AtomicInteger();
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/sqltests/BaseSqlTest.java b/modules/indexing/src/test/java/org/apache/ignite/sqltests/BaseSqlTest.java
+index 2e206c92e5..3b3b41273c 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/sqltests/BaseSqlTest.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/sqltests/BaseSqlTest.java
+@@ -49,6 +49,7 @@ import org.apache.ignite.cache.query.SqlFieldsQuery;
+ import org.apache.ignite.configuration.CacheConfiguration;
+ import org.apache.ignite.configuration.IgniteConfiguration;
+ import org.apache.ignite.internal.IgniteEx;
++import org.apache.ignite.internal.processors.cache.index.AbstractIndexingCommonTest;
+ import org.apache.ignite.internal.processors.query.IgniteSQLException;
+ import org.apache.ignite.internal.util.typedef.F;
+ import org.apache.ignite.lang.IgniteBiClosure;
+@@ -56,7 +57,6 @@ import org.apache.ignite.lang.IgniteBiPredicate;
+ import org.apache.ignite.lang.IgniteClosure;
+ import org.apache.ignite.lang.IgnitePredicate;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.jetbrains.annotations.Nullable;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+@@ -66,7 +66,7 @@ import org.junit.runners.JUnit4;
+  * Test base for test for sql features.
+  */
+ @RunWith(JUnit4.class)
+-public class BaseSqlTest extends GridCommonAbstractTest {
++public class BaseSqlTest extends AbstractIndexingCommonTest {
+     /** Number of all employees. */
+     public static final long EMP_CNT = 1000L;
+ 
+diff --git a/modules/indexing/src/test/java/org/apache/ignite/testsuites/IgniteBinaryCacheQueryTestSuite2.java b/modules/indexing/src/test/java/org/apache/ignite/testsuites/IgniteBinaryCacheQueryTestSuite2.java
+index e4c918ee83..8273e9e6b7 100644
+--- a/modules/indexing/src/test/java/org/apache/ignite/testsuites/IgniteBinaryCacheQueryTestSuite2.java
++++ b/modules/indexing/src/test/java/org/apache/ignite/testsuites/IgniteBinaryCacheQueryTestSuite2.java
+@@ -52,6 +52,7 @@ import org.apache.ignite.internal.processors.query.IgniteCacheGroupsCompareQuery
+ import org.apache.ignite.internal.processors.query.IgniteCacheGroupsSqlDistributedJoinSelfTest;
+ import org.apache.ignite.internal.processors.query.IgniteCacheGroupsSqlSegmentedIndexMultiNodeSelfTest;
+ import org.apache.ignite.internal.processors.query.IgniteCacheGroupsSqlSegmentedIndexSelfTest;
++import org.apache.ignite.internal.processors.query.SqlLocalQueryConnectionAndStatementTest;
+ import org.apache.ignite.internal.processors.query.h2.CacheQueryEntityWithDateTimeApiFieldsTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.CacheQueryMemoryLeakTest;
+ import org.apache.ignite.internal.processors.query.h2.twostep.CreateTableWithDateKeySelfTest;
+@@ -134,6 +135,8 @@ public class IgniteBinaryCacheQueryTestSuite2 {
+ 
+         suite.addTest(new JUnit4TestAdapter(IgniteCacheQueriesLoadTest1.class));
+ 
++        suite.addTest(new JUnit4TestAdapter(SqlLocalQueryConnectionAndStatementTest.class));
++
+         return suite;
+     }
+ }

@@ -1,0 +1,757 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index da99d8eccf..bd41a91b64 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -16,6 +16,10 @@ Trunk (unreleased changes)
+ 
+         BOOKKEEPER-141: Run extracting ledger id from entry log files in GC thread to speed up bookie restart (Sijie Gou via ivank)
+ 
++      hedwig-server/
++      
++        BOOKKEEPER-140: Hub server doesn't subscribe remote region correctly when a region is down. (Sijie Gou via ivank)
++
+     IMPROVEMENTS:
+ 
+ Release 4.0.0 - 2011-11-30
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/common/ServerConfiguration.java b/hedwig-server/src/main/java/org/apache/hedwig/server/common/ServerConfiguration.java
+index 3a8e8ca878..791c704eeb 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/common/ServerConfiguration.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/common/ServerConfiguration.java
+@@ -58,6 +58,7 @@ public class ServerConfiguration extends AbstractConfiguration {
+     protected final static String MESSAGES_CONSUMED_THREAD_RUN_INTERVAL = "messages_consumed_thread_run_interval";
+     protected final static String BK_ENSEMBLE_SIZE = "bk_ensemble_size";
+     protected final static String BK_QUORUM_SIZE = "bk_quorum_size";
++    protected final static String RETRY_REMOTE_SUBSCRIBE_THREAD_RUN_INTERVAL = "retry_remote_subscribe_thread_run_interval";
+ 
+     // these are the derived attributes
+     protected ByteString myRegionByteString = null;
+@@ -246,6 +247,13 @@ public class ServerConfiguration extends AbstractConfiguration {
+         return conf.getInt(MESSAGES_CONSUMED_THREAD_RUN_INTERVAL, 60000);
+     }
+ 
++    // This parameter is used to determine how often we run a thread
++    // to retry those failed remote subscriptions in asynchronous mode
++    // (in milliseconds).
++    public int getRetryRemoteSubscribeThreadRunInterval() {
++        return conf.getInt(RETRY_REMOTE_SUBSCRIBE_THREAD_RUN_INTERVAL, 120000);
++    }
++
+     // This parameter is used when Bookkeeper is the persistence store
+     // and indicates what the ensemble size is (i.e. how many bookie
+     // servers to stripe the ledger entries across).
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/regions/RegionManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/regions/RegionManager.java
+index 14037334f6..517fa87484 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/regions/RegionManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/regions/RegionManager.java
+@@ -18,10 +18,16 @@
+ package org.apache.hedwig.server.regions;
+ 
+ import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.Timer;
++import java.util.TimerTask;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.apache.zookeeper.ZooKeeper;
+@@ -52,6 +58,82 @@ public class RegionManager implements SubscriptionEventListener {
+     private final PersistenceManager pm;
+     private final ArrayList<HedwigHubClient> clients = new ArrayList<HedwigHubClient>();
+     private final TopicOpQueuer queue;
++    private final ByteString myRegion;
++    // Timer for running a retry thread task to retry remote-subscription in asynchronous mode.
++    private final Timer timer = new Timer(true);
++    private final HashMap<HedwigHubClient, Set<ByteString>> retryMap =
++            new HashMap<HedwigHubClient, Set<ByteString>>();
++    // map used to track whether a topic is remote subscribed or not
++    private final ConcurrentMap<ByteString, Boolean> topicStatuses =
++            new ConcurrentHashMap<ByteString, Boolean>();
++
++    /**
++     * This is the Timer Task for retrying subscribing to remote regions
++     */
++    class RetrySubscribeTask extends TimerTask {
++
++        @Override
++        public void run() {
++            Set<HedwigHubClient> hubClients = new HashSet<HedwigHubClient>();
++            synchronized (retryMap) {
++                hubClients.addAll(retryMap.keySet());
++            }
++            if (hubClients.isEmpty()) {
++                if (LOGGER.isDebugEnabled()) {
++                    LOGGER.debug("[" + myRegion.toStringUtf8() + "] There is no hub client needs to retry subscriptions.");
++                }
++                return;
++            }
++            for (HedwigHubClient client : hubClients) {
++                Set<ByteString> topics = null;
++                synchronized (retryMap) {
++                    topics = retryMap.remove(client);
++                }
++                if (null == topics || topics.isEmpty()) {
++                    continue;
++                }
++                final AtomicBoolean done = new AtomicBoolean(false);
++                Callback<Void> postCb = new Callback<Void>() {
++                    @Override
++                    public void operationFinished(Object ctx,
++                            Void resultOfOperation) {
++                        finish();
++                    }
++                    @Override
++                    public void operationFailed(Object ctx,
++                            PubSubException exception) {
++                        finish();
++                    }
++                    void finish() {
++                        synchronized (done) {
++                            done.set(true);
++                            done.notifyAll();
++                        }
++                    }
++                };
++                Callback<Void> mcb = CallbackUtils.multiCallback(topics.size(), postCb, null);
++                for (ByteString topic : topics) {
++                    Boolean doRemoteSubscribe = topicStatuses.get(topic);
++                    // topic has been removed, no retry again
++                    if (null == doRemoteSubscribe) {
++                        mcb.operationFinished(null, null);
++                        continue;
++                    }
++                    retrySubscribe(client, topic, mcb);
++                }
++                synchronized (done) {
++                    if (done.get()) {
++                        try {
++                            done.wait();
++                        } catch (InterruptedException e) {
++                            LOGGER.warn("Exception during retrying remote subscriptions : ", e);
++                        }
++                    }
++                }
++            }
++        }
++
++    }
+ 
+     public RegionManager(final PersistenceManager pm, final ServerConfiguration cfg, final ZooKeeper zk,
+                          ScheduledExecutorService scheduler, HedwigHubClientFactory hubClientFactory) {
+@@ -61,10 +143,143 @@ public class RegionManager implements SubscriptionEventListener {
+         for (final String hub : cfg.getRegions()) {
+             clients.add(hubClientFactory.create(new HedwigSocketAddress(hub)));
+         }
++        myRegion = cfg.getMyRegionByteString();
++        if (cfg.getRetryRemoteSubscribeThreadRunInterval() > 0) {
++            timer.schedule(new RetrySubscribeTask(), 0, cfg.getRetryRemoteSubscribeThreadRunInterval());
++        }
++    }
++
++    private void putTopicInRetryMap(HedwigHubClient client, ByteString topic) {
++        if (LOGGER.isDebugEnabled()) {
++            LOGGER.debug("[" + myRegion.toStringUtf8() + "] Put topic in retry map : " + topic.toStringUtf8());
++        }
++        synchronized (retryMap) {
++            Set<ByteString> topics = retryMap.get(client);
++            if (null == topics) {
++                topics = new HashSet<ByteString>();
++                retryMap.put(client, topics);
++            }
++            topics.add(topic);
++        }
++    }
++    
++    /**
++     * Do remote subscribe for a specified topic.
++     *
++     * @param client
++     *          Hedwig Hub Client to subscribe remote topic.
++     * @param topic
++     *          Topic to subscribe.
++     * @param synchronous
++     *          Whether to wait for the callback of subscription.
++     * @param mcb
++     *          Callback to trigger after subscription is done.
++     * @param contex
++     *          Callback context
++     */
++    private void doRemoteSubscribe(final HedwigHubClient client, final ByteString topic, final boolean synchronous,
++                                   final Callback<Void> mcb, final Object context) {
++        final HedwigSubscriber sub = client.getSubscriber();
++        try {
++            if (sub.hasSubscription(topic, mySubId)) {
++                if (LOGGER.isDebugEnabled()) {
++                    LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region subscription for topic "
++                                 + topic.toStringUtf8() + " has existed before.");
++                }
++                mcb.operationFinished(null, null);
++                return;
++            }
++        } catch (PubSubException e) {
++            LOGGER.error("[" + myRegion.toStringUtf8() + "] checking cross-region subscription for topic "
++                         + topic.toStringUtf8() + " failed (this is should not happen): ", e);
++            mcb.operationFailed(context, e);
++            return;
++        }
++        sub.asyncSubscribe(topic, mySubId, CreateOrAttach.CREATE_OR_ATTACH, new Callback<Void>() {
++            @Override
++            public void operationFinished(Object ctx, Void resultOfOperation) {
++                if (LOGGER.isDebugEnabled())
++                    LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region subscription done for topic " + topic.toStringUtf8());
++                try {
++                    sub.startDelivery(topic, mySubId, new MessageHandler() {
++                        @Override
++                        public void deliver(final ByteString topic, ByteString subscriberId, Message msg,
++                        final Callback<Void> callback, final Object context) {
++                            // When messages are first published
++                            // locally, the PublishHandler sets the
++                            // source region in the Message.
++                            if (msg.hasSrcRegion()) {
++                                Message.newBuilder(msg).setMsgId(
++                                    MessageSeqId.newBuilder(msg.getMsgId()).addRemoteComponents(
++                                        RegionSpecificSeqId.newBuilder().setRegion(
++                                            msg.getSrcRegion()).setSeqId(
++                                            msg.getMsgId().getLocalComponent())));
++                            }
++                            pm.persistMessage(new PersistRequest(topic, msg, new Callback<Long>() {
++                                @Override
++                                public void operationFinished(Object ctx, Long resultOfOperation) {
++                                    if (LOGGER.isDebugEnabled())
++                                        LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region recv-fwd succeeded for topic "
++                                                     + topic.toStringUtf8());
++                                    callback.operationFinished(context, null);
++                                }
++
++                                @Override
++                                public void operationFailed(Object ctx, PubSubException exception) {
++                                    if (LOGGER.isDebugEnabled())
++                                        LOGGER.error("[" + myRegion.toStringUtf8() + "] cross-region recv-fwd failed for topic "
++                                                     + topic.toStringUtf8(), exception);
++                                    callback.operationFailed(context, exception);
++                                }
++                            }, null));
++                        }
++                    });
++                    if (LOGGER.isDebugEnabled())
++                        LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region start-delivery succeeded for topic "
++                                     + topic.toStringUtf8());
++                    mcb.operationFinished(ctx, null);
++                } catch (PubSubException ex) {
++                    if (LOGGER.isDebugEnabled())
++                        LOGGER.error(
++                                "[" + myRegion.toStringUtf8() + "] cross-region start-delivery failed for topic " + topic.toStringUtf8(), ex);
++                    mcb.operationFailed(ctx, ex);
++                }
++            }
++
++            @Override
++            public void operationFailed(Object ctx, PubSubException exception) {
++                if (LOGGER.isDebugEnabled())
++                    LOGGER.error("[" + myRegion.toStringUtf8() + "] cross-region subscribe failed for topic " + topic.toStringUtf8(),
++                                 exception);
++                if (!synchronous) {
++                    putTopicInRetryMap(client, topic);
++                }
++                mcb.operationFailed(ctx, exception);
++            }
++        }, null);
++    }
++
++    private void retrySubscribe(final HedwigHubClient client, final ByteString topic, final Callback<Void> cb) {
++        if (LOGGER.isDebugEnabled()) {
++            LOGGER.debug("[" + myRegion.toStringUtf8() + "] Retry remote subscribe topic : " + topic.toStringUtf8());
++        }
++        queue.pushAndMaybeRun(topic, queue.new AsynchronousOp<Void>(topic, cb, null) {
++            @Override
++            public void run() {
++                Boolean doRemoteSubscribe = topicStatuses.get(topic);
++                // topic has been removed, no retry again
++                if (null == doRemoteSubscribe) {
++                    cb.operationFinished(ctx, null);
++                    return;
++                }
++                doRemoteSubscribe(client, topic, false, cb, ctx);
++            }
++        });
+     }
+ 
+     @Override
+     public void onFirstLocalSubscribe(final ByteString topic, final boolean synchronous, final Callback<Void> cb) {
++        topicStatuses.put(topic, true);
+         // Whenever we acquire a topic due to a (local) subscribe, subscribe on
+         // it to all the other regions (currently using simple all-to-all
+         // topology).
+@@ -72,70 +287,11 @@ public class RegionManager implements SubscriptionEventListener {
+             @Override
+             public void run() {
+                 Callback<Void> postCb = synchronous ? cb : CallbackUtils.logger(LOGGER, 
+-                        "all cross-region subscriptions succeeded", 
+-                        "at least one cross-region subscription failed");
++                        "[" + myRegion.toStringUtf8() + "] all cross-region subscriptions succeeded", 
++                        "[" + myRegion.toStringUtf8() + "] at least one cross-region subscription failed");
+                 final Callback<Void> mcb = CallbackUtils.multiCallback(clients.size(), postCb, ctx);
+                 for (final HedwigHubClient client : clients) {
+-                    final HedwigSubscriber sub = client.getSubscriber();
+-                    sub.asyncSubscribe(topic, mySubId, CreateOrAttach.CREATE_OR_ATTACH, new Callback<Void>() {
+-                        @Override
+-                        public void operationFinished(Object ctx, Void resultOfOperation) {
+-                            if (LOGGER.isDebugEnabled())
+-                                LOGGER.debug("cross-region subscription done for topic " + topic.toStringUtf8());
+-                            try {
+-                                sub.startDelivery(topic, mySubId, new MessageHandler() {
+-                                    @Override
+-                                    public void deliver(final ByteString topic, ByteString subscriberId, Message msg,
+-                                    final Callback<Void> callback, final Object context) {
+-                                        // When messages are first published
+-                                        // locally, the PublishHandler sets the
+-                                        // source region in the Message.
+-                                        if (msg.hasSrcRegion()) {
+-                                            Message.newBuilder(msg).setMsgId(
+-                                                MessageSeqId.newBuilder(msg.getMsgId()).addRemoteComponents(
+-                                                    RegionSpecificSeqId.newBuilder().setRegion(
+-                                                        msg.getSrcRegion()).setSeqId(
+-                                                        msg.getMsgId().getLocalComponent())));
+-                                        }
+-                                        pm.persistMessage(new PersistRequest(topic, msg, new Callback<Long>() {
+-                                            @Override
+-                                            public void operationFinished(Object ctx, Long resultOfOperation) {
+-                                                if (LOGGER.isDebugEnabled())
+-                                                    LOGGER.debug("cross-region recv-fwd succeeded for topic "
+-                                                                 + topic.toStringUtf8());
+-                                                callback.operationFinished(context, null);
+-                                            }
+-
+-                                            @Override
+-                                            public void operationFailed(Object ctx, PubSubException exception) {
+-                                                if (LOGGER.isDebugEnabled())
+-                                                    LOGGER.error("cross-region recv-fwd failed for topic "
+-                                                                 + topic.toStringUtf8(), exception);
+-                                                callback.operationFailed(context, exception);
+-                                            }
+-                                        }, null));
+-                                    }
+-                                });
+-                                if (LOGGER.isDebugEnabled())
+-                                    LOGGER.debug("cross-region start-delivery succeeded for topic "
+-                                                 + topic.toStringUtf8());
+-                                mcb.operationFinished(ctx, null);
+-                            } catch (PubSubException ex) {
+-                                if (LOGGER.isDebugEnabled())
+-                                    LOGGER.error(
+-                                        "cross-region start-delivery failed for topic " + topic.toStringUtf8(), ex);
+-                                mcb.operationFailed(ctx, ex);
+-                            }
+-                        }
+-
+-                        @Override
+-                        public void operationFailed(Object ctx, PubSubException exception) {
+-                            if (LOGGER.isDebugEnabled())
+-                                LOGGER.error("cross-region subscribe failed for topic " + topic.toStringUtf8(),
+-                                             exception);
+-                            mcb.operationFailed(ctx, exception);
+-                        }
+-                    }, null);
++                    doRemoteSubscribe(client, topic, synchronous, mcb, ctx);
+                 }
+                 if (!synchronous)
+                     cb.operationFinished(null, null);
+@@ -146,6 +302,7 @@ public class RegionManager implements SubscriptionEventListener {
+ 
+     @Override
+     public void onLastLocalUnsubscribe(final ByteString topic) {
++        topicStatuses.remove(topic);
+         // TODO may want to ease up on the eager unsubscribe; this is dropping
+         // cross-region subscriptions ASAP
+         queue.pushAndMaybeRun(topic, queue.new AsynchronousOp<Void>(topic, new Callback<Void>() {
+@@ -153,13 +310,13 @@ public class RegionManager implements SubscriptionEventListener {
+             @Override
+             public void operationFinished(Object ctx, Void result) {
+                 if (LOGGER.isDebugEnabled())
+-                    LOGGER.debug("cross-region unsubscribes succeeded for topic " + topic.toStringUtf8());
++                    LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region unsubscribes succeeded for topic " + topic.toStringUtf8());
+             }
+ 
+             @Override
+             public void operationFailed(Object ctx, PubSubException exception) {
+                 if (LOGGER.isDebugEnabled())
+-                    LOGGER.error("cross-region unsubscribes failed for topic " + topic.toStringUtf8(), exception);
++                    LOGGER.error("[" + myRegion.toStringUtf8() + "] cross-region unsubscribes failed for topic " + topic.toStringUtf8(), exception);
+             }
+ 
+         }, null) {
+@@ -167,7 +324,23 @@ public class RegionManager implements SubscriptionEventListener {
+             public void run() {
+                 Callback<Void> mcb = CallbackUtils.multiCallback(clients.size(), cb, ctx);
+                 for (final HedwigHubClient client : clients) {
+-                    client.getSubscriber().asyncUnsubscribe(topic, mySubId, mcb, null);
++                    final HedwigSubscriber sub = client.getSubscriber();
++                    try {
++                        if (!sub.hasSubscription(topic, mySubId)) {
++                            if (LOGGER.isDebugEnabled()) {
++                                LOGGER.debug("[" + myRegion.toStringUtf8() + "] cross-region subscription for topic "
++                                             + topic.toStringUtf8() + " has existed before.");
++                            }
++                            mcb.operationFinished(null, null);
++                            continue;
++                        }
++                    } catch (PubSubException e) {
++                        LOGGER.error("[" + myRegion.toStringUtf8() + "] checking cross-region subscription for topic "
++                                     + topic.toStringUtf8() + " failed (this is should not happen): ", e);
++                        mcb.operationFailed(ctx, e);
++                        continue;
++                    }
++                    sub.asyncUnsubscribe(topic, mySubId, mcb, null);
+                 }
+             }
+         });
+@@ -175,6 +348,7 @@ public class RegionManager implements SubscriptionEventListener {
+ 
+     // Method to shutdown and stop all of the cross-region Hedwig clients.
+     public void stop() {
++        timer.cancel();
+         for (HedwigHubClient client : clients) {
+             client.close();
+         }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
+index 831488c25d..78d1435079 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
+@@ -218,10 +218,11 @@ public abstract class AbstractSubscriptionManager implements SubscriptionManager
+     @Override
+     public void lostTopic(ByteString topic) {
+         top2sub2seq.remove(topic);
+-        AtomicInteger count = topic2LocalCounts.remove(topic);
+-        // Notify listeners if necessary.
+-        if (null != count && count.get() > 0)
+-            notifyUnsubcribe(topic);
++        topic2LocalCounts.remove(topic);
++        // Since we decrement local count when some of remote subscriptions failed,
++        // while we don't unsubscribe those succeed subscriptions. so we can't depends
++        // on local count, just try to notify unsubscribe.
++        notifyUnsubcribe(topic);
+     }
+ 
+     private void notifyUnsubcribe(ByteString topic) {
+@@ -300,10 +301,35 @@ public abstract class AbstractSubscriptionManager implements SubscriptionManager
+                     Callback<Void> cb2 = new Callback<Void>() {
+ 
+                         @Override
+-                        public void operationFailed(Object ctx, PubSubException exception) {
++                        public void operationFailed(final Object ctx, final PubSubException exception) {
+                             logger.error("subscription for subscriber " + subscriberId.toStringUtf8() + " to topic "
+                                          + topic.toStringUtf8() + " failed due to failed listener callback", exception);
+-                            cb.operationFailed(ctx, exception);
++                            // should remove subscription when synchronized cross-region subscription failed
++                            deleteSubscriptionState(topic, subscriberId, new Callback<Void>() {
++                                @Override
++                                public void operationFinished(Object context,
++                                        Void resultOfOperation) {
++                                    finish();
++                                }
++                                @Override
++                                public void operationFailed(Object context,
++                                        PubSubException ex) {
++                                    logger.error("Remove subscription for subscriber " + subscriberId.toStringUtf8() + " to topic "
++                                                 + topic.toStringUtf8() + " failed : ", ex);
++                                    finish();
++                                }
++                                private void finish() {
++                                    // we should decrement local count when remote subscription failed
++                                    if (!SubscriptionStateUtils.isHubSubscriber(subRequest.getSubscriberId())) {
++                                        // since the subscribe op is executed one by one in queue order,
++                                        // so the following codes only happened when remote subscription failed.
++                                        // it is safe to decrement the local count so next subscribe op
++                                        // could have the chance to subscribe remote.
++                                        topic2LocalCounts.get(topic).decrementAndGet();
++                                    }
++                                    cb.operationFailed(ctx, exception);
++                                }
++                            }, ctx);
+                         }
+ 
+                         @Override
+diff --git a/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigRegionTestBase.java b/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigRegionTestBase.java
+index 0d8677b8fd..2252f436e3 100644
+--- a/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigRegionTestBase.java
++++ b/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigRegionTestBase.java
+@@ -176,23 +176,7 @@ public abstract class HedwigRegionTestBase extends TestCase {
+         regionServersMap = new HashMap<String, List<PubSubServer>>(numRegions, 1.0f);
+         regionClientsMap = new HashMap<String, HedwigClient>(numRegions, 1.0f);
+         for (int i = 0; i < numRegions; i++) {
+-            List<PubSubServer> serversList = new LinkedList<PubSubServer>();
+-            // For the current region, create the necessary amount of hub
+-            // servers. We will basically increment through the port numbers
+-            // starting from the initial ones defined.
+-            for (int j = 0; j < numServersPerRegion; j++) {
+-                serversList.add(new PubSubServer(getServerConfiguration(initialServerPort
+-                                                 + (j + i * numServersPerRegion), initialSSLServerPort + (j + i * numServersPerRegion),
+-                                                 REGION_PREFIX + i)));
+-            }
+-            // Store this list of servers created for the current region
+-            regionServersMap.put(REGION_PREFIX + i, serversList);
+-
+-            // Create a Hedwig Client that points to the first Hub server
+-            // created in the loop above for the current region.
+-            HedwigClient regionClient = new HedwigClient(getClientConfiguration(initialServerPort
+-                    + (i * numServersPerRegion), initialSSLServerPort + (i * numServersPerRegion)));
+-            regionClientsMap.put(REGION_PREFIX + i, regionClient);
++            startRegion(i);
+         }
+         logger.info("HedwigRegion test setup finished");
+     }
+@@ -219,4 +203,45 @@ public abstract class HedwigRegionTestBase extends TestCase {
+         logger.info("FINISHED " + getName());
+     }
+ 
++    protected void stopRegion(int regionIdx) throws Exception {
++        String regionName = REGION_PREFIX + regionIdx;
++        if (logger.isDebugEnabled()) {
++            logger.debug("Stop region : " + regionName);
++        }
++        HedwigClient regionClient = regionClientsMap.remove(regionName);
++        if (null != regionClient) {
++            regionClient.close();
++        }
++        List<PubSubServer> serversList = regionServersMap.remove(regionName);
++        if (null == serversList) {
++            return;
++        }
++        for (PubSubServer server : serversList) {
++            server.shutdown();
++        }
++        logger.info("Finished shutting down all of the hub servers in region " + regionName);
++    }
++
++    protected void startRegion(int i) throws Exception {
++        String regionName = REGION_PREFIX + i;
++        if (logger.isDebugEnabled()) {
++            logger.debug("Start region : " + regionName);
++        }
++        List<PubSubServer> serversList = new LinkedList<PubSubServer>();
++        // For the current region, create the necessary amount of hub
++        // servers. We will basically increment through the port numbers
++        // starting from the initial ones defined.
++        for (int j = 0; j < numServersPerRegion; j++) {
++            serversList.add(new PubSubServer(getServerConfiguration(initialServerPort
++                                             + (j + i * numServersPerRegion), initialSSLServerPort + (j + i * numServersPerRegion),
++                                             regionName)));
++        }
++        // Store this list of servers created for the current region
++        regionServersMap.put(regionName, serversList);
++        // Create a Hedwig Client that points to the first Hub server
++        // created in the loop above for the current region.
++        HedwigClient regionClient = new HedwigClient(getClientConfiguration(initialServerPort
++                + (i * numServersPerRegion), initialSSLServerPort + (i * numServersPerRegion)));
++        regionClientsMap.put(regionName, regionClient);
++    }
+ }
+diff --git a/hedwig-server/src/test/java/org/apache/hedwig/server/integration/TestHedwigRegion.java b/hedwig-server/src/test/java/org/apache/hedwig/server/integration/TestHedwigRegion.java
+index aa09ee98bc..0b1851ebbc 100644
+--- a/hedwig-server/src/test/java/org/apache/hedwig/server/integration/TestHedwigRegion.java
++++ b/hedwig-server/src/test/java/org/apache/hedwig/server/integration/TestHedwigRegion.java
+@@ -17,6 +17,8 @@
+  */
+ package org.apache.hedwig.server.integration;
+ 
++import java.util.Map;
++import java.util.Random;
+ import java.util.concurrent.SynchronousQueue;
+ 
+ import org.junit.After;
+@@ -29,6 +31,7 @@ import org.apache.hedwig.client.api.Publisher;
+ import org.apache.hedwig.protocol.PubSubProtocol.Message;
+ import org.apache.hedwig.protocol.PubSubProtocol.SubscribeRequest.CreateOrAttach;
+ import org.apache.hedwig.server.HedwigRegionTestBase;
++import org.apache.hedwig.server.common.ServerConfiguration;
+ import org.apache.hedwig.server.integration.TestHedwigHub.TestCallback;
+ import org.apache.hedwig.server.integration.TestHedwigHub.TestMessageHandler;
+ 
+@@ -38,6 +41,25 @@ public class TestHedwigRegion extends HedwigRegionTestBase {
+     private final SynchronousQueue<Boolean> queue = new SynchronousQueue<Boolean>();
+     private final SynchronousQueue<Boolean> consumeQueue = new SynchronousQueue<Boolean>();
+ 
++    private static final int TEST_RETRY_REMOTE_SUBSCRIBE_INTERVAL_VALUE = 3000;
++
++    protected class NewRegionServerConfiguration extends RegionServerConfiguration {
++
++        public NewRegionServerConfiguration(int serverPort, int sslServerPort,
++                String regionName) {
++            super(serverPort, sslServerPort, regionName);
++        }
++
++        @Override
++        public int getRetryRemoteSubscribeThreadRunInterval() {
++            return TEST_RETRY_REMOTE_SUBSCRIBE_INTERVAL_VALUE;
++        }
++    }
++
++    protected ServerConfiguration getServerConfiguration(int serverPort, int sslServerPort, String regionName) {
++        return new NewRegionServerConfiguration(serverPort, sslServerPort, regionName);
++    }
++
+     @Override
+     @Before
+     public void setUp() throws Exception {
+@@ -90,4 +112,154 @@ public class TestHedwigRegion extends HedwigRegionTestBase {
+         }
+     }
+ 
++    /**
++     * Test region shuts down when first subscription.
++     *
++     * @throws Exception
++     */
++    @Test
++    public void testSubscribeAndConsumeWhenARegionDown() throws Exception {
++        int batchSize = 10;
++
++        // first shut down a region
++        Random r = new Random();
++        int regionId = r.nextInt(numRegions);
++        stopRegion(regionId);
++        // subscribe to topics when a region shuts down
++        for (HedwigClient client : regionClientsMap.values()) {
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().asyncSubscribe(ByteString.copyFromUtf8("Topic" + i),
++                                                      ByteString.copyFromUtf8("LocalSubscriber"), CreateOrAttach.CREATE_OR_ATTACH,
++                                                      new TestCallback(queue), null);
++                assertFalse(queue.take());
++            }
++        }
++
++        // start region gain
++        startRegion(regionId);
++
++        // sub it again
++        for (Map.Entry<String, HedwigClient> entry : regionClientsMap.entrySet()) {
++            HedwigClient client = entry.getValue();
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().asyncSubscribe(ByteString.copyFromUtf8("Topic" + i),
++                                                      ByteString.copyFromUtf8("LocalSubscriber"), CreateOrAttach.CREATE_OR_ATTACH,
++                                                      new TestCallback(queue), null);
++                assertTrue(queue.take());
++            }
++        }
++
++        // Start delivery for local subscribers in all regions
++        for (Map.Entry<String, HedwigClient> entry : regionClientsMap.entrySet()) {
++            HedwigClient client = entry.getValue();
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().startDelivery(ByteString.copyFromUtf8("Topic" + i),
++                                                     ByteString.copyFromUtf8("LocalSubscriber"), new TestMessageHandler(consumeQueue));
++            }
++        }
++
++        // Now start publishing messages for the subscribed topics in one of the
++        // regions and verify that it gets delivered and consumed in all of the
++        // other ones.
++        int rid = r.nextInt(numRegions);
++        String regionName = REGION_PREFIX + rid;
++        Publisher publisher = regionClientsMap.get(regionName).getPublisher();
++        for (int i = 0; i < batchSize; i++) {
++            publisher.asyncPublish(ByteString.copyFromUtf8("Topic" + i), Message.newBuilder().setBody(
++                                   ByteString.copyFromUtf8(regionName + "-Message" + i)).build(), new TestCallback(queue), null);
++            assertTrue(queue.take());
++        }
++        // Make sure each region consumes the same set of published messages.
++        for (int i = 0; i < regionClientsMap.size(); i++) {
++            for (int j = 0; j < batchSize; j++) {
++                assertTrue(consumeQueue.take());
++            }
++        }
++    }
++
++    /**
++     * Test region shuts down when attaching existing subscriptions.
++     *
++     * @throws Exception
++     */
++    @Test
++    public void testAttachExistingSubscriptionsWhenARegionDown() throws Exception {
++        int batchSize = 10;
++        
++        // sub it remotely to make subscriptions existed
++        for (Map.Entry<String, HedwigClient> entry : regionClientsMap.entrySet()) {
++            HedwigClient client = entry.getValue();
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().asyncSubscribe(ByteString.copyFromUtf8("Topic" + i),
++                                                      ByteString.copyFromUtf8("LocalSubscriber"), CreateOrAttach.CREATE_OR_ATTACH,
++                                                      new TestCallback(queue), null);
++                assertTrue(queue.take());
++            }
++        }
++
++        // stop regions
++        for (int i=0; i<numRegions; i++) {
++            stopRegion(i);
++        }
++        // start regions again
++        for (int i=0; i<numRegions; i++) {
++            startRegion(i);
++        }
++
++        // first shut down a region
++        Random r = new Random();
++        int regionId = r.nextInt(numRegions);
++        stopRegion(regionId);
++        // subscribe to topics when a region shuts down
++        // it should succeed since the subscriptions existed before
++        for (HedwigClient client : regionClientsMap.values()) {
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().asyncSubscribe(ByteString.copyFromUtf8("Topic" + i),
++                                                      ByteString.copyFromUtf8("LocalSubscriber"), CreateOrAttach.CREATE_OR_ATTACH,
++                                                      new TestCallback(queue), null);
++                assertTrue(queue.take());
++            }
++        }
++
++        // Start delivery for local subscribers in all regions
++        for (Map.Entry<String, HedwigClient> entry : regionClientsMap.entrySet()) {
++            HedwigClient client = entry.getValue();
++            for (int i = 0; i < batchSize; i++) {
++                client.getSubscriber().startDelivery(ByteString.copyFromUtf8("Topic" + i),
++                                                     ByteString.copyFromUtf8("LocalSubscriber"), new TestMessageHandler(consumeQueue));
++            }
++        }
++
++        // start region again
++        startRegion(regionId);
++        // wait for retry
++        Thread.sleep(3 * TEST_RETRY_REMOTE_SUBSCRIBE_INTERVAL_VALUE);
++
++        String regionName = REGION_PREFIX + regionId;
++        HedwigClient client = regionClientsMap.get(regionName);
++        for (int i = 0; i < batchSize; i++) {
++            client.getSubscriber().asyncSubscribe(ByteString.copyFromUtf8("Topic" + i),
++                                                  ByteString.copyFromUtf8("LocalSubscriber"), CreateOrAttach.CREATE_OR_ATTACH,
++                                                  new TestCallback(queue), null);
++            assertTrue(queue.take());
++            client.getSubscriber().startDelivery(ByteString.copyFromUtf8("Topic" + i),
++                    ByteString.copyFromUtf8("LocalSubscriber"), new TestMessageHandler(consumeQueue));
++        }
++
++        // Now start publishing messages for the subscribed topics in one of the
++        // regions and verify that it gets delivered and consumed in all of the
++        // other ones.        
++        Publisher publisher = client.getPublisher();
++        for (int i = 0; i < batchSize; i++) {
++            publisher.asyncPublish(ByteString.copyFromUtf8("Topic" + i), Message.newBuilder().setBody(
++                                   ByteString.copyFromUtf8(regionName + "-Message" + i)).build(), new TestCallback(queue), null);
++            assertTrue(queue.take());
++        }
++        // Make sure each region consumes the same set of published messages.
++        for (int i = 0; i < regionClientsMap.size(); i++) {
++            for (int j = 0; j < batchSize; j++) {
++                assertTrue(consumeQueue.take());
++            }
++        }
++    }
+ }

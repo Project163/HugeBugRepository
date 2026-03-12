@@ -1,0 +1,444 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index f946ed4f24..41e1cdab40 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -170,6 +170,8 @@ Trunk (unreleased changes)
+ 
+         BOOKKEEPER-530: data might be lost during compaction. (ivank)
+ 
++	BOOKKEEPER-538: Race condition in BookKeeper#close (ivank via fpj)
++
+       hedwig-protocol:
+ 
+         BOOKKEEPER-394: CompositeException message is not useful (Stu Hood via sijie)
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/BookKeeper.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/BookKeeper.java
+index 20fb2e01a4..630ea6ca5c 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/BookKeeper.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/BookKeeper.java
+@@ -24,6 +24,7 @@ import java.io.IOException;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.bookkeeper.client.AsyncCallback.CreateCallback;
+ import org.apache.bookkeeper.client.AsyncCallback.DeleteCallback;
+@@ -560,6 +561,15 @@ public class BookKeeper {
+      *
+      */
+     public void close() throws InterruptedException, BKException {
++        scheduler.shutdown();
++        if (!scheduler.awaitTermination(10, TimeUnit.SECONDS)) {
++            LOG.warn("The scheduler did not shutdown cleanly");
++        }
++        mainWorkerPool.shutdown();
++        if (!mainWorkerPool.awaitTermination(10, TimeUnit.SECONDS)) {
++            LOG.warn("The mainWorkerPool did not shutdown cleanly");
++        }
++
+         bookieClient.close();
+         try {
+             ledgerManager.close();
+@@ -567,14 +577,13 @@ public class BookKeeper {
+         } catch (IOException ie) {
+             LOG.error("Failed to close ledger manager : ", ie);
+         }
+-        scheduler.shutdown();
++
+         if (ownChannelFactory) {
+             channelFactory.releaseExternalResources();
+         }
+         if (ownZKHandle) {
+             zk.close();
+         }
+-        mainWorkerPool.shutdown();
+     }
+ 
+     private static class SyncCreateCallback implements CreateCallback {
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieClient.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieClient.java
+index f1e9e88227..13a69c1869 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieClient.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieClient.java
+@@ -42,6 +42,7 @@ import org.jboss.netty.buffer.ChannelBuffer;
+ import org.jboss.netty.buffer.ChannelBuffers;
+ import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
+ import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ /**
+  * Implements the client-side part of the BookKeeper protocol.
+@@ -58,21 +59,33 @@ public class BookieClient {
+     ConcurrentHashMap<InetSocketAddress, PerChannelBookieClient> channels = new ConcurrentHashMap<InetSocketAddress, PerChannelBookieClient>();
+ 
+     private final ClientConfiguration conf;
++    private volatile boolean closed;
++    private ReentrantReadWriteLock closeLock;
+ 
+     public BookieClient(ClientConfiguration conf, ClientSocketChannelFactory channelFactory, OrderedSafeExecutor executor) {
+         this.conf = conf;
+         this.channelFactory = channelFactory;
+         this.executor = executor;
++        this.closed = false;
++        this.closeLock = new ReentrantReadWriteLock();
+     }
+ 
+     public PerChannelBookieClient lookupClient(InetSocketAddress addr) {
+         PerChannelBookieClient channel = channels.get(addr);
+ 
+         if (channel == null) {
+-            channel = new PerChannelBookieClient(conf, executor, channelFactory, addr, totalBytesOutstanding);
+-            PerChannelBookieClient prevChannel = channels.putIfAbsent(addr, channel);
+-            if (prevChannel != null) {
+-                channel = prevChannel;
++            closeLock.readLock().lock();
++            try {
++                if (closed) {
++                    return null;
++                }
++                channel = new PerChannelBookieClient(conf, executor, channelFactory, addr, totalBytesOutstanding);
++                PerChannelBookieClient prevChannel = channels.putIfAbsent(addr, channel);
++                if (prevChannel != null) {
++                    channel = prevChannel;
++                }
++            } finally {
++                closeLock.readLock().unlock();
+             }
+         }
+ 
+@@ -95,7 +108,7 @@ public class BookieClient {
+                 @Override
+                 public void safeRun() {
+                     for (PerChannelBookieClient c : clients) {
+-                        c.close();
++                        c.disconnect();
+                     }
+                 }
+             });
+@@ -104,6 +117,11 @@ public class BookieClient {
+     public void addEntry(final InetSocketAddress addr, final long ledgerId, final byte[] masterKey, final long entryId,
+             final ChannelBuffer toSend, final WriteCallback cb, final Object ctx, final int options) {
+         final PerChannelBookieClient client = lookupClient(addr);
++        if (client == null) {
++            cb.writeComplete(BKException.Code.BookieHandleNotAvailableException,
++                             ledgerId, entryId, addr, ctx);
++            return;
++        }
+ 
+         client.connectIfNeededAndDoOp(new GenericCallback<Void>() {
+             @Override
+@@ -129,6 +147,11 @@ public class BookieClient {
+                                         final ReadEntryCallback cb,
+                                         final Object ctx) {
+         final PerChannelBookieClient client = lookupClient(addr);
++        if (client == null) {
++            cb.readEntryComplete(BKException.Code.BookieHandleNotAvailableException,
++                                 ledgerId, entryId, null, ctx);
++            return;
++        }
+ 
+         client.connectIfNeededAndDoOp(new GenericCallback<Void>() {
+             @Override
+@@ -150,6 +173,11 @@ public class BookieClient {
+     public void readEntry(final InetSocketAddress addr, final long ledgerId, final long entryId,
+                           final ReadEntryCallback cb, final Object ctx) {
+         final PerChannelBookieClient client = lookupClient(addr);
++        if (client == null) {
++            cb.readEntryComplete(BKException.Code.BookieHandleNotAvailableException,
++                                 ledgerId, entryId, null, ctx);
++            return;
++        }
+ 
+         client.connectIfNeededAndDoOp(new GenericCallback<Void>() {
+             @Override
+@@ -169,8 +197,14 @@ public class BookieClient {
+     }
+ 
+     public void close() {
+-        for (PerChannelBookieClient channel: channels.values()) {
+-            channel.close();
++        closeLock.writeLock().lock();
++        try {
++            closed = true;
++            for (PerChannelBookieClient channel: channels.values()) {
++                channel.close();
++            }
++        } finally {
++            closeLock.writeLock().unlock();
+         }
+     }
+ 
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
+index b2ae05e6bd..296401c314 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
+@@ -91,7 +91,7 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+     volatile Channel channel = null;
+ 
+     private enum ConnectionState {
+-        DISCONNECTED, CONNECTING, CONNECTED
++        DISCONNECTED, CONNECTING, CONNECTED, CLOSED
+             };
+ 
+     private volatile ConnectionState state;
+@@ -138,7 +138,8 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+                         rc = BKException.Code.OK;
+                         channel = future.getChannel();
+                         state = ConnectionState.CONNECTED;
+-                    } else if (future.isSuccess() && state == ConnectionState.DISCONNECTED) {
++                    } else if (future.isSuccess() && (state == ConnectionState.CLOSED
++                                                      || state == ConnectionState.DISCONNECTED)) {
+                         LOG.error("Closed before connection completed, clean up: " + addr);
+                         future.getChannel().close();
+                         rc = BKException.Code.BookieHandleNotAvailableException;
+@@ -147,7 +148,9 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+                         LOG.error("Could not connect to bookie: " + addr);
+                         rc = BKException.Code.BookieHandleNotAvailableException;
+                         channel = null;
+-                        state = ConnectionState.DISCONNECTED;
++                        if (state != ConnectionState.CLOSED) {
++                            state = ConnectionState.DISCONNECTED;
++                        }
+                     }
+ 
+                     // trick to not do operations under the lock, take the list
+@@ -166,17 +169,21 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+     }
+ 
+     void connectIfNeededAndDoOp(GenericCallback<Void> op) {
+-        boolean doOpNow = false;
+-
++        boolean completeOpNow = false;
++        int opRc = BKException.Code.OK;
+         // common case without lock first
+         if (channel != null && state == ConnectionState.CONNECTED) {
+-            doOpNow = true;
++            completeOpNow = true;
+         } else {
+ 
+             synchronized (this) {
+                 // check the channel status again under lock
+                 if (channel != null && state == ConnectionState.CONNECTED) {
+-                    doOpNow = true;
++                    completeOpNow = true;
++                    opRc = BKException.Code.OK;
++                } else if (state == ConnectionState.CLOSED) {
++                    completeOpNow = true;
++                    opRc = BKException.Code.BookieHandleNotAvailableException;
+                 } else {
+                     // channel is either null (first connection attempt), or the
+                     // channel is disconnected. Connection attempt is still in
+@@ -193,14 +200,14 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+                     state = ConnectionState.CONNECTING;
+                 }
+             }
+-            if (!doOpNow) {
++            if (!completeOpNow) {
+                 // Start connection attempt to the input server host.
+                 connect();
+             }
+         }
+ 
+-        if (doOpNow) {
+-            op.operationComplete(BKException.Code.OK, null);
++        if (completeOpNow) {
++            op.operationComplete(opRc, null);
+         }
+ 
+     }
+@@ -337,9 +344,27 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+         }
+     }
+ 
++    /**
++     * Disconnects the bookie client. It can be reused.
++     */
++    public void disconnect() {
++        closeInternal(false);
++    }
++
++    /**
++     * Closes the bookie client permanently. It cannot be reused.
++     */
+     public void close() {
++        closeInternal(true);
++    }
++
++    private void closeInternal(boolean permanent) {
+         synchronized (this) {
+-            state = ConnectionState.DISCONNECTED;
++            if (permanent) {
++                state = ConnectionState.CLOSED;
++            } else if (state != ConnectionState.CLOSED) {
++                state = ConnectionState.DISCONNECTED;
++            }
+         }
+         if (channel != null) {
+             channel.close().awaitUninterruptibly();
+@@ -446,9 +471,14 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+     public void channelDisconnected(ChannelHandlerContext ctx, ChannelStateEvent e) throws Exception {
+         LOG.info("Disconnected from bookie: " + addr);
+         errorOutOutstandingEntries();
+-        channel.close();
++        Channel c = this.channel;
++        if (c != null) {
++            c.close();
++        }
+         synchronized (this) {
+-            state = ConnectionState.DISCONNECTED;
++            if (state != ConnectionState.CLOSED) {
++                state = ConnectionState.DISCONNECTED;
++            }
+         }
+ 
+         // we don't want to reconnect right away. If someone sends a request to
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/util/OrderedSafeExecutor.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/util/OrderedSafeExecutor.java
+index 686b72a40c..ffaced963d 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/util/OrderedSafeExecutor.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/util/OrderedSafeExecutor.java
+@@ -22,6 +22,7 @@ import java.util.Random;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
+ 
+ import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.GenericCallback;
+ 
+@@ -97,6 +98,14 @@ public class OrderedSafeExecutor {
+         }
+     }
+ 
++    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
++        boolean ret = true;
++        for (int i = 0; i < threads.length; i++) {
++            ret = ret && threads[i].awaitTermination(timeout, unit);
++        }
++        return ret;
++    }
++
+     /**
+      * Generic callback implementation which will run the
+      * callback in the thread which matches the ordering key
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookKeeperTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookKeeperTest.java
+index aa04b8698b..c66abd37d3 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookKeeperTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookKeeperTest.java
+@@ -22,7 +22,9 @@ package org.apache.bookkeeper.client;
+ */
+ 
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.bookkeeper.conf.ClientConfiguration;
+ import org.apache.bookkeeper.client.AsyncCallback.AddCallback;
+@@ -177,4 +179,43 @@ public class BookKeeperTest extends BaseTestCase {
+         Assert.assertTrue(result.get() != 0);
+     }
+ 
++    /**
++     * Test that bookkeeper will close cleanly if close is issued
++     * while another operation is in progress.
++     */
++    @Test(timeout=60000)
++    public void testCloseDuringOp() throws Exception {
++        ClientConfiguration conf = new ClientConfiguration()
++            .setZkServers(zkUtil.getZooKeeperConnectString());
++        for (int i = 0; i < 100; i++) {
++            final BookKeeper client = new BookKeeper(conf);
++            final CountDownLatch l = new CountDownLatch(1);
++            final AtomicBoolean success = new AtomicBoolean(false);
++            Thread t = new Thread() {
++                    public void run() {
++                        try {
++                            LedgerHandle lh = client.createLedger(3, 3, digestType, "testPasswd".getBytes());
++                            startNewBookie();
++                            killBookie(0);
++                            lh.asyncAddEntry("test".getBytes(), new AddCallback() {
++                                    @Override
++                                    public void addComplete(int rc, LedgerHandle lh, long entryId, Object ctx) {
++                                        // noop, we don't care if this completes
++                                    }
++                                }, null);
++                            client.close();
++                            success.set(true);
++                            l.countDown();
++                        } catch (Exception e) {
++                            LOG.error("Error running test", e);
++                            success.set(false);
++                            l.countDown();
++                        }
++                    }
++                };
++            t.start();
++            assertTrue("Close never completed", l.await(10, TimeUnit.SECONDS));
++            assertTrue("Close was not successful", success.get());
++        }
++    }
+ }
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/replication/AuditorPeriodicCheckTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/replication/AuditorPeriodicCheckTest.java
+index b30bd4958e..3e46c8ba72 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/replication/AuditorPeriodicCheckTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/replication/AuditorPeriodicCheckTest.java
+@@ -233,11 +233,6 @@ public class AuditorPeriodicCheckTest extends BookKeeperClusterTestCase {
+                     throws IOException, NoLedgerException {
+                 // we want to disable during checking
+                 numReads.incrementAndGet();
+-                try {
+-                    underReplicationManager.disableLedgerReplication();
+-                } catch (ReplicationException.UnavailableException ue) {
+-                    LOG.error("Couldn't disable ledger replication", ue);
+-                }
+                 throw new IOException("Fake I/O exception");
+             }
+         };
+@@ -247,30 +242,32 @@ public class AuditorPeriodicCheckTest extends BookKeeperClusterTestCase {
+         Thread.sleep(CHECK_INTERVAL * 2);
+         assertEquals("Nothing should have tried to read", 0, numReads.get());
+         underReplicationManager.enableLedgerReplication();
++        Thread.sleep(CHECK_INTERVAL * 2); // give it time to run
++
++        underReplicationManager.disableLedgerReplication();
++        // give it time to stop, from this point nothing new should be marked
++        Thread.sleep(CHECK_INTERVAL * 2);
+ 
+         int numUnderreplicated = 0;
+         long underReplicatedLedger = -1;
+-        for (int i = 0; i < 10; i++) {
+-            underReplicatedLedger = underReplicationManager.pollLedgerToRereplicate();
+-            if (underReplicatedLedger != -1) {
+-                break;
+-            }
+-            Thread.sleep(CHECK_INTERVAL);
+-        }
+-        assertTrue("Some ledger should be under replicated", -1 != underReplicatedLedger);
+-        numUnderreplicated++;
+-        underReplicationManager.markLedgerReplicated(underReplicatedLedger);
+-        while (underReplicatedLedger != -1) {
++        do {
+             underReplicatedLedger = underReplicationManager.pollLedgerToRereplicate();
+             if (underReplicatedLedger == -1) {
+                 break;
+-            } else {
+-                numUnderreplicated++;
+             }
++            numUnderreplicated++;
++
+             underReplicationManager.markLedgerReplicated(underReplicatedLedger);
+-        }
+-        LOG.info("{} of {} ledgers underreplicated", numUnderreplicated, numLedgers);
+-        assertTrue("Some but not all should be underreplicated",
+-                   numUnderreplicated > 0 && numUnderreplicated < numLedgers);
++        } while (underReplicatedLedger != -1);
++
++        Thread.sleep(CHECK_INTERVAL * 2); // give a chance to run again (it shouldn't, it's disabled)
++
++        // ensure that nothing is marked as underreplicated
++        underReplicatedLedger = underReplicationManager.pollLedgerToRereplicate();
++        assertEquals("There should be no underreplicated ledgers", -1, underReplicatedLedger);
++
++        LOG.info("{} of {} ledgers underreplicated", numUnderreplicated, numUnderreplicated);
++        assertTrue("All should be underreplicated",
++                numUnderreplicated <= numLedgers && numUnderreplicated > 0);
+     }
+ }
