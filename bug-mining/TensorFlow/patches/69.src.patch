@@ -1,0 +1,1384 @@
+diff --git a/tensorflow/core/distributed_runtime/BUILD b/tensorflow/core/distributed_runtime/BUILD
+index b8402367d17..d6c8e05e317 100644
+--- a/tensorflow/core/distributed_runtime/BUILD
++++ b/tensorflow/core/distributed_runtime/BUILD
+@@ -66,6 +66,21 @@ cc_library(
+     ],
+ )
+ 
++cc_library(
++    name = "worker",
++    srcs = ["worker.cc"],
++    hdrs = [
++        "worker.h",
++    ],
++    deps = [
++        ":graph_mgr",
++        ":rendezvous_mgr_interface",
++        ":worker_interface",
++        "//tensorflow/core:core_cpu_internal",
++        "//tensorflow/core:lib_internal",
++    ],
++)
++
+ cc_library(
+     name = "call_options",
+     srcs = ["call_options.cc"],
+diff --git a/tensorflow/core/distributed_runtime/rpc/BUILD b/tensorflow/core/distributed_runtime/rpc/BUILD
+index ea1a6eb681a..89710a4654c 100644
+--- a/tensorflow/core/distributed_runtime/rpc/BUILD
++++ b/tensorflow/core/distributed_runtime/rpc/BUILD
+@@ -164,6 +164,7 @@ tf_cuda_library(
+         "//tensorflow/core:worker_proto_cc",
+         "//tensorflow/core/distributed_runtime:graph_mgr",
+         "//tensorflow/core/distributed_runtime:rendezvous_mgr_interface",
++        "//tensorflow/core/distributed_runtime:worker",
+         "//tensorflow/core/distributed_runtime:worker_cache",
+         "//tensorflow/core/distributed_runtime:worker_env",
+         "@grpc//:grpc++_unsecure",
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc b/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc
+index d485eb3e7cd..addf09672ab 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.cc
+@@ -144,7 +144,8 @@ Status GrpcServer::Init() {
+   builder.SetMaxMessageSize(std::numeric_limits<int32>::max());
+   master_impl_.reset(new Master(&master_env_, 0.0));
+   master_service_ = NewGrpcMasterService(master_impl_.get(), &builder);
+-  worker_service_ = NewGrpcWorkerService(&worker_env_, &builder);
++  worker_impl_.reset(NewGrpcWorker(&worker_env_));
++  worker_service_ = NewGrpcWorkerService(worker_impl_.get(), &builder);
+   server_ = builder.BuildAndStart();
+ 
+   if (!server_) {
+@@ -180,7 +181,8 @@ Status GrpcServer::Init() {
+     return errors::Internal("Could not parse port for local server from \"",
+                             channel_cache->TranslateTask(name_prefix), "\".");
+   }
+-  worker_env_.worker_cache = NewGrpcWorkerCache(channel_cache.release());
++  worker_env_.worker_cache = NewGrpcWorkerCacheWithLocalWorker(
++      channel_cache.release(), worker_impl_.get(), name_prefix);
+ 
+   // Finish setting up master environment.
+   master_env_.ops = OpRegistry::Global();
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.h b/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.h
+index 10cbca42105..cb66a963e62 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.h
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_server_lib.h
+@@ -32,6 +32,7 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ 
++class GrpcWorker;
+ class Master;
+ 
+ class GrpcServer : public ServerInterface {
+@@ -99,6 +100,7 @@ class GrpcServer : public ServerInterface {
+ 
+   // Implementation of a TensorFlow worker, and RPC polling thread.
+   WorkerEnv worker_env_;
++  std::unique_ptr<GrpcWorker> worker_impl_;
+   AsyncServiceInterface* worker_service_ = nullptr;
+   std::unique_ptr<Thread> worker_thread_ GUARDED_BY(mu_);
+ 
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.cc b/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.cc
+index 0c0c80117ac..3d39e389bec 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.cc
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.cc
+@@ -25,10 +25,16 @@ limitations under the License.
+ 
+ namespace tensorflow {
+ 
++namespace {
++
+ class GrpcWorkerCache : public WorkerCachePartial {
+  public:
+-  explicit GrpcWorkerCache(GrpcChannelCache* channel_cache)
+-      : channel_cache_(channel_cache) {
++  explicit GrpcWorkerCache(GrpcChannelCache* channel_cache,
++                           WorkerInterface* local_worker,
++                           const string& local_target)
++      : local_target_(local_target),
++        local_worker_(local_worker),
++        channel_cache_(channel_cache) {
+     // TODO(mrry): Investigate possible performance improvements by
+     // replacing this thread with a threadpool.
+     polling_thread_ = Env::Default()->StartThread(
+@@ -54,11 +60,24 @@ class GrpcWorkerCache : public WorkerCachePartial {
+   }
+ 
+   WorkerInterface* CreateWorker(const string& target) override {
+-    SharedGrpcChannelPtr channel = channel_cache_->FindWorkerChannel(target);
+-    if (!channel) return nullptr;
+-    WorkerInterface* ret =
+-        NewGrpcRemoteWorker(channel, &completion_queue_, &logger_);
+-    return ret;
++    if (target == local_target_) {
++      return local_worker_;
++    } else {
++      SharedGrpcChannelPtr channel = channel_cache_->FindWorkerChannel(target);
++      if (!channel) return nullptr;
++      WorkerInterface* ret =
++          NewGrpcRemoteWorker(channel, &completion_queue_, &logger_);
++      return ret;
++    }
++  }
++
++  void ReleaseWorker(const string& target, WorkerInterface* worker) override {
++    if (target == local_target_) {
++      CHECK_EQ(worker, local_worker_)
++          << "Releasing a worker that was not returned by this WorkerCache";
++    } else {
++      WorkerCacheInterface::ReleaseWorker(target, worker);
++    }
+   }
+ 
+   void SetLogging(bool v) override { logger_.SetLogging(v); }
+@@ -70,14 +89,24 @@ class GrpcWorkerCache : public WorkerCachePartial {
+   }
+ 
+  private:
++  const string local_target_;
++  WorkerInterface* const local_worker_;  // Not owned.
+   GrpcChannelCache* channel_cache_;  // Owned.
+   ::grpc::CompletionQueue completion_queue_;
+   Thread* polling_thread_;  // Owned.
+   WorkerCacheLogger logger_;
+ };
+ 
++}  // namespace
++
+ WorkerCacheInterface* NewGrpcWorkerCache(GrpcChannelCache* cc) {
+-  return new GrpcWorkerCache(cc);
++  return new GrpcWorkerCache(cc, nullptr, "");
++}
++
++WorkerCacheInterface* NewGrpcWorkerCacheWithLocalWorker(
++    GrpcChannelCache* cc, WorkerInterface* local_worker,
++    const string& local_target) {
++  return new GrpcWorkerCache(cc, local_worker, local_target);
+ }
+ 
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.h b/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.h
+index 736943215bf..17a307a6d99 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.h
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_worker_cache.h
+@@ -24,5 +24,9 @@ namespace tensorflow {
+ // The returned WorkerCacheInterface object takes the ownership of "cc".
+ WorkerCacheInterface* NewGrpcWorkerCache(GrpcChannelCache* cc);
+ 
++WorkerCacheInterface* NewGrpcWorkerCacheWithLocalWorker(
++    GrpcChannelCache* cc, WorkerInterface* local_worker,
++    const string& local_target);
++
+ }  // namespace tensorflow
+ #endif  // THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_RPC_GRPC_WORKER_CACHE_H_
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.cc b/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.cc
+index 71208538897..4462634b6c6 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.cc
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.cc
+@@ -36,8 +36,8 @@ limitations under the License.
+ #include "tensorflow/core/distributed_runtime/rpc/grpc_tensor_coding.h"
+ #include "tensorflow/core/distributed_runtime/rpc/grpc_util.h"
+ #include "tensorflow/core/distributed_runtime/rpc/grpc_worker_service_impl.h"
++#include "tensorflow/core/distributed_runtime/worker.h"
+ #include "tensorflow/core/distributed_runtime/worker_cache.h"
+-#include "tensorflow/core/distributed_runtime/worker_env.h"
+ #include "tensorflow/core/framework/cancellation.h"
+ #include "tensorflow/core/framework/tensor.h"
+ #include "tensorflow/core/lib/core/errors.h"
+@@ -49,14 +49,10 @@ namespace tensorflow {
+ 
+ namespace {
+ 
+-static Tensor empty_tensor(DT_FLOAT);
+-
+ class GrpcWorkerService : public AsyncServiceInterface {
+  public:
+-  GrpcWorkerService(WorkerEnv* env, ::grpc::ServerBuilder* builder)
+-      : env_(env),
+-        cancellation_manager_(new CancellationManager),
+-        is_shutdown_(false) {
++  GrpcWorkerService(GrpcWorker* worker, ::grpc::ServerBuilder* builder)
++      : worker_(worker), is_shutdown_(false) {
+     builder->RegisterService(&worker_service_);
+     cq_ = builder->AddCompletionQueue().release();
+   }
+@@ -64,7 +60,6 @@ class GrpcWorkerService : public AsyncServiceInterface {
+   ~GrpcWorkerService() {
+     delete shutdown_alarm_;
+     delete cq_;
+-    delete cancellation_manager_;
+   }
+ 
+   void Shutdown() override {
+@@ -156,63 +151,23 @@ class GrpcWorkerService : public AsyncServiceInterface {
+   }
+ 
+  private:
+-  WorkerEnv* env_;                     // Not owned.
++  GrpcWorker* worker_;                 // Not owned.
+   ::grpc::ServerCompletionQueue* cq_;  // Owned.
+ 
+   grpc::WorkerService::AsyncService worker_service_;
+ 
+-  mutex mu_;
+-  CancellationManager* cancellation_manager_ GUARDED_BY(mu_);
+-  struct PartialRunState {
+-    CancellationManager* cancellation_manager;
+-    Notification executor_done;
+-
+-    explicit PartialRunState(CancellationManager* cm)
+-        : cancellation_manager(cm) {}
+-  };
+-  struct PairHash {
+-    std::size_t operator()(std::pair<string, int> const& p) const {
+-      return Hash64Combine(std::hash<string>()(p.first),
+-                           std::hash<int>()(p.second));
+-    }
+-  };
+-  std::unordered_map<std::pair<string, int>, std::unique_ptr<PartialRunState>,
+-                     PairHash>
+-      partial_runs_ GUARDED_BY(mu_);
+-
+-  PartialRunState* FindPartialRun(const string& graph_handle, int step_id) {
+-    std::pair<string, int> k(graph_handle, step_id);
+-    PartialRunState* prun_state = nullptr;
+-    mutex_lock l(mu_);
+-    auto it = partial_runs_.find(k);
+-    if (it != partial_runs_.end()) {
+-      prun_state = it->second.get();
+-    }
+-    return prun_state;
+-  }
+-
+-  void InsertPartialRunLocked(const string& graph_handle, int step_id,
+-                              PartialRunState* partial_run_state)
+-      EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+-    std::pair<string, int> k(graph_handle, step_id);
+-    partial_runs_.emplace(
+-        std::make_pair(k, std::unique_ptr<PartialRunState>(partial_run_state)));
+-  }
+-
+-  void RemovePartialRun(const string& graph_handle, int step_id) {
+-    std::pair<string, int> k(graph_handle, step_id);
+-    mutex_lock l(mu_);
+-    partial_runs_.erase(partial_runs_.find(k));
+-  }
+-
+   mutex shutdown_mu_;
+   bool is_shutdown_ GUARDED_BY(shutdown_mu_);
+   ::grpc::Alarm* shutdown_alarm_;
+ 
++  void Schedule(std::function<void()> f) {
++    worker_->env()->compute_pool->Schedule(std::move(f));
++  }
++
+   // The following section contains one request handler method per
+   // RPC. The `FooHandler` method is called (indirectly) by
+   // `HandleRPCsLoop()` when the next Foo RPC is received. Each
+-  // `FooHandler` call schedules a closure on `env_->compute_pool`,
++  // `FooHandler` call schedules a closure on `worker_->env()->compute_pool`,
+   // and is responsible for requesting the next Foo call by calling
+   // `ENQUEUE_REQUEST(Foo)`.
+ 
+@@ -221,36 +176,26 @@ class GrpcWorkerService : public AsyncServiceInterface {
+                           RequestMessage, ResponseMessage>;
+ 
+   void GetStatusHandler(WorkerCall<GetStatusRequest, GetStatusResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      DeviceMgr* dm = env_->device_mgr;
+-      std::vector<DeviceAttributes> devices;
+-      dm->ListDeviceAttributes(&devices);
+-      call->response.mutable_device_attributes()->Reserve(devices.size());
+-      for (size_t i = 0; i < devices.size(); i++) {
+-        call->response.add_device_attributes()->Swap(&devices[i]);
+-      }
+-      call->SendResponse(::grpc::Status::OK);
++    Schedule([this, call]() {
++      Status s = worker_->GetStatus(&call->request, &call->response);
++      call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(GetStatus, false);
+   }
+ 
+   void CleanupAllHandler(
+       WorkerCall<CleanupAllRequest, CleanupAllResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      std::vector<string> containers;
+-      for (const auto& c : call->request.container()) containers.push_back(c);
+-      env_->device_mgr->ClearContainers(containers);
+-      call->SendResponse(::grpc::Status::OK);
++    Schedule([this, call]() {
++      Status s = worker_->CleanupAll(&call->request, &call->response);
++      call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(CleanupAll, false);
+   }
+ 
+   void RegisterGraphHandler(
+       WorkerCall<RegisterGraphRequest, RegisterGraphResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      Status s = env_->graph_mgr->Register(
+-          call->request.session_handle(), call->request.graph_def(),
+-          call->request.graph_options(), call->response.mutable_graph_handle());
++    Schedule([this, call]() {
++      Status s = worker_->RegisterGraph(&call->request, &call->response);
+       call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(RegisterGraph, false);
+@@ -258,56 +203,68 @@ class GrpcWorkerService : public AsyncServiceInterface {
+ 
+   void DeregisterGraphHandler(
+       WorkerCall<DeregisterGraphRequest, DeregisterGraphResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      Status s = env_->graph_mgr->Deregister(call->request.graph_handle());
++    Schedule([this, call]() {
++      Status s = worker_->DeregisterGraph(&call->request, &call->response);
+       call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(DeregisterGraph, false);
+   }
+ 
+   void RunGraphHandler(WorkerCall<RunGraphRequest, RunGraphResponse>* call) {
+-    if (call->request.is_partial()) {
+-      env_->compute_pool->Schedule([this, call]() { DoPartialRunGraph(call); });
+-    } else {
+-      env_->compute_pool->Schedule([this, call]() { DoRunGraph(call); });
+-    }
++    Schedule([this, call]() {
++      CallOptions* call_opts = new CallOptions;
++      call->SetCancelCallback([call_opts]() { call_opts->StartCancel(); });
++      worker_->RunGraphAsync(call_opts, &call->request, &call->response,
++                             [call, call_opts](const Status& s) {
++                               call->ClearCancelCallback();
++                               delete call_opts;
++                               call->SendResponse(ToGrpcStatus(s));
++                             });
++    });
+     ENQUEUE_REQUEST(RunGraph, true);
+   }
+ 
+   void RecvTensorHandlerRaw(
+       WorkerCall<RecvTensorRequest, ::grpc::ByteBuffer>* call) {
+-    env_->compute_pool->Schedule([this, call]() { DoRecvTensorRaw(call); });
++    Schedule([this, call]() {
++      CallOptions* call_opts = new CallOptions;
++      call->SetCancelCallback([call_opts]() { call_opts->StartCancel(); });
++      worker_->RecvTensorAsync(call_opts, &call->request, &call->response,
++                               [call, call_opts](const Status& s) {
++                                 call->ClearCancelCallback();
++                                 delete call_opts;
++                                 call->SendResponse(ToGrpcStatus(s));
++                               });
++    });
+     EnqueueRecvTensorRequestRaw();
+   }
+ 
+   void CleanupGraphHandler(
+       WorkerCall<CleanupGraphRequest, CleanupGraphResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      const int64 step_id = call->request.step_id();
+-      env_->rendezvous_mgr->Cleanup(step_id);
+-      call->SendResponse(::grpc::Status::OK);
++    Schedule([this, call]() {
++      Status s = worker_->CleanupGraph(&call->request, &call->response);
++      call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(CleanupGraph, false);
+   }
+ 
+   void LoggingHandler(WorkerCall<LoggingRequest, LoggingResponse>* call) {
+-    env_->compute_pool->Schedule([this, call]() {
+-      Status s = DoLogging(call);
++    Schedule([this, call]() {
++      Status s = worker_->Logging(&call->request, &call->response);
+       call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(Logging, false);
+   }
+ 
+   void TracingHandler(WorkerCall<TracingRequest, TracingResponse>* call) {
+-    SchedClosure([this, call]() {
+-      Status s = DoTracing(call);
++    Schedule([this, call]() {
++      Status s = worker_->Tracing(&call->request, &call->response);
+       call->SendResponse(ToGrpcStatus(s));
+     });
+     ENQUEUE_REQUEST(Tracing, false);
+   }
+ #undef ENQUEUE_REQUEST
+ 
+- private:
+   void EnqueueRecvTensorRequestRaw() {
+     mutex_lock l(shutdown_mu_);
+     if (!is_shutdown_) {
+@@ -321,344 +278,107 @@ class GrpcWorkerService : public AsyncServiceInterface {
+     }
+   }
+ 
+-  // The following section contains the implementation of RunGraph()
+-  // RecvTensor(), Logging(), and Tracing(), which are the four
+-  // non-trivial and potentially long-running RPCs performed by a
+-  // TensorFlow worker.
+-
+-  void AbortStep(int64 step_id) {
+-    Rendezvous* rendez = env_->rendezvous_mgr->Find(step_id);
+-    SchedNonBlockingClosureAfter(1000000, [rendez, step_id]() {
+-      // Delay a bit before aborting the step. This way, the root
+-      // cause may return first back to the client instead of this
+-      // cancellation generated abort error.
+-      rendez->StartAbort(errors::Aborted("Step ", step_id));
+-      rendez->Unref();
+-    });
+-  }
+-
+-  Status PrepareRunGraph(const RunGraphRequest& req, GraphMgr::NamedTensors* in,
+-                         GraphMgr::NamedTensors* out) {
+-    if (req.send_size() > 0) {
+-      // TODO(zhifengc): Let the caller decide on which device to
+-      // allocate the tensor.
+-      Device* cpu_dev = nullptr;
+-      TF_RETURN_IF_ERROR(env_->device_mgr->LookupDevice("CPU:0", &cpu_dev));
+-      AllocatorAttributes alloc_attrs;
+-      Tensor val;
+-      for (const NamedTensor& entry : req.send()) {
+-        TF_RETURN_IF_ERROR(
+-            cpu_dev->MakeTensorFromProto(entry.val(), alloc_attrs, &val));
+-        in->insert({entry.key(), val});
+-      }
+-    }
+-    for (const string& key : req.recv_key()) {
+-      out->insert({key, empty_tensor});
+-    }
+-    return Status::OK();
+-  }
+-
+-  void DoRunGraph(WorkerCall<RunGraphRequest, RunGraphResponse>* call) {
+-    const int64 step_id = call->request.step_id();
+-    TRACEPRINTF("RunGraph: %lld", step_id);
+-    GraphMgr::NamedTensors in;
+-    GraphMgr::NamedTensors* out = new GraphMgr::NamedTensors;
+-    Status s = PrepareRunGraph(call->request, &in, out);
+-    if (!s.ok()) {
+-      delete out;
+-      call->SendResponse(ToGrpcStatus(s));
+-      return;
+-    }
+-    StepStatsCollector* collector = nullptr;
+-    if (call->request.exec_opts().record_timeline() ||
+-        call->request.exec_opts().record_costs()) {
+-      collector = new StepStatsCollector(call->response.mutable_step_stats());
+-      // TODO(mrry,pbar): GPU tracing for distributed steps.
+-    }
+-    CancellationManager* cm = new CancellationManager;
+-    call->SetCancelCallback([this, cm, step_id]() {
+-      cm->StartCancel();
+-      AbortStep(step_id);
+-    });
+-    CancellationToken token;
+-    {
+-      mutex_lock l(mu_);
+-      token = cancellation_manager_->get_cancellation_token();
+-      bool already_cancelled = !cancellation_manager_->RegisterCallback(
+-          token, [cm]() { cm->StartCancel(); });
+-      if (already_cancelled) {
+-        call->ClearCancelCallback();
+-        delete cm;
+-        delete collector;
+-        delete out;
+-        call->SendResponse(ToGrpcStatus(errors::Aborted("Call was aborted")));
+-        return;
+-      }
+-    }
+-    CostGraphDef* cost_graph = call->response.mutable_cost_graph();
+-    env_->graph_mgr->ExecuteAsync(
+-        call->request.graph_handle(), step_id, call->request.exec_opts(),
+-        collector, cost_graph, cm, in,
+-        [this, step_id, call, cm, out, token, collector](Status s) {
+-          if (s.ok()) {
+-            env_->graph_mgr->RecvOutputs(step_id, out);
+-          }
+-          call->ClearCancelCallback();
+-          {
+-            mutex_lock l(mu_);
+-            cancellation_manager_->DeregisterCallback(token);
+-          }
+-          delete cm;
+-
+-          if (s.ok()) {
+-            for (const auto& p : *out) {
+-              const string& key = p.first;
+-              const Tensor& val = p.second;
+-              auto* recv = call->response.add_recv();
+-              recv->set_key(key);
+-              // TODO(zhifengc): Deal with gpu -> cpu copy.
+-              TensorProto* proto = recv->mutable_val();
+-              val.AsProtoTensorContent(proto);
+-            }
+-          }
+-          delete collector;
+-          delete out;
+-          call->SendResponse(ToGrpcStatus(s));
+-        });
+-  }
+-
+-  // TODO(suharshs): Add stats collection support to partial run.
+-  void DoPartialRunGraph(WorkerCall<RunGraphRequest, RunGraphResponse>* call) {
+-    const int64 step_id = call->request.step_id();
+-    const string& graph_handle = call->request.graph_handle();
+-    TRACEPRINTF("PartialRunGraph: %lld", step_id);
+-    GraphMgr::NamedTensors in;
+-    GraphMgr::NamedTensors* out = new GraphMgr::NamedTensors;
+-    Status s = PrepareRunGraph(call->request, &in, out);
+-    auto finish = [this, call, out](const Status& s) {
+-      delete out;
+-      call->ClearCancelCallback();
+-      call->SendResponse(ToGrpcStatus(s));
+-    };
+-    if (!s.ok()) {
+-      finish(s);
+-      return;
+-    }
+-
+-    PartialRunState* partial_run_state = FindPartialRun(graph_handle, step_id);
+-
+-    CancellationManager* cm = nullptr;
+-    // If this is a new partial run call we need to create a new cancellation
+-    // manager.
+-    // Otherwise we use the cancellation manager stored in the found partial
+-    // run state.
+-    if (partial_run_state == nullptr) {
+-      cm = new CancellationManager;
+-    } else {
+-      cm = partial_run_state->cancellation_manager;
+-    }
+-
+-    // Before we start doing anything, we set the RPC cancellation.
+-    call->SetCancelCallback([this, cm, step_id]() {
+-      cm->StartCancel();
+-      AbortStep(step_id);
+-    });
+-
+-    // If this is a new partial run request, the request will need to start the
+-    // executors.
+-    if (partial_run_state == nullptr) {
+-      CancellationToken token;
+-      {
+-        mutex_lock l(mu_);
+-        // Insert the new partial run into the partial_runs_ map.
+-        partial_run_state = new PartialRunState(cm);
+-        InsertPartialRunLocked(graph_handle, step_id, partial_run_state);
+-        token = cancellation_manager_->get_cancellation_token();
+-        cancellation_manager_->RegisterCallback(token,
+-                                                [cm]() { cm->StartCancel(); });
+-      }
+-      env_->graph_mgr->ExecuteAsync(
+-          graph_handle, step_id, call->request.exec_opts(),
+-          nullptr /* collector */, nullptr /* cost_graph */, cm, in,
+-          [this, step_id, graph_handle, token, partial_run_state](Status s) {
+-            {
+-              mutex_lock l(mu_);
+-              cancellation_manager_->DeregisterCallback(token);
+-            }
+-            partial_run_state->executor_done.Notify();
+-            // TODO(suharshs): Propagate the status once we keep state for
+-            // each partial run call.
+-          });
+-    } else {
+-      // Send the partial run's new inputs.
+-      s = env_->graph_mgr->SendInputs(step_id, in);
+-      if (!s.ok()) {
+-        finish(s);
+-        return;
+-      }
+-    }
+-
+-    // Receive the partial run's outputs.
+-    s = env_->graph_mgr->RecvOutputs(step_id, out);
+-    if (!s.ok()) {
+-      finish(s);
+-      return;
+-    }
+-
+-    // Construct and return the resp.
+-    for (const auto& p : *out) {
+-      const string& key = p.first;
+-      const Tensor& val = p.second;
+-      auto* recv = call->response.add_recv();
+-      recv->set_key(key);
+-      // TODO(zhifengc): Deal with gpu -> cpu copy.
+-      TensorProto* proto = recv->mutable_val();
+-      val.AsProtoField(proto);
+-    }
++  TF_DISALLOW_COPY_AND_ASSIGN(GrpcWorkerService);
++};
+ 
+-    // If this is the last partial run request we must also wait for the entire
+-    // graph execution to be completed.
+-    if (call->request.is_last_partial_run()) {
+-      partial_run_state->executor_done.WaitForNotification();
+-      RemovePartialRun(graph_handle, step_id);
+-      // Before deleting the cancellation manager on the final call, ensure
+-      // that we clear the RPC cancel callback, which has a reference to the
+-      // cancellation manager.
+-      call->ClearCancelCallback();
+-      delete cm;
+-    }
++}  // namespace
+ 
+-    finish(s);
++GrpcWorker::GrpcWorker(WorkerEnv* worker_env) : Worker(worker_env) {}
++
++// RecvTensorAsync: unlike the other Worker methods, which use protocol buffers
++// for a response object, to avoid extra protocol buffer serialization overhead
++// we generate our response directly into a ::grpc::ByteBuffer object
++void GrpcWorker::RecvTensorAsync(CallOptions* opts,
++                                 const RecvTensorRequest* request,
++                                 ::grpc::ByteBuffer* response,
++                                 StatusCallback done) {
++  const int64 step_id = request->step_id();
++  const string& key = request->rendezvous_key();
++  TRACEPRINTF("RecvTensor: %lld %s", step_id, key.c_str());
++  Rendezvous::ParsedKey parsed;
++  Status s = Rendezvous::ParseKey(key, &parsed);
++  Device* src_dev = nullptr;
++  if (s.ok()) {
++    s = PrepareRecvTensor(parsed, &src_dev);
+   }
+-
+-  // Helper for RecvTensor. Validates "key" and returns the source
+-  // device in "*src_dev".
+-  Status PrepareRecvTensor(const Rendezvous::ParsedKey& parsed,
+-                           Device** src_dev) {
+-    // Figures out which device the tensor is hosted on.
+-    TF_RETURN_IF_ERROR(
+-        env_->device_mgr->LookupDevice(parsed.src_device, src_dev));
+-
+-    // Does the device have the right incarnation number we expect?
+-    if ((*src_dev)->attributes().incarnation() != parsed.src_incarnation) {
+-      return errors::Aborted(
+-          "RecvTensor expects a different device incarnation: ",
+-          parsed.src_incarnation, " vs. ",
+-          (*src_dev)->attributes().incarnation(),
+-          ". Your worker job was probably restarted. Check your "
+-          "worker job for the reason why it was restarted.");
+-    }
+-
+-    return Status::OK();
++  if (!s.ok()) {
++    done(s);
++    return;
+   }
+ 
+-  // RecvTensorRaw: unlike the other RPCs, to avoid extra protocol buffer
+-  // serialization overhead, we generate our response directly into
+-  // a ::grpc::ByteBuffer object
+-  void DoRecvTensorRaw(
+-      WorkerCall<RecvTensorRequest, ::grpc::ByteBuffer>* call) {
+-    const int64 step_id = call->request.step_id();
+-    const string& key = call->request.rendezvous_key();
+-    TRACEPRINTF("RecvTensor: %lld %s", step_id, key.c_str());
+-    Rendezvous::ParsedKey parsed;
+-    Status s = Rendezvous::ParseKey(key, &parsed);
+-    Device* src_dev = nullptr;
+-    if (s.ok()) {
+-      s = PrepareRecvTensor(parsed, &src_dev);
+-    }
+-    if (!s.ok()) {
+-      call->SendResponse(ToGrpcStatus(s));
+-      return;
+-    }
+-
+-    // Request the tensor associated with the rendezvous key. Any time
+-    // while waiting for the tensor to be produced, up until the start
+-    // of execution of the callback lambda body below, an RPC
+-    // cancellation should abort the rendezvous.
+-    call->SetCancelCallback([this, step_id]() { AbortStep(step_id); });
+-    env_->rendezvous_mgr->RecvLocalAsync(
+-        step_id, parsed,
+-        [this, call, src_dev](const Status& status,
+-                              const Rendezvous::Args& send_args,
+-                              const Rendezvous::Args& recv_args,
+-                              const Tensor& val, const bool is_dead) {
+-          call->ClearCancelCallback();
+-          if (status.ok()) {
+-            // DMA can only be used for Tensors that do not fall into
+-            // the following three odd edge cases: 1) a zero-size
+-            // buffer, 2) a dead tensor which has an uninit value, and
+-            // 3) the tensor has the on_host allocation attribute,
+-            // i.e. it's in CPU RAM *independent of its assigned
+-            // device type*.
+-            // const size_t bytes = is_dead ? 0 : val.TotalBytes();
+-            const bool on_host = send_args.alloc_attrs.on_host();
+-            {
+-              // Non-DMA cases.
+-              if (src_dev->tensorflow_gpu_device_info() && (!on_host)) {
++  // Request the tensor associated with the rendezvous key. Any time
++  // while waiting for the tensor to be produced, up until the start
++  // of execution of the callback lambda body below, an RPC
++  // cancellation should abort the rendezvous.
++  opts->SetCancelCallback([this, step_id]() { AbortStep(step_id); });
++  env_->rendezvous_mgr->RecvLocalAsync(
++      step_id, parsed,
++      [opts, response, done, src_dev](const Status& status,
++                                      const Rendezvous::Args& send_args,
++                                      const Rendezvous::Args& recv_args,
++                                      const Tensor& val, const bool is_dead) {
++        opts->ClearCancelCallback();
++        if (status.ok()) {
++          // DMA can only be used for Tensors that do not fall into
++          // the following three odd edge cases: 1) a zero-size
++          // buffer, 2) a dead tensor which has an uninit value, and
++          // 3) the tensor has the on_host allocation attribute,
++          // i.e. it's in CPU RAM *independent of its assigned
++          // device type*.
++          const bool on_host = send_args.alloc_attrs.on_host();
++          {
++            // Non-DMA cases.
++            if (src_dev->tensorflow_gpu_device_info() && (!on_host)) {
+ #if GOOGLE_CUDA
+-                const DeviceContext* send_dev_context =
+-                    send_args.device_context;
+-                RecvTensorResponse* tmp = new RecvTensorResponse;
+-                tmp->set_is_dead(is_dead);
+-                CHECK(send_dev_context)
+-                    << "send dev name: " << src_dev->name()
+-                    << " gpu_info: " << src_dev->tensorflow_gpu_device_info();
+-                // "val" is on a GPU. Uses GPUUtil to fill the response proto.
+-                StatusCallback response_ready = [call, tmp](const Status& s) {
+-                  // The value is now ready to be returned on the wire.
+-                  tmp->set_send_start_micros(Env::Default()->NowMicros());
+-
+-                  grpc::EncodeRecvTensorResponseToByteBuffer(*tmp,
+-                                                             &call->response);
+-
+-                  call->SendResponse(ToGrpcStatus(s));
+-                  delete tmp;
+-                };
+-
+-                // TODO (jeff,sanjay,mrry): Avoid copy on GPU path by
+-                // modifying GPUUtil::SetProtoFromGPU to accept a
+-                // ::grpc::ByteBuffer to serialize to, rather than
+-                // encoding into a protocol buffer and then
+-                // serializing that (i.e. figure out how to use
+-                // EncodeTensorToByteBuffer on this path rather than
+-                // EncodeRecvTensorResponseToByteBuffer)
+-                GPUUtil::SetProtoFromGPU(val, src_dev, send_dev_context,
+-                                         tmp->mutable_tensor(), is_dead,
+-                                         response_ready);
++              const DeviceContext* send_dev_context = send_args.device_context;
++              RecvTensorResponse* tmp = new RecvTensorResponse;
++              tmp->set_is_dead(is_dead);
++              CHECK(send_dev_context)
++                  << "send dev name: " << src_dev->name()
++                  << " gpu_info: " << src_dev->tensorflow_gpu_device_info();
++              // "val" is on a GPU. Uses GPUUtil to fill the response proto.
++              StatusCallback response_ready = [response, done,
++                                               tmp](const Status& s) {
++                // The value is now ready to be returned on the wire.
++                tmp->set_send_start_micros(Env::Default()->NowMicros());
++
++                grpc::EncodeRecvTensorResponseToByteBuffer(*tmp, response);
++                done(s);
++                delete tmp;
++              };
++
++              // TODO (jeff,sanjay,mrry): Avoid copy on GPU path by
++              // modifying GPUUtil::SetProtoFromGPU to accept a
++              // ::grpc::ByteBuffer to serialize to, rather than
++              // encoding into a protocol buffer and then
++              // serializing that (i.e. figure out how to use
++              // EncodeTensorToByteBuffer on this path rather than
++              // EncodeRecvTensorResponseToByteBuffer)
++              GPUUtil::SetProtoFromGPU(val, src_dev, send_dev_context,
++                                       tmp->mutable_tensor(), is_dead,
++                                       response_ready);
+ #else
+-                call->SendResponse(
+-                    ToGrpcStatus(errors::Internal("No GPU device in process")));
++              done(errors::Internal("No GPU device in process"));
+ #endif  // GOOGLE_CUDA
+-              } else {
+-                grpc::EncodeTensorToByteBuffer(is_dead, val, &call->response);
+-                call->SendResponse(ToGrpcStatus(Status::OK()));
+-              }
++            } else {
++              grpc::EncodeTensorToByteBuffer(is_dead, val, response);
++              done(Status::OK());
+             }
+-          } else {
+-            //  !s.ok()
+-            call->SendResponse(ToGrpcStatus(status));
+           }
+-        });
++        } else {
++          //  !s.ok()
++          done(status);
++        }
++      });
+   }
+ 
+-  Status DoLogging(WorkerCall<LoggingRequest, LoggingResponse>* call) {
+-    // TODO(mrry): Platform-specific tracing support.
+-    return errors::Unimplemented("Logging");
+-  }
+-
+-  Status DoTracing(WorkerCall<TracingRequest, TracingResponse>* call) {
+-    // TODO(mrry): Platform-specific tracing support.
+-    return errors::Unimplemented("Tracing");
+-  }
++  WorkerEnv* GrpcWorker::env() { return env_; }
+ 
+-  TF_DISALLOW_COPY_AND_ASSIGN(GrpcWorkerService);
+-};
+-
+-}  // namespace
++  GrpcWorker* NewGrpcWorker(WorkerEnv* env) { return new GrpcWorker(env); }
+ 
+-AsyncServiceInterface* NewGrpcWorkerService(WorkerEnv* env,
+-                                            ::grpc::ServerBuilder* builder) {
+-  return new GrpcWorkerService(env, builder);
++  AsyncServiceInterface* NewGrpcWorkerService(GrpcWorker* worker,
++                                              ::grpc::ServerBuilder* builder) {
++    return new GrpcWorkerService(worker, builder);
+ }
+ 
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.h b/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.h
+index b6b05b7c304..9bd8416a0cb 100644
+--- a/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.h
++++ b/tensorflow/core/distributed_runtime/rpc/grpc_worker_service.h
+@@ -16,7 +16,10 @@ limitations under the License.
+ #ifndef THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_RPC_GRPC_WORKER_SERVICE_H_
+ #define THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_RPC_GRPC_WORKER_SERVICE_H_
+ 
++#include "tensorflow/core/distributed_runtime/worker.h"
++
+ namespace grpc {
++class ByteBuffer;
+ class ServerBuilder;
+ }  // namespace grpc
+ 
+@@ -25,8 +28,21 @@ namespace tensorflow {
+ class AsyncServiceInterface;
+ struct WorkerEnv;
+ 
++class GrpcWorker : public Worker {
++ public:
++  GrpcWorker(WorkerEnv* env);
++
++  // Specialized version of RecvTensor for gRPC, which avoids a copy.
++  void RecvTensorAsync(CallOptions* opts, const RecvTensorRequest* request,
++                       ::grpc::ByteBuffer* response, StatusCallback done);
++
++  WorkerEnv* env();
++};
++
++GrpcWorker* NewGrpcWorker(WorkerEnv* worker_env);
++
+ // Returns an implementation of WorkerService rpc service.
+-AsyncServiceInterface* NewGrpcWorkerService(WorkerEnv* env,
++AsyncServiceInterface* NewGrpcWorkerService(GrpcWorker* worker,
+                                             ::grpc::ServerBuilder* builder);
+ 
+ }  // namespace tensorflow
+diff --git a/tensorflow/core/distributed_runtime/worker.cc b/tensorflow/core/distributed_runtime/worker.cc
+new file mode 100644
+index 00000000000..ce9995a7901
+--- /dev/null
++++ b/tensorflow/core/distributed_runtime/worker.cc
+@@ -0,0 +1,360 @@
++/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "tensorflow/core/distributed_runtime/worker.h"
++
++#include "tensorflow/core/common_runtime/device_mgr.h"
++#include "tensorflow/core/common_runtime/process_util.h"
++#include "tensorflow/core/common_runtime/step_stats_collector.h"
++#include "tensorflow/core/distributed_runtime/rendezvous_mgr_interface.h"
++#include "tensorflow/core/distributed_runtime/tensor_coding.h"
++#include "tensorflow/core/platform/tracing.h"
++
++namespace tensorflow {
++
++Worker::Worker(WorkerEnv* env)
++    : env_(env), cancellation_manager_(new CancellationManager) {}
++
++void Worker::GetStatusAsync(const GetStatusRequest* request,
++                            GetStatusResponse* response, StatusCallback done) {
++  DeviceMgr* dm = env_->device_mgr;
++  std::vector<DeviceAttributes> devices;
++  dm->ListDeviceAttributes(&devices);
++  response->mutable_device_attributes()->Reserve(devices.size());
++  for (size_t i = 0; i < devices.size(); ++i) {
++    response->add_device_attributes()->Swap(&devices[i]);
++  }
++  done(Status::OK());
++}
++
++void Worker::RegisterGraphAsync(const RegisterGraphRequest* request,
++                                RegisterGraphResponse* response,
++                                StatusCallback done) {
++  Status s = env_->graph_mgr->Register(
++      request->session_handle(), request->graph_def(), request->graph_options(),
++      response->mutable_graph_handle());
++  done(s);
++}
++
++void Worker::DeregisterGraphAsync(const DeregisterGraphRequest* request,
++                                  DeregisterGraphResponse* response,
++                                  StatusCallback done) {
++  Status s = env_->graph_mgr->Deregister(request->graph_handle());
++  done(s);
++}
++
++Worker::PartialRunState* Worker::FindPartialRun(const string& graph_handle,
++                                                int step_id) {
++  std::pair<string, int> k(graph_handle, step_id);
++  Worker::PartialRunState* prun_state = nullptr;
++  mutex_lock l(mu_);
++  auto it = partial_runs_.find(k);
++  if (it != partial_runs_.end()) {
++    prun_state = it->second.get();
++  }
++  return prun_state;
++}
++
++void Worker::InsertPartialRunLocked(const string& graph_handle, int step_id,
++                                    Worker::PartialRunState* partial_run_state)
++    EXCLUSIVE_LOCKS_REQUIRED(mu_) {
++  std::pair<string, int> k(graph_handle, step_id);
++  partial_runs_.emplace(std::make_pair(
++      k, std::unique_ptr<Worker::PartialRunState>(partial_run_state)));
++}
++
++void Worker::RemovePartialRun(const string& graph_handle, int step_id) {
++  std::pair<string, int> k(graph_handle, step_id);
++  mutex_lock l(mu_);
++  partial_runs_.erase(partial_runs_.find(k));
++}
++
++void Worker::AbortStep(int64 step_id) {
++  Rendezvous* rendez = env_->rendezvous_mgr->Find(step_id);
++  SchedNonBlockingClosureAfter(1000000, [rendez, step_id]() {
++    // Delay a bit before aborting the step. This way, the root
++    // cause may return first back to the client instead of this
++    // cancellation generated abort error.
++    rendez->StartAbort(errors::Aborted("Step ", step_id));
++    rendez->Unref();
++  });
++}
++
++Status Worker::PrepareRunGraph(const RunGraphRequest& req,
++                               GraphMgr::NamedTensors* in,
++                               GraphMgr::NamedTensors* out) {
++  static Tensor empty_tensor(DT_FLOAT);
++  if (req.send_size() > 0) {
++    // TODO(zhifengc): Let the caller decide on which device to
++    // allocate the tensor.
++    Device* cpu_dev = nullptr;
++    TF_RETURN_IF_ERROR(env_->device_mgr->LookupDevice("CPU:0", &cpu_dev));
++    AllocatorAttributes alloc_attrs;
++    Tensor val;
++    for (const NamedTensor& entry : req.send()) {
++      TF_RETURN_IF_ERROR(
++          cpu_dev->MakeTensorFromProto(entry.val(), alloc_attrs, &val));
++      in->insert({entry.key(), val});
++    }
++  }
++  for (const string& key : req.recv_key()) {
++    out->insert({key, empty_tensor});
++  }
++  return Status::OK();
++}
++
++void Worker::RunGraphAsync(CallOptions* opts, const RunGraphRequest* request,
++                           RunGraphResponse* response, StatusCallback done) {
++  if (request->is_partial()) {
++    DoPartialRunGraph(opts, request, response, std::move(done));
++  } else {
++    DoRunGraph(opts, request, response, std::move(done));
++  }
++}
++
++void Worker::DoRunGraph(CallOptions* opts, const RunGraphRequest* request,
++                        RunGraphResponse* response, StatusCallback done) {
++  const int64 step_id = request->step_id();
++  TRACEPRINTF("RunGraph: %lld", step_id);
++  GraphMgr::NamedTensors in;
++  GraphMgr::NamedTensors* out = new GraphMgr::NamedTensors;
++  Status s = PrepareRunGraph(*request, &in, out);
++  if (!s.ok()) {
++    delete out;
++    done(s);
++    return;
++  }
++  StepStatsCollector* collector = nullptr;
++  if (request->exec_opts().record_timeline() ||
++      request->exec_opts().record_costs()) {
++    collector = new StepStatsCollector(response->mutable_step_stats());
++    // TODO(mrry,pbar): GPU tracing for distributed steps.
++  }
++  CancellationManager* cm = new CancellationManager;
++  opts->SetCancelCallback([this, cm, step_id]() {
++    cm->StartCancel();
++    AbortStep(step_id);
++  });
++  CancellationToken token;
++  {
++    mutex_lock l(mu_);
++    token = cancellation_manager_->get_cancellation_token();
++    bool already_cancelled = !cancellation_manager_->RegisterCallback(
++        token, [cm]() { cm->StartCancel(); });
++    if (already_cancelled) {
++      opts->ClearCancelCallback();
++      delete cm;
++      delete collector;
++      delete out;
++      done(errors::Aborted("Call was aborted"));
++      return;
++    }
++  }
++  CostGraphDef* cost_graph = response->mutable_cost_graph();
++  env_->graph_mgr->ExecuteAsync(
++      request->graph_handle(), step_id, request->exec_opts(), collector,
++      cost_graph, cm, in, [this, step_id, response, cm, out, token, collector,
++                           opts, done](Status s) {
++        if (s.ok()) {
++          env_->graph_mgr->RecvOutputs(step_id, out);
++        }
++        opts->ClearCancelCallback();
++        {
++          mutex_lock l(mu_);
++          cancellation_manager_->DeregisterCallback(token);
++        }
++        delete cm;
++
++        if (s.ok()) {
++          for (const auto& p : *out) {
++            const string& key = p.first;
++            const Tensor& val = p.second;
++            auto* recv = response->add_recv();
++            recv->set_key(key);
++            // TODO(zhifengc): Deal with gpu -> cpu copy.
++            TensorProto* proto = recv->mutable_val();
++            val.AsProtoField(proto);
++          }
++        }
++        delete collector;
++        delete out;
++        done(s);
++      });
++}
++
++// TODO(suharshs): Add stats collection support to partial run.
++void Worker::DoPartialRunGraph(CallOptions* opts,
++                               const RunGraphRequest* request,
++                               RunGraphResponse* response,
++                               StatusCallback done) {
++  const int64 step_id = request->step_id();
++  const string& graph_handle = request->graph_handle();
++  TRACEPRINTF("PartialRunGraph: %lld", step_id);
++  GraphMgr::NamedTensors in;
++  GraphMgr::NamedTensors* out = new GraphMgr::NamedTensors;
++  Status s = PrepareRunGraph(*request, &in, out);
++  auto finish = [this, done, out](const Status& s) {
++    delete out;
++    done(s);
++  };
++  if (!s.ok()) {
++    finish(s);
++    return;
++  }
++
++  PartialRunState* partial_run_state = FindPartialRun(graph_handle, step_id);
++
++  CancellationManager* cm = nullptr;
++  // If this is a new partial run call we need to create a new cancellation
++  // manager.
++  // Otherwise we use the cancellation manager stored in the found partial
++  // run state.
++  if (partial_run_state == nullptr) {
++    cm = new CancellationManager;
++  } else {
++    cm = partial_run_state->cancellation_manager;
++  }
++
++  // Before we start doing anything, we set the RPC cancellation.
++  opts->SetCancelCallback([this, cm, step_id]() {
++    cm->StartCancel();
++    AbortStep(step_id);
++  });
++
++  // If this is a new partial run request, the request will need to start the
++  // executors.
++  if (partial_run_state == nullptr) {
++    CancellationToken token;
++    {
++      mutex_lock l(mu_);
++      // Insert the new partial run into the partial_runs_ map.
++      partial_run_state = new PartialRunState(cm);
++      InsertPartialRunLocked(graph_handle, step_id, partial_run_state);
++      token = cancellation_manager_->get_cancellation_token();
++      cancellation_manager_->RegisterCallback(token,
++                                              [cm]() { cm->StartCancel(); });
++    }
++    env_->graph_mgr->ExecuteAsync(
++        graph_handle, step_id, request->exec_opts(), nullptr /* collector */,
++        nullptr /* cost_graph */, cm, in,
++        [this, step_id, graph_handle, token, partial_run_state](Status s) {
++          {
++            mutex_lock l(mu_);
++            cancellation_manager_->DeregisterCallback(token);
++          }
++          partial_run_state->executor_done.Notify();
++          // TODO(suharshs): Propagate the status once we keep state for
++          // each partial run call.
++        });
++    } else {
++      // Send the partial run's new inputs.
++      s = env_->graph_mgr->SendInputs(step_id, in);
++      if (!s.ok()) {
++        finish(s);
++        return;
++      }
++    }
++
++    // Receive the partial run's outputs.
++    s = env_->graph_mgr->RecvOutputs(step_id, out);
++    if (!s.ok()) {
++      finish(s);
++      return;
++    }
++
++    // Construct and return the resp.
++    for (const auto& p : *out) {
++      const string& key = p.first;
++      const Tensor& val = p.second;
++      auto* recv = response->add_recv();
++      recv->set_key(key);
++      // TODO(zhifengc): Deal with gpu -> cpu copy.
++      TensorProto* proto = recv->mutable_val();
++      val.AsProtoField(proto);
++    }
++
++    // If this is the last partial run request we must also wait for the entire
++    // graph execution to be completed.
++    if (request->is_last_partial_run()) {
++      partial_run_state->executor_done.WaitForNotification();
++      RemovePartialRun(graph_handle, step_id);
++      // Before deleting the cancellation manager on the final call, ensure
++      // that we clear the RPC cancel callback, which has a reference to the
++      // cancellation manager.
++      opts->ClearCancelCallback();
++      delete cm;
++    }
++
++    finish(s);
++}
++
++void Worker::CleanupGraphAsync(const CleanupGraphRequest* request,
++                               CleanupGraphResponse* response,
++                               StatusCallback done) {
++  const int64 step_id = request->step_id();
++  env_->rendezvous_mgr->Cleanup(step_id);
++  done(Status::OK());
++}
++
++void Worker::CleanupAllAsync(const CleanupAllRequest* request,
++                             CleanupAllResponse* response,
++                             StatusCallback done) {
++  std::vector<string> containers;
++  for (const auto& c : request->container()) containers.push_back(c);
++  env_->device_mgr->ClearContainers(containers);
++  done(Status::OK());
++}
++
++void Worker::LoggingAsync(const LoggingRequest* request,
++                          LoggingResponse* response, StatusCallback done) {
++  done(errors::Unimplemented("Logging"));
++}
++
++void Worker::TracingAsync(const TracingRequest* request,
++                          TracingResponse* response, StatusCallback done) {
++  done(errors::Unimplemented("Tracing"));
++}
++
++// Helper for RecvTensor. Validates "key" and returns the source
++// device in "*src_dev".
++Status Worker::PrepareRecvTensor(const Rendezvous::ParsedKey& parsed,
++                                 Device** src_dev) {
++  // Figures out which device the tensor is hosted on.
++  TF_RETURN_IF_ERROR(
++      env_->device_mgr->LookupDevice(parsed.src_device, src_dev));
++
++  // Does the device have the right incarnation number we expect?
++  if ((*src_dev)->attributes().incarnation() != parsed.src_incarnation) {
++    return errors::Aborted(
++        "RecvTensor expects a different device incarnation: ",
++        parsed.src_incarnation, " vs. ", (*src_dev)->attributes().incarnation(),
++        ". Your worker job was probably restarted. Check your "
++        "worker job for the reason why it was restarted.");
++  }
++
++  return Status::OK();
++}
++
++void Worker::RecvTensorAsync(CallOptions* opts,
++                             const RecvTensorRequest* request,
++                             TensorResponse* response, StatusCallback done) {
++  // The base Worker class does not implement RecvTensorAsync, because
++  // it is not currently used for worker-to-worker communication. Use a
++  // transport-specific implementation (such as `GrpcWorker::RecvTensorAsync()`)
++  // instead.
++  done(errors::Unimplemented("Worker::RecvTensorAsync()"));
++}
++
++}  // namespace tensorflow
+diff --git a/tensorflow/core/distributed_runtime/worker.h b/tensorflow/core/distributed_runtime/worker.h
+new file mode 100644
+index 00000000000..92ba63a7300
+--- /dev/null
++++ b/tensorflow/core/distributed_runtime/worker.h
+@@ -0,0 +1,127 @@
++/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_WORKER_H_
++#define THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_WORKER_H_
++
++#include <unordered_map>
++
++#include "tensorflow/core/distributed_runtime/graph_mgr.h"
++#include "tensorflow/core/distributed_runtime/worker_interface.h"
++
++namespace tensorflow {
++
++class CancellationManager;
++class Device;
++class WorkerEnv;
++
++// A TensorFlow Worker runs registered graphs and supports worker-to-worker
++// Tensor transfer.
++//
++// See `../protobuf/worker_service.proto` for more details about each method.
++//
++// This class may be subclassed to provide specialized implementations of
++// particular methods for different transport mechanism. For example,
++// `GrpcWorker` specializes the `RecvTensorAsync()` method to support a more
++// efficient gRPC data structure for handling large binary data.
++class Worker : public WorkerInterface {
++ public:
++  Worker(WorkerEnv* env);
++  virtual ~Worker() {}
++
++  void GetStatusAsync(const GetStatusRequest* request,
++                      GetStatusResponse* response,
++                      StatusCallback done) override;
++
++  void RegisterGraphAsync(const RegisterGraphRequest* request,
++                          RegisterGraphResponse* response,
++                          StatusCallback done) override;
++
++  void DeregisterGraphAsync(const DeregisterGraphRequest* request,
++                            DeregisterGraphResponse* response,
++                            StatusCallback done) override;
++
++  void RunGraphAsync(CallOptions* opts, const RunGraphRequest* request,
++                     RunGraphResponse* response, StatusCallback done) override;
++
++  void CleanupGraphAsync(const CleanupGraphRequest* request,
++                         CleanupGraphResponse* response,
++                         StatusCallback done) override;
++
++  void CleanupAllAsync(const CleanupAllRequest* request,
++                       CleanupAllResponse* response,
++                       StatusCallback done) override;
++
++  void RecvTensorAsync(CallOptions* opts, const RecvTensorRequest* request,
++                       TensorResponse* response, StatusCallback done) override;
++
++  void LoggingAsync(const LoggingRequest* request, LoggingResponse* response,
++                    StatusCallback done) override;
++
++  void TracingAsync(const TracingRequest* request, TracingResponse* response,
++                    StatusCallback done) override;
++
++ protected:
++  WorkerEnv* const env_;  // Not owned.
++
++  Status PrepareRecvTensor(const Rendezvous::ParsedKey& parsed,
++                           Device** src_dev);
++
++  void AbortStep(int64);
++
++ private:
++  mutex mu_;
++  CancellationManager* cancellation_manager_ GUARDED_BY(mu_);
++
++  struct PartialRunState {
++    CancellationManager* cancellation_manager;
++    Notification executor_done;
++
++    explicit PartialRunState(CancellationManager* cm)
++        : cancellation_manager(cm) {}
++  };
++  struct PairHash {
++    std::size_t operator()(std::pair<string, int> const& p) const {
++      return Hash64Combine(std::hash<string>()(p.first),
++                           std::hash<int>()(p.second));
++    }
++  };
++  std::unordered_map<std::pair<string, int>, std::unique_ptr<PartialRunState>,
++                     PairHash>
++      partial_runs_ GUARDED_BY(mu_);
++
++  PartialRunState* FindPartialRun(const string& graph_handle, int step_id);
++
++  void InsertPartialRunLocked(const string& graph_handle, int step_id,
++                              PartialRunState* partial_run_state)
++      EXCLUSIVE_LOCKS_REQUIRED(mu_);
++
++  void RemovePartialRun(const string& graph_handle, int step_id);
++
++  Status PrepareRunGraph(const RunGraphRequest& req, GraphMgr::NamedTensors* in,
++                         GraphMgr::NamedTensors* out);
++
++  void DoRunGraph(CallOptions* opts, const RunGraphRequest* request,
++                  RunGraphResponse* response, StatusCallback done);
++
++  void DoPartialRunGraph(CallOptions* opts, const RunGraphRequest* request,
++                         RunGraphResponse* response, StatusCallback done);
++
++  TF_DISALLOW_COPY_AND_ASSIGN(Worker);
++};
++
++}  // namespace tensorflow
++
++#endif  // THIRD_PARTY_TENSORFLOW_CORE_DISTRIBUTED_RUNTIME_WORKER_H_

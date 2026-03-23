@@ -1,0 +1,290 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index d8dc79df2a..f946ed4f24 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -168,6 +168,8 @@ Trunk (unreleased changes)
+ 
+         BOOKKEEPER-542: Remove trailing spaces in IndexCorruptionTest (fpj via ivank)
+ 
++        BOOKKEEPER-530: data might be lost during compaction. (ivank)
++
+       hedwig-protocol:
+ 
+         BOOKKEEPER-394: CompositeException message is not useful (Stu Hood via sijie)
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+index c0cdcd507b..1f848f5527 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
+ import org.apache.bookkeeper.meta.LedgerManager;
+ import org.apache.bookkeeper.meta.LedgerManagerFactory;
+ import org.apache.bookkeeper.bookie.BookieException;
++import org.apache.bookkeeper.bookie.GarbageCollectorThread.SafeEntryAdder;
+ import org.apache.bookkeeper.bookie.Journal.JournalScanner;
+ import org.apache.bookkeeper.bookie.LedgerDirsManager.LedgerDirsListener;
+ import org.apache.bookkeeper.bookie.LedgerDirsManager.NoWritableLedgerDirException;
+@@ -49,6 +50,7 @@ import org.apache.bookkeeper.conf.ServerConfiguration;
+ import org.apache.bookkeeper.jmx.BKMBeanInfo;
+ import org.apache.bookkeeper.jmx.BKMBeanRegistry;
+ import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.WriteCallback;
++import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.GenericCallback;
+ import org.apache.bookkeeper.util.BookKeeperConstants;
+ import org.apache.bookkeeper.util.IOUtils;
+ import org.apache.bookkeeper.util.MathUtils;
+@@ -524,7 +526,9 @@ public class Bookie extends Thread {
+         LOG.info("instantiate ledger manager {}", ledgerManagerFactory.getClass().getName());
+         ledgerManager = ledgerManagerFactory.newLedgerManager();
+         syncThread = new SyncThread(conf);
+-        ledgerStorage = new InterleavedLedgerStorage(conf, ledgerManager, ledgerDirsManager);
++        ledgerStorage = new InterleavedLedgerStorage(conf, ledgerManager,
++                                                     ledgerDirsManager,
++                                                     new BookieSafeEntryAdder());
+         handles = new HandleFactoryImpl(ledgerStorage);
+         // instantiate the journal
+         journal = new Journal(conf, ledgerDirsManager);
+@@ -1180,6 +1184,37 @@ public class Bookie extends Thread {
+         return true;
+     }
+ 
++    private class BookieSafeEntryAdder implements SafeEntryAdder {
++        @Override
++        public void safeAddEntry(final long ledgerId, final ByteBuffer buffer,
++                                 final GenericCallback<Void> cb) {
++            journal.logAddEntry(buffer, new WriteCallback() {
++                    @Override
++                    public void writeComplete(int rc, long ledgerId2, long entryId,
++                                              InetSocketAddress addr, Object ctx) {
++                        if (rc != BookieException.Code.OK) {
++                            LOG.error("Error rewriting to journal (ledger {}, entry {})", ledgerId2, entryId);
++                            cb.operationComplete(rc, null);
++                            return;
++                        }
++                        try {
++                            addEntryByLedgerId(ledgerId, buffer);
++                            cb.operationComplete(rc, null);
++                        } catch (IOException ioe) {
++                            LOG.error("Error adding to ledger storage (ledger " + ledgerId2
++                                      + ", entry " + entryId + ")", ioe);
++                            // couldn't add to ledger storage
++                            cb.operationComplete(BookieException.Code.IllegalOpException, null);
++                        } catch (BookieException bke) {
++                            LOG.error("Bookie error adding to ledger storage (ledger " + ledgerId2
++                                      + ", entry " + entryId + ")", bke);
++                            // couldn't add to ledger storage
++                            cb.operationComplete(bke.getCode(), null);
++                        }
++                    }
++                }, null);
++        }
++    }
+     /**
+      * @param args
+      * @throws IOException
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/GarbageCollectorThread.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/GarbageCollectorThread.java
+index 0f55d3208e..c9f5adebdb 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/GarbageCollectorThread.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/GarbageCollectorThread.java
+@@ -30,7 +30,9 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
++import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.GenericCallback;
+ import org.apache.bookkeeper.bookie.EntryLogger.EntryLogScanner;
+ import org.apache.bookkeeper.bookie.GarbageCollector.GarbageCleaner;
+ import org.apache.bookkeeper.conf.ServerConfiguration;
+@@ -46,7 +48,7 @@ import org.slf4j.LoggerFactory;
+  */
+ public class GarbageCollectorThread extends Thread {
+     private static final Logger LOG = LoggerFactory.getLogger(GarbageCollectorThread.class);
+-
++    private static final int COMPACTION_MAX_OUTSTANDING_REQUESTS = 1000;
+     private static final int SECOND = 1000;
+ 
+     // Maps entry log files to the set of ledgers that comprise the file and the size usage per ledger
+@@ -69,7 +71,7 @@ public class GarbageCollectorThread extends Thread {
+ 
+     // Entry Logger Handle
+     final EntryLogger entryLogger;
+-    final EntryLogScanner scanner;
++    final SafeEntryAdder safeEntryAdder;
+ 
+     // Ledger Cache Handle
+     final LedgerCache ledgerCache;
+@@ -87,11 +89,23 @@ public class GarbageCollectorThread extends Thread {
+     final GarbageCollector garbageCollector;
+     final GarbageCleaner garbageCleaner;
+ 
++
++    /**
++     * Interface for adding entries. When the write callback is triggered, the
++     * entry must be guaranteed to be presisted.
++     */
++    interface SafeEntryAdder {
++        public void safeAddEntry(long ledgerId, ByteBuffer buffer, GenericCallback<Void> cb);
++    }
++
+     /**
+      * A scanner wrapper to check whether a ledger is alive in an entry log file
+      */
+     class CompactionScanner implements EntryLogScanner {
+         EntryLogMetadata meta;
++        Object completionLock = new Object();
++        AtomicInteger outstandingRequests = new AtomicInteger(0);
++        AtomicBoolean allSuccessful = new AtomicBoolean(true);
+ 
+         public CompactionScanner(EntryLogMetadata meta) {
+             this.meta = meta;
+@@ -99,13 +113,53 @@ public class GarbageCollectorThread extends Thread {
+ 
+         @Override
+         public boolean accept(long ledgerId) {
+-            return meta.containsLedger(ledgerId) && scanner.accept(ledgerId);
++            return meta.containsLedger(ledgerId);
+         }
+ 
+         @Override
+-        public void process(long ledgerId, long offset, ByteBuffer entry)
++        public void process(final long ledgerId, long offset, ByteBuffer entry)
+             throws IOException {
+-            scanner.process(ledgerId, offset, entry);
++            if (!allSuccessful.get()) {
++                return;
++            }
++
++            outstandingRequests.incrementAndGet();
++            synchronized (completionLock) {
++                while (outstandingRequests.get() >= COMPACTION_MAX_OUTSTANDING_REQUESTS) {
++                    try {
++                        completionLock.wait();
++                    } catch (InterruptedException ie) {
++                        LOG.error("Interrupted while waiting to re-add entry", ie);
++                        Thread.currentThread().interrupt();
++                        throw new IOException("Interrupted while waiting to re-add entry", ie);
++                    }
++                }
++            }
++            safeEntryAdder.safeAddEntry(ledgerId, entry, new GenericCallback<Void>() {
++                    @Override
++                    public void operationComplete(int rc, Void result) {
++                        if (rc != BookieException.Code.OK) {
++                            LOG.error("Error {} re-adding entry for ledger {})",
++                                      rc, ledgerId);
++                            allSuccessful.set(false);
++                        }
++                        synchronized(completionLock) {
++                            outstandingRequests.decrementAndGet();
++                            completionLock.notifyAll();
++                        }
++                    }
++                });
++        }
++
++        void awaitComplete() throws InterruptedException, IOException {
++            synchronized(completionLock) {
++                while (outstandingRequests.get() > 0) {
++                    completionLock.wait();
++                }
++                if (allSuccessful.get() == false) {
++                    throw new IOException("Couldn't re-add all entries");
++                }
++            }
+         }
+     }
+ 
+@@ -121,7 +175,7 @@ public class GarbageCollectorThread extends Thread {
+                                   final LedgerCache ledgerCache,
+                                   EntryLogger entryLogger,
+                                   SnapshotMap<Long, Boolean> activeLedgers,
+-                                  EntryLogScanner scanner,
++                                  SafeEntryAdder safeEntryAdder,
+                                   LedgerManager ledgerManager)
+         throws IOException {
+         super("GarbageCollectorThread");
+@@ -129,7 +183,7 @@ public class GarbageCollectorThread extends Thread {
+         this.ledgerCache = ledgerCache;
+         this.entryLogger = entryLogger;
+         this.activeLedgers = activeLedgers;
+-        this.scanner = scanner;
++        this.safeEntryAdder = safeEntryAdder;
+ 
+         this.gcWaitTime = conf.getGcWaitTime();
+ 
+@@ -366,11 +420,16 @@ public class GarbageCollectorThread extends Thread {
+         LOG.info("Compacting entry log : " + entryLogId);
+ 
+         try {
+-            entryLogger.scanEntryLog(entryLogId, new CompactionScanner(entryLogMeta));
++            CompactionScanner scanner = new CompactionScanner(entryLogMeta);
++            entryLogger.scanEntryLog(entryLogId, scanner);
++            scanner.awaitComplete();
+             // after moving entries to new entry log, remove this old one
+             removeEntryLog(entryLogId);
+         } catch (IOException e) {
+             LOG.info("Premature exception when compacting " + entryLogId, e);
++        } catch (InterruptedException ie) {
++            Thread.currentThread().interrupt();
++            LOG.warn("Interrupted while compacting", ie);
+         } finally {
+             // clear compacting flag
+             compacting.set(false);
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
+index f6e985126d..fd834c3930 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
+@@ -57,13 +57,14 @@ class InterleavedLedgerStorage implements LedgerStorage {
+     private volatile boolean somethingWritten = false;
+ 
+     InterleavedLedgerStorage(ServerConfiguration conf,
+-            LedgerManager ledgerManager, LedgerDirsManager ledgerDirsManager)
++                             LedgerManager ledgerManager, LedgerDirsManager ledgerDirsManager,
++                             GarbageCollectorThread.SafeEntryAdder safeEntryAdder)
+ 			throws IOException {
+         activeLedgers = new SnapshotMap<Long, Boolean>();
+         entryLogger = new EntryLogger(conf, ledgerDirsManager);
+         ledgerCache = new LedgerCacheImpl(conf, activeLedgers, ledgerDirsManager);
+         gcThread = new GarbageCollectorThread(conf, ledgerCache, entryLogger,
+-                activeLedgers, new EntryLogCompactionScanner(), ledgerManager);
++                activeLedgers, safeEntryAdder, ledgerManager);
+     }
+ 
+     @Override
+@@ -184,23 +185,4 @@ class InterleavedLedgerStorage implements LedgerStorage {
+     public BKMBeanInfo getJMXBean() {
+         return ledgerCache.getJMXBean();
+     }
+-
+-    /**
+-     * Scanner used to do entry log compaction
+-     */
+-    class EntryLogCompactionScanner implements EntryLogger.EntryLogScanner {
+-        @Override
+-        public boolean accept(long ledgerId) {
+-            // bookie has no knowledge about which ledger is deleted
+-            // so just accept all ledgers.
+-            return true;
+-        }
+-
+-        @Override
+-        public void process(long ledgerId, long offset, ByteBuffer buffer)
+-            throws IOException {
+-            addEntry(buffer);
+-        }
+-    }
+-
+ }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Journal.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Journal.java
+index aefffd424a..bfdb02e1ab 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Journal.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Journal.java
+@@ -503,7 +503,8 @@ class Journal extends Thread {
+                             lastFlushPosition = bc.position();
+                             lastLogMark.setLastLogMark(logId, lastFlushPosition);
+                             for (QueueEntry e : toFlush) {
+-                                e.cb.writeComplete(0, e.ledgerId, e.entryId, null, e.ctx);
++                                e.cb.writeComplete(BookieException.Code.OK,
++                                                   e.ledgerId, e.entryId, null, e.ctx);
+                             }
+                             toFlush.clear();
+ 

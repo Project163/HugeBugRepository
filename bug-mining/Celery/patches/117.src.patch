@@ -1,0 +1,656 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index fdec6d58f..7d4fbbdc3 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -22,6 +22,7 @@ from kombu.utils.url import maybe_sanitize_url
+ import celery.exceptions
+ from celery import current_app, group, maybe_signature, states
+ from celery._state import get_current_task
++from celery.app.task import Context
+ from celery.exceptions import (BackendGetMetaError, BackendStoreError,
+                                ChordError, ImproperlyConfigured,
+                                NotRegistered, TaskRevokedError, TimeoutError)
+@@ -170,8 +171,44 @@ class Backend:
+             self.store_result(task_id, exc, state,
+                               traceback=traceback, request=request)
+         if request:
++            # This task may be part of a chord
+             if request.chord:
+                 self.on_chord_part_return(request, state, exc)
++            # It might also have chained tasks which need to be propagated to,
++            # this is most likely to be exclusive with being a direct part of a
++            # chord but we'll handle both cases separately.
++            #
++            # The `chain_data` try block here is a bit tortured since we might
++            # have non-iterable objects here in tests and it's easier this way.
++            try:
++                chain_data = iter(request.chain)
++            except (AttributeError, TypeError):
++                chain_data = tuple()
++            for chain_elem in chain_data:
++                chain_elem_opts = chain_elem['options']
++                # If the state should be propagated, we'll do so for all
++                # elements of the chain. This is only truly important so
++                # that the last chain element which controls completion of
++                # the chain itself is marked as completed to avoid stalls.
++                if self.store_result and state in states.PROPAGATE_STATES:
++                    try:
++                        chained_task_id = chain_elem_opts['task_id']
++                    except KeyError:
++                        pass
++                    else:
++                        self.store_result(
++                            chained_task_id, exc, state,
++                            traceback=traceback, request=chain_elem
++                        )
++                # If the chain element is a member of a chord, we also need
++                # to call `on_chord_part_return()` as well to avoid stalls.
++                if 'chord' in chain_elem_opts:
++                    failed_ctx = Context(chain_elem)
++                    failed_ctx.update(failed_ctx.options)
++                    failed_ctx.id = failed_ctx.options['task_id']
++                    failed_ctx.group = failed_ctx.options['group_id']
++                    self.on_chord_part_return(failed_ctx, state, exc)
++            # And finally we'll fire any errbacks
+             if call_errbacks and request.errbacks:
+                 self._call_task_errbacks(request, exc, traceback)
+ 
+diff --git a/celery/canvas.py b/celery/canvas.py
+index a80e979af..9b32e832f 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -1134,7 +1134,14 @@ class group(Signature):
+             # pass a Mock object as argument.
+             sig['immutable'] = True
+             sig = Signature.from_dict(sig)
+-        return self.tasks[0].link_error(sig)
++        # Any child task might error so we need to ensure that they are all
++        # capable of calling the linked error signature. This opens the
++        # possibility that the task is called more than once but that's better
++        # than it not being called at all.
++        #
++        # We return a concretised tuple of the signatures actually applied to
++        # each child task signature, of which there might be none!
++        return tuple(child_task.link_error(sig) for child_task in self.tasks)
+ 
+     def _prepared(self, tasks, partial_args, group_id, root_id, app,
+                   CallableSignature=abstract.CallableSignature,
+@@ -1179,7 +1186,7 @@ class group(Signature):
+                 # end up messing up chord counts and there are all sorts of
+                 # awful race conditions to think about. We'll hope it's not!
+                 sig, res, group_id = current_task
+-                chord_obj = sig.options.get("chord") or chord
++                chord_obj = chord if chord is not None else sig.options.get("chord")
+                 # We need to check the chord size of each contributing task so
+                 # that when we get to the final one, we can correctly set the
+                 # size in the backend and the chord can be sensible completed.
+diff --git a/docs/userguide/canvas.rst b/docs/userguide/canvas.rst
+index 55811f2fb..45912a6d2 100644
+--- a/docs/userguide/canvas.rst
++++ b/docs/userguide/canvas.rst
+@@ -688,6 +688,52 @@ Group also supports iterators:
+ A group is a signature object, so it can be used in combination
+ with other signatures.
+ 
++.. _group-callbacks:
++
++Group Callbacks and Error Handling
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Groups can have callback and errback signatures linked to them as well, however
++the behaviour can be somewhat surprising due to the fact that groups are not
++real tasks and simply pass linked tasks down to their encapsulated signatures.
++This means that the return values of a group are not collected to be passed to
++a linked callback signature.
++As an example, the following snippet using a simple `add(a, b)` task is faulty
++since the linked `add.s()` signature will not received the finalised group
++result as one might expect.
++
++.. code-block:: pycon
++
++    >>> g = group(add.s(2, 2), add.s(4, 4))
++    >>> g.link(add.s())
++    >>> res = g()
++    [4, 8]
++
++Note that the finalised results of the first two tasks are returned, but the
++callback signature will have run in the background and raised an exception
++since it did not receive the two arguments it expects.
++
++Group errbacks are passed down to encapsulated signatures as well which opens
++the possibility for an errback linked only once to be called more than once if
++multiple tasks in a group were to fail.
++As an example, the following snippet using a `fail()` task which raises an
++exception can be expected to invoke the `log_error()` signature once for each
++failing task which gets run in the group.
++
++.. code-block:: pycon
++
++    >>> g = group(fail.s(), fail.s())
++    >>> g.link_error(log_error.s())
++    >>> res = g()
++
++With this in mind, it's generally advisable to create idempotent or counting
++tasks which are tolerant to being called repeatedly for use as errbacks.
++
++These use cases are better addressed by the :class:`~celery.chord` class which
++is supported on certain backend implementations.
++
++.. _group-results:
++
+ Group Results
+ ~~~~~~~~~~~~~
+ 
+@@ -884,6 +930,12 @@ an errback to the chord callback:
+     >>> c = (group(add.s(i, i) for i in range(10)) |
+     ...      xsum.s().on_error(on_chord_error.s())).delay()
+ 
++Chords may have callback and errback signatures linked to them, which addresses
++some of the issues with linking signatures to groups.
++Doing so will link the provided signature to the chord's body which can be
++expected to gracefully invoke callbacks just once upon completion of the body,
++or errbacks just once if any task in the chord header or body fails.
++
+ .. _chord-important-notes:
+ 
+ Important Notes
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index 4e88bcd88..d1b825fcf 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -223,6 +223,13 @@ def redis_echo(message):
+     redis_connection.rpush('redis-echo', message)
+ 
+ 
++@shared_task
++def redis_count():
++    """Task that increments a well-known redis key."""
++    redis_connection = get_redis_connection()
++    redis_connection.incr('redis-count')
++
++
+ @shared_task(bind=True)
+ def second_order_replace1(self, state=False):
+     redis_connection = get_redis_connection()
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index 28560e33e..02beb8550 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -1,9 +1,11 @@
+ import re
+ import tempfile
++import uuid
+ from datetime import datetime, timedelta
+ from time import sleep
+ 
+ import pytest
++import pytest_subtests  # noqa: F401
+ 
+ from celery import chain, chord, group, signature
+ from celery.backends.base import BaseKeyValueStoreBackend
+@@ -17,7 +19,7 @@ from .tasks import (ExpectedException, add, add_chord_to_chord, add_replaced,
+                     add_to_all, add_to_all_to_chord, build_chain_inside_task,
+                     chord_error, collect_ids, delayed_sum,
+                     delayed_sum_with_soft_guard, fail, identity, ids,
+-                    print_unicode, raise_error, redis_echo,
++                    print_unicode, raise_error, redis_count, redis_echo,
+                     replace_with_chain, replace_with_chain_which_raises,
+                     replace_with_empty_chain, retry_once, return_exception,
+                     return_priority, second_order_replace1, tsum,
+@@ -810,6 +812,109 @@ class test_group:
+         # Re-raise the expected exception so this test will XFAIL
+         raise expected_excinfo.value
+ 
++    def test_callback_called_by_group(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        callback_msg = str(uuid.uuid4()).encode()
++        callback = redis_echo.si(callback_msg)
++
++        group_sig = group(identity.si(42), identity.si(1337))
++        group_sig.link(callback)
++        redis_connection.delete("redis-echo")
++        with subtests.test(msg="Group result is returned"):
++            res = group_sig.delay()
++            assert res.get(timeout=TIMEOUT) == [42, 1337]
++        with subtests.test(msg="Callback is called after group is completed"):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Callback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == callback_msg
++
++    def test_errback_called_by_group_fail_first(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++
++        group_sig = group(fail.s(), identity.si(42))
++        group_sig.link_error(errback)
++        redis_connection.delete("redis-echo")
++        with subtests.test(msg="Error propagates from group"):
++            res = group_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after group task fails"):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_errback_called_by_group_fail_last(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++
++        group_sig = group(identity.si(42), fail.s())
++        group_sig.link_error(errback)
++        redis_connection.delete("redis-echo")
++        with subtests.test(msg="Error propagates from group"):
++            res = group_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after group task fails"):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_errback_called_by_group_fail_multiple(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        expected_errback_count = 42
++        errback = redis_count.si()
++
++        # Include a mix of passing and failing tasks
++        group_sig = group(
++            *(identity.si(42) for _ in range(24)),  # arbitrary task count
++            *(fail.s() for _ in range(expected_errback_count)),
++        )
++        group_sig.link_error(errback)
++        redis_connection.delete("redis-count")
++        with subtests.test(msg="Error propagates from group"):
++            res = group_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after group task fails"):
++            check_interval = 0.1
++            check_max = int(TIMEOUT * check_interval)
++            for i in range(check_max + 1):
++                maybe_count = redis_connection.get("redis-count")
++                # It's either `None` or a base-10 integer
++                count = int(maybe_count or b"0")
++                if count == expected_errback_count:
++                    # escape and pass
++                    break
++                elif i < check_max:
++                    # try again later
++                    sleep(check_interval)
++                else:
++                    # fail
++                    assert count == expected_errback_count
++            else:
++                raise TimeoutError("Errbacks were not called in time")
++
+ 
+ def assert_ids(r, expected_value, expected_root_id, expected_parent_id):
+     root_id, parent_id, value = r.get(timeout=TIMEOUT)
+@@ -1406,6 +1511,335 @@ class test_chord:
+         with pytest.raises(ExpectedException):
+             res.get(timeout=TIMEOUT)
+ 
++    def test_error_propagates_to_chord_from_simple(self, manager, subtests):
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        child_sig = fail.s()
++
++        chord_sig = chord((child_sig, ), identity.s())
++        with subtests.test(msg="Error propagates from simple header task"):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        with subtests.test(msg="Error propagates from simple body task"):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++    def test_errback_called_by_chord_from_simple(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++        child_sig = fail.s()
++
++        chord_sig = chord((child_sig, ), identity.s())
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from simple header task"):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after simple header task fails"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from simple body task"):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after simple body task fails"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_error_propagates_to_chord_from_chain(self, manager, subtests):
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        child_sig = chain(identity.si(42), fail.s(), identity.si(42))
++
++        chord_sig = chord((child_sig, ), identity.s())
++        with subtests.test(
++            msg="Error propagates from header chain which fails before the end"
++        ):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        with subtests.test(
++            msg="Error propagates from body chain which fails before the end"
++        ):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++    def test_errback_called_by_chord_from_chain(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++        child_sig = chain(identity.si(42), fail.s(), identity.si(42))
++
++        chord_sig = chord((child_sig, ), identity.s())
++        chord_sig.link_error(errback)
++        with subtests.test(
++            msg="Error propagates from header chain which fails before the end"
++        ):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after header chain which fails before the end"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        chord_sig.link_error(errback)
++        with subtests.test(
++            msg="Error propagates from body chain which fails before the end"
++        ):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after body chain which fails before the end"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_error_propagates_to_chord_from_chain_tail(self, manager, subtests):
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        child_sig = chain(identity.si(42), fail.s())
++
++        chord_sig = chord((child_sig, ), identity.s())
++        with subtests.test(
++            msg="Error propagates from header chain which fails at the end"
++        ):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        with subtests.test(
++            msg="Error propagates from body chain which fails at the end"
++        ):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++    def test_errback_called_by_chord_from_chain_tail(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++        child_sig = chain(identity.si(42), fail.s())
++
++        chord_sig = chord((child_sig, ), identity.s())
++        chord_sig.link_error(errback)
++        with subtests.test(
++            msg="Error propagates from header chain which fails at the end"
++        ):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after header chain which fails at the end"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        chord_sig.link_error(errback)
++        with subtests.test(
++            msg="Error propagates from body chain which fails at the end"
++        ):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(
++            msg="Errback is called after body chain which fails at the end"
++        ):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_error_propagates_to_chord_from_group(self, manager, subtests):
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        child_sig = group(identity.si(42), fail.s())
++
++        chord_sig = chord((child_sig, ), identity.s())
++        with subtests.test(msg="Error propagates from header group"):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        with subtests.test(msg="Error propagates from body group"):
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++
++    def test_errback_called_by_chord_from_group(self, manager, subtests):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        errback_msg = str(uuid.uuid4()).encode()
++        errback = redis_echo.si(errback_msg)
++        child_sig = group(identity.si(42), fail.s())
++
++        chord_sig = chord((child_sig, ), identity.s())
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from header group"):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after header group fails"):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from body group"):
++            redis_connection.delete("redis-echo")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after body group fails"):
++            maybe_key_msg = redis_connection.blpop("redis-echo", TIMEOUT)
++            if maybe_key_msg is None:
++                raise TimeoutError("Errback was not called in time")
++            _, msg = maybe_key_msg
++            assert msg == errback_msg
++
++    def test_errback_called_by_chord_from_group_fail_multiple(
++        self, manager, subtests
++    ):
++        if not manager.app.conf.result_backend.startswith("redis"):
++            raise pytest.skip("Requires redis result backend.")
++        redis_connection = get_redis_connection()
++
++        fail_task_count = 42
++        errback = redis_count.si()
++        # Include a mix of passing and failing tasks
++        child_sig = group(
++            *(identity.si(42) for _ in range(24)),  # arbitrary task count
++            *(fail.s() for _ in range(fail_task_count)),
++        )
++
++        chord_sig = chord((child_sig, ), identity.s())
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from header group"):
++            redis_connection.delete("redis-count")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after header group fails"):
++            # NOTE: Here we only expect the errback to be called once since it
++            # is attached to the chord body which is a single task!
++            expected_errback_count = 1
++            check_interval = 0.1
++            check_max = int(TIMEOUT * check_interval)
++            for i in range(check_max + 1):
++                maybe_count = redis_connection.get("redis-count")
++                # It's either `None` or a base-10 integer
++                count = int(maybe_count or b"0")
++                if count == expected_errback_count:
++                    # escape and pass
++                    break
++                elif i < check_max:
++                    # try again later
++                    sleep(check_interval)
++                else:
++                    # fail
++                    assert count == expected_errback_count
++            else:
++                raise TimeoutError("Errbacks were not called in time")
++
++        chord_sig = chord((identity.si(42), ), child_sig)
++        chord_sig.link_error(errback)
++        with subtests.test(msg="Error propagates from body group"):
++            redis_connection.delete("redis-count")
++            res = chord_sig.delay()
++            with pytest.raises(ExpectedException):
++                res.get(timeout=TIMEOUT)
++        with subtests.test(msg="Errback is called after body group fails"):
++            # NOTE: Here we expect the errback to be called once per failing
++            # task in the chord body since it is a group
++            expected_errback_count = fail_task_count
++            check_interval = 0.1
++            check_max = int(TIMEOUT * check_interval)
++            for i in range(check_max + 1):
++                maybe_count = redis_connection.get("redis-count")
++                # It's either `None` or a base-10 integer
++                count = int(maybe_count or b"0")
++                if count == expected_errback_count:
++                    # escape and pass
++                    break
++                elif i < check_max:
++                    # try again later
++                    sleep(check_interval)
++                else:
++                    # fail
++                    assert count == expected_errback_count
++            else:
++                raise TimeoutError("Errbacks were not called in time")
++
+ 
+ class test_signature_serialization:
+     """
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index c6e9ca860..7527f0aed 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -1,5 +1,5 @@
+ import json
+-from unittest.mock import MagicMock, Mock, call, patch, sentinel, ANY
++from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
+ 
+ import pytest
+ import pytest_subtests  # noqa: F401

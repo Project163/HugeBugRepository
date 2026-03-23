@@ -1,0 +1,580 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 6e4a91dc66..21a05a54a0 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -148,6 +148,8 @@ Trunk (unreleased changes)
+ 
+         BOOKKEEPER-496: Ensure that the auditor and replication worker will shutdown if they lose their ZK session (ivank)
+ 
++        BOOKKEEPER-500: Fencing doesn't work when restarting bookies. (sijie via ivank)
++
+       hedwig-protocol:
+ 
+         BOOKKEEPER-394: CompositeException message is not useful (Stu Hood via sijie)
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+index d3f9122878..e96f880f58 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+@@ -35,6 +35,7 @@ import java.util.Map;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+@@ -89,6 +90,7 @@ public class Bookie extends Thread {
+     final HandleFactory handles;
+ 
+     static final long METAENTRY_ID_LEDGER_KEY = -0x1000;
++    static final long METAENTRY_ID_FENCE_KEY  = -0x2000;
+ 
+     // ZK registration path for this bookie
+     private final String bookieRegistrationPath;
+@@ -155,6 +157,75 @@ public class Bookie extends Thread {
+         }
+     }
+ 
++    final static Future<Boolean> SUCCESS_FUTURE = new Future<Boolean>() {
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) { return false; }
++        @Override
++        public Boolean get() { return true; }
++        @Override
++        public Boolean get(long timeout, TimeUnit unit) { return true; }
++        @Override
++        public boolean isCancelled() { return false; }
++        @Override
++        public boolean isDone() {
++            return true;
++        }
++    };
++
++    static class CountDownLatchFuture<T> implements Future<T> {
++
++        T value = null;
++        volatile boolean done = false;
++        CountDownLatch latch = new CountDownLatch(1);
++
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning) { return false; }
++        @Override
++        public T get() throws InterruptedException {
++            latch.await();
++            return value;
++        }
++        @Override
++        public T get(long timeout, TimeUnit unit) throws InterruptedException {
++            latch.await(timeout, unit);
++            return value;
++        }
++
++        @Override
++        public boolean isCancelled() { return false; }
++
++        @Override
++        public boolean isDone() {
++            return done;
++        }
++
++        void setDone(T value) {
++            this.value = value;
++            done = true;
++            latch.countDown();
++        }
++    }
++
++    static class FutureWriteCallback implements WriteCallback {
++
++        CountDownLatchFuture<Boolean> result =
++            new CountDownLatchFuture<Boolean>();
++
++        @Override
++        public void writeComplete(int rc, long ledgerId, long entryId,
++                                  InetSocketAddress addr, Object ctx) {
++            if (LOG.isDebugEnabled()) {
++                LOG.debug("Finished writing entry {} @ ledger {} for {} : {}",
++                          new Object[] { entryId, ledgerId, addr, rc });
++            }
++            result.setDone(0 == rc);
++        }
++
++        public Future<Boolean> getResult() {
++            return result;
++        }
++    }
++
+     /**
+      * SyncThread is a background thread which flushes ledger index pages periodically.
+      * Also it takes responsibility of garbage collecting journal files.
+@@ -451,6 +522,19 @@ public class Bookie extends Thread {
+                                     + " but layout version (" + journalVersion
+                                     + ") is too old to hold this");
+                         }
++                    } else if (entryId == METAENTRY_ID_FENCE_KEY) {
++                        if (journalVersion >= 4) {
++                            byte[] key = masterKeyCache.get(ledgerId);
++                            if (key == null) {
++                                key = ledgerStorage.readMasterKey(ledgerId);
++                            }
++                            LedgerDescriptor handle = handles.getHandle(ledgerId, key);
++                            handle.setFenced();
++                        } else {
++                            throw new IOException("Invalid journal. Contains fenceKey "
++                                    + " but layout version (" + journalVersion
++                                    + ") is too old to hold this");
++                        }
+                     } else {
+                         byte[] key = masterKeyCache.get(ledgerId);
+                         if (key == null) {
+@@ -934,10 +1018,26 @@ public class Bookie extends Thread {
+      * This method is idempotent. Once a ledger is fenced, it can
+      * never be unfenced. Fencing a fenced ledger has no effect.
+      */
+-    public void fenceLedger(long ledgerId, byte[] masterKey) throws IOException, BookieException {
++    public Future<Boolean> fenceLedger(long ledgerId, byte[] masterKey) throws IOException, BookieException {
+         LedgerDescriptor handle = handles.getHandle(ledgerId, masterKey);
++        boolean success;
+         synchronized (handle) {
+-            handle.setFenced();
++            success = handle.setFenced();
++        }
++        if (success) {
++            // fenced first time, we should add the key to journal ensure we can rebuild
++            ByteBuffer bb = ByteBuffer.allocate(8 + 8);
++            bb.putLong(ledgerId);
++            bb.putLong(METAENTRY_ID_FENCE_KEY);
++            bb.flip();
++
++            FutureWriteCallback fwc = new FutureWriteCallback();
++            LOG.debug("record fenced state for ledger {} in journal.", ledgerId);
++            journal.logAddEntry(bb, fwc, null);
++            return fwc.getResult();
++        } else {
++            // already fenced
++            return SUCCESS_FUTURE;
+         }
+     }
+ 
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/FileInfo.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/FileInfo.java
+index c48ecdaaa1..b554ab1065 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/FileInfo.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/FileInfo.java
+@@ -44,6 +44,7 @@ import org.slf4j.LoggerFactory;
+  * <li>magic bytes: 4 bytes, 'BKLE', version: 4 bytes
+  * <li>len of master key: indicates length of master key. -1 means no master key stored in header.
+  * <li>master key: master key
++ * <li>state: bit map to indicate the state, 32 bits.
+  * </ul>
+  * <b>Index page</b> is a fixed-length page, which contains serveral entries which point to the offsets of data stored in entry loggers.
+  * </p>
+@@ -52,6 +53,7 @@ class FileInfo {
+     static Logger LOG = LoggerFactory.getLogger(FileInfo.class);
+ 
+     static final int NO_MASTER_KEY = -1;
++    static final int STATE_FENCED_BIT = 0x1;
+ 
+     private FileChannel fc;
+     private File lf;
+@@ -69,6 +71,10 @@ class FileInfo {
+     private boolean isClosed;
+     private long sizeSinceLastwrite;
+ 
++    // bit map for states of the ledger.
++    private int stateBits;
++    private boolean needFlushHeader = false;
++
+     // file access mode
+     protected String mode;
+ 
+@@ -118,6 +124,8 @@ class FileInfo {
+             }
+             masterKey = new byte[length];
+             bb.get(masterKey);
++            stateBits = bb.getInt();
++            needFlushHeader = false;
+         } else {
+             throw new IOException("Ledger index file does not exist");
+         }
+@@ -163,11 +171,43 @@ class FileInfo {
+         bb.putInt(headerVersion);
+         bb.putInt(masterKey.length);
+         bb.put(masterKey);
++        bb.putInt(stateBits);
+         bb.rewind();
+         fc.position(0);
+         fc.write(bb);
+     }
+ 
++    synchronized public boolean isFenced() throws IOException {
++        checkOpen(false);
++        return (stateBits & STATE_FENCED_BIT) == STATE_FENCED_BIT;
++    }
++
++    /**
++     * @return true if set fence succeed, otherwise false when
++     * it already fenced or failed to set fenced.
++     */
++    synchronized public boolean setFenced() throws IOException {
++        checkOpen(false);
++        LOG.debug("Try to set fenced state in file info {} : state bits {}.", lf, stateBits);
++        if ((stateBits & STATE_FENCED_BIT) != STATE_FENCED_BIT) {
++            // not fenced yet
++            stateBits |= STATE_FENCED_BIT;
++            needFlushHeader = true;
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++    // flush the header when header is changed
++    synchronized public void flushHeader() throws IOException {
++        if (needFlushHeader) {
++            checkOpen(true);
++            writeHeader();
++            needFlushHeader = false;
++        }
++    }
++
+     synchronized public long size() throws IOException {
+         checkOpen(false);
+         long rc = size-START_OF_DATA;
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
+index c3f5149876..fcb8aa053a 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/InterleavedLedgerStorage.java
+@@ -77,6 +77,16 @@ class InterleavedLedgerStorage implements LedgerStorage {
+         }
+     }
+ 
++    @Override
++    public boolean setFenced(long ledgerId) throws IOException {
++        return ledgerCache.setFenced(ledgerId);
++    }
++
++    @Override
++    public boolean isFenced(long ledgerId) throws IOException {
++        return ledgerCache.isFenced(ledgerId);
++    }
++
+     @Override
+     public void setMasterKey(long ledgerId, byte[] masterKey) throws IOException {
+         ledgerCache.setMasterKey(ledgerId, masterKey);
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/JournalChannel.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/JournalChannel.java
+index 8f4deec236..360b9889be 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/JournalChannel.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/JournalChannel.java
+@@ -51,7 +51,7 @@ class JournalChannel implements Closeable {
+ 
+     int HEADER_SIZE = 8; // 4byte magic word, 4 byte version
+     int MIN_COMPAT_JOURNAL_FORMAT_VERSION = 1;
+-    int CURRENT_JOURNAL_FORMAT_VERSION = 3;
++    int CURRENT_JOURNAL_FORMAT_VERSION = 4;
+ 
+     public final static long preAllocSize = 4*1024*1024;
+     public final static ByteBuffer zeros = ByteBuffer.allocate(512);
+@@ -155,4 +155,4 @@ class JournalChannel implements Closeable {
+     public void close() throws IOException {
+         fc.close();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCache.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCache.java
+index 597d89ffb4..b2f8a9114e 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCache.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCache.java
+@@ -30,6 +30,10 @@ import java.io.IOException;
+  * head scheduling.
+  */
+ interface LedgerCache extends Closeable {
++
++    boolean setFenced(long ledgerId) throws IOException;
++    boolean isFenced(long ledgerId) throws IOException;
++
+     void setMasterKey(long ledgerId, byte[] masterKey) throws IOException;
+     byte[] readMasterKey(long ledgerId) throws IOException, BookieException;
+     boolean ledgerExists(long ledgerId) throws IOException;
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCacheImpl.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCacheImpl.java
+index c689bb9e24..ebdf583814 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCacheImpl.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerCacheImpl.java
+@@ -414,6 +414,15 @@ public class LedgerCacheImpl implements LedgerCache {
+         synchronized(this) {
+             HashMap<Long, LedgerEntryPage> pageMap = pages.get(l);
+             if (pageMap == null || pageMap.isEmpty()) {
++                FileInfo fi = null;
++                try {
++                    fi = getFileInfo(l, null);
++                    fi.flushHeader();
++                } finally {
++                    if (null != fi) {
++                        fi.release();
++                    }
++                }
+                 return;
+             }
+             firstEntryList = new LinkedList<Long>();
+@@ -451,6 +460,8 @@ public class LedgerCacheImpl implements LedgerCache {
+                     });
+             ArrayList<Integer> versions = new ArrayList<Integer>(entries.size());
+             fi = getFileInfo(l, null);
++            // flush the header if necessary
++            fi.flushHeader();
+             int start = 0;
+             long lastOffset = -1;
+             for(int i = 0; i < entries.size(); i++) {
+@@ -789,6 +800,38 @@ public class LedgerCacheImpl implements LedgerCache {
+         }
+     }
+ 
++    @Override
++    public boolean setFenced(long ledgerId) throws IOException {
++        FileInfo fi = null;
++        try {
++            fi = getFileInfo(ledgerId, null);
++            if (null != fi) {
++                return fi.setFenced();
++            }
++            return false;
++        } finally {
++            if (null != fi) {
++                fi.release();
++            }
++        }
++    }
++
++    @Override
++    public boolean isFenced(long ledgerId) throws IOException {
++        FileInfo fi = null;
++        try {
++            fi = getFileInfo(ledgerId, null);
++            if (null != fi) {
++                return fi.isFenced();
++            }
++            return false;
++        } finally {
++            if (null != fi) {
++                fi.release();
++            }
++        }
++    }
++
+     @Override
+     public void setMasterKey(long ledgerId, byte[] masterKey) throws IOException {
+         FileInfo fi = null;
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptor.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptor.java
+index cfeab64118..02850d13b2 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptor.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptor.java
+@@ -54,8 +54,8 @@ public abstract class LedgerDescriptor {
+ 
+     abstract long getLedgerId();
+ 
+-    abstract void setFenced() throws IOException;
+-    abstract boolean isFenced();
++    abstract boolean setFenced() throws IOException;
++    abstract boolean isFenced() throws IOException;
+ 
+     abstract long addEntry(ByteBuffer entry) throws IOException;
+     abstract ByteBuffer readEntry(long entryId) throws IOException;
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorImpl.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorImpl.java
+index e05ecb7179..82d95ebc01 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorImpl.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorImpl.java
+@@ -38,7 +38,6 @@ public class LedgerDescriptorImpl extends LedgerDescriptor {
+     final LedgerStorage ledgerStorage;
+     private long ledgerId;
+ 
+-    volatile private boolean fenced = false;
+     final byte[] masterKey;
+ 
+     LedgerDescriptorImpl(byte[] masterKey, long ledgerId, LedgerStorage ledgerStorage) {
+@@ -60,13 +59,13 @@ public class LedgerDescriptorImpl extends LedgerDescriptor {
+     }
+ 
+     @Override
+-    void setFenced() throws IOException {
+-        fenced = true;
++    boolean setFenced() throws IOException {
++        return ledgerStorage.setFenced(ledgerId);
+     }
+ 
+     @Override
+-    boolean isFenced() {
+-        return fenced;
++    boolean isFenced() throws IOException {
++        return ledgerStorage.isFenced(ledgerId);
+     }
+ 
+     @Override
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorReadOnlyImpl.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorReadOnlyImpl.java
+index 476bc28e2d..29dcfaf2a0 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorReadOnlyImpl.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerDescriptorReadOnlyImpl.java
+@@ -33,7 +33,7 @@ public class LedgerDescriptorReadOnlyImpl extends LedgerDescriptorImpl {
+     }
+ 
+     @Override
+-    void setFenced() throws IOException {
++    boolean setFenced() throws IOException {
+         assert false;
+         throw new IOException("Invalid action on read only descriptor");
+     }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerStorage.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerStorage.java
+index 14f1338004..f622834a4e 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerStorage.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/LedgerStorage.java
+@@ -49,6 +49,24 @@ interface LedgerStorage {
+      */
+     boolean ledgerExists(long ledgerId) throws IOException;
+ 
++    /**
++     * Fenced the ledger id in ledger storage.
++     *
++     * @param ledgerId
++     *          Ledger Id.
++     * @throws IOException when failed to fence the ledger.
++     */
++    boolean setFenced(long ledgerId) throws IOException;
++
++    /**
++     * Check whether the ledger is fenced in ledger storage or not.
++     *
++     * @param ledgerId
++     *          Ledger ID.
++     * @throws IOException
++     */
++    boolean isFenced(long ledgerId) throws IOException;
++
+     /**
+      * Set the master key for a ledger
+      */
+@@ -88,4 +106,4 @@ interface LedgerStorage {
+      * Get the JMX management bean for this LedgerStorage
+      */
+     BKMBeanInfo getJMXBean();
+-}
+\ No newline at end of file
++}
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieServer.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieServer.java
+index dd54a71b77..8756db495a 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieServer.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/BookieServer.java
+@@ -26,6 +26,10 @@ import java.net.InetSocketAddress;
+ import java.net.MalformedURLException;
+ import java.net.UnknownHostException;
+ import java.nio.ByteBuffer;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ 
+ import org.apache.zookeeper.KeeperException;
+ 
+@@ -399,13 +403,14 @@ public class BookieServer implements NIOServerFactory.PacketProcessor, Bookkeepe
+             LOG.debug("Received new read request: {}, {}", ledgerId, entryId);
+             int errorCode = BookieProtocol.EIO;
+             try {
++                Future<Boolean> fenceResult = null;
+                 if ((flags & BookieProtocol.FLAG_DO_FENCING) == BookieProtocol.FLAG_DO_FENCING) {
+                     LOG.warn("Ledger " + ledgerId + " fenced by " + src.getPeerName());
+                     if (h.getVersion() >= 2) {
+                         masterKey = new byte[BookieProtocol.MASTER_KEY_LENGTH];
+                         packet.get(masterKey, 0, BookieProtocol.MASTER_KEY_LENGTH);
+ 
+-                        bookie.fenceLedger(ledgerId, masterKey);
++                        fenceResult = bookie.fenceLedger(ledgerId, masterKey);
+                     } else {
+                         LOG.error("Password not provided, Not safe to fence {}", ledgerId);
+                         throw BookieException.create(BookieException.Code.UnauthorizedAccessException);
+@@ -413,8 +418,49 @@ public class BookieServer implements NIOServerFactory.PacketProcessor, Bookkeepe
+                 }
+                 rsp[1] = bookie.readEntry(ledgerId, entryId);
+                 LOG.debug("##### Read entry ##### {}", rsp[1].remaining());
+-                errorCode = BookieProtocol.EOK;
+-                success = true;
++                if (null != fenceResult) {
++                    // TODO:
++                    // currently we don't have readCallback to run in separated read
++                    // threads. after BOOKKEEPER-429 is complete, we could improve
++                    // following code to make it not wait here
++                    //
++                    // For now, since we only try to wait after read entry. so writing
++                    // to journal and read entry are executed in different thread
++                    // it would be fine.
++                    try {
++                        Boolean fenced = fenceResult.get(1000, TimeUnit.MILLISECONDS);
++                        if (null == fenced || !fenced) {
++                            // if failed to fence, fail the read request to make it retry.
++                            errorCode = BookieProtocol.EIO;
++                            success = false;
++                            rsp[1] = null;
++                        } else {
++                            errorCode = BookieProtocol.EOK;
++                            success = true;
++                        }
++                    } catch (InterruptedException ie) {
++                        LOG.error("Interrupting fence read entry (lid:" + ledgerId
++                                  + ", eid:" + entryId + ") :", ie);
++                        errorCode = BookieProtocol.EIO;
++                        success = false;
++                        rsp[1] = null;
++                    } catch (ExecutionException ee) {
++                        LOG.error("Failed to fence read entry (lid:" + ledgerId
++                                  + ", eid:" + entryId + ") :", ee);
++                        errorCode = BookieProtocol.EIO;
++                        success = false;
++                        rsp[1] = null;
++                    } catch (TimeoutException te) {
++                        LOG.error("Timeout to fence read entry (lid:" + ledgerId
++                                  + ", eid:" + entryId + ") :", te);
++                        errorCode = BookieProtocol.EIO;
++                        success = false;
++                        rsp[1] = null;
++                    }
++                } else {
++                    errorCode = BookieProtocol.EOK;
++                    success = true;
++                }
+             } catch (Bookie.NoLedgerException e) {
+                 if (LOG.isTraceEnabled()) {
+                     LOG.error("Error reading " + entryId + "@" + ledgerId, e);
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/TestFencing.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/TestFencing.java
+index 6f16f44a96..e65bc7f5d2 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/TestFencing.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/TestFencing.java
+@@ -377,4 +377,32 @@ public class TestFencing extends BaseTestCase {
+         writelh.addEntry(tmp.getBytes());
+     }
+ 
++    @Test
++    public void testFencingAndRestartBookies() throws Exception {
++        LedgerHandle writelh = null;
++        writelh = bkc.createLedger(digestType, "password".getBytes());
++
++        String tmp = "BookKeeper is cool!";
++        for (int i = 0; i < 10; i++) {
++            writelh.addEntry(tmp.getBytes());
++        }
++
++        /*
++         * Try to open ledger.
++         */
++        LedgerHandle readlh = bkc.openLedger(writelh.getId(), digestType,
++                                             "password".getBytes());
++
++        restartBookies();
++
++        try {
++            writelh.addEntry(tmp.getBytes());
++            LOG.error("Should have thrown an exception");
++            fail("Should have thrown an exception when trying to write");
++        } catch (BKException.BKLedgerFencedException e) {
++            // correct behaviour
++        }
++
++        readlh.close();
++    }
+ }

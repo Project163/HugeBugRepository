@@ -1,0 +1,1024 @@
+diff --git a/docs/changelog/114990.yaml b/docs/changelog/114990.yaml
+new file mode 100644
+index 00000000000..2575942d15b
+--- /dev/null
++++ b/docs/changelog/114990.yaml
+@@ -0,0 +1,6 @@
++pr: 114990
++summary: Allow for querries on `_tier` to skip shards in the `can_match` phase
++area: Search
++type: bug
++issues:
++ - 114910
+diff --git a/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContext.java b/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContext.java
+index 3e5deeeebae..964358610e0 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContext.java
++++ b/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContext.java
+@@ -9,17 +9,23 @@
+ 
+ package org.elasticsearch.index.query;
+ 
++import org.apache.lucene.search.Query;
+ import org.elasticsearch.client.internal.Client;
+ import org.elasticsearch.cluster.metadata.DataStream;
+ import org.elasticsearch.cluster.metadata.IndexMetadata;
++import org.elasticsearch.common.Strings;
++import org.elasticsearch.common.regex.Regex;
+ import org.elasticsearch.core.Nullable;
++import org.elasticsearch.index.mapper.ConstantFieldType;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+ import org.elasticsearch.index.mapper.MappingLookup;
++import org.elasticsearch.index.mapper.ValueFetcher;
+ import org.elasticsearch.index.shard.IndexLongFieldRange;
+ import org.elasticsearch.indices.DateFieldRangeInfo;
+ import org.elasticsearch.xcontent.XContentParserConfiguration;
+ 
+ import java.util.Collections;
++import java.util.Map;
+ import java.util.function.LongSupplier;
+ 
+ /**
+@@ -30,20 +36,57 @@ import java.util.function.LongSupplier;
+  * and skip the shards that don't hold queried data. See IndexMetadata for more details.
+  */
+ public class CoordinatorRewriteContext extends QueryRewriteContext {
++
++    public static final String TIER_FIELD_NAME = "_tier";
++
++    private static final ConstantFieldType TIER_FIELD_TYPE = new ConstantFieldType(TIER_FIELD_NAME, Map.of()) {
++        @Override
++        public ValueFetcher valueFetcher(SearchExecutionContext context, String format) {
++            throw new UnsupportedOperationException("fetching field values is not supported on the coordinator node");
++        }
++
++        @Override
++        public String typeName() {
++            return TIER_FIELD_NAME;
++        }
++
++        @Override
++        protected boolean matches(String pattern, boolean caseInsensitive, QueryRewriteContext context) {
++            if (caseInsensitive) {
++                pattern = Strings.toLowercaseAscii(pattern);
++            }
++
++            String tierPreference = context.getTierPreference();
++            if (tierPreference == null) {
++                return false;
++            }
++            return Regex.simpleMatch(pattern, tierPreference);
++        }
++
++        @Override
++        public Query existsQuery(SearchExecutionContext context) {
++            throw new UnsupportedOperationException("field exists query is not supported on the coordinator node");
++        }
++    };
++
+     private final DateFieldRangeInfo dateFieldRangeInfo;
++    private final String tier;
+ 
+     /**
+      * Context for coordinator search rewrites based on time ranges for the @timestamp field and/or 'event.ingested' field
++     *
+      * @param parserConfig
+      * @param client
+      * @param nowInMillis
+      * @param dateFieldRangeInfo range and field type info for @timestamp and 'event.ingested'
++     * @param tier               the configured data tier (via the _tier_preference setting) for the index
+      */
+     public CoordinatorRewriteContext(
+         XContentParserConfiguration parserConfig,
+         Client client,
+         LongSupplier nowInMillis,
+-        DateFieldRangeInfo dateFieldRangeInfo
++        DateFieldRangeInfo dateFieldRangeInfo,
++        String tier
+     ) {
+         super(
+             parserConfig,
+@@ -63,10 +106,12 @@ public class CoordinatorRewriteContext extends QueryRewriteContext {
+             null
+         );
+         this.dateFieldRangeInfo = dateFieldRangeInfo;
++        this.tier = tier;
+     }
+ 
+     /**
+-     * @param fieldName Must be one of DataStream.TIMESTAMP_FIELD_FIELD or IndexMetadata.EVENT_INGESTED_FIELD_NAME
++     * @param fieldName Must be one of DataStream.TIMESTAMP_FIELD_FIELD, IndexMetadata.EVENT_INGESTED_FIELD_NAME, or
++     *                  DataTierFiledMapper.NAME
+      * @return MappedField with type for the field. Returns null if fieldName is not one of the allowed field names.
+      */
+     @Nullable
+@@ -75,6 +120,8 @@ public class CoordinatorRewriteContext extends QueryRewriteContext {
+             return dateFieldRangeInfo.timestampFieldType();
+         } else if (IndexMetadata.EVENT_INGESTED_FIELD_NAME.equals(fieldName)) {
+             return dateFieldRangeInfo.eventIngestedFieldType();
++        } else if (TIER_FIELD_NAME.equals(fieldName)) {
++            return TIER_FIELD_TYPE;
+         } else {
+             return null;
+         }
+@@ -99,4 +146,18 @@ public class CoordinatorRewriteContext extends QueryRewriteContext {
+     public CoordinatorRewriteContext convertToCoordinatorRewriteContext() {
+         return this;
+     }
++
++    @Override
++    public String getTierPreference() {
++        // dominant branch first (tier preference is configured)
++        return tier.isEmpty() == false ? tier : null;
++    }
++
++    /**
++     * We're holding on to the index tier in the context as otherwise we'd need
++     * to re-parse it from the index settings when evaluating the _tier field.
++     */
++    public String tier() {
++        return tier;
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContextProvider.java b/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContextProvider.java
+index 67042a98db4..e48d7699d03 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContextProvider.java
++++ b/server/src/main/java/org/elasticsearch/index/query/CoordinatorRewriteContextProvider.java
+@@ -52,6 +52,12 @@ public class CoordinatorRewriteContextProvider {
+             return null;
+         }
+         DateFieldRangeInfo dateFieldRangeInfo = mappingSupplier.apply(index);
++        // we've now added a coordinator rewrite based on the _tier field so the requirement
++        // for the timestamps fields to be present is artificial (we could do a coordinator
++        // rewrite only based on the _tier field) and we might decide to remove this artificial
++        // limitation to enable coordinator rewrites based on _tier for hot and warm indices
++        // (currently the _tier coordinator rewrite is only available for mounted and partially mounted
++        // indices)
+         if (dateFieldRangeInfo == null) {
+             return null;
+         }
+@@ -74,7 +80,8 @@ public class CoordinatorRewriteContextProvider {
+             parserConfig,
+             client,
+             nowInMillis,
+-            new DateFieldRangeInfo(timestampFieldType, timestampRange, dateFieldRangeInfo.eventIngestedFieldType(), eventIngestedRange)
++            new DateFieldRangeInfo(timestampFieldType, timestampRange, dateFieldRangeInfo.eventIngestedFieldType(), eventIngestedRange),
++            indexMetadata.getTierPreference().isEmpty() == false ? indexMetadata.getTierPreference().getFirst() : ""
+         );
+     }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/query/PrefixQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/PrefixQueryBuilder.java
+index 24817b778a4..fcf986191da 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/PrefixQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/PrefixQueryBuilder.java
+@@ -20,6 +20,7 @@ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+ import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
++import org.elasticsearch.core.Nullable;
+ import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.index.mapper.ConstantFieldType;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+@@ -189,11 +190,24 @@ public class PrefixQueryBuilder extends AbstractQueryBuilder<PrefixQueryBuilder>
+     }
+ 
+     @Override
+-    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) throws IOException {
++    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) {
+         MappedFieldType fieldType = context.getFieldType(this.fieldName);
+         if (fieldType == null) {
+             return new MatchNoneQueryBuilder("The \"" + getName() + "\" query is against a field that does not exist");
+-        } else if (fieldType instanceof ConstantFieldType constantFieldType) {
++        }
++        return maybeRewriteBasedOnConstantFields(fieldType, context);
++    }
++
++    @Override
++    protected QueryBuilder doCoordinatorRewrite(CoordinatorRewriteContext coordinatorRewriteContext) {
++        MappedFieldType fieldType = coordinatorRewriteContext.getFieldType(this.fieldName);
++        // we don't rewrite a null field type to `match_none` on the coordinator because the coordinator has access
++        // to only a subset of fields see {@link CoordinatorRewriteContext#getFieldType}
++        return maybeRewriteBasedOnConstantFields(fieldType, coordinatorRewriteContext);
++    }
++
++    private QueryBuilder maybeRewriteBasedOnConstantFields(@Nullable MappedFieldType fieldType, QueryRewriteContext context) {
++        if (fieldType instanceof ConstantFieldType constantFieldType) {
+             // This logic is correct for all field types, but by only applying it to constant
+             // fields we also have the guarantee that it doesn't perform I/O, which is important
+             // since rewrites might happen on a network thread.
+diff --git a/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java b/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
+index 8808cd79072..fce74aa60ab 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
++++ b/server/src/main/java/org/elasticsearch/index/query/QueryRewriteContext.java
+@@ -11,9 +11,12 @@ package org.elasticsearch.index.query;
+ import org.elasticsearch.action.ActionListener;
+ import org.elasticsearch.action.ResolvedIndices;
+ import org.elasticsearch.client.internal.Client;
++import org.elasticsearch.cluster.routing.allocation.DataTier;
++import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.collect.Iterators;
+ import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
+ import org.elasticsearch.common.regex.Regex;
++import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.CountDown;
+ import org.elasticsearch.core.Nullable;
+ import org.elasticsearch.index.Index;
+@@ -407,4 +410,22 @@ public class QueryRewriteContext {
+     public PointInTimeBuilder getPointInTimeBuilder() {
+         return pit;
+     }
++
++    /**
++     * Retrieve the first tier preference from the index setting. If the setting is not
++     * present, then return null.
++     */
++    @Nullable
++    public String getTierPreference() {
++        Settings settings = getIndexSettings().getSettings();
++        String value = DataTier.TIER_PREFERENCE_SETTING.get(settings);
++
++        if (Strings.hasText(value) == false) {
++            return null;
++        }
++
++        // Tier preference can be a comma-delimited list of tiers, ordered by preference
++        // It was decided we should only test the first of these potentially multiple preferences.
++        return value.split(",")[0].trim();
++    }
+ }
+diff --git a/server/src/main/java/org/elasticsearch/index/query/TermQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/TermQueryBuilder.java
+index 2978b3bfbf6..113f66f3e58 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/TermQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/TermQueryBuilder.java
+@@ -17,6 +17,7 @@ import org.elasticsearch.TransportVersions;
+ import org.elasticsearch.common.ParsingException;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
++import org.elasticsearch.core.Nullable;
+ import org.elasticsearch.index.mapper.ConstantFieldType;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+ import org.elasticsearch.xcontent.ParseField;
+@@ -170,11 +171,24 @@ public class TermQueryBuilder extends BaseTermQueryBuilder<TermQueryBuilder> {
+     }
+ 
+     @Override
+-    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) throws IOException {
++    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) {
+         MappedFieldType fieldType = context.getFieldType(this.fieldName);
+         if (fieldType == null) {
+             return new MatchNoneQueryBuilder("The \"" + getName() + "\" query is against a field that does not exist");
+-        } else if (fieldType instanceof ConstantFieldType constantFieldType) {
++        }
++        return maybeRewriteBasedOnConstantFields(fieldType, context);
++    }
++
++    @Override
++    protected QueryBuilder doCoordinatorRewrite(CoordinatorRewriteContext coordinatorRewriteContext) {
++        MappedFieldType fieldType = coordinatorRewriteContext.getFieldType(this.fieldName);
++        // we don't rewrite a null field type to `match_none` on the coordinator because the coordinator has access
++        // to only a subset of fields see {@link CoordinatorRewriteContext#getFieldType}
++        return maybeRewriteBasedOnConstantFields(fieldType, coordinatorRewriteContext);
++    }
++
++    private QueryBuilder maybeRewriteBasedOnConstantFields(@Nullable MappedFieldType fieldType, QueryRewriteContext context) {
++        if (fieldType instanceof ConstantFieldType constantFieldType) {
+             // This logic is correct for all field types, but by only applying it to constant
+             // fields we also have the guarantee that it doesn't perform I/O, which is important
+             // since rewrites might happen on a network thread.
+diff --git a/server/src/main/java/org/elasticsearch/index/query/TermsQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/TermsQueryBuilder.java
+index 4035bc02fba..dec4090a3e6 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/TermsQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/TermsQueryBuilder.java
+@@ -393,11 +393,24 @@ public class TermsQueryBuilder extends AbstractQueryBuilder<TermsQueryBuilder> {
+     }
+ 
+     @Override
+-    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) throws IOException {
++    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) {
+         MappedFieldType fieldType = context.getFieldType(this.fieldName);
+         if (fieldType == null) {
+             return new MatchNoneQueryBuilder("The \"" + getName() + "\" query is against a field that does not exist");
+-        } else if (fieldType instanceof ConstantFieldType constantFieldType) {
++        }
++        return maybeRewriteBasedOnConstantFields(fieldType, context);
++    }
++
++    @Override
++    protected QueryBuilder doCoordinatorRewrite(CoordinatorRewriteContext coordinatorRewriteContext) {
++        MappedFieldType fieldType = coordinatorRewriteContext.getFieldType(this.fieldName);
++        // we don't rewrite a null field type to `match_none` on the coordinator because the coordinator has access
++        // to only a subset of fields see {@link CoordinatorRewriteContext#getFieldType}
++        return maybeRewriteBasedOnConstantFields(fieldType, coordinatorRewriteContext);
++    }
++
++    private QueryBuilder maybeRewriteBasedOnConstantFields(@Nullable MappedFieldType fieldType, QueryRewriteContext context) {
++        if (fieldType instanceof ConstantFieldType constantFieldType) {
+             // This logic is correct for all field types, but by only applying it to constant
+             // fields we also have the guarantee that it doesn't perform I/O, which is important
+             // since rewrites might happen on a network thread.
+diff --git a/server/src/main/java/org/elasticsearch/index/query/WildcardQueryBuilder.java b/server/src/main/java/org/elasticsearch/index/query/WildcardQueryBuilder.java
+index f287812ebbc..419195e5e5b 100644
+--- a/server/src/main/java/org/elasticsearch/index/query/WildcardQueryBuilder.java
++++ b/server/src/main/java/org/elasticsearch/index/query/WildcardQueryBuilder.java
+@@ -20,6 +20,7 @@ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+ import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
++import org.elasticsearch.core.Nullable;
+ import org.elasticsearch.index.mapper.ConstantFieldType;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+ import org.elasticsearch.index.query.support.QueryParsers;
+@@ -200,11 +201,24 @@ public class WildcardQueryBuilder extends AbstractQueryBuilder<WildcardQueryBuil
+     }
+ 
+     @Override
+-    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) throws IOException {
++    protected QueryBuilder doIndexMetadataRewrite(QueryRewriteContext context) {
+         MappedFieldType fieldType = context.getFieldType(this.fieldName);
+         if (fieldType == null) {
+-            return new MatchNoneQueryBuilder("The \"" + getName() + "\" query  is against a field that does not exist");
+-        } else if (fieldType instanceof ConstantFieldType constantFieldType) {
++            return new MatchNoneQueryBuilder("The \"" + getName() + "\" query is against a field that does not exist");
++        }
++        return maybeRewriteBasedOnConstantFields(fieldType, context);
++    }
++
++    @Override
++    protected QueryBuilder doCoordinatorRewrite(CoordinatorRewriteContext coordinatorRewriteContext) {
++        MappedFieldType fieldType = coordinatorRewriteContext.getFieldType(this.fieldName);
++        // we don't rewrite a null field type to `match_none` on the coordinator because the coordinator has access
++        // to only a subset of fields see {@link CoordinatorRewriteContext#getFieldType}
++        return maybeRewriteBasedOnConstantFields(fieldType, coordinatorRewriteContext);
++    }
++
++    private QueryBuilder maybeRewriteBasedOnConstantFields(@Nullable MappedFieldType fieldType, QueryRewriteContext context) {
++        if (fieldType instanceof ConstantFieldType constantFieldType) {
+             // This logic is correct for all field types, but by only applying it to constant
+             // fields we also have the guarantee that it doesn't perform I/O, which is important
+             // since rewrites might happen on a network thread.
+diff --git a/server/src/test/java/org/elasticsearch/index/query/PrefixQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/PrefixQueryBuilderTests.java
+index 0260fa2ef4c..918815f2a4f 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/PrefixQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/PrefixQueryBuilderTests.java
+@@ -17,7 +17,9 @@ import org.apache.lucene.search.PrefixQuery;
+ import org.apache.lucene.search.Query;
+ import org.elasticsearch.common.ParsingException;
+ import org.elasticsearch.core.Strings;
++import org.elasticsearch.index.mapper.DateFieldMapper;
+ import org.elasticsearch.test.AbstractQueryTestCase;
++import org.hamcrest.CoreMatchers;
+ import org.hamcrest.Matchers;
+ 
+ import java.io.IOException;
+@@ -175,4 +177,37 @@ public class PrefixQueryBuilderTests extends AbstractQueryTestCase<PrefixQueryBu
+         IllegalStateException e = expectThrows(IllegalStateException.class, () -> queryBuilder.toQuery(context));
+         assertEquals("Rewrite first", e.getMessage());
+     }
++
++    public void testCoordinatorTierRewriteToMatchAll() throws IOException {
++        QueryBuilder query = new PrefixQueryBuilder("_tier", "data_fro");
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchAllQueryBuilder.class));
++    }
++
++    public void testCoordinatorTierRewriteToMatchNone() throws IOException {
++        QueryBuilder query = QueryBuilders.boolQuery().mustNot(new PrefixQueryBuilder("_tier", "data_fro"));
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchNoneQueryBuilder.class));
++    }
++
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/query/QueryRewriteContextTests.java b/server/src/test/java/org/elasticsearch/index/query/QueryRewriteContextTests.java
+new file mode 100644
+index 00000000000..0b2a8ab4856
+--- /dev/null
++++ b/server/src/test/java/org/elasticsearch/index/query/QueryRewriteContextTests.java
+@@ -0,0 +1,131 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the "Elastic License
++ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
++ * Public License v 1"; you may not use this file except in compliance with, at
++ * your election, the "Elastic License 2.0", the "GNU Affero General Public
++ * License v3.0 only", or the "Server Side Public License, v 1".
++ */
++
++package org.elasticsearch.index.query;
++
++import org.elasticsearch.cluster.metadata.IndexMetadata;
++import org.elasticsearch.cluster.routing.allocation.DataTier;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.index.IndexSettings;
++import org.elasticsearch.index.IndexVersion;
++import org.elasticsearch.index.mapper.DateFieldMapper;
++import org.elasticsearch.index.mapper.MappingLookup;
++import org.elasticsearch.indices.DateFieldRangeInfo;
++import org.elasticsearch.test.ESTestCase;
++
++import java.util.Collections;
++
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.nullValue;
++
++public class QueryRewriteContextTests extends ESTestCase {
++
++    public void testGetTierPreference() {
++        {
++            // cold->hot tier preference
++            IndexMetadata metadata = newIndexMeta(
++                "index",
++                Settings.builder()
++                    .put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current())
++                    .put(DataTier.TIER_PREFERENCE, "data_cold,data_warm,data_hot")
++                    .build()
++            );
++            QueryRewriteContext context = new QueryRewriteContext(
++                parserConfig(),
++                null,
++                System::currentTimeMillis,
++                null,
++                MappingLookup.EMPTY,
++                Collections.emptyMap(),
++                new IndexSettings(metadata, Settings.EMPTY),
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null
++            );
++
++            assertThat(context.getTierPreference(), is("data_cold"));
++        }
++
++        {
++            // missing tier preference
++            IndexMetadata metadata = newIndexMeta(
++                "index",
++                Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current()).build()
++            );
++            QueryRewriteContext context = new QueryRewriteContext(
++                parserConfig(),
++                null,
++                System::currentTimeMillis,
++                null,
++                MappingLookup.EMPTY,
++                Collections.emptyMap(),
++                new IndexSettings(metadata, Settings.EMPTY),
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null,
++                null
++            );
++
++            assertThat(context.getTierPreference(), is(nullValue()));
++        }
++
++        {
++            // coordinator rewrite context
++            IndexMetadata metadata = newIndexMeta(
++                "index",
++                Settings.builder()
++                    .put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current())
++                    .put(DataTier.TIER_PREFERENCE, "data_cold,data_warm,data_hot")
++                    .build()
++            );
++            CoordinatorRewriteContext coordinatorRewriteContext = new CoordinatorRewriteContext(
++                parserConfig(),
++                null,
++                System::currentTimeMillis,
++                new DateFieldRangeInfo(null, null, new DateFieldMapper.DateFieldType(IndexMetadata.EVENT_INGESTED_FIELD_NAME), null),
++                "data_frozen"
++            );
++
++            assertThat(coordinatorRewriteContext.getTierPreference(), is("data_frozen"));
++        }
++        {
++            // coordinator rewrite context empty tier
++            IndexMetadata metadata = newIndexMeta(
++                "index",
++                Settings.builder()
++                    .put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current())
++                    .put(DataTier.TIER_PREFERENCE, "data_cold,data_warm,data_hot")
++                    .build()
++            );
++            CoordinatorRewriteContext coordinatorRewriteContext = new CoordinatorRewriteContext(
++                parserConfig(),
++                null,
++                System::currentTimeMillis,
++                new DateFieldRangeInfo(null, null, new DateFieldMapper.DateFieldType(IndexMetadata.EVENT_INGESTED_FIELD_NAME), null),
++                ""
++            );
++
++            assertThat(coordinatorRewriteContext.getTierPreference(), is(nullValue()));
++        }
++    }
++
++    public static IndexMetadata newIndexMeta(String name, Settings indexSettings) {
++        return IndexMetadata.builder(name).settings(indexSettings(IndexVersion.current(), 1, 1).put(indexSettings)).build();
++    }
++
++}
+diff --git a/server/src/test/java/org/elasticsearch/index/query/TermQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/TermQueryBuilderTests.java
+index b5cf42cf5df..bbac216754e 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/TermQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/TermQueryBuilderTests.java
+@@ -17,9 +17,11 @@ import org.apache.lucene.search.PointRangeQuery;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.TermQuery;
+ import org.elasticsearch.common.ParsingException;
++import org.elasticsearch.index.mapper.DateFieldMapper;
+ import org.elasticsearch.index.mapper.FieldTypeTestCase;
+ import org.elasticsearch.index.mapper.MappedFieldType;
+ import org.elasticsearch.xcontent.json.JsonStringEncoder;
++import org.hamcrest.CoreMatchers;
+ 
+ import java.io.IOException;
+ import java.util.Locale;
+@@ -238,4 +240,36 @@ public class TermQueryBuilderTests extends AbstractTermQueryTestCase<TermQueryBu
+             { "term" : { "foo" : "%s" } }""", longTerm)));
+         assertThat(e.getMessage(), containsString("term starting with [aaaaa"));
+     }
++
++    public void testCoordinatorTierRewriteToMatchAll() throws IOException {
++        QueryBuilder query = new TermQueryBuilder("_tier", "data_frozen");
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchAllQueryBuilder.class));
++    }
++
++    public void testCoordinatorTierRewriteToMatchNone() throws IOException {
++        QueryBuilder query = QueryBuilders.boolQuery().mustNot(new TermQueryBuilder("_tier", "data_frozen"));
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchNoneQueryBuilder.class));
++    }
+ }
+diff --git a/server/src/test/java/org/elasticsearch/index/query/TermsQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/TermsQueryBuilderTests.java
+index 1ce69355379..2faee7bc89e 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/TermsQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/TermsQueryBuilderTests.java
+@@ -25,6 +25,7 @@ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.io.stream.BytesStreamOutput;
+ import org.elasticsearch.index.get.GetResult;
++import org.elasticsearch.index.mapper.DateFieldMapper;
+ import org.elasticsearch.indices.TermsLookup;
+ import org.elasticsearch.test.AbstractQueryTestCase;
+ import org.elasticsearch.xcontent.XContentBuilder;
+@@ -317,6 +318,38 @@ public class TermsQueryBuilderTests extends AbstractQueryTestCase<TermsQueryBuil
+         assertThat(e.getMessage(), containsString("term starting with [aaaaa"));
+     }
+ 
++    public void testCoordinatorTierRewriteToMatchAll() throws IOException {
++        QueryBuilder query = new TermsQueryBuilder("_tier", "data_frozen");
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchAllQueryBuilder.class));
++    }
++
++    public void testCoordinatorTierRewriteToMatchNone() throws IOException {
++        QueryBuilder query = QueryBuilders.boolQuery().mustNot(new TermsQueryBuilder("_tier", "data_frozen"));
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchNoneQueryBuilder.class));
++    }
++
+     @Override
+     protected QueryBuilder parseQuery(XContentParser parser) throws IOException {
+         QueryBuilder query = super.parseQuery(parser);
+diff --git a/server/src/test/java/org/elasticsearch/index/query/WildcardQueryBuilderTests.java b/server/src/test/java/org/elasticsearch/index/query/WildcardQueryBuilderTests.java
+index 7ee6d75a087..182bd4d6b5b 100644
+--- a/server/src/test/java/org/elasticsearch/index/query/WildcardQueryBuilderTests.java
++++ b/server/src/test/java/org/elasticsearch/index/query/WildcardQueryBuilderTests.java
+@@ -15,7 +15,9 @@ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.WildcardQuery;
+ import org.elasticsearch.common.ParsingException;
+ import org.elasticsearch.core.Strings;
++import org.elasticsearch.index.mapper.DateFieldMapper;
+ import org.elasticsearch.test.AbstractQueryTestCase;
++import org.hamcrest.CoreMatchers;
+ 
+ import java.io.IOException;
+ import java.util.HashMap;
+@@ -166,4 +168,36 @@ public class WildcardQueryBuilderTests extends AbstractQueryTestCase<WildcardQue
+         IllegalStateException e = expectThrows(IllegalStateException.class, () -> queryBuilder.toQuery(context));
+         assertEquals("Rewrite first", e.getMessage());
+     }
++
++    public void testCoordinatorTierRewriteToMatchAll() throws IOException {
++        QueryBuilder query = new WildcardQueryBuilder("_tier", "data_fr*");
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchAllQueryBuilder.class));
++    }
++
++    public void testCoordinatorTierRewriteToMatchNone() throws IOException {
++        QueryBuilder query = QueryBuilders.boolQuery().mustNot(new WildcardQueryBuilder("_tier", "data_fro*"));
++        final String timestampFieldName = "@timestamp";
++        long minTimestamp = 1685714000000L;
++        long maxTimestamp = 1685715000000L;
++        final CoordinatorRewriteContext coordinatorRewriteContext = createCoordinatorRewriteContext(
++            new DateFieldMapper.DateFieldType(timestampFieldName),
++            minTimestamp,
++            maxTimestamp,
++            "data_frozen"
++        );
++
++        QueryBuilder rewritten = query.rewrite(coordinatorRewriteContext);
++        assertThat(rewritten, CoreMatchers.instanceOf(MatchNoneQueryBuilder.class));
++    }
+ }
+diff --git a/test/framework/src/main/java/org/elasticsearch/test/AbstractBuilderTestCase.java b/test/framework/src/main/java/org/elasticsearch/test/AbstractBuilderTestCase.java
+index 77ff194e268..0543bc7a78f 100644
+--- a/test/framework/src/main/java/org/elasticsearch/test/AbstractBuilderTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/test/AbstractBuilderTestCase.java
+@@ -342,6 +342,15 @@ public abstract class AbstractBuilderTestCase extends ESTestCase {
+         return serviceHolder.createCoordinatorContext(dateFieldType, min, max);
+     }
+ 
++    protected static CoordinatorRewriteContext createCoordinatorRewriteContext(
++        DateFieldMapper.DateFieldType dateFieldType,
++        long min,
++        long max,
++        String tier
++    ) {
++        return serviceHolder.createCoordinatorContext(dateFieldType, min, max, tier);
++    }
++
+     protected static DataRewriteContext dataRewriteContext() {
+         return serviceHolder.createDataContext();
+     }
+@@ -625,13 +634,17 @@ public abstract class AbstractBuilderTestCase extends ESTestCase {
+         }
+ 
+         CoordinatorRewriteContext createCoordinatorContext(DateFieldMapper.DateFieldType dateFieldType, long min, long max) {
++            return createCoordinatorContext(dateFieldType, min, max, "");
++        }
++
++        CoordinatorRewriteContext createCoordinatorContext(DateFieldMapper.DateFieldType dateFieldType, long min, long max, String tier) {
+             DateFieldRangeInfo timestampFieldInfo = new DateFieldRangeInfo(
+                 dateFieldType,
+                 IndexLongFieldRange.NO_SHARDS.extendWithShardRange(0, 1, ShardLongFieldRange.of(min, max)),
+                 dateFieldType,
+                 IndexLongFieldRange.NO_SHARDS.extendWithShardRange(0, 1, ShardLongFieldRange.of(min, max))
+             );
+-            return new CoordinatorRewriteContext(parserConfiguration, this.client, () -> nowInMillis, timestampFieldInfo);
++            return new CoordinatorRewriteContext(parserConfiguration, this.client, () -> nowInMillis, timestampFieldInfo, tier);
+         }
+ 
+         DataRewriteContext createDataContext() {
+diff --git a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/cluster/routing/allocation/mapper/DataTierFieldMapper.java b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/cluster/routing/allocation/mapper/DataTierFieldMapper.java
+index 527f8d1c176..0e185a90ed3 100644
+--- a/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/cluster/routing/allocation/mapper/DataTierFieldMapper.java
++++ b/x-pack/plugin/core/src/main/java/org/elasticsearch/xpack/cluster/routing/allocation/mapper/DataTierFieldMapper.java
+@@ -10,10 +10,8 @@ package org.elasticsearch.xpack.cluster.routing.allocation.mapper;
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.MatchNoDocsQuery;
+ import org.apache.lucene.search.Query;
+-import org.elasticsearch.cluster.routing.allocation.DataTier;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.regex.Regex;
+-import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.index.mapper.ConstantFieldType;
+ import org.elasticsearch.index.mapper.KeywordFieldMapper;
+ import org.elasticsearch.index.mapper.MetadataFieldMapper;
+@@ -55,7 +53,7 @@ public class DataTierFieldMapper extends MetadataFieldMapper {
+                 pattern = Strings.toLowercaseAscii(pattern);
+             }
+ 
+-            String tierPreference = getTierPreference(context);
++            String tierPreference = context.getTierPreference();
+             if (tierPreference == null) {
+                 return false;
+             }
+@@ -64,7 +62,7 @@ public class DataTierFieldMapper extends MetadataFieldMapper {
+ 
+         @Override
+         public Query existsQuery(SearchExecutionContext context) {
+-            String tierPreference = getTierPreference(context);
++            String tierPreference = context.getTierPreference();
+             if (tierPreference == null) {
+                 return new MatchNoDocsQuery();
+             }
+@@ -77,26 +75,9 @@ public class DataTierFieldMapper extends MetadataFieldMapper {
+                 throw new IllegalArgumentException("Field [" + name() + "] of type [" + typeName() + "] doesn't support formats.");
+             }
+ 
+-            String tierPreference = getTierPreference(context);
++            String tierPreference = context.getTierPreference();
+             return tierPreference == null ? ValueFetcher.EMPTY : ValueFetcher.singleton(tierPreference);
+         }
+-
+-        /**
+-         * Retrieve the first tier preference from the index setting. If the setting is not
+-         * present, then return null.
+-         */
+-        private static String getTierPreference(QueryRewriteContext context) {
+-            Settings settings = context.getIndexSettings().getSettings();
+-            String value = DataTier.TIER_PREFERENCE_SETTING.get(settings);
+-
+-            if (Strings.hasText(value) == false) {
+-                return null;
+-            }
+-
+-            // Tier preference can be a comma-delimited list of tiers, ordered by preference
+-            // It was decided we should only test the first of these potentially multiple preferences.
+-            return value.split(",")[0].trim();
+-        }
+     }
+ 
+     public DataTierFieldMapper() {
+@@ -107,4 +88,5 @@ public class DataTierFieldMapper extends MetadataFieldMapper {
+     protected String contentType() {
+         return CONTENT_TYPE;
+     }
++
+ }
+diff --git a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/LocalStateCompositeXPackPlugin.java b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/LocalStateCompositeXPackPlugin.java
+index 918976c0d3d..1f2c89c473a 100644
+--- a/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/LocalStateCompositeXPackPlugin.java
++++ b/x-pack/plugin/core/src/test/java/org/elasticsearch/xpack/core/LocalStateCompositeXPackPlugin.java
+@@ -637,10 +637,15 @@ public class LocalStateCompositeXPackPlugin extends XPackPlugin
+ 
+     @Override
+     public Map<String, MetadataFieldMapper.TypeParser> getMetadataMappers() {
+-        return filterPlugins(MapperPlugin.class).stream()
++        Map<String, MetadataFieldMapper.TypeParser> pluginsMetadataMappers = filterPlugins(MapperPlugin.class).stream()
+             .map(MapperPlugin::getMetadataMappers)
+             .flatMap(map -> map.entrySet().stream())
+             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
++
++        // the xpack plugin itself exposes a metadata mapper so let's include it as well
++        Map<String, MetadataFieldMapper.TypeParser> metadataMappersIncludingXPackPlugin = new HashMap<>(pluginsMetadataMappers);
++        metadataMappersIncludingXPackPlugin.putAll(super.getMetadataMappers());
++        return metadataMappersIncludingXPackPlugin;
+     }
+ 
+     @Override
+diff --git a/x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/SearchableSnapshotsCanMatchOnCoordinatorIntegTests.java b/x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/SearchableSnapshotsCanMatchOnCoordinatorIntegTests.java
+index eab73fbe5ad..ed42d86bc8c 100644
+--- a/x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/SearchableSnapshotsCanMatchOnCoordinatorIntegTests.java
++++ b/x-pack/plugin/searchable-snapshots/src/internalClusterTest/java/org/elasticsearch/xpack/searchablesnapshots/SearchableSnapshotsCanMatchOnCoordinatorIntegTests.java
+@@ -20,14 +20,18 @@ import org.elasticsearch.blobcache.shared.SharedBlobCacheService;
+ import org.elasticsearch.cluster.metadata.DataStream;
+ import org.elasticsearch.cluster.metadata.IndexMetadata;
+ import org.elasticsearch.cluster.node.DiscoveryNode;
++import org.elasticsearch.cluster.node.DiscoveryNodeRole;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.CollectionUtils;
+ import org.elasticsearch.index.Index;
+ import org.elasticsearch.index.mapper.DateFieldMapper;
++import org.elasticsearch.index.query.BoolQueryBuilder;
+ import org.elasticsearch.index.query.QueryBuilders;
+ import org.elasticsearch.index.query.RangeQueryBuilder;
++import org.elasticsearch.index.query.TermQueryBuilder;
++import org.elasticsearch.index.query.TermsQueryBuilder;
+ import org.elasticsearch.index.shard.IndexLongFieldRange;
+ import org.elasticsearch.indices.DateFieldRangeInfo;
+ import org.elasticsearch.indices.IndicesService;
+@@ -36,6 +40,7 @@ import org.elasticsearch.plugins.Plugin;
+ import org.elasticsearch.search.builder.SearchSourceBuilder;
+ import org.elasticsearch.snapshots.SnapshotId;
+ import org.elasticsearch.test.ESIntegTestCase;
++import org.elasticsearch.test.NodeRoles;
+ import org.elasticsearch.test.junit.annotations.TestIssueLogging;
+ import org.elasticsearch.test.transport.MockTransportService;
+ import org.elasticsearch.xcontent.XContentFactory;
+@@ -51,6 +56,7 @@ import java.util.Locale;
+ import java.util.stream.Collectors;
+ 
+ import static org.elasticsearch.cluster.metadata.IndexMetadata.INDEX_ROUTING_REQUIRE_GROUP_SETTING;
++import static org.elasticsearch.cluster.node.DiscoveryNode.getRolesFromSettings;
+ import static org.elasticsearch.index.IndexSettings.INDEX_SOFT_DELETES_SETTING;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertResponse;
+@@ -76,14 +82,24 @@ public class SearchableSnapshotsCanMatchOnCoordinatorIntegTests extends BaseFroz
+     @Override
+     protected Settings nodeSettings(int nodeOrdinal, Settings otherSettings) {
+         final Settings initialSettings = super.nodeSettings(nodeOrdinal, otherSettings);
+-        if (DiscoveryNode.canContainData(otherSettings)) {
++
++        if (DiscoveryNode.canContainData(otherSettings)
++            && getRolesFromSettings(otherSettings).stream()
++                .anyMatch(
++                    nr -> nr.roleName().equals(DiscoveryNodeRole.DATA_FROZEN_NODE_ROLE.roleName())
++                        || nr.roleName().equals(DiscoveryNodeRole.DATA_ROLE.roleName())
++                )) {
+             return Settings.builder()
+                 .put(initialSettings)
+                 // Have a shared cache of reasonable size available on each node because tests randomize over frozen and cold allocation
+                 .put(SharedBlobCacheService.SHARED_CACHE_SIZE_SETTING.getKey(), ByteSizeValue.ofMb(randomLongBetween(1, 10)))
+                 .build();
+         } else {
+-            return initialSettings;
++            return Settings.builder()
++                .put(initialSettings)
++                // Have a shared cache of reasonable size available on each node because tests randomize over frozen and cold allocation
++                .putNull(SharedBlobCacheService.SHARED_CACHE_SIZE_SETTING.getKey())
++                .build();
+         }
+     }
+ 
+@@ -955,6 +971,129 @@ public class SearchableSnapshotsCanMatchOnCoordinatorIntegTests extends BaseFroz
+         }
+     }
+ 
++    public void testCanMatchSkipsPartiallyMountedIndicesWhenFrozenNodesUnavailable() throws Exception {
++        internalCluster().startMasterOnlyNode();
++        internalCluster().startCoordinatingOnlyNode(Settings.EMPTY);
++        final String dataNodeHoldingRegularIndex = internalCluster().startNode(
++            NodeRoles.onlyRole(DiscoveryNodeRole.DATA_CONTENT_NODE_ROLE)
++        );
++        final String dataNodeHoldingSearchableSnapshot = internalCluster().startNode(
++            NodeRoles.onlyRole(DiscoveryNodeRole.DATA_FROZEN_NODE_ROLE)
++        );
++
++        final String indexToMountInFrozen = "frozen-" + randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
++        final int shardCount = randomIntBetween(2, 3);
++        createIndexWithTimestampAndEventIngested(indexToMountInFrozen, shardCount, Settings.EMPTY);
++        final int numDocsFrozenIndex = between(350, 1000);
++        indexRandomDocs(indexToMountInFrozen, numDocsFrozenIndex);
++
++        final String regularIndex = "regular-" + randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
++        createIndexWithTimestampAndEventIngested(
++            regularIndex,
++            shardCount,
++            Settings.builder()
++                .put(INDEX_ROUTING_REQUIRE_GROUP_SETTING.getConcreteSettingForNamespace("_name").getKey(), dataNodeHoldingRegularIndex)
++                .build()
++        );
++        int numDocsRegularIndex = between(100, 1000);
++        indexDocumentsWithTimestampAndEventIngestedDates(regularIndex, numDocsRegularIndex, TIMESTAMP_TEMPLATE_WITHIN_RANGE);
++
++        final String repositoryName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
++        createRepository(repositoryName, "mock");
++
++        final SnapshotId snapshotId = createSnapshot(repositoryName, "snapshot-1", List.of(indexToMountInFrozen)).snapshotId();
++        assertAcked(indicesAdmin().prepareDelete(indexToMountInFrozen));
++
++        final String partiallyMountedIndex = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
++
++        final MountSearchableSnapshotRequest mountRequest = new MountSearchableSnapshotRequest(
++            TEST_REQUEST_TIMEOUT,
++            partiallyMountedIndex,
++            repositoryName,
++            snapshotId.getName(),
++            indexToMountInFrozen,
++            Settings.EMPTY,
++            Strings.EMPTY_ARRAY,
++            false,
++            MountSearchableSnapshotRequest.Storage.SHARED_CACHE
++        );
++        client().execute(MountSearchableSnapshotAction.INSTANCE, mountRequest).actionGet();
++
++        ensureGreen(regularIndex, partiallyMountedIndex);
++
++        // Stop the node holding the searchable snapshots, and since we defined
++        // the index allocation criteria to require the searchable snapshot
++        // index to be allocated in that node, the shards should remain unassigned
++        internalCluster().stopNode(dataNodeHoldingSearchableSnapshot);
++        final IndexMetadata partiallyMountedIndexMetadata = getIndexMetadata(partiallyMountedIndex);
++        waitUntilAllShardsAreUnassigned(partiallyMountedIndexMetadata.getIndex());
++
++        {
++            // term query
++            TermQueryBuilder termQueryBuilder = QueryBuilders.termQuery("_tier", "data_content");
++            List<String> indicesToSearch = List.of(regularIndex, partiallyMountedIndex);
++            SearchRequest request = new SearchRequest().indices(indicesToSearch.toArray(new String[0]))
++                .source(new SearchSourceBuilder().query(termQueryBuilder));
++
++            assertResponse(client().search(request), searchResponse -> {
++                // as we excluded the frozen tier we shouldn't get any failures
++                assertThat(searchResponse.getFailedShards(), equalTo(0));
++                // we should be receiving all the hits from the index that's in the data_content tier
++                assertNotNull(searchResponse.getHits().getTotalHits());
++                assertThat(searchResponse.getHits().getTotalHits().value(), equalTo((long) numDocsRegularIndex));
++            });
++        }
++
++        {
++            // termS query
++            TermsQueryBuilder termsQueryBuilder = QueryBuilders.termsQuery("_tier", "data_hot", "data_content");
++            List<String> indicesToSearch = List.of(regularIndex, partiallyMountedIndex);
++            SearchRequest request = new SearchRequest().indices(indicesToSearch.toArray(new String[0]))
++                .source(new SearchSourceBuilder().query(termsQueryBuilder));
++
++            assertResponse(client().search(request), searchResponse -> {
++                // as we excluded the frozen tier we shouldn't get any failures
++                assertThat(searchResponse.getFailedShards(), equalTo(0));
++                // we should be receiving all the hits from the index that's in the data_content tier
++                assertNotNull(searchResponse.getHits().getTotalHits());
++                assertThat(searchResponse.getHits().getTotalHits().value(), equalTo((long) numDocsRegularIndex));
++            });
++        }
++
++        {
++            // bool term query
++            BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("_tier", "data_frozen"));
++            List<String> indicesToSearch = List.of(regularIndex, partiallyMountedIndex);
++            SearchRequest request = new SearchRequest().indices(indicesToSearch.toArray(new String[0]))
++                .source(new SearchSourceBuilder().query(boolQueryBuilder));
++
++            assertResponse(client().search(request), searchResponse -> {
++                // as we excluded the frozen tier we shouldn't get any failures
++                assertThat(searchResponse.getFailedShards(), equalTo(0));
++                // we should be receiving all the hits from the index that's in the data_content tier
++                assertNotNull(searchResponse.getHits().getTotalHits());
++                assertThat(searchResponse.getHits().getTotalHits().value(), equalTo((long) numDocsRegularIndex));
++            });
++        }
++
++        {
++            // bool prefix, wildcard
++            BoolQueryBuilder boolQueryBuilder = QueryBuilders.boolQuery()
++                .mustNot(randomFrom(QueryBuilders.wildcardQuery("_tier", "dat*ozen"), QueryBuilders.prefixQuery("_tier", "data_fro")));
++            List<String> indicesToSearch = List.of(regularIndex, partiallyMountedIndex);
++            SearchRequest request = new SearchRequest().indices(indicesToSearch.toArray(new String[0]))
++                .source(new SearchSourceBuilder().query(boolQueryBuilder));
++
++            assertResponse(client().search(request), searchResponse -> {
++                // as we excluded the frozen tier we shouldn't get any failures
++                assertThat(searchResponse.getFailedShards(), equalTo(0));
++                // we should be receiving all the hits from the index that's in the data_content tier
++                assertNotNull(searchResponse.getHits().getTotalHits());
++                assertThat(searchResponse.getHits().getTotalHits().value(), equalTo((long) numDocsRegularIndex));
++            });
++        }
++    }
++
+     private void createIndexWithTimestampAndEventIngested(String indexName, int numShards, Settings extraSettings) throws IOException {
+         assertAcked(
+             indicesAdmin().prepareCreate(indexName)

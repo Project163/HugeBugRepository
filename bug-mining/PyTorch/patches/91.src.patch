@@ -1,0 +1,188 @@
+diff --git a/aten/src/ATen/DLConvertor.cpp b/aten/src/ATen/DLConvertor.cpp
+index 614dc46158e..d795d3db44a 100644
+--- a/aten/src/ATen/DLConvertor.cpp
++++ b/aten/src/ATen/DLConvertor.cpp
+@@ -249,14 +249,20 @@ DLManagedTensor* toDLPack(const Tensor& src) {
+ }
+ 
+ Tensor fromDLPack(const DLManagedTensor* src) {
+-  Device device = getATenDevice(src->dl_tensor.device);
+-  ScalarType stype = toScalarType(src->dl_tensor.dtype);
+   auto deleter = [src](void* self) {
+     if (src->deleter) {
+       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+       src->deleter(const_cast<DLManagedTensor*>(src));
+     }
+   };
++  return fromDLPack(src, std::move(deleter));
++}
++
++Tensor fromDLPack(
++    const DLManagedTensor* src,
++    std::function<void(void*)> deleter) {
++  Device device = getATenDevice(src->dl_tensor.device);
++  ScalarType stype = toScalarType(src->dl_tensor.dtype);
+   if (!src->dl_tensor.strides) {
+     return at::from_blob(src->dl_tensor.data,
+         IntArrayRef(src->dl_tensor.shape, src->dl_tensor.ndim),
+diff --git a/aten/src/ATen/DLConvertor.h b/aten/src/ATen/DLConvertor.h
+index 9ee55ed5df2..9b8fce1015f 100644
+--- a/aten/src/ATen/DLConvertor.h
++++ b/aten/src/ATen/DLConvertor.h
+@@ -13,6 +13,8 @@ namespace at {
+ TORCH_API ScalarType toScalarType(const DLDataType& dtype);
+ TORCH_API DLManagedTensor* toDLPack(const Tensor& src);
+ TORCH_API Tensor fromDLPack(const DLManagedTensor* src);
++TORCH_API Tensor
++fromDLPack(const DLManagedTensor* src, std::function<void(void*)> deleter);
+ TORCH_API DLDataType getDLDataType(const Tensor& t);
+ TORCH_API DLDevice getDLContext(const Tensor& tensor, const int64_t& device_id);
+ 
+diff --git a/torch/csrc/autograd/python_variable.cpp b/torch/csrc/autograd/python_variable.cpp
+index ca415f7a86a..c595ccfbcf5 100644
+--- a/torch/csrc/autograd/python_variable.cpp
++++ b/torch/csrc/autograd/python_variable.cpp
+@@ -38,6 +38,7 @@
+ #include <torch/csrc/utils/python_strings.h>
+ #include <torch/csrc/utils/tensor_memoryformats.h>
+ #include <torch/csrc/utils/tensor_new.h>
++#include <torch/csrc/utils/tensor_numpy.h>
+ 
+ #include <torch/csrc/jit/python/pybind_utils.h>
+ #include <torch/csrc/utils/torch_dispatch_mode.h>
+@@ -2205,6 +2206,7 @@ bool THPVariable_initModule(PyObject* module) {
+   PyModule_AddObject(module, "_TensorBase", (PyObject*)&THPVariableType);
+   torch::autograd::initTorchFunctions(module);
+   torch::autograd::initTensorImplConversion(module);
++  torch::utils::validate_numpy_for_dlpack_deleter_bug();
+   return true;
+ }
+ 
+diff --git a/torch/csrc/utils/tensor_new.cpp b/torch/csrc/utils/tensor_new.cpp
+index 83506346505..37e121bd039 100644
+--- a/torch/csrc/utils/tensor_new.cpp
++++ b/torch/csrc/utils/tensor_new.cpp
+@@ -1667,11 +1667,22 @@ Tensor tensor_fromDLPack(PyObject* data) {
+       "Note that DLTensor capsules can be consumed only once, "
+       "so you might have already constructed a tensor from it once.");
+ 
++  auto deleter_with_gil = [dlMTensor](void*) {
++    if (dlMTensor->deleter) {
++      pybind11::gil_scoped_acquire gil;
++      dlMTensor->deleter(dlMTensor);
++    }
++  };
++
+   // atensor steals the ownership of the underlying storage. It also passes a
+   // destructor function that will be called when the underlying storage goes
+   // out of scope. When the destructor is called, the dlMTensor is destructed
+   // too.
+-  auto atensor = at::fromDLPack(dlMTensor);
++  // HACK: Ensure that we hold the GIL here just in case the
++  // managed tensor originating from a buggy NumPy build.
++  auto atensor = torch::utils::is_numpy_dlpack_deleter_bugged()
++      ? at::fromDLPack(dlMTensor, std::move(deleter_with_gil))
++      : at::fromDLPack(dlMTensor);
+ 
+   // Make sure this capsule will never be used again.
+   PyCapsule_SetName(data, "used_dltensor");
+diff --git a/torch/csrc/utils/tensor_numpy.cpp b/torch/csrc/utils/tensor_numpy.cpp
+index fc866c3dafb..0ba584eac7b 100644
+--- a/torch/csrc/utils/tensor_numpy.cpp
++++ b/torch/csrc/utils/tensor_numpy.cpp
+@@ -33,6 +33,13 @@ at::Tensor tensor_from_cuda_array_interface(PyObject* obj) {
+ void warn_numpy_not_writeable() {
+   throw std::runtime_error("PyTorch was compiled without NumPy support");
+ }
++
++// No-op stubs.
++void validate_numpy_for_dlpack_deleter_bug() {}
++
++bool is_numpy_dlpack_deleter_bugged() {
++  return false;
++}
+ } // namespace utils
+ } // namespace torch
+ #else
+@@ -456,6 +463,68 @@ at::Tensor tensor_from_cuda_array_interface(PyObject* obj) {
+       },
+       at::device(kCUDA).dtype(dtype));
+ }
++
++// Mutated only once (during module init); behaves as an immutable variable
++// thereafter.
++bool numpy_with_dlpack_deleter_bug_installed = false;
++
++// NumPy implemented support for Dlpack capsules in version 1.22.0. However, the
++// initial implementation did not correctly handle the invocation of
++// `DLManagedTensor::deleter` in a no-GIL context. Until PyTorch 1.13.0, we
++// were implicitly holding the GIL when the deleter was invoked, but this
++// incurred a significant performance overhead when mem-unmapping large tensors.
++// Starting with PyTorch 1.13.0, we release the GIL in `THPVariable_clear` just
++// before deallocation, but this triggers the aforementioned bug in NumPy.
++//
++// The NumPy bug should be fixed in version 1.24.0, but all releases
++// between 1.22.0 and 1.23.5 result in internal assertion failures that
++// consequently lead to segfaults. To work around this, we need to selectively
++// disable the optimization whenever we detect a buggy NumPy installation.
++// We would ideally restrict the "fix" just to Dlpack-backed tensors that stem
++// from NumPy, but given that it is difficult to confidently detect the
++// provenance of such tensors, we have to resort to a more general approach.
++//
++// References:
++//  https://github.com/pytorch/pytorch/issues/88082
++//  https://github.com/pytorch/pytorch/issues/77139
++//  https://github.com/numpy/numpy/issues/22507
++void validate_numpy_for_dlpack_deleter_bug() {
++  // Ensure that we don't call this more than once per session.
++  static bool validated = false;
++  TORCH_INTERNAL_ASSERT(validated == false);
++  validated = true;
++
++  THPObjectPtr numpy_module(PyImport_ImportModule("numpy"));
++  if (!numpy_module) {
++    PyErr_Clear();
++    return;
++  }
++
++  THPObjectPtr version_attr(
++      PyObject_GetAttrString(numpy_module.get(), "__version__"));
++  if (!version_attr) {
++    PyErr_Clear();
++    return;
++  }
++
++  Py_ssize_t version_utf8_size = 0;
++  const char* version_utf8 =
++      PyUnicode_AsUTF8AndSize(version_attr.get(), &version_utf8_size);
++  if (!version_utf8_size) {
++    PyErr_Clear();
++    return;
++  }
++  std::string version(version_utf8, version_utf8_size);
++  if (version_utf8_size < 4)
++    return;
++  std::string truncated_version(version.substr(0, 4));
++  numpy_with_dlpack_deleter_bug_installed =
++      truncated_version == "1.22" || truncated_version == "1.23";
++}
++
++bool is_numpy_dlpack_deleter_bugged() {
++  return numpy_with_dlpack_deleter_bug_installed;
++}
+ } // namespace utils
+ } // namespace torch
+ 
+diff --git a/torch/csrc/utils/tensor_numpy.h b/torch/csrc/utils/tensor_numpy.h
+index a0397f9ff71..257bb60a30c 100644
+--- a/torch/csrc/utils/tensor_numpy.h
++++ b/torch/csrc/utils/tensor_numpy.h
+@@ -19,5 +19,8 @@ bool is_numpy_scalar(PyObject* obj);
+ void warn_numpy_not_writeable();
+ at::Tensor tensor_from_cuda_array_interface(PyObject* obj);
+ 
++void validate_numpy_for_dlpack_deleter_bug();
++bool is_numpy_dlpack_deleter_bugged();
++
+ } // namespace utils
+ } // namespace torch

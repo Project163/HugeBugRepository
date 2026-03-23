@@ -1,0 +1,224 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 1c9e1c5ede..c80907319d 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -152,6 +152,8 @@ Trunk (unreleased changes)
+ 
+         BOOKKEEPER-520: BookieFailureTest hangs on precommit build (ivank via sijie)
+ 
++        BOOKKEEPER-447: Bookie can fail to recover if index pages flushed before ledger flush acknowledged (ivank via sijie)
++
+       hedwig-protocol:
+ 
+         BOOKKEEPER-394: CompositeException message is not useful (Stu Hood via sijie)
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+index 638e7e36fd..effe9fad69 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/Bookie.java
+@@ -133,10 +133,15 @@ public class Bookie extends Thread {
+         private long ledgerId;
+         private long entryId;
+         public NoEntryException(long ledgerId, long entryId) {
+-            super("Entry " + entryId + " not found in " + ledgerId);
++            this("Entry " + entryId + " not found in " + ledgerId, ledgerId, entryId);
++        }
++
++        public NoEntryException(String msg, long ledgerId, long entryId) {
++            super(msg);
+             this.ledgerId = ledgerId;
+             this.entryId = entryId;
+         }
++
+         public long getLedger() {
+             return ledgerId;
+         }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/EntryLogger.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/EntryLogger.java
+index 281c40562f..7b5dcbb7c6 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/EntryLogger.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/bookie/EntryLogger.java
+@@ -349,7 +349,7 @@ public class EntryLogger {
+         return (logId << 32L) | pos;
+     }
+ 
+-    byte[] readEntry(long ledgerId, long entryId, long location) throws IOException {
++    byte[] readEntry(long ledgerId, long entryId, long location) throws IOException, Bookie.NoEntryException {
+         long entryLogId = location >> 32L;
+         long pos = location & 0xffffffffL;
+         ByteBuffer sizeBuff = ByteBuffer.allocate(4);
+@@ -363,7 +363,8 @@ public class EntryLogger {
+             throw newe;
+         }
+         if (fc.read(sizeBuff, pos) != sizeBuff.capacity()) {
+-            throw new IOException("Short read from entrylog " + entryLogId);
++            throw new Bookie.NoEntryException("Short read from entrylog " + entryLogId,
++                                              ledgerId, entryId);
+         }
+         pos += 4;
+         sizeBuff.flip();
+@@ -377,7 +378,16 @@ public class EntryLogger {
+         ByteBuffer buff = ByteBuffer.wrap(data);
+         int rc = fc.read(buff, pos);
+         if ( rc != data.length) {
+-            throw new IOException("Short read for " + ledgerId + "@" + entryId + " in " + entryLogId + "@" + pos + "("+rc+"!="+data.length+")");
++            // Note that throwing NoEntryException here instead of IOException is not
++            // without risk. If all bookies in a quorum throw this same exception
++            // the client will assume that it has reached the end of the ledger.
++            // However, this may not be the case, as a very specific error condition
++            // could have occurred, where the length of the entry was corrupted on all
++            // replicas. However, the chance of this happening is very very low, so
++            // returning NoEntryException is mostly safe.
++            throw new Bookie.NoEntryException("Short read for " + ledgerId + "@"
++                                              + entryId + " in " + entryLogId + "@"
++                                              + pos + "("+rc+"!="+data.length+")", ledgerId, entryId);
+         }
+         buff.flip();
+         long thisLedgerId = buff.getLong();
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/bookie/LedgerCacheTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/bookie/LedgerCacheTest.java
+index 4e7fc26a0d..235f474961 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/bookie/LedgerCacheTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/bookie/LedgerCacheTest.java
+@@ -50,6 +50,7 @@ public class LedgerCacheTest extends TestCase {
+     SnapshotMap<Long, Boolean> activeLedgers;
+     LedgerManagerFactory ledgerManagerFactory;
+     LedgerCache ledgerCache;
++    Thread flushThread;
+     ServerConfiguration conf;
+     File txnDir, ledgerDir;
+ 
+@@ -82,6 +83,10 @@ public class LedgerCacheTest extends TestCase {
+     @Override
+     @After
+     public void tearDown() throws Exception {
++        if (flushThread != null) {
++            flushThread.interrupt();
++            flushThread.join();
++        }
+         bookie.ledgerStorage.shutdown();
+         ledgerManagerFactory.uninitialize();
+         FileUtils.deleteDirectory(txnDir);
+@@ -94,9 +99,26 @@ public class LedgerCacheTest extends TestCase {
+         }
+         ledgerCache = ((InterleavedLedgerStorage) bookie.ledgerStorage).ledgerCache = new LedgerCacheImpl(
+                 conf, activeLedgers, bookie.getLedgerDirsManager());
++        flushThread = new Thread() {
++                public void run() {
++                    while (true) {
++                        try {
++                            sleep(conf.getFlushInterval());
++                            ledgerCache.flushLedger(true);
++                        } catch (InterruptedException ie) {
++                            // killed by teardown
++                            Thread.currentThread().interrupt();
++                            return;
++                        } catch (Exception e) {
++                            LOG.error("Exception in flush thread", e);
++                        }
++                    }
++                }
++            };
++        flushThread.start();
+     }
+ 
+-    @Test
++    @Test(timeout=30000)
+     public void testAddEntryException() throws IOException {
+         // set page limitation
+         conf.setPageLimit(10);
+@@ -117,7 +139,7 @@ public class LedgerCacheTest extends TestCase {
+         }
+     }
+ 
+-    @Test
++    @Test(timeout=30000)
+     public void testLedgerEviction() throws Exception {
+         int numEntries = 10;
+         // limit open files & pages
+@@ -140,7 +162,7 @@ public class LedgerCacheTest extends TestCase {
+         }
+     }
+ 
+-    @Test
++    @Test(timeout=30000)
+     public void testDeleteLedger() throws Exception {
+         int numEntries = 10;
+         // limit open files & pages
+@@ -175,7 +197,7 @@ public class LedgerCacheTest extends TestCase {
+         }
+     }
+ 
+-    @Test
++    @Test(timeout=30000)
+     public void testPageEviction() throws Exception {
+         int numLedgers = 10;
+         byte[] masterKey = "blah".getBytes();
+@@ -226,6 +248,7 @@ public class LedgerCacheTest extends TestCase {
+     /**
+      * Test Ledger Cache flush failure
+      */
++    @Test(timeout=30000)
+     public void testLedgerCacheFlushFailureOnDiskFull() throws Exception {
+         File ledgerDir1 = File.createTempFile("bkTest", ".dir");
+         ledgerDir1.delete();
+@@ -266,6 +289,62 @@ public class LedgerCacheTest extends TestCase {
+         Assert.assertArrayEquals(generateEntry(1, 3).array(), ledgerStorage.getEntry(1, 3).array());
+     }
+ 
++    /**
++     * Test that if we are writing to more ledgers than there
++     * are pages, then we will not flush the index before the
++     * entries in the entrylogger have been persisted to disk.
++     * {@link https://issues.apache.org/jira/browse/BOOKKEEPER-447}
++     */
++    @Test(timeout=30000)
++    public void testIndexPageEvictionWriteOrder() throws Exception {
++        final int numLedgers = 10;
++        File journalDir = File.createTempFile("bookie", "journal");
++        journalDir.delete();
++        journalDir.mkdir();
++        Bookie.checkDirectoryStructure(Bookie.getCurrentDirectory(journalDir));
++
++        File ledgerDir = File.createTempFile("bookie", "ledger");
++        ledgerDir.delete();
++        ledgerDir.mkdir();
++        Bookie.checkDirectoryStructure(Bookie.getCurrentDirectory(ledgerDir));
++
++        ServerConfiguration conf = new ServerConfiguration()
++            .setZkServers(null)
++            .setJournalDirName(journalDir.getPath())
++            .setLedgerDirNames(new String[] { ledgerDir.getPath() })
++            .setFlushInterval(1000)
++            .setPageLimit(1);
++
++        Bookie b = new Bookie(conf);
++        b.start();
++        for (int i = 1; i <= numLedgers; i++) {
++            ByteBuffer packet = generateEntry(i, 1);
++            b.addEntry(packet, new Bookie.NopWriteCallback(), null, "passwd".getBytes());
++        }
++
++        conf = new ServerConfiguration()
++            .setZkServers(null)
++            .setJournalDirName(journalDir.getPath())
++            .setLedgerDirNames(new String[] { ledgerDir.getPath() });
++
++        b = new Bookie(conf);
++        for (int i = 1; i <= numLedgers; i++) {
++            try {
++                b.readEntry(i, 1);
++            } catch (Bookie.NoLedgerException nle) {
++                // this is fine, means the ledger was never written to the index cache
++                assertEquals("No ledger should only happen for the last ledger",
++                             i, numLedgers);
++            } catch (Bookie.NoEntryException nee) {
++                // this is fine, means the ledger was written to the index cache, but not
++                // the entry log
++            } catch (IOException ioe) {
++                LOG.info("Shouldn't have received IOException", ioe);
++                fail("Shouldn't throw IOException, should say that entry is not found");
++            }
++        }
++    }
++
+     private ByteBuffer generateEntry(long ledger, long entry) {
+         byte[] data = ("ledger-" + ledger + "-" + entry).getBytes();
+         ByteBuffer bb = ByteBuffer.wrap(new byte[8 + 8 + data.length]);

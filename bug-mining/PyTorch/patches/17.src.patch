@@ -1,0 +1,962 @@
+diff --git a/aten/src/ATen/native/Linear.cpp b/aten/src/ATen/native/Linear.cpp
+index c9e03aaa3b6..6f66c7a120f 100644
+--- a/aten/src/ATen/native/Linear.cpp
++++ b/aten/src/ATen/native/Linear.cpp
+@@ -136,241 +136,331 @@ static Tensor sumproduct_pair(const Tensor& left_, const Tensor& right_, IntArra
+   return result;
+ }
+ 
+-Tensor einsum(std::string eqn, TensorList tensors) {
+-  constexpr size_t number_of_letters = 26;
+-  std::string in_eqn;
+-  size_t pos;
+-  // The equation is given in terms of single lowercase letters ('a'..'z') and potentially an ellipsis.
+-  // Internally, we represent it using indices from 0 to num_total_dimensions, with each letter
+-  // mapped to an index and the ellipsis ('...') being mapped to a number of consequtive indices.
+-  // The mapping of letters to internal indices is given in letter_mapping. A value of -1 means that
+-  // the letter has not been assigned an index yet (because it has not been seen).
+-  // The ellipsis is defined by first_ell_idx (the first index) and num_ell_idxes (the number of indices).
+-  // A value of -1 for num_ell_idxes specifies that we have not seen an ellipsis yet.
+-  // Note: The internal indices are NOT the dimensions used internally. There is a mapping to them below.
+-
+-  std::array<std::int64_t, number_of_letters> letter_mapping; // map letter to internal (numerical) label
+-  letter_mapping.fill(-1);
+-  int64_t num_ell_idxes = -1;
+-  int64_t first_ell_idx = 0;
+-
+-  // The internal representation of the left hand side fo the equation (with ellipsis expanded) is stored in input_op_idxes.
+-  // For each operand, we have a vector mapping each dimension to an internal index.
+-  // We also keep track of the number of occurrences for each letter (to infer a right hand side if not given) and
+-  // of the last occurrence of each index.
+-  std::vector<std::vector<int64_t>> input_op_idxes;                   // the parsed operand indices
+-  std::array<std::int64_t, number_of_letters> num_letter_occurrences; // number of occurrence in the equation of this letter
+-  num_letter_occurrences.fill(0);
+-  std::vector<std::int64_t> last_idx_occurrence;                      // the last operator (left to right) using this index
+-
+-  if ((pos = eqn.find("->")) != std::string::npos) { // check whether we have a right hand side. in_eq is the left hand side
+-    in_eqn = eqn.substr(0, pos);
+-  } else {
+-    in_eqn = eqn;
+-  }
+-  // remove spaces for einsum compatibility (#9929)
+-  in_eqn.erase(std::remove_if(in_eqn.begin(), in_eqn.end(), isspace), in_eqn.end());
+-
+-  // next we parse in_eq (the left hand side) by iterating. It is a string of comma separated terms per index
+-  int64_t operand = 0;
+-  std::stringstream eqn_stream(in_eqn);
+-  std::string term;
+-  int64_t num_total_idxes = 0;
+-  while (! eqn_stream.eof()) {
+-    std::getline(eqn_stream, term, ',');  // term = string with indices of current term
+-    TORCH_CHECK((int64_t) tensors.size()>operand, "more operands in equation than tensors"); // we cannot have a longer equation than operands. We need to check here before we use the dimension
+-
+-    int64_t ell_char_count = 0;            // handling of ellipsis '...' is a bit tedious, we count the '.'
+-    // if there is an ellipsis, the number of dimensions it represents must be total dim - letter dimensions
+-    int64_t candidate_num_ell_idxes = tensors[operand].dim() - term.size() + 3;
+-    int64_t dims_in_term = 0;              // dimensions we have seen
+-    std::vector<int64_t> current_op_idxes; // mapping of operand dimensions to indices for current term
+-    for (auto &c : term) {                 // c = character with a single letter or '.'
+-      if (c == '.') {
+-        ell_char_count++;
+-        TORCH_CHECK(ell_char_count <= 3, "can only have '.' in one ellispis '...' in term ", operand, " of the equation");
+-        if (ell_char_count == 3) {        // this completes the ellipsis
+-          if (num_ell_idxes == -1) {      // if we have not seen an ellipsis before, keep track of indices and size
+-            first_ell_idx = num_total_idxes;
+-            num_ell_idxes = candidate_num_ell_idxes;
+-            num_total_idxes += num_ell_idxes;
+-          }
+-          else {                          // we have seen an ellipsis before, so we check compatibility
+-            TORCH_CHECK(candidate_num_ell_idxes == num_ell_idxes,
+-                     "ellipsis must represent ", num_ell_idxes, " dimensions in all terms");
+-          }
+-          for (int64_t i = 0; i < num_ell_idxes; ++i) { // map ellipsis dimensions in operand to indices
+-            current_op_idxes.push_back(first_ell_idx + i);
+-            last_idx_occurrence.push_back(operand);
+-          }
+-          dims_in_term += num_ell_idxes;                // keep track of dimensions
+-        }
+-      } else {                                          // a letter (hopefully)
+-        TORCH_CHECK((ell_char_count == 0) || (ell_char_count == 3), "'.' must only occur in ellipsis, operand ", operand);
+-        TORCH_CHECK(('a' <= c) && (c <= 'z'), "only lowercase letters a-z allowed as indices");
+-        int64_t letter_num = c-'a';                     // letter_num  = position in letter_mapping
+-        if (letter_mapping[letter_num] == -1) {         // new letter, add internal index and mapping
+-          letter_mapping[letter_num] = num_total_idxes;
+-          num_total_idxes++;
+-          last_idx_occurrence.push_back(operand);
+-        } else {                                        // letter we have already seen
+-          last_idx_occurrence[letter_mapping[letter_num]] = operand;
+-        }
+-        num_letter_occurrences[letter_num]++;
+-        current_op_idxes.push_back(letter_mapping[letter_num]);
+-        dims_in_term++;
+-      }
++// There are roughly three parts to compute einsum:
++// 1. Parse equation to extract the labels for each input operand and output
++// 2. Unsqueeze missing dimensions from input operands and permute to align them
++// 3. Compute result by multiplying input operands and summing contraction
++//    dimensions We do the last part by reducing to bmm.
++Tensor einsum(std::string equation, TensorList operands) {
++  TORCH_CHECK(!operands.empty(), "einsum() must provide at least one operand");
++  checkDeviceType("einsum()", operands, operands[0].device().type());
++
++  // Code for encoding ellipsis ("...") with labels
++  constexpr int ELLIPSIS = '.';
++
++  // Find arrow (->) to split equation into lhs and rhs
++  const auto arrow_pos = equation.find("->");
++
++  // Convert labels for input operands into an index in [0, 25] and store
++  // them in op_labels for each operand along with ELLIPSIS.
++  std::string lhs = equation.substr(0, arrow_pos);
++  std::vector<std::vector<int>> op_labels(operands.size());
++  bool found_ell = false;
++  std::string::size_type curr_op = 0;
++  for (auto i = decltype(lhs.length()){0}; i < lhs.length(); ++i) {
++    switch (lhs[i]) {
++      case ' ':
++        // Ignore spaces
++        break;
++
++      case '.':
++        TORCH_CHECK(
++            // Only one ellipsis per operand can be given
++            !found_ell,
++            "einsum() found \'.\' for operand ",
++            curr_op,
++            " for which an ellipsis was already found");
++        TORCH_CHECK(
++            // Ensure it's a valid ellipsis
++            i + 2 < lhs.length() && lhs[++i] == '.' && lhs[++i] == '.',
++            "einsum() found \'.\' for operand ",
++            curr_op,
++            " that is not part of any ellipsis");
++        op_labels[curr_op].push_back(ELLIPSIS);
++        found_ell = true;
++        break;
++
++      case ',':
++        // Move onto next operand
++        ++curr_op;
++        TORCH_CHECK(
++            curr_op < operands.size(),
++            "einsum() fewer operands were provided than specified in the equation");
++        found_ell = false;
++        break;
++
++      default:
++        // Parse label
++        TORCH_CHECK(
++            lhs[i] >= 'a' && lhs[i] <= 'z',
++            "einsum() operand subscript must be in range [a, z] but found ",
++            lhs[i],
++            " for operand ",
++            curr_op);
++        // Convert label to index in [0, 25] and store
++        op_labels[curr_op].push_back(lhs[i] - 'a');
+     }
+-    TORCH_CHECK(dims_in_term == tensors[operand].dim(), "dimension mismatch for operand ", operand, ": equation ", dims_in_term, " tensor ", tensors[operand].dim());
+-    input_op_idxes.push_back(std::move(current_op_idxes));
+-    operand++;
+   }
+-  // in the check below, we need ==, but > is captured above, so the error message can be specific that it is <.
+-  TORCH_CHECK((int64_t) tensors.size()==operand, "more tensors than operands in equation");
+-
+-  // the following parses or infers output (right hand side)
+-  // it also assigns the idxes_to_preprocessed_dims (index -> dimension in preprocessed / output tensors)
+-  // for the output indices. -1 means that the index has not been assigned a dimension yet
+-  std::vector<int64_t> idxes_to_preprocessed_dims(num_total_idxes, -1);     // the position of the index in the tensor dimensions
+-  int64_t num_output_dims = 0;
+-  if (pos != std::string::npos) {            // parse the user provided right hand side
+-    int64_t ell_char_count = 0;
+-    for (auto &c : eqn.substr(pos+2)) {
+-      if (c == '.') {                        // '.' as part of ellipsis
+-        ell_char_count++;
+-        TORCH_CHECK(ell_char_count <= 3, "can only have '.' in one ellispis '...' in right hand side of the equation");
+-        if (ell_char_count == 3) {           // ellipsis complete
+-          TORCH_CHECK(num_ell_idxes >= 0, "ellipsis '...' may only appear in right hand side if it does in left hand side");
+-          for (int64_t i = 0; i < num_ell_idxes; ++i) {
+-            idxes_to_preprocessed_dims[first_ell_idx + i] = num_output_dims;
+-            num_output_dims++;
+-          }
+-        }
+-      } else if (! isspace(c)) {                              // letter (hopefully)
+-        TORCH_CHECK((ell_char_count == 0) || (ell_char_count == 3), "'.' must only occur in ellipsis in the right hand side");
+-        TORCH_CHECK(('a' <= c) && (c <= 'z'), "only lowercase letters a-z allowed as indices");
+-        int64_t letter_num = c-'a';
+-        TORCH_CHECK(idxes_to_preprocessed_dims[letter_mapping[letter_num]] == -1, "index ", c, " occurs twice in output");
+-        idxes_to_preprocessed_dims[letter_mapping[letter_num]] = num_output_dims;
+-        num_output_dims++;
++
++  TORCH_CHECK(
++      curr_op == operands.size() - 1,
++      "einsum() more operands were provided than specified in the equation");
++
++  // Labels must be within [a, z].
++  constexpr int total_labels = 'z' - 'a' + 1;
++  std::vector<int> label_count(total_labels, 0);
++
++  // The maximum number of dimensions covered by any ellipsis, needed when
++  // unsqueezing missing dimensions from operands to permute and broadcast
++  int64_t ell_num_dim = 0;
++
++  // Compute label frequency and number of dimensions covered by ellipsis
++  // We do this after parsing labels to make it more readable and simpler
++  // to compute the number of dimensions covered by ellipsis.
++  for (std::size_t i = 0; i < operands.size(); ++i) {
++    Tensor operand = operands[i];
++    std::vector<int> labels = op_labels[i];
++    int64_t nlabels = labels.size();
++    int64_t ndims = operand.dim();
++    bool has_ellipsis = false;
++
++    for (int label : labels) {
++      if (label == ELLIPSIS) {
++        --nlabels;
++        has_ellipsis = true;
++        ell_num_dim = std::max(ell_num_dim, ndims - nlabels);
++      } else {
++        ++label_count[label];
+       }
+     }
+-  } else { // create an inferred right hand side
+-    // the ellipsis (if in the lhs) comes first
+-    if (num_ell_idxes >= 0) {
+-      for (int64_t i = 0; i < num_ell_idxes; ++i) {
+-        idxes_to_preprocessed_dims[first_ell_idx + i] = num_output_dims;
+-        num_output_dims++;
++
++    TORCH_CHECK(
++        has_ellipsis ? nlabels <= ndims : nlabels == ndims,
++        "einsum() the number of subscripts in the equation (",
++        nlabels,
++        has_ellipsis ? ") is more than the number of dimensions ("
++                     : ") does not match the number of dimensions (",
++        ndims,
++        ") for operand ",
++        i,
++        has_ellipsis ? "" : " and no ellipsis was given");
++  }
++
++  // Mapping of label to index in the permuted tensors (out_dims + sum_dims)
++  // This will be used for aligning the dimensions of all input operands
++  std::vector<int> label_perm_index(total_labels, -1);
++  
++  // Current index in the permuted shape
++  int perm_index = 0;
++
++  // Start index of ellipsis dimensions in the permuted shape
++  int64_t ell_index = 0;
++
++  if (arrow_pos == std::string::npos) {
++    // Implicit output is ellipsis (...) + labels seen only once
++    perm_index = ell_num_dim;
++    for (int label = 0; label < total_labels; ++label) {
++      if (label_count[label] == 1) {
++        label_perm_index[label] = perm_index++;
+       }
+     }
+-    // then the indices that occur exactly once in alphabetic order
+-    for (size_t idx = 0; idx < number_of_letters; idx++) {
+-      if (num_letter_occurrences[idx] == 1) {
+-        idxes_to_preprocessed_dims[letter_mapping[idx]] = num_output_dims;
+-        num_output_dims++;
++  } else {
++    // Parse explicit output
++    std::string rhs = equation.substr(arrow_pos + 2);
++    found_ell = false;
++    for (std::size_t i = 0; i < rhs.length(); ++i) {
++      switch (rhs[i]) {
++        case ' ':
++          // Ignore spaces
++          break;
++
++        case '.':
++          TORCH_CHECK(
++              // There can only be one ellipsis in the output
++              !found_ell,
++              "einsum() found \'.\' for output but an ellipsis (...) was already found");
++          TORCH_CHECK(
++              // Ensure ellipsis is correct
++              i + 2 < rhs.length() && rhs[++i] == '.' && rhs[++i] == '.',
++              "einsum() found \'.\' for output that is not part of any ellipsis (...)");
++          ell_index = perm_index;
++          perm_index += ell_num_dim;
++          found_ell = true;
++          break;
++
++        default:
++          TORCH_CHECK(
++              rhs[i] >= 'a' && rhs[i] <= 'z',
++              "einsum() subscripts must be in range [a, z] but found ",
++              rhs[i],
++              " for the output");
++          TORCH_CHECK(
++              // Ensure label appeared at least once for some input operand and at
++              // most once for the output
++              label_count[rhs[i] - 'a'] > 0,
++              "einsum() output subscript ",
++              rhs[i],
++              label_count[rhs[i] - 'a'] == -1
++                  ? " appears more than once in the output"
++                  : " does not appear in the equation for any input operand");
++          label_perm_index[rhs[i] - 'a'] = perm_index++;
++          
++          // Set to -1 to mark that this label already appeared in the output
++          label_count[rhs[i] - 'a'] = -1;
+       }
+     }
++
++    TORCH_CHECK(
++        // Dimensions under ellipsis are not contracted, so ensure it appears in output
++        ell_num_dim <= 0 || found_ell,
++        "einsum() ellipsis (...) covering one or more dimensions was given in the input but not in the output");
+   }
+-  // now we assign the idxes_to_preprocessed_dims (index -> dimension in preprocessed / output tensors)
+-  // for the non-output indices - those that are eventually summed over
+-  int64_t position = num_output_dims;
+-  for (int64_t i = 0; i < num_total_idxes; i++) {
+-    if (idxes_to_preprocessed_dims[i]==-1) {
+-      idxes_to_preprocessed_dims[i] = position;
+-      position++;
++
++  // Save output size before adding sum dims
++  int out_size = perm_index;
++
++  // Add contraction labels (labels not present in output)
++  for (int label = 0; label < total_labels; ++label) {
++    if (label_count[label] > 0 && label_perm_index[label] == -1) {
++      label_perm_index[label] = perm_index++;
+     }
+   }
+ 
+-  // we now "homogenize the dimensions", i.e.
+-  // - take diagonals for duplicated indices
+-  // - permute the dimensions to match the order given by idxes_to_preprocessed_dims
+-  // - unsqueeze to create all dimensions for each index in each tensor where they are missing
+-  // we also check that sizes match
+-  // after this, all operands will have compatible shapes (i.e. all dimensions are aligned are broadcastable)
+-  std::vector<Tensor> preprocessed_operands;
+-  std::vector<std::int64_t> size_of_dims(num_total_idxes, -1); // keep track of sizes for each index, -1 means we have not seen a size yet
+-  for (int64_t op = 0; op < (int64_t) tensors.size(); op++) {
+-    auto preprocessed_op = tensors[op];
+-    std::vector<int64_t> idx_to_dim(num_total_idxes, -1); // the dimension which the index refers to in the original tensor, -1 means it does not appear
+-    std::vector<int64_t>& current_op_input_idxes = input_op_idxes[op];
+-    int64_t dim = 0; // there are two dimension indices: dim is after taking diagonals, i is in input
+-    for (size_t i = 0; i < current_op_input_idxes.size(); i++) {
+-      auto idx = current_op_input_idxes[i];
+-      auto dim_out = idxes_to_preprocessed_dims[idx];
+-      if (idx_to_dim[dim_out] == -1) { // first appearance
+-        idx_to_dim[dim_out] = dim;
+-        if (size_of_dims[idx] == -1) { // keep track of sizes
+-          size_of_dims[idx] = preprocessed_op.size(dim);
++  // Here we unsqueeze missing dimensions to make all operands have the same
++  // number of dimensions. We take diagonals for repeated labels within the
++  // same operand. Finally we permute the operands to align dimensions as 
++  // per the perm_out_index we computed above.
++  std::vector<Tensor> permuted_operands;
++  for (std::size_t i = 0; i < operands.size(); ++i) {
++    std::vector<int64_t> perm_shape(perm_index, -1);
++    std::vector<int64_t> label_dim(total_labels, -1);
++    std::vector<int> labels = op_labels[i];
++    Tensor operand = operands[i];
++    std::size_t j = 0;
++
++    for (int label : labels) {
++      if (label == ELLIPSIS) {
++        // Add missing dimensions under ellipsis
++        int64_t num_dim_diff =
++            ell_num_dim - (operand.dim() - labels.size() + 1);
++        for (int64_t k = 0; k < num_dim_diff; ++k) {
++          operand = operand.unsqueeze(j);
+         }
+-        else {
+-          TORCH_CHECK(size_of_dims[idx] == preprocessed_op.size(dim), "size of dimension does not match previous size, operand ", op, ", dim ", i);
++        for (int64_t k = 0; k < ell_num_dim; ++k) {
++          perm_shape[ell_index + k] = j++;
+         }
+-        dim++;
+-      } else { // duplicate dimension in tensor --> take diagonal of idx_to_dim[dim_out] and dim and put the diagonal dimension to idx_to_dim[dim_out]
+-        TORCH_CHECK(size_of_dims[idx] == preprocessed_op.size(dim), "size of dimension does not match previous size, operand ", op, ", dim ", i);
+-        preprocessed_op = preprocessed_op.diagonal(0, idx_to_dim[dim_out], dim);
+-        // diagonal moves the diagonal dimension to the back
+-        // now we permute the last dim back to idx_to_dim[dim_out]
+-        std::vector<int64_t> perm(preprocessed_op.dim(), 0);
+-        for (int64_t d = 0; d < preprocessed_op.dim(); d++) {
+-          if (d == idx_to_dim[dim_out]) {
+-            perm[d] = preprocessed_op.dim() - 1;
+-          } else {
+-            perm[d] = d - (d > idx_to_dim[dim_out]);
+-          }
+-        }
+-        preprocessed_op = preprocessed_op.permute(perm);
++      } else if (label_dim[label] != -1) {
++        // Repeated label, take diagonal
++        int64_t dim = label_dim[label];
++        TORCH_CHECK(
++            operand.size(j) == operand.size(dim),
++            "einsum() subscript ",
++            char(label + 'a'),
++            " is repeated for operand ",
++            i,
++            " but the sizes don't match, ",
++            operand.size(j),
++            " != ",
++            operand.size(dim));
++        operand = operand.diagonal(0, j, dim).movedim(-1, dim);
++      } else {
++        // Lookup output index for label
++        label_dim[label] = j;
++        perm_shape[label_perm_index[label]] = j++;
+       }
+     }
+-    // now we permute the dimensions in the right order
+-    std::vector<int64_t> permutation; // permutation for this tensor
+-    for (auto &d : idx_to_dim) {
+-      if (d > -1) {
+-        permutation.push_back(d);
++
++    // Add dimensions for missing labels
++    for (int64_t& index : perm_shape) {
++      if (index == -1) {
++        operand = operand.unsqueeze(-1);
++        index = j++;
+       }
+     }
+-    preprocessed_op = preprocessed_op.permute(permutation);
+-    // finally, we insert dimensions for idxes not in the operand
+-    for (size_t dim = 0; dim < idx_to_dim.size(); dim++) {
+-      if (idx_to_dim[dim] == -1) {
+-        preprocessed_op = preprocessed_op.unsqueeze(dim);
++
++    permuted_operands.push_back(operand.permute(perm_shape));
++  }
++
++  // Check if operands broadcast and keep track of last operand with
++  // dimension size != 1 for optimizing reductions
++  std::vector<std::size_t> dim_last_op(perm_index, 0);
++  bool has_zero_size_dim = false;
++  for (int dim = 0; dim < perm_index; ++dim) {
++    int64_t broadcast_size = permuted_operands[0].size(dim);
++    for (std::size_t i = 1; i < permuted_operands.size(); ++i) {
++      int64_t dim_size = permuted_operands[i].size(dim);
++      if (broadcast_size != dim_size && broadcast_size != 1 && dim_size != 1) {
++        std::ostringstream msg;
++        msg << "einsum() operands do not broadcast with remapped shapes [original->remapped]:";
++        for (std::size_t j = 0; j < operands.size(); ++j) {
++          msg << " " << operands[j].sizes() << "->"
++              << permuted_operands[j].sizes();
++        }
++        TORCH_CHECK(false, msg.str());
++      }
++      if (dim_size != 1) {
++        broadcast_size = dim_size;
++        dim_last_op[dim] = i;
+       }
+     }
++    has_zero_size_dim |= broadcast_size == 0;
++  }
+ 
+-    preprocessed_operands.push_back(std::move(preprocessed_op));
++  // Compute result
++  Tensor result = permuted_operands[0];
++
++  // Fast path for when an operand has zero sized dim
++  if (has_zero_size_dim) {
++    std::vector<int64_t> out_shape(out_size);
++    for (int i = 0; i < out_size; ++i) {
++      out_shape[i] = permuted_operands[dim_last_op[i]].size(i);
++    }
++    return at::zeros(out_shape, result.options());
+   }
+ 
+-  // now we reduce the indices from left to right
+-  // numpy allows to optimize the path using various
+-  // algorithms (see eigen_path in numpy docs)
+-  // we start with the leftmost operator and reduce indices that
+-  // appear only there
+-  Tensor result = std::move(preprocessed_operands[0]);
+-  for (int64_t idx = 0; idx < num_total_idxes; idx++) {
+-    if ((last_idx_occurrence[idx] == 0)
+-        && (idxes_to_preprocessed_dims[idx]>=num_output_dims)) {
+-      result = result.sum(idxes_to_preprocessed_dims[idx], true);
++  // Sum out or squeeze dimensions that are size 1 for all later operands
++  int dim = out_size;
++  for (int i = dim; i < perm_index; ++i, ++dim) {
++    if (dim_last_op[i] == 0) {
++      if (result.size(dim) == 1) {
++        result = result.squeeze(dim--);
++      } else {
++        result = result.sum(dim--);
++      }
+     }
+   }
+ 
+-  // now we process each tensor using sumproduct_pair
+-  for (int64_t i = 1; i < (int64_t) preprocessed_operands.size(); i++) {
++  for (std::size_t i = 1; i < permuted_operands.size(); ++i) {
++    Tensor operand = permuted_operands[i];
+     std::vector<int64_t> sum_dims;
+-    for (int64_t idx = 0; idx < num_total_idxes; idx++) {
+-      if ((last_idx_occurrence[idx] == i)
+-          && (idxes_to_preprocessed_dims[idx]>=num_output_dims)) {
+-        sum_dims.push_back(idxes_to_preprocessed_dims[idx]);
++
++    // Sum out or squeeze dimensions that are size 1 for all later operands
++    dim = out_size;
++    for (int j = dim; j < perm_index; ++j, ++dim) {
++      if (dim_last_op[j] < i) {
++        operand = operand.squeeze(dim);
++        --dim;
++      } else if (dim_last_op[j] == i) {
++        if (result.size(dim) == 1) {
++          operand = operand.sum(dim);
++          result = result.squeeze(dim);
++          --dim;
++        } else {
++          sum_dims.push_back(dim);
++        }
+       }
+     }
+-    result = at::native::sumproduct_pair(result, std::move(preprocessed_operands[i]), sum_dims, true);
+-  }
+-  // finally, we squeeze out all non-result dimensions
+-  auto sizes = result.sizes().vec();
+-  for (int64_t dim = num_total_idxes-1; dim >= num_output_dims; dim--) {
+-    sizes.erase(sizes.begin() + dim);
++
++    // Multiply tensors and sum out dimensions in sum_dims
++    if (sum_dims.empty()) {
++      result = result.mul(operand);
++    } else if (sum_dims.size() == result.sizes().size()) {
++      result = result.flatten().dot(operand.flatten());
++    } else {
++      result = sumproduct_pair(result, operand, sum_dims, false);
++    }
+   }
+ 
+-  result = result.view(sizes);
+   return result;
+ }
+ 
+diff --git a/test/test_linalg.py b/test/test_linalg.py
+index 53ba84e6348..cbab1bde696 100644
+--- a/test/test_linalg.py
++++ b/test/test_linalg.py
+@@ -1208,6 +1208,145 @@ class TestLinalg(TestCase):
+         self._test_dot_vdot_invalid_args(device, torch.dot)
+         self._test_dot_vdot_invalid_args(device, torch.dot, complex_dtypes=True)
+ 
++    def test_einsum(self, device):
++        def check(equation, *operands):
++            ref = np.einsum(equation, *[operand.cpu().numpy() for operand in operands])
++            res = torch.einsum(equation, operands)
++            self.assertEqual(res.cpu(), torch.from_numpy(np.array(ref)))
++
++            # Autograd check (FIXME: tests below fail check)
++            if equation not in {"i,i->", "i,i->i", "ij,ij->ij"}:
++                ops = [op.detach().requires_grad_() for op in operands]
++                self.assertTrue(torch.autograd.gradcheck(lambda *ops: torch.einsum(equation, ops), ops))
++                for op in ops:
++                    self.assertTrue(op._version == 0)
++
++        # Test cases from https://gist.github.com/rockt/15ee013889d65342088e9260a377dc8f
++        x = torch.rand(5, device=device)
++        y = torch.rand(7, device=device)
++        A = torch.randn(3, 5, device=device)
++        B = torch.randn(2, 5, device=device)
++        C = torch.randn(2, 3, 5, device=device)
++        D = torch.randn(2, 5, 7, device=device)
++        E = torch.randn(7, 9, device=device)
++        F = torch.randn(2, 3, 3, 5, device=device)
++        G = torch.randn(5, 4, 6, device=device)
++        H = torch.randn(4, 4, device=device)
++        I = torch.rand(2, 3, 2, device=device)
++
++        # Vector operations
++        check('i->', x)                     # sum
++        check('i,i->', x, x)                # dot
++        check('i,i->i', x, x)               # vector element-wisem mul
++        check('i,j->ij', x, y)              # outer
++
++        # Matrix operations
++        check("ij->ji", A)                  # transpose
++        check("ij->j", A)                   # row sum
++        check("ij->i", A)                   # col sum
++        check("ij,ij->ij", A, A)            # matrix element-wise mul
++        check("ij,j->i", A, x)              # matrix vector multiplication
++        check("ij,kj->ik", A, B)            # matmul
++        check("ij,ab->ijab", A, E)          # matrix outer product
++
++        # Tensor operations
++        check("aij,ajk->aik", C, D)         # batch matmul
++        check("ijk,jk->i", C, A)            # tensor matrix contraction
++        check("aij,jk->aik", D, E)          # tensor matrix contraction
++        check("abcd,dfg->abcfg", F, G)      # tensor tensor contraction
++        check("ijk,jk->ik", C, A)           # tensor matrix contraction with double indices
++        check("ijk,jk->ij", C, A)           # tensor matrix contraction with double indices
++        check("ijk,ik->j", C, B)            # non contiguous
++        check("ijk,ik->jk", C, B)           # non contiguous with double indices
++
++        # Test diagonals
++        check("ii", H)                      # trace
++        check("ii->i", H)                   # diagonal
++        check('iji->j', I)                  # non-contiguous trace
++
++        # Test ellipsis
++        check("i...->...", H)
++        check("ki,...k->i...", A.t(), B)
++        check("k...,jk", A.t(), B)
++        check('...ik, ...kj -> ...ij', torch.rand(2, 3, 4), torch.rand(1, 5))
++        check('bik,k...j->i...j', torch.rand(5, 2, 3), torch.rand(3, 2))
++        check('i...j, ij... -> ...ij', torch.rand(2, 3, 4), torch.rand(2, 4, 2, 3))
++
++        # torch.bilinear with discontiguous tensors
++        l = torch.randn(10, 5, device=device).transpose(0, 1)
++        r = torch.randn(20, 5, device=device).transpose(0, 1)
++        w = torch.randn(15, 10, 20, device=device)
++        check("bn,anm,bm->ba", l, w, r)
++        # with strided tensors
++        check("bn,anm,bm->ba", l[:, ::2], w[:, ::2, ::2], r[:, ::2])
++
++    def test_einsum_corner_cases(self, device):
++        def check(equation, *operands, expected_output):
++            tensors = [torch.tensor(operand, dtype=torch.float32, device=device) if not isinstance(operand, tuple)
++                       else torch.rand(operand, dtype=torch.float32, device=device) for operand in operands]
++            output = torch.einsum(equation, tensors)
++            self.assertEqual(output, torch.tensor(expected_output, dtype=torch.float32, device=device))
++
++        # Test equation variantions
++        check(' ', 1, expected_output=1)
++        check(' -> ', 1, expected_output=1)
++        check(' , ', 2, 2, expected_output=4)
++        check(' , , ', 2, 2, 2, expected_output=8)
++        check(' , -> ', 2, 2, expected_output=4)
++        check(' i ', [1], expected_output=[1])
++        check(' i -> ', [1], expected_output=1)
++        check(' i -> i ', [1], expected_output=[1])
++        check(' i , i ', [2], [2], expected_output=4)
++        check(' i , i -> i ', [2], [2], expected_output=[4])
++
++        # Test tensors with 0 size dimensions
++        check('i', [], expected_output=[])
++        check(' i j -> j', [[], []], expected_output=[])
++        check('ij->i', [[], []], expected_output=[0., 0.])
++        check(' i j k  ,  k  -> i j ', (3, 0, 6), (6,), expected_output=[[], [], []])
++
++        # Test broadcasting
++        check('i,j', [2], [1, 2], expected_output=[[2, 4]])
++        check('i,ij->ij', [1, 2], [[1, 2, 3], [2, 3, 4]], expected_output=[[1, 2, 3], [4, 6, 8]])
++
++        # Test ellipsis broadcasting
++        check('...', 1, expected_output=1)
++        check('...->', 1, expected_output=1)
++        check('...->...', 1, expected_output=1)
++        check('i...->i', [1], expected_output=[1])
++        check('i...->...i', [1], expected_output=[1])
++
++    def test_einsum_error_cases(self, device):
++        def check(equation, operands, regex, exception=RuntimeError):
++            with self.assertRaisesRegex(exception, r'einsum\(\) ' + regex):
++                torch.einsum(equation, operands)
++
++        x = torch.rand(2)
++        y = torch.rand(2, 3)
++
++        check('', [], r'must provide at least one operand')
++        check('. ..', [x], r'found \'.\' for operand 0 that is not part of any ellipsis')
++        check('... ...', [x], r'found \'.\' for operand 0 for which an ellipsis was already found')
++        check('A', [x], r'operand subscript must be in range \[a, z\] but found A for operand 0')
++        check(',', [x], r'fewer operands were provided than specified in the equation')
++        check('', [x, x], r'more operands were provided than specified in the equation')
++        check('', [x], r'the number of subscripts in the equation \(0\) does not match the number '
++                       r'of dimensions \(1\) for operand 0 and no ellipsis was given')
++        check('ai', [x], r'the number of subscripts in the equation \(2\) does not match the number '
++                         r'of dimensions \(1\) for operand 0 and no ellipsis was given')
++        check('ai...', [x], r'the number of subscripts in the equation \(2\) is more than the number '
++                            r'of dimensions \(1\) for operand 0')
++        check('a->... .', [x], r'found \'.\' for output but an ellipsis \(...\) was already found')
++        check('a->..', [x], r'found \'.\' for output that is not part of any ellipsis \(...\)')
++        check('a->A', [x], r'subscripts must be in range \[a, z\] but found A for the output')
++        check('a->aa', [x], r'output subscript a appears more than once in the output')
++        check('a->i', [x], r'output subscript i does not appear in the equation for any input operand')
++        check('...->', [x], r'ellipsis \(...\) covering one or more dimensions was given in the input '
++                            r'but not in the output')
++        check('aa', [y], r'subscript a is repeated for operand 0 but the sizes don\'t match, 3 != 2')
++        check('a, ba', [x, y], r'operands do not broadcast with remapped shapes \[original->remapped\]: '
++                               r'\[2\]->\[1, 2\] \[2, 3\]->\[2, 3\]')
++
+ instantiate_device_type_tests(TestLinalg, globals())
+ 
+ if __name__ == '__main__':
+diff --git a/test/test_torch.py b/test/test_torch.py
+index f5c00e20df5..fce680b2b7a 100644
+--- a/test/test_torch.py
++++ b/test/test_torch.py
+@@ -39,7 +39,7 @@ from torch.testing._internal.common_device_type import instantiate_device_type_t
+     onlyCUDA, onlyCPU, \
+     dtypes, dtypesIfCUDA, dtypesIfCPU, deviceCountAtLeast, skipCUDAIf, precisionOverride, \
+     PYTORCH_CUDA_MEMCHECK, largeTensorTest, onlyOnCPUAndCUDA, expectedAlertNondeterministic
+-from typing import Dict, List, Tuple, Union
++from typing import Dict, List
+ import torch.backends.quantized
+ import torch.testing._internal.data
+ from torch.testing._internal.common_cuda import tf32_on_and_off, tf32_is_not_fp32, with_tf32_off
+@@ -16290,81 +16290,6 @@ class TestTorchDeviceType(TestCase):
+ 
+         test_helper(torch.finfo(dtype).tiny, torch.finfo(dtype).max)
+ 
+-    @onlyCPU
+-    @slowTest
+-    @unittest.skipIf(not TEST_NUMPY, 'Numpy not found')
+-    @dtypes(torch.double)
+-    def test_einsum(self, device: torch.device, dtype: torch.dtype) -> None:
+-        # test cases taken from https://gist.github.com/rockt/15ee013889d65342088e9260a377dc8f
+-        x = torch.randn(5, dtype=dtype, device=device)
+-        y = torch.randn(7, dtype=dtype, device=device)
+-        A = torch.randn(3, 5, dtype=dtype, device=device)
+-        B = torch.randn(2, 5, dtype=dtype, device=device)
+-        C = torch.randn(2, 3, 5, dtype=dtype, device=device)
+-        D = torch.randn(2, 5, 7, dtype=dtype, device=device)
+-        E = torch.randn(7, 9, dtype=dtype, device=device)
+-        F = torch.randn(2, 3, 5, 7, dtype=dtype, device=device)
+-        G = torch.randn(7, 11, 13, dtype=dtype, device=device)
+-        H = torch.randn(4, 4, dtype=dtype, device=device)
+-        I = torch.randn(3, 4, 4, dtype=dtype, device=device)
+-        l = torch.randn(5, 10, dtype=dtype, device=device)
+-        r = torch.randn(5, 20, dtype=dtype, device=device)
+-        w = torch.randn(30, 10, 20, dtype=dtype, device=device)
+-        test_list: List[Union[Tuple[str, torch.Tensor],
+-                        Tuple[str, torch.Tensor, torch.Tensor],
+-                        Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]]] = [
+-            # -- Vector
+-            ("i->", x),                 # sum
+-            ("i,i->", x, x),            # dot
+-            ("i,i->i", x, x),           # vector element-wise mul
+-            ("i,j->ij", x, y),          # outer
+-            # -- Matrix
+-            ("ij->ji", A),              # transpose
+-            ("ij->j", A),               # row sum
+-            ("ij->i", A),               # col sum
+-            ("ij,ij->ij", A, A),        # matrix element-wise mul
+-            ("ij,j->i", A, x),          # matrix vector multiplication
+-            ("ij,kj->ik", A, B),        # matmul
+-            ("ij,ab->ijab", A, E),      # matrix outer product
+-            # -- Tensor
+-            ("aij,ajk->aik", C, D),     # batch matmul
+-            ("ijk,jk->i", C, A),        # tensor matrix contraction
+-            ("aij,jk->aik", D, E),      # tensor matrix contraction
+-            ("abcd,dfg->abcfg", F, G),  # tensor tensor contraction
+-            ("ijk,jk->ik", C, A),       # tensor matrix contraction with double indices
+-            ("ijk,jk->ij", C, A),       # tensor matrix contraction with double indices
+-            ("ijk,ik->j", C, B),        # non contiguous
+-            ("ijk,ik->jk", C, B),       # non contiguous with double indices
+-            # -- Diagonal
+-            ("ii", H),                 # trace
+-            ("ii->i", H),              # diagonal
+-            # -- Ellipsis
+-            ("i...->...", H),
+-            ("ki,...k->i...", A.t(), B),
+-            ("k...,jk", A.t(), B),
+-            ("...ii->...i", I),       # batch diagonal
+-            # -- Other
+-            ("bn,anm,bm->ba", l, w, r),  # as torch.bilinear
+-            ("... ii->...i  ", I),       # batch diagonal with spaces
+-        ]
+-        for test in test_list:
+-            actual = torch.einsum(test[0], test[1:])
+-            expected = np.einsum(test[0], *[t.numpy() for t in test[1:]])
+-            self.assertEqual(expected.shape, actual.shape, msg=test[0])
+-            self.assertEqual(expected, actual, msg=test[0])
+-            # test vararg
+-            actual2 = torch.einsum(test[0], *test[1:])
+-            self.assertEqual(expected.shape, actual2.shape, msg=test[0])
+-            self.assertEqual(expected, actual2, msg=test[0])
+-
+-            def do_einsum(*args):
+-                return torch.einsum(test[0], args)
+-            # FIXME: following test cases fail gradcheck
+-            if test[0] not in {"i,i->", "i,i->i", "ij,ij->ij"}:
+-                gradcheck_inps = tuple(t.detach().requires_grad_() for t in test[1:])
+-                self.assertTrue(torch.autograd.gradcheck(do_einsum, gradcheck_inps))
+-            self.assertTrue(A._version == 0)  # check that we do not use inplace ops
+-
+     @onlyCPU
+     @dtypes(torch.bool, torch.double)
+     def test_sum_all(self, device, dtype) -> None:
+diff --git a/torch/functional.py b/torch/functional.py
+index 3781b73a178..e26b4c1b412 100644
+--- a/torch/functional.py
++++ b/torch/functional.py
+@@ -262,76 +262,102 @@ def lu_unpack(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True):
+ def einsum(equation, *operands):
+     r"""einsum(equation, *operands) -> Tensor
+ 
+-This function provides a way of computing multilinear expressions (i.e. sums of products) using the
+-Einstein summation convention.
+-
+-Args:
+-    equation (string): The equation is given in terms of lower case letters (indices) to be associated
+-           with each dimension of the operands and result. The left hand side lists the operands
+-           dimensions, separated by commas. There should be one index letter per tensor dimension.
+-           The right hand side follows after `->` and gives the indices for the output.
+-           If the `->` and right hand side are omitted, it implicitly defined as the alphabetically
+-           sorted list of all indices appearing exactly once in the left hand side.
+-           The indices not apprearing in the output are summed over after multiplying the operands
+-           entries.
+-           If an index appears several times for the same operand, a diagonal is taken.
+-           Ellipses `...` represent a fixed number of dimensions. If the right hand side is inferred,
+-           the ellipsis dimensions are at the beginning of the output.
+-    operands (Tensor): The operands to compute the Einstein sum of.
+-
+-.. note::
+-
+-    This function does not optimize the given expression, so a different formula for the same computation may
+-    run faster or consume less memory. Projects like opt_einsum (https://optimized-einsum.readthedocs.io/en/stable/)
+-    can optimize the formula for you.
+-
+-Examples::
+-
+-    >>> x = torch.randn(5)
+-    >>> y = torch.randn(4)
+-    >>> torch.einsum('i,j->ij', x, y)  # outer product
+-    tensor([[-0.0570, -0.0286, -0.0231,  0.0197],
+-            [ 1.2616,  0.6335,  0.5113, -0.4351],
+-            [ 1.4452,  0.7257,  0.5857, -0.4984],
+-            [-0.4647, -0.2333, -0.1883,  0.1603],
+-            [-1.1130, -0.5588, -0.4510,  0.3838]])
+-
+-
+-    >>> A = torch.randn(3,5,4)
+-    >>> l = torch.randn(2,5)
+-    >>> r = torch.randn(2,4)
+-    >>> torch.einsum('bn,anm,bm->ba', l, A, r) # compare torch.nn.functional.bilinear
+-    tensor([[-0.3430, -5.2405,  0.4494],
+-            [ 0.3311,  5.5201, -3.0356]])
+-
+-
+-    >>> As = torch.randn(3,2,5)
+-    >>> Bs = torch.randn(3,5,4)
+-    >>> torch.einsum('bij,bjk->bik', As, Bs) # batch matrix multiplication
+-    tensor([[[-1.0564, -1.5904,  3.2023,  3.1271],
+-             [-1.6706, -0.8097, -0.8025, -2.1183]],
+-
+-            [[ 4.2239,  0.3107, -0.5756, -0.2354],
+-             [-1.4558, -0.3460,  1.5087, -0.8530]],
+-
+-            [[ 2.8153,  1.8787, -4.3839, -1.2112],
+-             [ 0.3728, -2.1131,  0.0921,  0.8305]]])
+-
+-    >>> A = torch.randn(3, 3)
+-    >>> torch.einsum('ii->i', A) # diagonal
+-    tensor([-0.7825,  0.8291, -0.1936])
+-
+-    >>> A = torch.randn(4, 3, 3)
+-    >>> torch.einsum('...ii->...i', A) # batch diagonal
+-    tensor([[-1.0864,  0.7292,  0.0569],
+-            [-0.9725, -1.0270,  0.6493],
+-            [ 0.5832, -1.1716, -1.5084],
+-            [ 0.4041, -1.1690,  0.8570]])
+-
+-    >>> A = torch.randn(2, 3, 4, 5)
+-    >>> torch.einsum('...ij->...ji', A).shape # batch permute
+-    torch.Size([2, 3, 5, 4])
+-"""
++    Sums the product of the elements of the input :attr:`operands` along dimensions specified using a notation
++    based on the Einstein summation convention.
++
++    Einsum allows computing many common multi-dimensional linear algebraic array operations by representing them
++    in a short-hand format based on the Einstein summation convention, given by :attr:`equation`. The details of 
++    this format are described below, but the general idea is to label every dimension of the input :attr:`operands`
++    with some subscript and define which subscripts are part of the output. The output is then computed by summing
++    the product of the elements of the :attr:`operands` along the dimensions whose subscripts are not part of the
++    output. For example, matrix multiplication can be computed using einsum as `torch.einsum("ij,jk->ik", A, B)`.
++    Here, j is the summation subscript and i and k the output subscripts (see section below for more details on why).
++
++    Equation:
++
++        The :attr:`equation` string specifies the subscripts (lower case letters `['a', 'z']`) for each dimension of
++        the input :attr:`operands` in the same order as the dimensions, separating subcripts for each operand by a
++        comma (','), e.g. `'ij,jk'` specify subscripts for two 2D operands. The dimensions labeled with the same subscript
++        must be broadcastable, that is, their size must either match or be `1`. The exception is if a subscript is
++        repeated for the same input operand, in which case the dimensions labeled with this subscript for this operand
++        must match in size and the operand will be replaced by its diagonal along these dimensions. The subscripts that
++        appear exactly once in the :attr:`equation` will be part of the output, sorted in increasing alphabetical order.
++        The output is computed by multiplying the input :attr:`operands` element-wise, with their dimensions aligned based
++        on the subscripts, and then summing out the dimensions whose subscripts are not part of the output.
++
++        Optionally, the output subscripts can be explictly defined by adding an arrow ('->') at the end of the equation
++        followed by the subscripts for the output. For instance, the following equation computes the transpose of a
++        matrix multiplication: 'ij,jk->ki'. The output subscripts must appear at least once for some input operand and
++        at most once for the output.
++
++        Ellipsis ('...') can be used in place of subscripts to broadcast the dimensions covered by the ellipsis.
++        Each input operand may contain at most one ellipsis which will cover the dimensions not covered by subscripts,
++        e.g. for an input operand with 5 dimensions, the ellipsis in the equation `'ab...c'` cover the third and fourth
++        dimensions. The ellipsis does not need to cover the same number of dimensions across the :attr:`operands` but the
++        'shape' of the ellipsis (the size of the dimensions covered by them) must be broadcastable. In implicit mode,
++        the ellipsis will come first in the output. In explicit mode, if an ellipses covers at least one dimension then
++        it must appear in the output since the dimensions under the ellipsis cannot be summed over. e.g. the following
++        equation implements batch matrix multiplication `'...ij,...jk->...ik'`.
++
++        A few final notes: the equation may contain whitespaces between the different elements (subscripts, ellipsis,
++        arrow and comma) but something like `'. . .'` is not valid. An empty string `''` is valid for scalar operands.
++
++    .. note::
++
++        This function does not optimize the given expression, so a different formula for the same computation may
++        run faster or consume less memory. Projects like opt_einsum (https://optimized-einsum.readthedocs.io/en/stable/)
++        can optimize the formula for you.
++
++    Args:
++        equation (string): The subscripts for the Einstein summation.
++        operands (Tensor): The operands to compute the Einstein sum of.
++
++    Examples::
++
++        # trace
++        >>> torch.einsum('ii', torch.randn(4, 4))
++        tensor(-1.2104)
++
++        # diagonal
++        >>> torch.einsum('ii->i', torch.randn(4, 4))
++        tensor([-0.1034,  0.7952, -0.2433,  0.4545])
++
++        # outer product
++        >>> x = torch.randn(5)
++        >>> y = torch.randn(4)
++        >>> torch.einsum('i,j->ij', x, y)
++        tensor([[ 0.1156, -0.2897, -0.3918,  0.4963],
++                [-0.3744,  0.9381,  1.2685, -1.6070],
++                [ 0.7208, -1.8058, -2.4419,  3.0936],
++                [ 0.1713, -0.4291, -0.5802,  0.7350],
++                [ 0.5704, -1.4290, -1.9323,  2.4480]])
++
++        # batch matrix multiplication
++        >>> As = torch.randn(3,2,5)
++        >>> Bs = torch.randn(3,5,4)
++        >>> torch.einsum('bij,bjk->bik', As, Bs)
++        tensor([[[-1.0564, -1.5904,  3.2023,  3.1271],
++                [-1.6706, -0.8097, -0.8025, -2.1183]],
++
++                [[ 4.2239,  0.3107, -0.5756, -0.2354],
++                [-1.4558, -0.3460,  1.5087, -0.8530]],
++
++                [[ 2.8153,  1.8787, -4.3839, -1.2112],
++                [ 0.3728, -2.1131,  0.0921,  0.8305]]])
++
++        # batch permute
++        >>> A = torch.randn(2, 3, 4, 5)
++        >>> torch.einsum('...ij->...ji', A).shape 
++        torch.Size([2, 3, 5, 4])
++
++        # equivalent to torch.nn.functional.bilinear
++        >>> A = torch.randn(3,5,4)
++        >>> l = torch.randn(2,5)
++        >>> r = torch.randn(2,4)
++        >>> torch.einsum('bn,anm,bm->ba', l, A, r)
++        tensor([[-0.3430, -5.2405,  0.4494],
++                [ 0.3311,  5.5201, -3.0356]])
++    """
+     if not torch.jit.is_scripting():
+         if any(type(t) is not Tensor for t in operands) and has_torch_function(operands):
+             return handle_torch_function(einsum, operands, equation, *operands)

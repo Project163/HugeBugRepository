@@ -11,21 +11,50 @@ def _parse_llm_input_text(llm_text: str) -> Tuple[str, str, str]:
     if not llm_text:
         return "", "", ""
 
-    title = ""
-    description = ""
-    discussion = ""
+    import re
+    
+    # Use Multiline mode to match start of lines, ensuring we process tags correctly at line boundaries.
+    # We use [ \t]* to match horizontal whitespace without consuming newlines, preventing the "swallowing" of subsequent tags.
+    
+    flags = re.MULTILINE | re.IGNORECASE
 
-    parts = llm_text.split("\n\n")
+    # 1. Title
+    # Matches start of line, optional spaces, [Title] or Title:, optional spaces
+    text = re.sub(r'^[ \t]*(?:\[Title\][ \t]*[:：]?|Title[ \t]*[:：])[ \t]*', '\n<TAG:TITLE>\n', llm_text, flags=flags)
 
+    # 2. Description
+    # Matches start of line, [Description]/[Symptom] etc.
+    text = re.sub(r'^[ \t]*(?:(?:\[Description\]|\[Symptom\])[ \t]*[:：]?|(?:Description|Symptom)[ \t]*[:：])[ \t]*', '\n<TAG:DESCRIPTION>\n', text, flags=flags)
+
+    # 3. Discussion
+    # Matches start of line, [Context/Logs]/[Discussion] etc.
+    text = re.sub(r'^[ \t]*(?:(?:\[Context/Logs\]|\[Discussion\])[ \t]*[:：]?|(?:Context/Logs|Discussion)[ \t]*[:：])[ \t]*', '\n<TAG:DISCUSSION>\n', text, flags=flags)
+
+    # Split by tags
+    parts = re.split(r'(<TAG:TITLE>|<TAG:DESCRIPTION>|<TAG:DISCUSSION>)', text)
+    
+    data = {"TITLE": "", "DESCRIPTION": "", "DISCUSSION": ""}
+    current_key = None
+    
     for part in parts:
-        if part.startswith("Title:"):
-            title = part[len("Title:"):].strip()
-        elif part.startswith("Description:"):
-            description = part[len("Description:"):].strip()
-        elif part.startswith("Discussion:"):
-            discussion = part[len("Discussion:"):].strip()
+        part = part.strip()
+        if part in ["<TAG:TITLE>", "<TAG:DESCRIPTION>", "<TAG:DISCUSSION>"]:
+            current_key = part.replace("<TAG:", "").replace(">", "")
+        elif current_key and part:
+            # If we already have content for this key, append it (unlikely but safe)
+            if data[current_key]:
+                data[current_key] += "\n" + part
+            else:
+                data[current_key] = part
 
-    return title, description, discussion
+    # Fallback: if no Title tag found, use simple split logic
+    if not data["TITLE"] and not data["DESCRIPTION"] and not data["DISCUSSION"]:
+        lines = llm_text.split('\n', 1)
+        data["TITLE"] = lines[0].strip()
+        if len(lines) > 1:
+            data["DESCRIPTION"] = lines[1].strip()
+
+    return data["TITLE"], data["DESCRIPTION"], data["DISCUSSION"]
 
 
 def import_data_if_empty() -> None:
@@ -50,8 +79,8 @@ def import_data_if_empty() -> None:
             for r in reader:
                 rows.append(r)
 
-    # 2. 建立 (project_id, bug_id) -> llm_input_text + label 映射
-    llm_text_map = {}
+    # 2. 建立 (project_id, bug_id) -> (llm_input_text, source_type)
+    bug_data_map = {}
     parsed_path = BUG_CLASSIFICATION_DIR / "parsed_data.jsonl"
     if parsed_path.exists():
         with parsed_path.open("r", encoding="utf-8") as f:
@@ -61,7 +90,10 @@ def import_data_if_empty() -> None:
                 except json.JSONDecodeError:
                     continue
                 key = (obj.get("project_id"), str(obj.get("bug_id")))
-                llm_text_map[key] = obj.get("llm_input_text") or ""
+                bug_data_map[key] = {
+                    "text": obj.get("llm_input_text") or "",
+                    "source": obj.get("source_type") or "unknown"
+                }
 
     llm_label_map = {}
     classified_path = BUG_CLASSIFICATION_DIR / "classified_data_llm.jsonl"
@@ -82,10 +114,13 @@ def import_data_if_empty() -> None:
             bug_id = str(r.get("bug.id"))
             key = (project_id, bug_id)
 
-            llm_full_text = llm_text_map.get(key, "")
+            data = bug_data_map.get(key, {})
+            llm_full_text = data.get("text", "")
+            source_type = data.get("source", None)
+
             title, description, discussion = _parse_llm_input_text(llm_full_text)
             llm_label = llm_label_map.get(key)
-
+            
             cur.execute(
                 """
                 INSERT OR IGNORE INTO bug_index (
@@ -106,7 +141,7 @@ def import_data_if_empty() -> None:
                     r.get("buggy_commit_url"),
                     r.get("fixed_commit_url"),
                     r.get("compare_url"),
-                    None,
+                    source_type,
                     title,
                     description,
                     discussion,
@@ -182,7 +217,8 @@ def get_bug(project_id: str, bug_id: str):
 def upsert_bug_meta(project_id: str, bug_id: str, manual_label: Optional[str], status: Optional[str], notes: Optional[str], tags_json: Optional[str]):
     from datetime import datetime
 
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    # 使用本地时间并格式化为 YYYY-MM-DD HH:MM:SS
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with db_session() as conn:
         cur = conn.cursor()

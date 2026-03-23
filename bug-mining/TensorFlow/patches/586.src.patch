@@ -1,0 +1,145 @@
+diff --git a/third_party/xla/xla/service/gpu/ir_emission_utils.cc b/third_party/xla/xla/service/gpu/ir_emission_utils.cc
+index cb51e715673..3a91c91b71a 100644
+--- a/third_party/xla/xla/service/gpu/ir_emission_utils.cc
++++ b/third_party/xla/xla/service/gpu/ir_emission_utils.cc
+@@ -971,6 +971,47 @@ static bool IsParameter(const HloInstruction& instr) {
+   return instr.opcode() == HloOpcode::kParameter;
+ }
+ 
++std::optional<HloInstructionAdaptor> FindTransposeHero(
++    HloInstructionAdaptor root, const HloFusionAdaptor& fusion) {
++  std::optional<HloInstructionAdaptor> transpose = std::nullopt;
++  std::vector<HloInstructionAdaptor> non_trivial;
++  auto visit = [&transpose, &non_trivial](HloInstructionAdaptor node) {
++    if (FindTiledLogicalTranspose(node.instruction())) {
++      // If we do not find a unique transpose op, use the original non-trivial
++      // hero.
++      if (transpose) {
++        transpose = std::nullopt;
++        return TraversalResult::kAbortTraversal;
++      }
++      transpose = node;
++      return TraversalResult::kDoNotVisitOperands;
++    }
++
++    if (!IsIntermediate(&node.instruction(), /*allowed_operand_count=*/3)) {
++      non_trivial.push_back(node);
++      return TraversalResult::kDoNotVisitOperands;
++    }
++    return TraversalResult::kVisitOperands;
++  };
++  HloBfsConsumersFirstTraversal({root}, fusion, visit);
++
++  if (transpose) {
++    // There is a single transpose instruction that is a hero candidate.
++    // However, the transpose must be unreachable from any of the non-trivial
++    // instructions that were encountered, because that would mean that its
++    // output is accessed with different access patterns.
++    auto visit_nt = [&transpose](HloInstructionAdaptor node) {
++      if (node == transpose) {
++        transpose = std::nullopt;
++        return TraversalResult::kAbortTraversal;
++      }
++      return TraversalResult::kVisitOperands;
++    };
++    HloBfsConsumersFirstTraversal(non_trivial, fusion, visit_nt);
++  }
++  return transpose;
++}
++
+ const HloInstruction& FindNonTrivialHero(const HloInstruction& instr,
+                                          const HloFusionAdaptor& fusion) {
+   HloInstructionAdaptor idx{instr};
+@@ -999,30 +1040,12 @@ const HloInstruction& FindNonTrivialHero(const HloInstruction& instr,
+     return instr;
+   }
+ 
+-  std::optional<HloInstructionAdaptor> transpose = std::nullopt;
+   // Try a bit harder to find a transpose hero. The shared memory transpose
+   // emitter also works if there are ops with more than 1 operand on the path
+   // between root and the transpose op, we still want the restriction though
+   // that each op on the path is elementwise and has only 1 user.
+-  auto visit = [&transpose](HloInstructionAdaptor node) {
+-    if (FindTiledLogicalTranspose(node.instruction())) {
+-      // If we do not find a unique transpose op, use the original non-trivial
+-      // hero.
+-      if (transpose) {
+-        transpose = std::nullopt;
+-        return TraversalResult::kAbortTraversal;
+-      }
+-      transpose = node;
+-      return TraversalResult::kDoNotVisitOperands;
+-    }
+-
+-    if (!IsIntermediate(&node.instruction(), /*allowed_operand_count=*/3)) {
+-      return TraversalResult::kDoNotVisitOperands;
+-    }
+-    return TraversalResult::kVisitOperands;
+-  };
+-  HloBfsConsumersFirstTraversal({idx}, fusion, visit);
+-
++  std::optional<HloInstructionAdaptor> transpose =
++      FindTransposeHero(idx, fusion);
+   return transpose ? transpose->instruction() : idx.instruction();
+ }
+ 
+diff --git a/third_party/xla/xla/service/gpu/ir_emission_utils_test.cc b/third_party/xla/xla/service/gpu/ir_emission_utils_test.cc
+index 1b3e323a58d..6067b03b66f 100644
+--- a/third_party/xla/xla/service/gpu/ir_emission_utils_test.cc
++++ b/third_party/xla/xla/service/gpu/ir_emission_utils_test.cc
+@@ -360,6 +360,29 @@ ENTRY entry {
+       transpose);
+ }
+ 
++TEST_F(IrEmissionUtilsTest, TransposeReachableViaTrivialAndNontrivialOps) {
++  const char* hlo = R"(
++HloModule module
++
++ENTRY entry {
++  p = f64[16,16]{1,0} parameter(0)
++  trans = f64[16,16]{1,0} transpose(p), dimensions={1,0}
++  rev = f64[16,16]{1,0} reverse(trans), dimensions={0,1}
++  sub = f64[16,16]{1,0} subtract(trans, trans)
++  ROOT add = f64[16,16]{1,0} add(rev, sub)
++}
++)";
++
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(hlo));
++
++  HloInstruction* r = module->entry_computation()->root_instruction();
++  EXPECT_FALSE(
++      GetDescriptionForTiledTransposeEmitter(*r, FindNonTrivialHero(*r))
++          .has_value());
++  EXPECT_EQ(&FindNonTrivialHero(*r), r);
++}
++
+ TEST_F(IrEmissionUtilsTest, FindTiledTransposeOneSwapDimIsSmall) {
+   const char* hlo = R"(
+ HloModule module
+diff --git a/third_party/xla/xla/tests/cpu_gpu_fusion_test.cc b/third_party/xla/xla/tests/cpu_gpu_fusion_test.cc
+index 452d1dc0a6c..e4dba3a7427 100644
+--- a/third_party/xla/xla/tests/cpu_gpu_fusion_test.cc
++++ b/third_party/xla/xla/tests/cpu_gpu_fusion_test.cc
+@@ -872,6 +872,21 @@ XLA_TEST_F(FusionClientLibraryTest, ManyLayoutTransformations) {
+   ComputeAndCompare(&b, {});
+ }
+ 
++XLA_TEST_F(CpuGpuFusionTest, TransposeDiamondWithNonTrivialBranch) {
++  const char* hlo = R"(
++HloModule module
++
++ENTRY entry {
++  p = f64[16,16]{1,0} parameter(0)
++  trans = f64[16,16]{1,0} transpose(p), dimensions={1,0}
++  rev = f64[16,16]{1,0} reverse(trans), dimensions={0,1}
++  sub = f64[16,16]{1,0} subtract(trans, trans)
++  ROOT add = f64[16,16]{1,0} add(rev, sub)
++}
++)";
++  EXPECT_TRUE(RunAndCompare(hlo, ErrorSpec{1e-5, 1e-5}));
++}
++
+ void BM_ParallelFusion(::testing::benchmark::State& state) {
+   // Simple element-wise computation to benchmark parallel task partitioning.
+ 

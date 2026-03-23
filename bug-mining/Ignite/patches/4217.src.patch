@@ -1,0 +1,241 @@
+diff --git a/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/mvcc/MvccProcessorImpl.java b/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/mvcc/MvccProcessorImpl.java
+index 760af12e15..e7b42898a9 100644
+--- a/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/mvcc/MvccProcessorImpl.java
++++ b/modules/core/src/main/java/org/apache/ignite/internal/processors/cache/mvcc/MvccProcessorImpl.java
+@@ -55,6 +55,7 @@ import org.apache.ignite.internal.cluster.ClusterTopologyCheckedException;
+ import org.apache.ignite.internal.managers.communication.GridMessageListener;
+ import org.apache.ignite.internal.managers.discovery.CustomEventListener;
+ import org.apache.ignite.internal.managers.discovery.DiscoCache;
++import org.apache.ignite.internal.managers.eventstorage.DiscoveryEventListener;
+ import org.apache.ignite.internal.processors.GridProcessorAdapter;
+ import org.apache.ignite.internal.processors.affinity.AffinityTopologyVersion;
+ import org.apache.ignite.internal.processors.cache.CacheGroupContext;
+@@ -85,6 +86,7 @@ import org.apache.ignite.internal.processors.cache.tree.mvcc.data.MvccDataRow;
+ import org.apache.ignite.internal.processors.cache.tree.mvcc.search.MvccLinkAwareSearchRow;
+ import org.apache.ignite.internal.util.GridAtomicLong;
+ import org.apache.ignite.internal.util.GridLongList;
++import org.apache.ignite.internal.util.GridSpinBusyLock;
+ import org.apache.ignite.internal.util.future.GridCompoundIdentityFuture;
+ import org.apache.ignite.internal.util.future.GridFinishedFuture;
+ import org.apache.ignite.internal.util.future.GridFutureAdapter;
+@@ -225,6 +227,18 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+      */
+     private final ConcurrentHashMap<UUID, RecoveryBallotBox> recoveryBallotBoxes = new ConcurrentHashMap<>();
+ 
++    /** */
++    private final GridSpinBusyLock busyLock = new GridSpinBusyLock();
++
++    /** */
++    private final DiscoveryEventListener discoLsnr;
++
++    /** */
++    private final GridMessageListener msgLsnr;
++
++    /** */
++    private final CustomEventListener customLsnr;
++
+     /**
+      * @param ctx Context.
+      */
+@@ -232,20 +246,24 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+         super(ctx);
+ 
+         ctx.internalSubscriptionProcessor().registerDatabaseListener(this);
++
++        discoLsnr = this::onDiscovery;
++        msgLsnr = new MvccMessageListener();
++        customLsnr = new CustomEventListener<DynamicCacheChangeBatch>() {
++            @Override public void onCustomEvent(AffinityTopologyVersion topVer, ClusterNode snd,
++                DynamicCacheChangeBatch msg) {
++                checkMvccCacheStarted(msg);
++            }
++        };
+     }
+ 
+     /** {@inheritDoc} */
+     @Override public void start() throws IgniteCheckedException {
+-        ctx.event().addDiscoveryEventListener(this::onDiscovery, EVT_NODE_FAILED, EVT_NODE_LEFT, EVT_NODE_JOINED);
++        ctx.event().addDiscoveryEventListener(discoLsnr, EVT_NODE_FAILED, EVT_NODE_LEFT, EVT_NODE_JOINED);
+ 
+-        ctx.io().addMessageListener(TOPIC_CACHE_COORDINATOR, new MvccMessageListener());
++        ctx.io().addMessageListener(TOPIC_CACHE_COORDINATOR, msgLsnr);
+ 
+-        ctx.discovery().setCustomEventListener(DynamicCacheChangeBatch.class,
+-            new CustomEventListener<DynamicCacheChangeBatch>() {
+-                @Override public void onCustomEvent(AffinityTopologyVersion topVer, ClusterNode snd, DynamicCacheChangeBatch msg) {
+-                    checkMvccCacheStarted(msg);
+-                }
+-            });
++        ctx.discovery().setCustomEventListener(DynamicCacheChangeBatch.class, customLsnr);
+     }
+ 
+     /** {@inheritDoc} */
+@@ -427,6 +445,21 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+         }
+     }
+ 
++    /** {@inheritDoc} */
++    @Override public void onKernalStop(boolean cancel) {
++        busyLock.block();
++
++        try {
++            ctx.io().removeMessageListener(TOPIC_CACHE_COORDINATOR, msgLsnr);
++
++            ctx.event().removeDiscoveryEventListener(discoLsnr, EVT_NODE_FAILED, EVT_NODE_LEFT, EVT_NODE_JOINED);
++        }
++        finally {
++            // Cleanup pending futures.
++            onCoordinatorFailed(curCrd.nodeId());
++        }
++    }
++
+     /**
+      * Discovery listener. Note: initial join event is handled by {@link MvccProcessorImpl#onLocalJoin}
+      * method.
+@@ -761,44 +794,55 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+             return;
+         }
+ 
+-        if (ctx.localNodeId().equals(crd.nodeId())) {
+-            if (!initFut.isDone()) {
+-                // Wait for the local coordinator init.
+-                initFut.listen(new IgniteInClosure<IgniteInternalFuture>() {
+-                    @Override public void apply(IgniteInternalFuture fut) {
+-                        if (forRead)
+-                            lsnr.onResponse(activeQueries.assignQueryCounter(ctx.localNodeId(), 0L));
+-                        else
+-                            lsnr.onResponse(assignTxSnapshot(0L, ctx.localNodeId(), false));
+-                    }
+-                });
+-            }
+-            else if (forRead)
+-                lsnr.onResponse(activeQueries.assignQueryCounter(ctx.localNodeId(), 0L));
+-            else
+-                lsnr.onResponse(assignTxSnapshot(0L, ctx.localNodeId(), false));
++        if (!busyLock.enterBusy()) {
++            lsnr.onError(new NodeStoppingException("Failed to request snapshot (Node is stopping)."));
+ 
+             return;
+         }
+ 
+-        // Send request to the remote coordinator.
+-        UUID nodeId = crd.nodeId();
++        try {
++            if (ctx.localNodeId().equals(crd.nodeId())) {
++                if (!initFut.isDone()) {
++                    // Wait for the local coordinator init.
++                    initFut.listen(new IgniteInClosure<IgniteInternalFuture>() {
++                        @Override public void apply(IgniteInternalFuture fut) {
++                            if (forRead)
++                                lsnr.onResponse(activeQueries.assignQueryCounter(ctx.localNodeId(), 0L));
++                            else
++                                lsnr.onResponse(assignTxSnapshot(0L, ctx.localNodeId(), false));
++                        }
++                    });
++                }
++                else if (forRead)
++                    lsnr.onResponse(activeQueries.assignQueryCounter(ctx.localNodeId(), 0L));
++                else
++                    lsnr.onResponse(assignTxSnapshot(0L, ctx.localNodeId(), false));
+ 
+-        long id = futIdCntr.incrementAndGet();
++                return;
++            }
+ 
+-        Map<Long, MvccSnapshotResponseListener> map = snapLsnrs.get(nodeId), map0;
++            // Send request to the remote coordinator.
++            UUID nodeId = crd.nodeId();
+ 
+-        if (map == null && (map0 = snapLsnrs.putIfAbsent(nodeId, map = new ConcurrentHashMap<>())) != null)
+-            map = map0;
++            long id = futIdCntr.incrementAndGet();
+ 
+-        map.put(id, lsnr);
++            Map<Long, MvccSnapshotResponseListener> map = snapLsnrs.get(nodeId), map0;
+ 
+-        try {
+-            sendMessage(nodeId, forRead ? new MvccQuerySnapshotRequest(id) : new MvccTxSnapshotRequest(id));
++            if (map == null && (map0 = snapLsnrs.putIfAbsent(nodeId, map = new ConcurrentHashMap<>())) != null)
++                map = map0;
++
++            map.put(id, lsnr);
++
++            try {
++                sendMessage(nodeId, forRead ? new MvccQuerySnapshotRequest(id) : new MvccTxSnapshotRequest(id));
++            }
++            catch (IgniteCheckedException e) {
++                if (map.remove(id) != null)
++                    lsnr.onError(e);
++            }
+         }
+-        catch (IgniteCheckedException e) {
+-            if (map.remove(id) != null)
+-                lsnr.onError(e);
++        finally {
++            busyLock.leaveBusy();
+         }
+     }
+ 
+@@ -1306,15 +1350,20 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+ 
+     /** */
+     @NotNull private IgniteInternalFuture<Void> sendTxCommit(MvccCoordinator crd, MvccAckRequestTx msg) {
+-        WaitAckFuture fut = new WaitAckFuture(msg.futureId(), crd.nodeId(), true);
++        if (!busyLock.enterBusy())
++            return new GridFinishedFuture<>();
+ 
+-        ackFuts.put(fut.id, fut);
++        WaitAckFuture fut = null;
+ 
+         try {
++            fut = new WaitAckFuture(msg.futureId(), crd.nodeId(), true);
++
++            ackFuts.put(fut.id, fut);
++
+             sendMessage(crd.nodeId(), msg);
+         }
+         catch (IgniteCheckedException e) {
+-            if (ackFuts.remove(fut.id) != null) {
++            if (fut != null && ackFuts.remove(fut.id) != null) {
+                 if (e instanceof ClusterTopologyCheckedException) {
+                     if (log.isDebugEnabled())
+                         log.debug("Failed to send tx ack, node left [crd=" + crd + ", msg=" + msg + ']');
+@@ -1325,8 +1374,11 @@ public class MvccProcessorImpl extends GridProcessorAdapter implements MvccProce
+                     fut.onDone(e);
+             }
+         }
++        finally {
++            busyLock.leaveBusy();
++        }
+ 
+-        return fut;
++        return fut != null ? fut : new GridFinishedFuture<>();
+     }
+ 
+     /**
+diff --git a/modules/core/src/test/java/org/apache/ignite/internal/processors/cache/persistence/baseline/ClientAffinityAssignmentWithBaselineTest.java b/modules/core/src/test/java/org/apache/ignite/internal/processors/cache/persistence/baseline/ClientAffinityAssignmentWithBaselineTest.java
+index 9e3c73f554..7788193c34 100644
+--- a/modules/core/src/test/java/org/apache/ignite/internal/processors/cache/persistence/baseline/ClientAffinityAssignmentWithBaselineTest.java
++++ b/modules/core/src/test/java/org/apache/ignite/internal/processors/cache/persistence/baseline/ClientAffinityAssignmentWithBaselineTest.java
+@@ -51,12 +51,10 @@ import org.apache.ignite.internal.util.typedef.internal.U;
+ import org.apache.ignite.lang.IgniteFuture;
+ import org.apache.ignite.lang.IgnitePredicate;
+ import org.apache.ignite.testframework.GridTestUtils;
+-import org.apache.ignite.testframework.MvccFeatureChecker;
+ import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
+ import org.apache.ignite.transactions.Transaction;
+ import org.apache.ignite.transactions.TransactionConcurrency;
+ import org.apache.ignite.transactions.TransactionIsolation;
+-import org.junit.Assume;
+ import org.junit.Ignore;
+ import org.junit.Test;
+ 
+@@ -163,8 +161,6 @@ public class ClientAffinityAssignmentWithBaselineTest extends GridCommonAbstract
+ 
+     /** {@inheritDoc} */
+     @Override protected void beforeTestsStarted() throws Exception {
+-        Assume.assumeFalse("https://issues.apache.org/jira/browse/IGNITE-11559", MvccFeatureChecker.forcedMvcc());
+-
+         System.setProperty(IGNITE_BASELINE_AUTO_ADJUST_ENABLED, "false");
+ 
+         super.beforeTestsStarted();

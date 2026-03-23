@@ -1,0 +1,1864 @@
+diff --git a/third_party/xla/xla/service/BUILD b/third_party/xla/xla/service/BUILD
+index 614864cfaef..5f490b4d833 100644
+--- a/third_party/xla/xla/service/BUILD
++++ b/third_party/xla/xla/service/BUILD
+@@ -2598,6 +2598,7 @@ cc_library(
+     name = "algebraic_simplifier",
+     srcs = ["algebraic_simplifier.cc"],
+     hdrs = ["algebraic_simplifier.h"],
++    copts = tsl_copts(),
+     deps = [
+         ":hlo_cost_analysis",
+         ":hlo_creation_utils",
+diff --git a/third_party/xla/xla/service/algebraic_simplifier.cc b/third_party/xla/xla/service/algebraic_simplifier.cc
+index 9cb49ab70be..c9b9850a94d 100644
+--- a/third_party/xla/xla/service/algebraic_simplifier.cc
++++ b/third_party/xla/xla/service/algebraic_simplifier.cc
+@@ -8805,6 +8805,82 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::SwapConvOperands(
+   return true;
+ }
+ 
++absl::StatusOr<bool> AlgebraicSimplifierVisitor::IsOneDnnRewritableBF16Conv(
++    HloInstruction** convolution) {
++  bool can_rewrite = true;
++  auto from_dtype = (*convolution)->shape().element_type();
++  if (!options_.executing_on_cpu() || from_dtype != PrimitiveType::BF16) {
++    return false;
++  }
++  if ((*convolution)->batch_group_count() != 1 ||
++      (*convolution)->operand(1)->opcode() == HloOpcode::kReverse) {
++    can_rewrite = false;
++  }
++  const Shape& inp_shape = (*convolution)->operand(0)->shape();
++  const Shape& ker_shape = (*convolution)->operand(1)->shape();
++  const Shape& out_shape = (*convolution)->shape();
++  if (ShapeUtil::IsZeroElementArray(inp_shape) ||
++      ShapeUtil::IsZeroElementArray(ker_shape) ||
++      ShapeUtil::IsZeroElementArray(out_shape)) {
++    can_rewrite = false;
++  }
++
++  auto dims = (*convolution)->window().dimensions().size();
++  if (dims >= 4 || dims <= 0) can_rewrite = false;
++
++  if (inp_shape.rank() != ker_shape.rank() ||
++      inp_shape.rank() != out_shape.rank()) {
++    can_rewrite = false;
++  }
++
++  for (auto it = (*convolution)->window().dimensions().begin();
++       it != (*convolution)->window().dimensions().end(); it++) {
++    if ((*it).padding_low() < 0 || (*it).padding_high() < 0 ||
++        (*it).stride() < 0 || (*it).base_dilation() != 1 ||
++        (*it).window_reversal()) {
++      can_rewrite = false;
++    }
++  }
++
++  if (can_rewrite) {
++    return true;
++  }
++
++  // To ensure the correctness of the generated LLVM IR, we cast
++  // the convolutions that are not rewritable to onednn custom calls to higher
++  // precision. This does not compromise performance as lower floating point
++  // precision convolutions are converted to higher precision in the regular
++  // optimization pipeline.
++  auto to_dtype = PrimitiveType::F32;
++  std::vector<HloInstruction*> new_operands;
++  auto from_dtype_operands = (*convolution)->operands();
++
++  std::for_each(
++      from_dtype_operands.begin(), from_dtype_operands.end(),
++      [&new_operands, &to_dtype](HloInstruction* instr) {
++        new_operands.push_back(
++            instr->AddInstruction(HloInstruction::CreateConvert(
++                ShapeUtil::ChangeElementType(instr->shape(), to_dtype),
++                instr)));
++      });
++
++  HloInstruction* to_conv =
++      (*convolution)
++          ->AddInstruction(
++              (*convolution)
++                  ->CloneWithNewOperands(ShapeUtil::ChangeElementType(
++                                             (*convolution)->shape(), to_dtype),
++                                         new_operands));
++
++  HloInstruction* from_conv =
++      to_conv->AddInstruction(HloInstruction::CreateConvert(
++          ShapeUtil::ChangeElementType(to_conv->shape(), from_dtype), to_conv));
++
++  TF_RETURN_IF_ERROR(ReplaceInstruction(*convolution, from_conv));
++  *convolution = to_conv;
++  return false;
++}
++
+ absl::StatusOr<bool> AlgebraicSimplifierVisitor::SimplifyConvToDot(
+     HloInstruction* convolution) {
+   auto* lhs = convolution->mutable_operand(0);
+@@ -9064,6 +9140,15 @@ absl::Status AlgebraicSimplifierVisitor::HandleConvolution(
+   if (swapped) {
+     return absl::OkStatus();
+   }
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++  // Convert the data type back to F32 if we can't rewrite BF16 convolution to
++  // oneDNN custom call.
++  TF_ASSIGN_OR_RETURN(bool can_rewrite_bf16_conv_to_onednn,
++                      IsOneDnnRewritableBF16Conv(&convolution));
++  if (can_rewrite_bf16_conv_to_onednn) {
++    return OkStatus();
++  }
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+   // Try to replace the convolution with a kDot or a kMultiply instruction.
+   TF_ASSIGN_OR_RETURN(bool replaced_with_dot, SimplifyConvToDot(convolution));
+   if (replaced_with_dot) {
+diff --git a/third_party/xla/xla/service/algebraic_simplifier.h b/third_party/xla/xla/service/algebraic_simplifier.h
+index 18e8b56f6d4..7bece1ccd32 100644
+--- a/third_party/xla/xla/service/algebraic_simplifier.h
++++ b/third_party/xla/xla/service/algebraic_simplifier.h
+@@ -247,6 +247,12 @@ class AlgebraicSimplifierOptions {
+         enable_unconditional_reduce_of_concat_replacement;
+   }
+ 
++  // Indicates whether running on CPU
++  bool executing_on_cpu() const { return executing_on_cpu_; }
++  void set_executing_on_cpu(bool executing_on_cpu) {
++    executing_on_cpu_ = executing_on_cpu;
++  }
++
+  private:
+   // Metadata struct can be used to store any metadata information encapsulated
+   // with the AlgebraicSimplierOptions that can be later used in an
+@@ -280,6 +286,7 @@ class AlgebraicSimplifierOptions {
+   bool minmax_propagate_nan_{true};
+   bool enable_unconditional_reduce_of_concat_replacement_{true};
+   bool use_associative_reordering_{false};
++  bool executing_on_cpu_{false};
+   double associative_reordering_threshold_{2.0};
+   Metadata metadata_;
+ };
+@@ -590,6 +597,10 @@ class AlgebraicSimplifierVisitor : public DfsHloRewriteVisitor {
+   // convolution.
+   absl::StatusOr<bool> SwapConvOperands(HloInstruction* convolution);
+ 
++  // Checks if the given convolution is in BF16 and is oneDNN rewritable, if not
++  // then it promotes the data type of the convolution to F32
++  absl::StatusOr<bool> IsOneDnnRewritableBF16Conv(HloInstruction** convolution);
++
+   // Tries to use a kDot in place of the given convolution.
+   absl::StatusOr<bool> SimplifyConvToDot(HloInstruction* convolution);
+   // Tries to use a multiplication in place of the given convolution.
+diff --git a/third_party/xla/xla/service/cpu/BUILD b/third_party/xla/xla/service/cpu/BUILD
+index 6bad3c5c9b9..e7350a66d09 100644
+--- a/third_party/xla/xla/service/cpu/BUILD
++++ b/third_party/xla/xla/service/cpu/BUILD
+@@ -221,6 +221,7 @@ cc_library(
+         ":ir_emission_utils",
+         ":ir_emitter",
+         ":ir_emitter2",
++        ":onednn_convolution_rewriter",
+         ":onednn_matmul_rewriter",
+         ":onednn_ops_rewriter",
+         ":parallel_task_assignment",
+@@ -460,6 +461,7 @@ cc_library(
+     deps = [
+         ":compiler_functor",
+         ":cpu_runtime",
++        ":onednn_convolution",
+         ":onednn_layer_norm",
+         ":onednn_matmul",
+         ":onednn_softmax",
+@@ -1641,10 +1643,19 @@ xla_cc_test(
+     ],
+ )
+ 
++tf_proto_library(
++    name = "onednn_config_proto",
++    srcs = ["onednn_config.proto"],
++    cc_api_version = 2,
++)
++
+ tf_proto_library(
+     name = "backend_config_proto",
+     srcs = ["backend_config.proto"],
+     cc_api_version = 2,
++    protodeps = [
++        ":onednn_config_proto",
++    ],
+ )
+ 
+ cc_library(
+@@ -1720,6 +1731,29 @@ cc_library(
+     ] + mkl_deps(),
+ )
+ 
++cc_library(
++    name = "onednn_convolution",
++    srcs = ["onednn_convolution.cc"],
++    hdrs = ["onednn_convolution.h"],
++    copts = runtime_copts() + tsl_copts(),
++    visibility = ["//visibility:public"],
++    deps = [
++        ":backend_config_proto_cc",
++        ":onednn_memory_util",
++        ":onednn_util",
++        ":runtime_lightweight_check",
++        "//xla:executable_run_options",
++        "//xla:shape_util",
++        "@com_google_absl//absl/base:core_headers",
++        "@com_google_absl//absl/base:dynamic_annotations",
++        "@eigen_archive//:eigen3",
++        "@local_tsl//tsl/platform:blocking_counter",
++        "@local_tsl//tsl/platform:env",
++        "@local_tsl//tsl/platform:logging",
++        "@local_tsl//tsl/platform:platform_port",
++    ] + mkl_deps(),
++)
++
+ cc_library(
+     name = "onednn_layer_norm",
+     srcs = ["onednn_layer_norm.cc"],
+@@ -1832,12 +1866,41 @@ cc_library(
+     ] + mkl_deps(),
+ )
+ 
++cc_library(
++    name = "onednn_convolution_rewriter",
++    srcs = ["onednn_convolution_rewriter.cc"],
++    hdrs = ["onednn_convolution_rewriter.h"],
++    copts = tsl_copts(),
++    deps = [
++        ":backend_config_proto_cc",
++        ":onednn_convolution",
++        ":onednn_memory_util",
++        ":onednn_util",
++        "//xla:executable_run_options",
++        "//xla:shape_util",
++        "//xla:status_macros",
++        "//xla:xla_data_proto_cc",
++        "//xla/hlo/evaluator:hlo_evaluator",
++        "//xla/hlo/ir:hlo",
++        "//xla/service:hlo_creation_utils",
++        "//xla/service:hlo_pass",
++        "//xla/service:pattern_matcher",
++        "@com_google_absl//absl/algorithm:container",
++        "@eigen_archive//:eigen3",
++        "@local_tsl//tsl/platform:blocking_counter",
++        "@local_tsl//tsl/platform:env",
++        "@local_tsl//tsl/platform:logging",
++        "@local_tsl//tsl/platform:platform_port",
++    ] + mkl_deps(),
++)
++
+ cc_library(
+     name = "cpu_float_support",
+     srcs = ["cpu_float_support.cc"],
+     hdrs = ["cpu_float_support.h"],
+     copts = tsl_copts(),
+     deps = [
++        ":onednn_convolution_rewriter",
+         ":onednn_matmul_rewriter",
+         "//xla/service:float_support",
+     ],
+diff --git a/third_party/xla/xla/service/cpu/backend_config.proto b/third_party/xla/xla/service/cpu/backend_config.proto
+index 9bbab4d1c5d..c75a3e6df9e 100644
+--- a/third_party/xla/xla/service/cpu/backend_config.proto
++++ b/third_party/xla/xla/service/cpu/backend_config.proto
+@@ -2,58 +2,22 @@ syntax = "proto3";
+ 
+ package xla.cpu;
+ 
++import "xla/service/cpu/onednn_config.proto";
++
+ // Backend config for XLA:CPU.
+ message BackendConfig {
+   // Number of partitions per outer dimension (in order, starting with
+   // outer-most dimension first). Used by the parallel cpu backend to partition
+   // HLOs into parallel tasks.
+   repeated int64 outer_dimension_partitions = 1;
+-  // Configuration to be used by oneDNN matmul
+-  OneDnnMatMulConfig onednn_matmul_config = 2;
+-  OneDnnLayerNormConfig onednn_layer_norm_config = 3;
+-  OneDnnSoftmaxConfig onednn_softmax_config = 4;
+-}
+-
+-message OneDnnMatMulConfig {
+-  bool transpose_a = 1;
+-  bool transpose_b = 2;
+-  // These enum needs to be mapped to oneDNN enum for post_op algorithm.
+-  // TODO(intel-tf): Add kinds supported by oneDNN.
+-  enum FusionKind {
+-    UNDEFINED = 0;
+-    BIAS = 1;
+-    RELU = 2;
+-    TANH = 3;
+-    GELU_ERF = 4;
+-    GELU_TANH = 5;
+-    BINARY_ADD = 6;
+-    LINEAR = 7;
+-    ELU = 8;
+-    RELU6 = 9;
+-    SIGMOID = 10;
+-  }
+-  repeated FusionKind fused_ops = 3;
+-  bool bias_broadcast = 4;
+-  // To avoid protobuf failures for specific decimal values,
+-  // the original float value alpha is type-casted to int32.
+-  int32 alpha_typecast = 5;
+-  bool weights_prepacked = 6;
+-  bool user_scratchpad = 7;
+-}
+-
+-message OneDnnLayerNormConfig {
+-  // These enum needs to be mapped to oneDNN enum for post_op algorithm.
+-  // TODO(intel-tf): Add kinds supported by oneDNN.
+-  enum FusionKind {
+-    UNDEFINED = 0;
+-    SCALE = 1;
+-    SHIFT = 2;
+-    SCALE_AND_SHIFT = 3;
++  oneof backend_config_oneof {
++    // Configuration to be used by oneDNN matmul
++    OneDnnMatMulConfig onednn_matmul_config = 2;
++    // Configuration to be used by oneDNN layer norm
++    OneDnnNormConfig onednn_layer_norm_config = 3;
++    // Configuration to be used by oneDNN softmax
++    OneDnnSoftmaxConfig onednn_softmax_config = 4;
++    // Configuration to be used by oneDNN convolution
++    OneDnnConvolutionConfig onednn_conv_config = 5;
+   }
+-  FusionKind fused_ops = 1;
+-  int32 epsilon_typecast = 2;
+-}
+-
+-message OneDnnSoftmaxConfig {
+-  int32 softmax_axis = 1;
+ }
+diff --git a/third_party/xla/xla/service/cpu/cpu_compiler.cc b/third_party/xla/xla/service/cpu/cpu_compiler.cc
+index 8cd2d488e14..8b4b11b43a4 100644
+--- a/third_party/xla/xla/service/cpu/cpu_compiler.cc
++++ b/third_party/xla/xla/service/cpu/cpu_compiler.cc
+@@ -202,6 +202,7 @@ limitations under the License.
+ 
+ #if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
+ #include "xla/service/cpu/cpu_float_support.h"
++#include "xla/service/cpu/onednn_convolution_rewriter.h"
+ #include "xla/service/cpu/onednn_matmul_rewriter.h"
+ #include "xla/service/cpu/onednn_ops_rewriter.h"
+ #include "xla/service/simplify_fp_conversions.h"
+@@ -629,6 +630,7 @@ absl::Status CpuCompiler::RunHloPassesThroughLayoutAssn(
+     // other platforms do, so it should be changed.
+     options.set_minmax_propagate_nan(false);
+     options.set_supports_non_canonical_dots(false);
++    options.set_executing_on_cpu(true);
+     pipeline.AddPass<AlgebraicSimplifier>(options);
+     pipeline.AddPass<SortSimplifier>();
+     pipeline.AddPass<HloDCE>();
+@@ -743,6 +745,7 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
+     if (debug_options.xla_allow_excess_precision()) {
+       pipeline.AddPass<SimplifyFPConversions>();
+     }
++    pipeline.AddPass<OneDnnConvolutionRewriter>();
+     pipeline.AddPass<OneDnnMatMulRewriter>(max_parallelism,
+                                            compile_options.thread_pool);
+     // Run SimplifyFPConversions pass again to remove redundant Convert ops
+@@ -774,6 +777,7 @@ absl::Status CpuCompiler::RunHloPassesAfterLayoutAssn(
+     // TODO(b/209827141): XLA:CPU doesn't propagate NaN through min/max, but
+     // other platforms do, so it should be changed.
+     options.set_minmax_propagate_nan(false);
++    options.set_executing_on_cpu(true);
+     pipeline.AddPass<AlgebraicSimplifier>(options);
+     pipeline.AddPass<HloDCE>();
+     pipeline.AddPass<HloCSE>(/*is_layout_sensitive=*/true);
+diff --git a/third_party/xla/xla/service/cpu/cpu_float_support.cc b/third_party/xla/xla/service/cpu/cpu_float_support.cc
+index 0bb4dd8e875..6914e656b90 100644
+--- a/third_party/xla/xla/service/cpu/cpu_float_support.cc
++++ b/third_party/xla/xla/service/cpu/cpu_float_support.cc
+@@ -17,6 +17,7 @@ limitations under the License.
+ 
+ #include "xla/service/cpu/cpu_float_support.h"
+ 
++#include "xla/service/cpu/onednn_convolution_rewriter.h"
+ #include "xla/service/cpu/onednn_matmul_rewriter.h"
+ 
+ namespace xla {
+@@ -28,6 +29,9 @@ bool CpuFloatSupport::IsSupported(const HloInstruction& hlo) const {
+     case HloOpcode::kDot:
+       return LowPrecisionType() == BF16 &&
+              OneDnnMatMulRewriter::ShouldRewrite(&hlo);
++    case HloOpcode::kConvolution:
++      return LowPrecisionType() == BF16 &&
++             OneDnnConvolutionRewriter::ShouldRewrite(&hlo);
+     // Collective ops.
+     case HloOpcode::kAllGather:
+     case HloOpcode::kAllReduce:
+diff --git a/third_party/xla/xla/service/cpu/cpu_runtime.cc b/third_party/xla/xla/service/cpu/cpu_runtime.cc
+index 05125edd3d5..95916458f02 100644
+--- a/third_party/xla/xla/service/cpu/cpu_runtime.cc
++++ b/third_party/xla/xla/service/cpu/cpu_runtime.cc
+@@ -163,6 +163,8 @@ extern const char* const kOneDnnSoftmaxSymbolName =
+     "__xla_cpu_runtime_OneDnnSoftmax";
+ extern const char* const kOneDnnLayerNormSymbolName =
+     "__xla_cpu_runtime_OneDnnLayerNorm";
++extern const char* const kOneDnnConvolutionSymbolName =
++    "__xla_cpu_runtime_OneDnnConvolution";
+ extern const char* const kOneDnnMatMulReorderSymbolName =
+     "__xla_cpu_runtime_OneDnnMatMulReorder";
+ extern const char* const kHandleFfiCallSymbolName =
+diff --git a/third_party/xla/xla/service/cpu/cpu_runtime.h b/third_party/xla/xla/service/cpu/cpu_runtime.h
+index 976017ae83c..54385855f0b 100644
+--- a/third_party/xla/xla/service/cpu/cpu_runtime.h
++++ b/third_party/xla/xla/service/cpu/cpu_runtime.h
+@@ -89,6 +89,7 @@ extern const char* const kReduceScatterSymbolName;
+ extern const char* const kOneDnnMatMulSymbolName;
+ extern const char* const kOneDnnSoftmaxSymbolName;
+ extern const char* const kOneDnnLayerNormSymbolName;
++extern const char* const kOneDnnConvolutionSymbolName;
+ extern const char* const kOneDnnMatMulReorderSymbolName;
+ extern const char* const kHandleFfiCallSymbolName;
+ 
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter.cc b/third_party/xla/xla/service/cpu/ir_emitter.cc
+index 802cd9e14a4..a5a87ef0ba2 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter.cc
++++ b/third_party/xla/xla/service/cpu/ir_emitter.cc
+@@ -2702,14 +2702,89 @@ absl::Status IrEmitter::HandleOneDnnMatMulCalls(
+   return absl::OkStatus();
+ }
+ 
++absl::Status IrEmitter::HandleOneDnnConvolution(HloInstruction* custom_call) {
++  //      args[0]: ptr to nargs
++  //      args[1]: ptr to ExecutableRunOptions
++  //      args[2]: ptr to OneDnnConvolutionConfig
++  //      args[3...]: ptrs to operands
++
++  // First three arguments: nargs, ExecutableRunOptions, and
++  // OneDnnConvolutionConfig.
++  const int nargs_offset = 3;
++  const int num_operands = custom_call->operand_count();
++  const int nargs = nargs_offset + num_operands;
++  int arg_indx = 0;
++
++  llvm::Type* i64_type = b_.getInt64Ty();
++  llvm::Type* ptr_type = b_.getPtrTy();
++  llvm::ArrayType* ptr_array_type = llvm::ArrayType::get(ptr_type, nargs);
++  llvm::Value* args_val = llvm::UndefValue::get(ptr_array_type);
++
++  llvm::Value* nargs_val = b_.getInt64(nargs);
++  llvm::Value* nargs_ptr =
++      llvm_ir::EmitAllocaAtFunctionEntry(i64_type, "nargs", &b_);
++  b_.CreateLifetimeStart(nargs_ptr, b_.getInt64(-1));
++  b_.CreateStore(nargs_val, nargs_ptr);
++  args_val = b_.CreateInsertValue(args_val, nargs_ptr, arg_indx++);
++
++  llvm::Value* run_opts_val = GetExecutableRunOptionsArgument();
++  args_val = b_.CreateInsertValue(args_val, run_opts_val, arg_indx++);
++
++  auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
++  auto backend_config = typed_custom_call->backend_config<BackendConfig>();
++  OneDnnConvolutionConfig conv_config;
++  conv_config.CopyFrom(backend_config->onednn_conv_config());
++  std::string str_config;
++  conv_config.SerializeToString(&str_config);
++  llvm::Value* conv_config_val =
++      b_.CreateGlobalStringPtr(llvm_ir::AsStringRef(str_config));
++  args_val = b_.CreateInsertValue(args_val, conv_config_val, arg_indx++);
++
++  std::vector<StackAlloca> operands_stack_alloca;
++  operands_stack_alloca.reserve(num_operands);
++  absl::c_transform(custom_call->operands(), operands_stack_alloca.begin(),
++                    [this](HloInstruction* instr) {
++                      llvm_ir::IrArray ir_array(GetIrArrayFor(instr));
++                      return GetAllocaAndEmitMemrefInfo(b_, ir_array);
++                    });
++  for (int i = 0; i < num_operands; ++i) {
++    args_val = b_.CreateInsertValue(args_val, operands_stack_alloca[i].value,
++                                    arg_indx++);
++  }
++  TF_RET_CHECK(nargs == arg_indx)
++      << "Number of arguments don't equal the last argument index.";
++
++  llvm::Value* args_ptr = llvm_ir::EmitAllocaAtFunctionEntry(
++      ptr_array_type, "convolution.args", &b_);
++  b_.CreateLifetimeStart(args_ptr, b_.getInt64(-1));
++  b_.CreateStore(args_val, args_ptr);
++
++  TF_RETURN_IF_ERROR(EmitTargetAddressForOp(custom_call));
++  llvm_ir::IrArray result_array = GetIrArrayFor(custom_call);
++  auto result_stack_alloca = GetAllocaAndEmitMemrefInfo(b_, result_array);
++
++  EmitCallToFunc(runtime::kOneDnnConvolutionSymbolName,
++                 {result_stack_alloca.value, args_ptr}, b_.getVoidTy());
++
++  // Lifetime ends for all stack allocations.
++  b_.CreateLifetimeEnd(nargs_ptr, b_.getInt64(-1));
++  for (int i = 0; i < num_operands; ++i) {
++    operands_stack_alloca[i].EmitLifetimeEnd();
++  }
++  b_.CreateLifetimeEnd(args_ptr, b_.getInt64(-1));
++  result_stack_alloca.EmitLifetimeEnd();
++
++  return OkStatus();
++}
++
+ absl::Status IrEmitter::HandleOneDnnLayerNorm(HloInstruction* custom_call) {
+   //      args[0]: ptr to nargs
+   //      args[1]: ptr to ExecutableRunOptions
+-  //      args[2]: ptr to OneDnnLayerNormConfig
++  //      args[2]: ptr to OneDnnNormConfig
+   //      args[3...]: ptrs to operands
+ 
+   // First three arguments: nargs, ExecutableRunOptions, and
+-  // OneDnnLayerNormConfig.
++  // OneDnnNormConfig.
+   const int nargs_offset = 3;
+   const int num_operands = custom_call->operand_count();
+   const int nargs = nargs_offset + num_operands;
+@@ -2732,10 +2807,10 @@ absl::Status IrEmitter::HandleOneDnnLayerNorm(HloInstruction* custom_call) {
+   llvm::Value* run_opts_val = GetExecutableRunOptionsArgument();
+   args_val = b_.CreateInsertValue(args_val, run_opts_val, arg_indx++);
+ 
+-  // Insert OneDnnLayerNormConfig.
++  // Insert OneDnnNormConfig.
+   auto typed_custom_call = Cast<HloCustomCallInstruction>(custom_call);
+   auto backend_config = typed_custom_call->backend_config<BackendConfig>();
+-  OneDnnLayerNormConfig ln_config;
++  OneDnnNormConfig ln_config;
+   ln_config.CopyFrom(backend_config->onednn_layer_norm_config());
+   std::string str_config;
+   ln_config.SerializeToString(&str_config);
+@@ -2831,6 +2906,9 @@ absl::Status IrEmitter::HandleCustomCall(HloInstruction* custom_call) {
+   if (custom_call->custom_call_target() == "__onednn$layernorm") {
+     return HandleOneDnnLayerNorm(custom_call);
+   }
++  if (custom_call->custom_call_target() == "__onednn$convolution") {
++    return HandleOneDnnConvolution(custom_call);
++  }
+   if (custom_call->custom_call_target() == "__onednn$matmul_reorder") {
+     return HandleOneDnnMatMulCalls(custom_call,
+                                    runtime::kOneDnnMatMulReorderSymbolName);
+diff --git a/third_party/xla/xla/service/cpu/ir_emitter.h b/third_party/xla/xla/service/cpu/ir_emitter.h
+index 7e34bbf9e7b..1e05edc0bcc 100644
+--- a/third_party/xla/xla/service/cpu/ir_emitter.h
++++ b/third_party/xla/xla/service/cpu/ir_emitter.h
+@@ -234,6 +234,7 @@ class IrEmitter : public DfsHloVisitorWithDefault,
+                                        std::string runtime_symbol_name);
+   absl::Status HandleOneDnnSoftmax(HloInstruction* hlo);
+   absl::Status HandleOneDnnLayerNorm(HloInstruction* hlo);
++  absl::Status HandleOneDnnConvolution(HloInstruction* hlo);
+ #endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+   // Private helper to initialize an IR function for the computation.
+   void InitializeIrFunction(const std::string& function_name);
+diff --git a/third_party/xla/xla/service/cpu/onednn_config.proto b/third_party/xla/xla/service/cpu/onednn_config.proto
+new file mode 100644
+index 00000000000..9f38673eaac
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_config.proto
+@@ -0,0 +1,116 @@
++syntax = "proto3";
++
++package xla.cpu;
++
++message OneDnnDataLayoutProto {
++  // The batch dimension of the tensor
++  uint64 batch_dim = 1;
++  // The feature dimension of the tensor
++  uint64 feature_dim = 2;
++  // The spatial dimensions of the tensor
++  repeated uint64 spatial_dims = 3;
++}
++
++message OneDnnFilterLayoutProto {
++  // The input feature dimension of the tensor
++  uint64 input_feature_dim = 1;
++  // The output feature dimension of the tensor
++  uint64 output_feature_dim = 2;
++  // The spatial dimensions of the tensor
++  repeated uint64 spatial_dims = 3;
++  // Shape of the tensor
++  repeated uint64 shape = 4;
++}
++
++message OneDnnFactorLayoutProto {
++  // The dimensions of the tensor
++  repeated uint64 dimensions = 1;
++  // Shape of the tensor
++  repeated uint64 shape = 2;
++}
++
++message OneDnnOptimizationConfig {
++  bool weights_prepacked = 1;
++  bool user_scratchpad = 2;
++  bool bias_broadcast = 3;
++}
++
++message OneDnnFusionConfig {
++  // These enum needs to be mapped to oneDNN enum for post_op algorithm.
++  // TODO(intel-tf): Add kinds supported by oneDNN.
++  enum FusionKind {
++    UNDEFINED = 0;
++    BIAS = 1;
++    RELU = 2;
++    TANH = 3;
++    GELU_ERF = 4;
++    GELU_TANH = 5;
++    BINARY_ADD = 6;
++    LINEAR = 7;
++    ELU = 8;
++    RELU6 = 9;
++    SIGMOID = 10;
++  }
++  repeated FusionKind ops = 1;
++  // To avoid protobuf failures for specific decimal values,
++  // the original float value alpha is type-casted to int32.
++  int32 alpha_typecast = 2;
++}
++
++message OneDnnTensorLayoutProto {
++  uint64 dims = 1;
++  oneof layout {
++    OneDnnDataLayoutProto data = 2;
++    OneDnnFilterLayoutProto filter = 3;
++    OneDnnFactorLayoutProto tensor = 4;
++  }
++}
++
++message OneDnnSoftmaxConfig {
++  int32 softmax_axis = 1;
++}
++
++message OneDnnMatMulConfig {
++  bool transpose_a = 1;
++  bool transpose_b = 2;
++
++  OneDnnFusionConfig fusions = 3;
++
++  reserved 4;  // was bias_broadcast
++  reserved 5;  // was alpha_typecast
++  reserved 6;  // was weights_prepacked
++  reserved 7;  // was user_scratchpad
++
++  OneDnnOptimizationConfig optimization_config = 8;
++}
++
++message OneDnnWindowProto {
++  repeated uint64 size = 1;
++  repeated uint64 pad_left = 2;
++  repeated uint64 pad_right = 3;
++  repeated uint64 strides = 4;
++  repeated uint64 window_dilations = 5;
++}
++
++message OneDnnNormConfig {
++  enum ScaleAndShift {
++    UNDEFINED = 0;
++    SCALE = 1;
++    SHIFT = 2;
++    SCALE_AND_SHIFT = 3;
++  }
++  ScaleAndShift rescale = 1;
++  int32 epsilon_typecast = 2;
++  OneDnnFusionConfig fusions = 3;
++}
++
++message OneDnnConvolutionConfig {
++  uint64 dims = 1;
++  OneDnnTensorLayoutProto input = 2;
++  OneDnnTensorLayoutProto kernel = 3;
++  OneDnnTensorLayoutProto output = 4;
++  OneDnnWindowProto window = 5;
++
++  OneDnnFusionConfig fusions = 6;
++  uint64 feature_groups = 7;
++}
+diff --git a/third_party/xla/xla/service/cpu/onednn_convolution.cc b/third_party/xla/xla/service/cpu/onednn_convolution.cc
+new file mode 100644
+index 00000000000..f7a4e17d339
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_convolution.cc
+@@ -0,0 +1,230 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++#include "xla/service/cpu/onednn_convolution.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <initializer_list>
++#include <utility>
++#include <vector>
++
++#define EIGEN_USE_THREADS
++
++#include "dnnl.hpp"
++#include "absl/base/dynamic_annotations.h"
++#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
++#include "xla/executable_run_options.h"
++#include "xla/service/cpu/backend_config.pb.h"
++#include "xla/service/cpu/onednn_memory_util.h"
++#include "xla/service/cpu/runtime_lightweight_check.h"
++#include "xla/tsl/util/onednn_threadpool.h"
++#include "tsl/platform/logging.h"
++
++namespace xla {
++namespace cpu {
++namespace {
++using dnnl::algorithm;
++using dnnl::convolution_forward;
++using dnnl::memory;
++using dnnl::prop_kind;
++using dnnl::stream;
++}  // namespace
++
++dnnl::memory ReorderMemory(const dnnl::engine& engine,
++                           const dnnl::memory::desc& dest_md,
++                           dnnl::memory& src_mem,
++                           const dnnl::stream& onednn_stream) {
++  auto dest_mem = memory(dest_md, engine);
++  dnnl::reorder(src_mem, dest_mem).execute(onednn_stream, src_mem, dest_mem);
++  return dest_mem;
++}
++
++dnnl::memory::format_tag GetFormatTag(const int dims) {
++  return (dims == 3)   ? dnnl::memory::format_tag::nwc
++         : (dims == 4) ? dnnl::memory::format_tag::nhwc
++         : (dims == 5) ? dnnl::memory::format_tag::ndhwc
++                       : dnnl::memory::format_tag::any;
++}
++
++ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnConvolution(
++    void* result, void** args) {
++  // args[0]: ptr to nargs
++  // args[1]: ptr to ExecutableRunOptions
++  // args[2]: ptr to OneDnnConvolutionConfig
++  // args[3...]: ptrs to operands
++  int arg_indx = 0;
++  const int64_t num_args = *(static_cast<int64_t*>(args[arg_indx++]));
++
++  const xla::ExecutableRunOptions* run_options =
++      static_cast<const xla::ExecutableRunOptions*>(args[arg_indx++]);
++  XLA_LIGHTWEIGHT_CHECK(run_options != nullptr);
++  XLA_LIGHTWEIGHT_CHECK(run_options->intra_op_thread_pool() != nullptr);
++  tsl::OneDnnThreadPool thread_pool(
++      run_options->intra_op_thread_pool()->getPool(), false);
++  dnnl::engine cpu_engine(dnnl::engine::kind::cpu, 0);
++#ifndef ENABLE_ONEDNN_OPENMP
++  auto onednn_stream =
++      stream(dnnl::threadpool_interop::make_stream(cpu_engine, &thread_pool));
++#else
++  auto onednn_stream = stream(cpu_engine);
++#endif  // ENABLE_ONEDNN_OPENMP
++
++  std::string config_str(static_cast<const char*>(args[arg_indx++]));
++  OneDnnConvolutionConfig conv_config;
++  conv_config.ParseFromString(config_str);
++
++  // Generate permutations to create memory descriptors
++  std::vector<int64_t> inp_perm_axes(conv_config.dims());
++  std::vector<int64_t> ker_perm_axes(conv_config.dims());
++  std::vector<int64_t> out_perm_axes(conv_config.dims());
++
++  int index_i = 0;
++  int index_o = 0;
++  int index_k = 0;
++
++  inp_perm_axes[conv_config.input().data().batch_dim()] = index_i++;
++  out_perm_axes[conv_config.output().data().batch_dim()] = index_o++;
++  ker_perm_axes[conv_config.kernel().filter().output_feature_dim()] = index_k++;
++
++  inp_perm_axes[conv_config.input().data().feature_dim()] = index_i++;
++  out_perm_axes[conv_config.output().data().feature_dim()] = index_o++;
++  ker_perm_axes[conv_config.kernel().filter().input_feature_dim()] = index_k++;
++
++  std::vector<int64_t> inp_dim_axes(
++      conv_config.input().data().spatial_dims().begin(),
++      conv_config.input().data().spatial_dims().end());
++  std::vector<int64_t> ker_dim_axes(
++      conv_config.kernel().filter().spatial_dims().begin(),
++      conv_config.kernel().filter().spatial_dims().end());
++  std::vector<int64_t> out_dim_axes(
++      conv_config.output().data().spatial_dims().begin(),
++      conv_config.output().data().spatial_dims().end());
++
++  std::for_each(inp_dim_axes.begin(), inp_dim_axes.end(),
++                [&inp_perm_axes, &index_i](int64_t& n) {
++                  n -= 1;
++                  inp_perm_axes[n] = index_i++;
++                });
++  std::for_each(ker_dim_axes.begin(), ker_dim_axes.end(),
++                [&ker_perm_axes, &index_k](int64_t& n) {
++                  n -= 1;
++                  ker_perm_axes[n] = index_k++;
++                });
++  std::for_each(out_dim_axes.begin(), out_dim_axes.end(),
++                [&out_perm_axes, &index_o](int64_t& n) {
++                  n -= 1;
++                  out_perm_axes[n] = index_o++;
++                });
++
++  memory::dims strides(conv_config.window().strides().begin(),
++                       conv_config.window().strides().end());
++  memory::dims pad_left(conv_config.window().pad_left().begin(),
++                        conv_config.window().pad_left().end());
++  memory::dims pad_right(conv_config.window().pad_right().begin(),
++                         conv_config.window().pad_right().end());
++  memory::dims rhs_dilations(conv_config.window().window_dilations().begin(),
++                             conv_config.window().window_dilations().end());
++
++  std::for_each(strides.begin(), strides.end(), [](int64_t& n) { n -= 1; });
++  std::for_each(pad_left.begin(), pad_left.end(), [](int64_t& n) { n -= 1; });
++  std::for_each(pad_right.begin(), pad_right.end(), [](int64_t& n) { n -= 1; });
++  std::for_each(rhs_dilations.begin(), rhs_dilations.end(),
++                [](int64_t& n) { n -= 2; });
++
++  auto groups = conv_config.feature_groups();
++
++  MemrefInfo inp_minfo(args[arg_indx++]);
++  MemrefInfo ker_minfo(args[arg_indx++]);
++  MemrefInfo res_minfo(result);
++
++  // Permute memory descriptors
++  auto inp_md = inp_minfo.GetOneDnnMemDesc();
++  auto ker_md = ker_minfo.GetOneDnnMemDesc();
++  auto res_md = res_minfo.GetOneDnnMemDesc();
++
++  std::vector<int> inp_axes(inp_perm_axes.begin(), inp_perm_axes.end());
++  std::vector<int> ker_axes(ker_perm_axes.begin(), ker_perm_axes.end());
++  std::vector<int> out_axes(out_perm_axes.begin(), out_perm_axes.end());
++
++  auto new_inp_md = inp_md.permute_axes(inp_axes);
++  auto new_ker_md = ker_md.permute_axes(ker_axes);
++  auto new_res_md = res_md.permute_axes(out_axes);
++
++  if (groups > 1) {
++    auto corr_dims = new_ker_md.get_dims();
++    corr_dims.insert(corr_dims.begin(), 1, groups);
++    corr_dims[1] = corr_dims[1] / groups;
++    new_ker_md = new_ker_md.reshape(corr_dims);
++  }
++
++  auto any_ker_md =
++      memory::desc(new_ker_md.get_dims(), new_ker_md.get_data_type(),
++                   dnnl::memory::format_tag::any);
++  auto any_inp_md =
++      memory::desc(new_inp_md.get_dims(), new_inp_md.get_data_type(),
++                   GetFormatTag(new_inp_md.get_ndims()));
++  auto any_res_md =
++      memory::desc(new_res_md.get_dims(), new_res_md.get_data_type(),
++                   GetFormatTag(new_res_md.get_ndims()));
++
++  XLA_LIGHTWEIGHT_CHECK(num_args == arg_indx);
++
++  dnnl::primitive_attr attrs;
++
++  auto inp_mem = memory(new_inp_md, cpu_engine, inp_minfo.Data());
++  auto ker_mem = memory(new_ker_md, cpu_engine, ker_minfo.Data());
++  auto res_mem = memory(new_res_md, cpu_engine, res_minfo.Data());
++
++  auto conv_pd = convolution_forward::primitive_desc(
++      cpu_engine, prop_kind::forward_inference, algorithm::convolution_direct,
++      any_inp_md, any_ker_md, any_res_md, strides, rhs_dilations, pad_left,
++      pad_right, attrs);
++
++  auto new_inp_mem = (conv_pd.src_desc() == inp_mem.get_desc())
++                         ? inp_mem
++                         : ReorderMemory(cpu_engine, conv_pd.src_desc(),
++                                         inp_mem, onednn_stream);
++  auto new_ker_mem = (conv_pd.weights_desc() == ker_mem.get_desc())
++                         ? ker_mem
++                         : ReorderMemory(cpu_engine, conv_pd.weights_desc(),
++                                         ker_mem, onednn_stream);
++  auto new_res_mem = (conv_pd.dst_desc() == res_mem.get_desc())
++                         ? res_mem
++                         : memory(conv_pd.dst_desc(), cpu_engine);
++
++  auto conv_prim = convolution_forward(conv_pd);
++
++  std::unordered_map<int, memory> conv_args{{DNNL_ARG_SRC, new_inp_mem},
++                                            {DNNL_ARG_WEIGHTS, new_ker_mem},
++                                            {DNNL_ARG_DST, new_res_mem}};
++
++  conv_prim.execute(onednn_stream, conv_args);
++
++  if (conv_pd.dst_desc() == res_mem.get_desc()) {
++    res_mem = new_res_mem;
++  } else {
++    dnnl::reorder(new_res_mem, res_mem)
++        .execute(onednn_stream, new_res_mem, res_mem);
++  }
++}
++
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+diff --git a/third_party/xla/xla/service/cpu/onednn_convolution.h b/third_party/xla/xla/service/cpu/onednn_convolution.h
+new file mode 100644
+index 00000000000..19cbbe2e2a3
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_convolution.h
+@@ -0,0 +1,31 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_H_
++#define XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_H_
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++namespace xla {
++namespace cpu {
++
++extern "C" {
++extern void __xla_cpu_runtime_OneDnnConvolution(void* result, void** args);
++}  // extern "C"
++
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
++#endif  // XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_H_
+diff --git a/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.cc b/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.cc
+new file mode 100644
+index 00000000000..c148f116988
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.cc
+@@ -0,0 +1,140 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++#include "xla/service/cpu/onednn_convolution_rewriter.h"
++
++#include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/service/cpu/backend_config.pb.h"
++#include "xla/service/cpu/onednn_memory_util.h"
++#include "xla/service/cpu/onednn_util.h"
++#include "xla/service/pattern_matcher.h"
++#include "xla/status_macros.h"
++
++namespace xla {
++namespace cpu {
++
++namespace {
++namespace m = match;
++}  // namespace
++
++bool OneDnnConvolutionRewriter::ShouldRewrite(const HloInstruction* conv) {
++  if (conv->HasControlDependencies()) return false;
++  if (!IsSupportedType(conv->shape().element_type())) return false;
++  if (conv->batch_group_count() != 1) return false;
++
++  if (conv->operand(1)->opcode() == HloOpcode::kReverse) return false;
++
++  const Shape& inp_shape = conv->operand(0)->shape();
++  const Shape& ker_shape = conv->operand(1)->shape();
++  const Shape& out_shape = conv->shape();
++  if (ShapeUtil::IsZeroElementArray(inp_shape) ||
++      ShapeUtil::IsZeroElementArray(ker_shape) ||
++      ShapeUtil::IsZeroElementArray(out_shape)) {
++    return false;
++  }
++
++  auto dims = conv->window().dimensions().size();
++  if (dims >= 4 || dims <= 0) return false;
++
++  if (inp_shape.rank() != ker_shape.rank() ||
++      inp_shape.rank() != out_shape.rank()) {
++    return false;
++  }
++
++  return true;
++}
++
++class OneDnnConvolutionRewriterVisitor : public DfsHloRewriteVisitor {
++ public:
++  Status HandleConvolution(HloInstruction* conv) override {
++    auto pattern = match::Op(&conv).WithOpcode(HloOpcode::kConvolution);
++    if (!Match(conv, pattern)) return OkStatus();
++    if (!OneDnnConvolutionRewriter::ShouldRewrite(conv)) return OkStatus();
++
++    const Shape& conv_shape = conv->shape();
++    auto dims = conv->window().dimensions().size();
++    const ConvolutionDimensionNumbers& conv_ddata =
++        conv->convolution_dimension_numbers();
++
++    BackendConfig backend_config;
++    OneDnnConvolutionConfig* conv_config =
++        backend_config.mutable_onednn_conv_config();
++
++    conv_config->set_dims(conv_shape.rank());
++    conv_config->set_feature_groups(conv->feature_group_count());
++    conv_config->mutable_input()->mutable_data()->set_batch_dim(
++        conv_ddata.input_batch_dimension());
++    conv_config->mutable_kernel()->mutable_filter()->set_input_feature_dim(
++        conv_ddata.kernel_input_feature_dimension());
++    conv_config->mutable_output()->mutable_data()->set_batch_dim(
++        conv_ddata.output_batch_dimension());
++    conv_config->mutable_input()->mutable_data()->set_feature_dim(
++        conv_ddata.input_feature_dimension());
++    conv_config->mutable_kernel()->mutable_filter()->set_output_feature_dim(
++        conv_ddata.kernel_output_feature_dimension());
++    conv_config->mutable_output()->mutable_data()->set_feature_dim(
++        conv_ddata.output_feature_dimension());
++
++    const Shape& output_shape = conv->shape();
++
++    for (auto it = conv->window().dimensions().begin();
++         it != conv->window().dimensions().end(); it++) {
++      if ((*it).padding_low() < 0 || (*it).padding_high() < 0 ||
++          (*it).stride() < 0) {
++        return OkStatus();
++      }
++      conv_config->mutable_window()->add_pad_left((*it).padding_low() + 1);
++      conv_config->mutable_window()->add_pad_right((*it).padding_high() + 1);
++      conv_config->mutable_window()->add_strides((*it).stride() + 1);
++      conv_config->mutable_window()->add_window_dilations(
++          (*it).window_dilation() + 1);
++      if ((*it).base_dilation() != 1 || (*it).window_reversal()) {
++        return OkStatus();
++      }
++    }
++
++    for (int i = 0; i < dims; i++) {
++      conv_config->mutable_input()->mutable_data()->add_spatial_dims(
++          conv_ddata.input_spatial_dimensions()[i] + 1);
++      conv_config->mutable_kernel()->mutable_filter()->add_spatial_dims(
++          conv_ddata.kernel_spatial_dimensions()[i] + 1);
++      conv_config->mutable_output()->mutable_data()->add_spatial_dims(
++          conv_ddata.output_spatial_dimensions()[i] + 1);
++    }
++
++    HloInstruction* custom_call =
++        conv->AddInstruction(HloInstruction::CreateCustomCall(
++            output_shape, {conv->mutable_operand(0), conv->mutable_operand(1)},
++            "__onednn$convolution"));
++
++    TF_RETURN_IF_ERROR(custom_call->set_backend_config(backend_config));
++    TF_RETURN_IF_ERROR(ReplaceInstruction(conv, custom_call));
++    return OkStatus();
++  }
++};
++
++StatusOr<bool> OneDnnConvolutionRewriter::Run(
++    HloModule* module,
++    const absl::flat_hash_set<absl::string_view>& execution_threads) {
++  OneDnnConvolutionRewriterVisitor visitor;
++  return visitor.RunOnModule(module, execution_threads);
++}
++
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+diff --git a/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.h b/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.h
+new file mode 100644
+index 00000000000..334db7f60b8
+--- /dev/null
++++ b/third_party/xla/xla/service/cpu/onednn_convolution_rewriter.h
+@@ -0,0 +1,49 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#ifndef XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_REWRITER_H_
++#define XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_REWRITER_H_
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++#include <optional>
++
++#include "absl/algorithm/container.h"
++#include "xla/hlo/ir/hlo_instructions.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/service/hlo_pass_interface.h"
++
++namespace xla {
++namespace cpu {
++
++// This pass converts hlo convolution instructions into a single oneDNN
++// operation and rewrites into custom calls.
++class OneDnnConvolutionRewriter : public HloModulePass {
++ public:
++  absl::string_view name() const override {
++    return "onednn-convolution-rewriter";
++  }
++
++  using HloPassInterface::Run;
++  StatusOr<bool> Run(
++      HloModule* module,
++      const absl::flat_hash_set<absl::string_view>& execution_threads) override;
++
++  static bool ShouldRewrite(const HloInstruction* instr);
++};
++
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
++#endif  // XLA_SERVICE_CPU_ONEDNN_CONVOLUTION_REWRITER_H_
+diff --git a/third_party/xla/xla/service/cpu/onednn_layer_norm.cc b/third_party/xla/xla/service/cpu/onednn_layer_norm.cc
+index d2109a1bc2f..6abd698f589 100644
+--- a/third_party/xla/xla/service/cpu/onednn_layer_norm.cc
++++ b/third_party/xla/xla/service/cpu/onednn_layer_norm.cc
+@@ -48,7 +48,7 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnLayerNorm(
+     void* result, void** args) {
+   // args[0]: ptr to nargs. We don't use nargs here.
+   // args[1]: ptr to ExecutableRunOptions
+-  // args[2]: ptr to OneDnnLayerNormConfig
++  // args[2]: ptr to OneDnnNormConfig
+   // args[3...]: ptrs to operands
+   int arg_indx = 1;
+   const xla::ExecutableRunOptions* run_options =
+@@ -65,7 +65,7 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnLayerNorm(
+   auto onednn_stream = stream(cpu_engine);
+ #endif  // ENABLE_ONEDNN_OPENMP
+   std::string config_str(static_cast<const char*>(args[arg_indx++]));
+-  OneDnnLayerNormConfig ln_config;
++  OneDnnNormConfig ln_config;
+   ln_config.ParseFromString(config_str);
+ 
+   MemrefInfo layer_minfo(args[arg_indx++]);
+@@ -82,7 +82,6 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnLayerNorm(
+   auto scale_mem = memory(scaleshift_md, cpu_engine, gamma_minfo.Data());
+   auto shift_mem = memory(scaleshift_md, cpu_engine, beta_minfo.Data());
+ 
+-  // TODO(intel-tf): Move epsilon to OneDnnLayerNormConfig.
+   float epsilon;
+   *(reinterpret_cast<int32_t*>(&epsilon)) = ln_config.epsilon_typecast();
+ 
+diff --git a/third_party/xla/xla/service/cpu/onednn_matmul.cc b/third_party/xla/xla/service/cpu/onednn_matmul.cc
+index 414e4d6da9a..5e066795344 100644
+--- a/third_party/xla/xla/service/cpu/onednn_matmul.cc
++++ b/third_party/xla/xla/service/cpu/onednn_matmul.cc
+@@ -70,10 +70,10 @@ dnnl::memory::desc OneDnnMatMulOptWeightsDesc(
+   auto weights_md = ShapeToMemDesc(weights_shape);
+   TRANSPOSE_LAST_TWO_DIMS_IF(matmul_config->transpose_a(), input_md);
+   TRANSPOSE_LAST_TWO_DIMS_IF(matmul_config->transpose_b(), weights_md);
+-  auto bias_md =
+-      absl::c_count(matmul_config->fused_ops(), OneDnnMatMulConfig::BIAS) > 0
+-          ? ShapeToMemDesc(bias_shape)
+-          : dnnl::memory::desc{};
++  auto bias_md = absl::c_count(matmul_config->fusions().ops(),
++                               OneDnnFusionConfig::BIAS) > 0
++                     ? ShapeToMemDesc(bias_shape)
++                     : dnnl::memory::desc{};
+   auto output_md = ShapeToMemDesc(output_shape);
+ 
+   // extend bias rank to match result rank
+@@ -115,7 +115,7 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+     const OneDnnMatMulConfig& matmul_config,
+     FusedOperandsRef* fused_operands_ref = nullptr) {
+   auto bias_md = memory::desc();
+-  bool weights_packed = matmul_config.weights_prepacked();
++  bool weights_packed = matmul_config.optimization_config().weights_prepacked();
+   auto weights_md = plain_weights_md;
+   if (weights_packed) {
+     weights_md = memory::desc(weights_md.get_dims(), weights_md.get_data_type(),
+@@ -124,27 +124,27 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+ 
+   dnnl::post_ops post_ops;
+   int fused_operand_idx = 0;
+-  for (auto& fused_op : matmul_config.fused_ops()) {
++  for (auto& fused_op : matmul_config.fusions().ops()) {
+     switch (fused_op) {
+-      case OneDnnMatMulConfig::RELU:
++      case OneDnnFusionConfig::RELU:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_relu, 0.f, 0.f);
+         break;
+-      case OneDnnMatMulConfig::TANH:
++      case OneDnnFusionConfig::TANH:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_tanh, 0.f, 0.f);
+         break;
+-      case OneDnnMatMulConfig::GELU_TANH:
++      case OneDnnFusionConfig::GELU_TANH:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_gelu_tanh, 0.f, 0.f);
+         break;
+-      case OneDnnMatMulConfig::GELU_ERF:
++      case OneDnnFusionConfig::GELU_ERF:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_gelu_erf, 0.f, 0.f);
+         break;
+-      case OneDnnMatMulConfig::RELU6:
++      case OneDnnFusionConfig::RELU6:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_clip_v2, 0.f, 6.0f);
+         break;
+-      case OneDnnMatMulConfig::SIGMOID:
++      case OneDnnFusionConfig::SIGMOID:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_logistic, 0.f, 0.f);
+         break;
+-      case OneDnnMatMulConfig::BIAS: {
++      case OneDnnFusionConfig::BIAS: {
+         bias_md = fused_mds.at(fused_operand_idx);
+         // Extend bias rank to match result rank.
+         auto missed_rank = output_md.get_ndims() - bias_md.get_ndims();
+@@ -162,10 +162,10 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+         }
+         fused_operand_idx++;
+       } break;
+-      case OneDnnMatMulConfig::ELU:
++      case OneDnnFusionConfig::ELU:
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_elu, 1.0f, 0.0f);
+         break;
+-      case OneDnnMatMulConfig::BINARY_ADD: {
++      case OneDnnFusionConfig::BINARY_ADD: {
+         auto binary_md = fused_mds.at(fused_operand_idx);
+         // Extend addend rank to match result rank.
+         auto missed_rank = output_md.get_ndims() - binary_md.get_ndims();
+@@ -186,10 +186,10 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+         post_ops.append_binary(dnnl::algorithm::binary_add, binary_md);
+         fused_operand_idx++;
+       } break;
+-      case OneDnnMatMulConfig::LINEAR: {
++      case OneDnnFusionConfig::LINEAR: {
+         float const_float;
+         *(reinterpret_cast<int32_t*>(&const_float)) =
+-            matmul_config.alpha_typecast();
++            matmul_config.fusions().alpha_typecast();
+         post_ops.append_eltwise(dnnl::algorithm::eltwise_linear, const_float,
+                                 0.f);
+       } break;
+@@ -202,7 +202,7 @@ std::unique_ptr<matmul::primitive_desc> CreateMatMulPrimDesc(
+   }
+ 
+   dnnl::primitive_attr attrs;
+-  if (matmul_config.user_scratchpad()) {
++  if (matmul_config.optimization_config().user_scratchpad()) {
+     attrs.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+   }
+   if (post_ops.len() > 0) {
+@@ -294,7 +294,7 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnMatMul(
+   TRANSPOSE_LAST_TWO_DIMS_IF(
+       matmul_config.transpose_b() && weights_md.get_ndims() > 1, weights_md);
+   auto output_md = output_minfo.GetOneDnnMemDesc();
+-  if (matmul_config.weights_prepacked()) {
++  if (matmul_config.optimization_config().weights_prepacked()) {
+     // Weight pre-packing is supported for 2D weights only.
+     // Since prepacked weights array is flattened, try to infer the dims from
+     // input and output.
+@@ -336,7 +336,7 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnMatMul(
+                                               {DNNL_ARG_WEIGHTS, rhs_mem},
+                                               {DNNL_ARG_DST, result_mem}};
+ 
+-  if (matmul_config.user_scratchpad()) {
++  if (matmul_config.optimization_config().user_scratchpad()) {
+     XLA_LIGHTWEIGHT_CHECK(scratch != nullptr);
+     MemrefInfo scratch_minfo(scratch);
+     auto scratchpad_md = matmul_pd->scratchpad_desc();
+@@ -380,7 +380,8 @@ ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY void __xla_cpu_runtime_OneDnnMatMulReorder(
+   auto output_md = output_minfo.GetOneDnnMemDesc();
+ 
+   auto bias_md = dnnl::memory::desc{};
+-  if (absl::c_count(matmul_config.fused_ops(), OneDnnMatMulConfig::BIAS) > 0) {
++  if (absl::c_count(matmul_config.fusions().ops(), OneDnnFusionConfig::BIAS) >
++      0) {
+     MemrefInfo bias_minfo(args[arg_indx++]);
+     bias_md = bias_minfo.GetOneDnnMemDesc();
+   }
+diff --git a/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc b/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
+index 08ae6767998..95098dd31cf 100644
+--- a/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
++++ b/third_party/xla/xla/service/cpu/onednn_matmul_rewriter.cc
+@@ -264,13 +264,13 @@ auto GELUActivation(HloInstruction* instr, HloInstruction** src) {
+ 
+     if (Match(errf, errf_apprx_pattern)) {
+       // Matched Gelu-approximate pattern
+-      return OneDnnMatMulConfig::GELU_TANH;
++      return OneDnnFusionConfig::GELU_TANH;
+     } else if (Match(errf, errf_exact_pattern)) {
+       // Matched Gelu-exact pattern
+-      return OneDnnMatMulConfig::GELU_ERF;
++      return OneDnnFusionConfig::GELU_ERF;
+     }
+   }
+-  return OneDnnMatMulConfig::UNDEFINED;
++  return OneDnnFusionConfig::UNDEFINED;
+ }
+ 
+ // OneDNN matmul can fuse add operation with automatic broadcasting along the
+@@ -502,11 +502,13 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+       // Add(bias) + Add(e.g., residual) is enabled.
+       if (!dot->backend_config<BackendConfig>()
+                ->mutable_onednn_matmul_config()
+-               ->fused_ops()
++               ->mutable_fusions()
++               ->ops()
+                .empty() &&
+           dot->backend_config<BackendConfig>()
+                   ->mutable_onednn_matmul_config()
+-                  ->fused_ops(0) == OneDnnMatMulConfig::BIAS) {
++                  ->mutable_fusions()
++                  ->ops(0) == OneDnnFusionConfig::BIAS) {
+         return absl::OkStatus();
+       }
+       std::vector<HloInstruction*> new_operands;
+@@ -559,19 +561,25 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+       auto matmul_call = Cast<HloCustomCallInstruction>(instr->AddInstruction(
+           dot->CloneWithNewOperands(dot->shape(), new_operands)));
+ 
+-      OneDnnMatMulConfig_FusionKind kind;
++      OneDnnFusionConfig_FusionKind kind;
+       auto backend_config = matmul_call->backend_config<BackendConfig>();
+-      if (backend_config->mutable_onednn_matmul_config()->fused_ops().empty() &&
++      if (backend_config->mutable_onednn_matmul_config()
++              ->fusions()
++              .ops()
++              .empty() &&
+           addend->shape().rank() == 1) {
+-        kind = OneDnnMatMulConfig::BIAS;
++        kind = OneDnnFusionConfig::BIAS;
+       } else {
+-        kind = OneDnnMatMulConfig::BINARY_ADD;
++        kind = OneDnnFusionConfig::BINARY_ADD;
+       }
+-      backend_config->mutable_onednn_matmul_config()->add_fused_ops(kind);
++      backend_config->mutable_onednn_matmul_config()
++          ->mutable_fusions()
++          ->add_ops(kind);
+ 
+       if (optional_addend_broadcast) {
+-        backend_config->mutable_onednn_matmul_config()->set_bias_broadcast(
+-            true);
++        backend_config->mutable_onednn_matmul_config()
++            ->mutable_optimization_config()
++            ->set_bias_broadcast(true);
+       }
+       TF_RETURN_IF_ERROR(matmul_call->set_backend_config(*backend_config));
+ 
+@@ -629,7 +637,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+                                      OneDnnMatmulInstr(&matmul_call))
+                                      .WithOneUser(),
+                                  BcastConstScalar(0)))) {
+-      return FuseActivation(OneDnnMatMulConfig::RELU, instr, matmul_call,
++      return FuseActivation(OneDnnFusionConfig::RELU, instr, matmul_call,
+                             intermediate_instr, optional_bitcast);
+     }
+     return absl::OkStatus();
+@@ -659,7 +667,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+       if (Match(src, ElementwiseSafeIntermediates(
+                          &intermediate_instr, &optional_bitcast,
+                          OneDnnMatmulInstr(&matmul_call)))) {
+-        return FuseActivation(OneDnnMatMulConfig::ELU, instr, matmul_call,
++        return FuseActivation(OneDnnFusionConfig::ELU, instr, matmul_call,
+                               intermediate_instr);
+       }
+     }
+@@ -676,7 +684,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+                                  &intermediate_instr, &optional_bitcast,
+                                  OneDnnMatmulInstr(&matmul_call))
+                                  .WithOneUser()))) {
+-      return FuseActivation(OneDnnMatMulConfig::TANH, instr, matmul_call,
++      return FuseActivation(OneDnnFusionConfig::TANH, instr, matmul_call,
+                             intermediate_instr);
+     }
+     return absl::OkStatus();
+@@ -694,7 +702,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+                                   OneDnnMatmulInstr(&matmul_call))
+                                   .WithOneUser(),
+                               BcastConstScalar(6)))) {
+-      return FuseActivation(OneDnnMatMulConfig::RELU6, instr, matmul_call,
++      return FuseActivation(OneDnnFusionConfig::RELU6, instr, matmul_call,
+                             intermediate_instr);
+     }
+     return absl::OkStatus();
+@@ -705,7 +713,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+     HloInstruction* intermediate_instr = nullptr;
+     HloInstruction* src;
+     auto activation = GELUActivation(instr, &src);
+-    if (activation != OneDnnMatMulConfig::UNDEFINED) {
++    if (activation != OneDnnFusionConfig::UNDEFINED) {
+       HloInstruction* optional_bitcast = nullptr;
+       if (Match(src, ElementwiseSafeIntermediates(
+                          &intermediate_instr, &optional_bitcast,
+@@ -741,12 +749,15 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+       auto matmul_call = Cast<HloCustomCallInstruction>(instr->AddInstruction(
+           dot->CloneWithNewOperands(instr->shape(), new_operands)));
+       auto backend_config = matmul_call->backend_config<BackendConfig>();
+-      backend_config->mutable_onednn_matmul_config()->add_fused_ops(
+-          OneDnnMatMulConfig::LINEAR);
++      backend_config->mutable_onednn_matmul_config()
++          ->mutable_fusions()
++          ->add_ops(OneDnnFusionConfig::LINEAR);
+       // Casting to int32 because of issues in proto config for decimal types
+       // handling.
+-      backend_config->mutable_onednn_matmul_config()->set_alpha_typecast(
+-          *(reinterpret_cast<int32_t*>(&constant_value.value())));
++      backend_config->mutable_onednn_matmul_config()
++          ->mutable_fusions()
++          ->set_alpha_typecast(
++              *(reinterpret_cast<int32_t*>(&constant_value.value())));
+       TF_RETURN_IF_ERROR(matmul_call->set_backend_config(*backend_config));
+       HloInstruction* new_instr;
+       if (optional_convert != nullptr &&
+@@ -781,14 +792,14 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+                          &intermediate_instr, &optional_bitcast,
+                          OneDnnMatmulInstr(&matmul_call))
+                          .WithOneUser())) {
+-        return FuseActivation(OneDnnMatMulConfig::SIGMOID, instr, matmul_call,
++        return FuseActivation(OneDnnFusionConfig::SIGMOID, instr, matmul_call,
+                               intermediate_instr, optional_bitcast);
+       }
+     }
+     return absl::OkStatus();
+   }
+ 
+-  absl::Status FuseActivation(OneDnnMatMulConfig_FusionKind kind,
++  absl::Status FuseActivation(OneDnnFusionConfig_FusionKind kind,
+                               HloInstruction* activation,
+                               HloInstruction* matmul,
+                               HloInstruction* intermediate_instr = nullptr,
+@@ -796,7 +807,7 @@ class OneDnnMatMulRewriteVisitor : public DfsHloRewriteVisitor {
+     TF_ASSIGN_OR_RETURN(auto backend_config,
+                         matmul->backend_config<BackendConfig>());
+     auto* matmul_config = backend_config.mutable_onednn_matmul_config();
+-    matmul_config->add_fused_ops(kind);
++    matmul_config->mutable_fusions()->add_ops(kind);
+     TF_RETURN_IF_ERROR(matmul->set_backend_config(backend_config));
+     std::unique_ptr<HloInstruction> output = matmul->Clone();
+     if (optional_bitcast != nullptr &&
+@@ -1052,42 +1063,45 @@ class OneDnnPostRewriteVisitor : public DfsHloRewriteVisitor {
+   std::unique_ptr<Eigen::ThreadPoolDevice> threadpool_device_;
+ };
+ 
+-#define EMIT_GET_BACKEND_CONFIG_SPECIALIZATION(GETTER, PRIM_DESC, CONFIG,  \
+-                                               FIELD)                      \
+-  template <>                                                              \
+-  inline bool OneDnnPostRewriteVisitor::GETTER<PRIM_DESC>(HloInstruction * \
+-                                                          custom_call) {   \
+-    auto backend_config = custom_call->backend_config<BackendConfig>();    \
+-    return backend_config.ok() ? backend_config->CONFIG().FIELD() : false; \
++#define EMIT_GET_BACKEND_CONFIG_SPECIALIZATION(GETTER, PRIM_DESC, CONFIG,      \
++                                               SUB_CONFIG, FIELD)              \
++  template <>                                                                  \
++  inline bool OneDnnPostRewriteVisitor::GETTER<PRIM_DESC>(HloInstruction *     \
++                                                          custom_call) {       \
++    auto backend_config = custom_call->backend_config<BackendConfig>();        \
++    return backend_config.ok() ? backend_config->CONFIG().SUB_CONFIG().FIELD() \
++                               : false;                                        \
+   }
+ 
+ EMIT_GET_BACKEND_CONFIG_SPECIALIZATION(GetUserScratch,
+                                        dnnl::matmul::primitive_desc,
+-                                       onednn_matmul_config, user_scratchpad);
++                                       onednn_matmul_config,
++                                       optimization_config, user_scratchpad);
+ EMIT_GET_BACKEND_CONFIG_SPECIALIZATION(GetWeightsPrepack,
+                                        dnnl::matmul::primitive_desc,
+-                                       onednn_matmul_config, weights_prepacked);
++                                       onednn_matmul_config,
++                                       optimization_config, weights_prepacked);
+ 
+ #define EMIT_SET_BACKEND_CONFIG_SPECIALIZATION(SETTER, PRIM_DESC, CONFIG_TYPE, \
+-                                               CONFIG, FIELD)                  \
++                                               CONFIG, SUB_CONFIG, FIELD)      \
+   template <>                                                                  \
+   inline absl::Status OneDnnPostRewriteVisitor::SETTER<PRIM_DESC>(             \
+       HloInstruction * custom_call, bool value) {                              \
+     TF_ASSIGN_OR_RETURN(auto backend_config,                                   \
+                         custom_call->backend_config<BackendConfig>());         \
+     CONFIG_TYPE* config = backend_config.mutable_##CONFIG();                   \
+-    config->set_##FIELD(value);                                                \
++    config->mutable_##SUB_CONFIG()->set_##FIELD(value);                        \
+     return custom_call->set_backend_config(backend_config);                    \
+   }
+ 
+ EMIT_SET_BACKEND_CONFIG_SPECIALIZATION(SetWeightsPrepack,
+                                        dnnl::matmul::primitive_desc,
+                                        OneDnnMatMulConfig, onednn_matmul_config,
+-                                       weights_prepacked);
++                                       optimization_config, weights_prepacked);
+ EMIT_SET_BACKEND_CONFIG_SPECIALIZATION(SetUserScratch,
+                                        dnnl::matmul::primitive_desc,
+                                        OneDnnMatMulConfig, onednn_matmul_config,
+-                                       user_scratchpad);
++                                       optimization_config, user_scratchpad);
+ 
+ absl::StatusOr<bool> OneDnnMatMulRewriter::Run(
+     HloModule* module,
+diff --git a/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc b/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
+index 0a54d70c69b..f95bf138800 100644
+--- a/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
++++ b/third_party/xla/xla/service/cpu/onednn_ops_rewriter.cc
+@@ -499,9 +499,9 @@ class OneDnnOpsRewriterVisitor : public DfsHloRewriteVisitor {
+             src_shape, {src, scale_operand, bias_operand},
+             "__onednn$layernorm"));
+     BackendConfig backend_config;
+-    OneDnnLayerNormConfig* ln_config =
++    OneDnnNormConfig* ln_config =
+         backend_config.mutable_onednn_layer_norm_config();
+-    ln_config->set_fused_ops(OneDnnLayerNormConfig::SCALE_AND_SHIFT);
++    ln_config->set_rescale(OneDnnNormConfig::SCALE_AND_SHIFT);
+     ln_config->set_epsilon_typecast(*(reinterpret_cast<int32_t*>(&eps)));
+     TF_RETURN_IF_ERROR(ln_call->set_backend_config(backend_config));
+ 
+diff --git a/third_party/xla/xla/service/cpu/simple_orc_jit.cc b/third_party/xla/xla/service/cpu/simple_orc_jit.cc
+index 21ce0280906..715d5ef1ad4 100644
+--- a/third_party/xla/xla/service/cpu/simple_orc_jit.cc
++++ b/third_party/xla/xla/service/cpu/simple_orc_jit.cc
+@@ -70,6 +70,7 @@ limitations under the License.
+ #include "tsl/platform/logging.h"
+ 
+ #if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++#include "xla/service/cpu/onednn_convolution.h"
+ #include "xla/service/cpu/onednn_layer_norm.h"
+ #include "xla/service/cpu/onednn_matmul.h"
+ #include "xla/service/cpu/onednn_softmax.h"
+@@ -547,6 +548,7 @@ bool RegisterKnownJITSymbols() {
+   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnMatMul);
+   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnSoftmax);
+   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnLayerNorm);
++  REGISTER_CPU_RUNTIME_SYMBOL(OneDnnConvolution);
+   REGISTER_CPU_RUNTIME_SYMBOL(OneDnnMatMulReorder);
+ #endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+ 
+diff --git a/third_party/xla/xla/tests/BUILD b/third_party/xla/xla/tests/BUILD
+index 2bdfe02297d..c10e7c04725 100644
+--- a/third_party/xla/xla/tests/BUILD
++++ b/third_party/xla/xla/tests/BUILD
+@@ -2985,6 +2985,26 @@ xla_test(
+     ],
+ )
+ 
++xla_test(
++    name = "onednn_convolution_test",
++    srcs = ["onednn_convolution_test.cc"],
++    backends = [
++        "cpu",
++    ],
++    copts = tsl_copts(),
++    deps = [
++        ":hlo_test_base",
++        ":test_macros_header",
++        ":xla_internal_test_main",
++        "//xla:literal",
++        "//xla:shape_util",
++        "//xla:test",
++        "//xla:test_helpers",
++        "//xla/hlo/utils:hlo_matchers",
++        "@local_tsl//tsl/platform:platform_port",
++    ],
++)
++
+ xla_test(
+     name = "onednn_layer_norm_test",
+     srcs = ["onednn_layer_norm_test.cc"],
+diff --git a/third_party/xla/xla/tests/onednn_convolution_test.cc b/third_party/xla/xla/tests/onednn_convolution_test.cc
+new file mode 100644
+index 00000000000..9d606ae44fa
+--- /dev/null
++++ b/third_party/xla/xla/tests/onednn_convolution_test.cc
+@@ -0,0 +1,87 @@
++/* Copyright 2024 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
++
++#include <utility>
++
++#include "xla/hlo/utils/hlo_matchers.h"
++#include "xla/literal.h"
++#include "xla/service/cpu/onednn_matmul_rewriter.h"
++#include "xla/service/cpu/onednn_util.h"
++#include "xla/shape_util.h"
++#include "xla/test.h"
++#include "xla/test_helpers.h"
++#include "xla/tests/filecheck.h"
++#include "xla/tests/hlo_test_base.h"
++#include "xla/tests/test_macros.h"
++#include "tsl/platform/cpu_info.h"
++
++namespace xla {
++namespace cpu {
++
++class ConvolutionTest : public HloTestBase {
++ protected:
++  const char* conv_rewrite_str_ = R"(
++    ; CHECK:     custom_call_target="__onednn$convolution",
++    ; CHECK:       backend_config={
++    ; CHECK-DAG:     "outer_dimension_partitions":[],
++    ; CHECK-DAG:       "onednn_conv_config":{
++    ; CHECK-DAG:   }
++    ; CHECK:     }
++    )";
++};
++
++TEST_F(ConvolutionTest, Simple2DTestF32) {
++  const char* convolution_module_str = R"(
++  HloModule convolution.test.f32
++
++  ENTRY convolution.test.f32 {
++    arg.0 = f32[1,22,22,1] parameter(0), parameter_replication={false}
++    reshape.0 = f32[1,22,22,1] reshape(arg.0)
++    arg.1 = f32[8,8,1,1] parameter(1), parameter_replication={false}
++    reshape.1 = f32[8,8,1,1] reshape(arg.1)
++    convolution.0 = f32[1,11,11,1] convolution(reshape.0, reshape.1), window={size=8x8 stride=2x2 pad=3_3x3_3}, dim_labels=b01f_01io->b01f
++    reshape.2 = f32[1,11,11,1] reshape(convolution.0)
++    tuple.0 = (f32[1,11,11,1]) tuple(reshape.2)
++    ROOT get-tuple-element.0 = f32[1,11,11,1] get-tuple-element(tuple.0), index=0
++  })";
++
++  EXPECT_TRUE(RunAndCompare(convolution_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(convolution_module_str, conv_rewrite_str_);
++}
++
++TEST_F(ConvolutionTest, Simple3DTestBF16) {
++  if (!IsSupportedType(PrimitiveType::BF16)) {
++    GTEST_SKIP() << "CPU does not support BF16.";
++  }
++
++  const char* convolution_module_str = R"(
++  HloModule convolution.test.bf16
++
++  ENTRY convolution.test.bf16 {
++    p0 = bf16[8,4,5,5,1] parameter(0)
++    p1 = bf16[3,3,3,1,32] parameter(1)
++    ROOT conv = bf16[8,4,5,5,32] convolution(p0, p1), window={size=3x3x3 pad=1_1x1_1x1_1}, dim_labels=b012f_012io->b012f
++})";
++
++  EXPECT_TRUE(RunAndCompare(convolution_module_str, ErrorSpec{1e-4, 1e-4}));
++  MatchOptimizedHlo(convolution_module_str, conv_rewrite_str_);
++}
++
++}  // namespace cpu
++}  // namespace xla
++
++#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+diff --git a/third_party/xla/xla/tests/onednn_layer_norm_test.cc b/third_party/xla/xla/tests/onednn_layer_norm_test.cc
+index 5645822f9e1..9751e207b5e 100644
+--- a/third_party/xla/xla/tests/onednn_layer_norm_test.cc
++++ b/third_party/xla/xla/tests/onednn_layer_norm_test.cc
+@@ -29,7 +29,7 @@ class LayerNormTest : public HloTestBase {
+   ; CHECK:     custom_call_target="__onednn$layernorm",
+   ; CHECK:       backend_config={
+   ; CHECK-DAG:     "onednn_layer_norm_config":{
+-  ; CHECK-DAG:       "fused_ops":"SCALE_AND_SHIFT"
++  ; CHECK-DAG:       "rescale":"SCALE_AND_SHIFT"
+   ; CHECK-DAG:   }
+   ; CHECK:     }
+   )";
+diff --git a/third_party/xla/xla/tests/onednn_matmul_test.cc b/third_party/xla/xla/tests/onednn_matmul_test.cc
+index 463bac0313b..0c250c14276 100644
+--- a/third_party/xla/xla/tests/onednn_matmul_test.cc
++++ b/third_party/xla/xla/tests/onednn_matmul_test.cc
+@@ -41,7 +41,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -50,7 +52,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BINARY_ADD"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BINARY_ADD"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -59,7 +63,6 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":[]
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -68,7 +71,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","GELU_TANH"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","GELU_TANH"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -77,7 +82,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","GELU_ERF"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","GELU_ERF"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -86,7 +93,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","ELU"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","ELU"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -95,7 +104,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","TANH"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","TANH"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -104,7 +115,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","RELU6"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","RELU6"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )";
+@@ -113,8 +126,9 @@ class MatmulTest : public HloTestBase {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["BIAS","SIGMOID"]
+-    ; CHECK-DAG:   }
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["BIAS","SIGMOID"]
++    ; CHECK-DAG:     }
+     ; CHECK:     }
+     )";
+ };
+@@ -406,7 +420,9 @@ TEST_F(MatmulTest, ApproxGELUTestF32) {
+   ; CHECK:       backend_config={
+   ; CHECK-DAG:     "outer_dimension_partitions":[],
+   ; CHECK-DAG:     "onednn_matmul_config":{
+-  ; CHECK-DAG:       "fused_ops":["GELU_TANH"]
++  ; CHECK-DAG:       "fusions":{
++  ; CHECK-DAG:         "ops":["GELU_TANH"]
++  ; CHECK-DAG:     }
+   ; CHECK-DAG:   }
+   ; CHECK:     }
+   )");
+@@ -597,7 +613,9 @@ TEST_F(MatmulTest, ExactGELUTestF32) {
+   ; CHECK:       backend_config={
+   ; CHECK-DAG:     "outer_dimension_partitions":[],
+   ; CHECK-DAG:     "onednn_matmul_config":{
+-  ; CHECK-DAG:       "fused_ops":["GELU_ERF"]
++  ; CHECK-DAG:       "fusions":{
++  ; CHECK-DAG:         "ops":["GELU_ERF"]
++  ; CHECK-DAG:     }
+   ; CHECK-DAG:   }
+   ; CHECK:     }
+   )");
+@@ -810,7 +828,9 @@ TEST_F(MatmulTest, ReLUTestF32) {
+   ; CHECK:       backend_config={
+   ; CHECK-DAG:     "outer_dimension_partitions":[],
+   ; CHECK-DAG:     "onednn_matmul_config":{
+-  ; CHECK-DAG:       "fused_ops":["RELU"]
++  ; CHECK-DAG:       "fusions":{
++  ; CHECK-DAG:         "ops":["RELU"]
++  ; CHECK-DAG:     }
+   ; CHECK-DAG:   }
+   ; CHECK:     }
+   )");
+@@ -888,7 +908,9 @@ TEST_F(MatmulTest, DivisionByConstantWithEltwiseLinearF32) {
+   ; CHECK:       backend_config={
+   ; CHECK-DAG:     "outer_dimension_partitions":[],
+   ; CHECK-DAG:     "onednn_matmul_config":{
+-  ; CHECK-DAG:       "fused_ops":["LINEAR"]
++  ; CHECK-DAG:       "fusions":{
++  ; CHECK-DAG:         "ops":["LINEAR"]
++  ; CHECK-DAG:     }
+   ; CHECK-DAG:   }
+   ; CHECK:     }
+   )");
+@@ -1264,7 +1286,9 @@ TEST_F(MatmulTest, SimpleTestF32WithMulAndAddFusion) {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["LINEAR","BINARY_ADD"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["LINEAR","BINARY_ADD"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )");
+@@ -1437,7 +1461,9 @@ TEST_F(MatmulTest, SimpleTestBF16WithMulAndAddFusion) {
+     ; CHECK:       backend_config={
+     ; CHECK-DAG:     "outer_dimension_partitions":[],
+     ; CHECK-DAG:     "onednn_matmul_config":{
+-    ; CHECK-DAG:       "fused_ops":["LINEAR","BINARY_ADD"]
++    ; CHECK-DAG:       "fusions":{
++    ; CHECK-DAG:         "ops":["LINEAR","BINARY_ADD"]
++    ; CHECK-DAG:     }
+     ; CHECK-DAG:   }
+     ; CHECK:     }
+     )");

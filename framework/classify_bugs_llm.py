@@ -12,7 +12,7 @@ if not api_key:
 
 # Initialize OpenAI client pointing to Qwen's compatible API
 client = OpenAI(
-    api_key=api_key,
+    api_key="sk-ntvcxmzcntxtxulhfudigidspmbdasfqxvtbukereyljbghc",
     base_url="https://api.siliconflow.cn/v1",
 )
 
@@ -30,11 +30,11 @@ LABELS_STRING = ", ".join(DEFAULT_LABELS)
 
 # Input and output files
 INPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'parsed_data.jsonl'))
-OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug-_classification', 'classified_data_llm.jsonl'))
+OUTPUT_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bug_classification', 'classified_data_llm.jsonl'))
 
 # Concurrency settings
-MAX_WORKERS = 10  # Adjust according to API limits
-REQUEST_DELAY = 0.1
+MAX_WORKERS = 2  # Drastically reduced from 10 to avoid rate limits
+REQUEST_DELAY = 1.0  # Increased delay between requests
 
 # 2. System Prompt
 SYSTEM_PROMPT = f"""
@@ -62,31 +62,47 @@ def get_bug_classification(bug_text):
     """
     Call API to classify a single bug text.
     """
-    try:
-        completion = client.chat.completions.create(
-            model="Qwen/Qwen2.5-7B-Instruct",  
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": bug_text}
-            ],
-            temperature=0,
-        )
-        
-        # Extract the raw label returned by the model
-        raw_label = completion.choices[0].message.content.strip()
-        
-        # Validate if the returned label is in our list
-        if raw_label in DEFAULT_LABELS:
-            return raw_label
-        else:
-            for label in DEFAULT_LABELS:
-                if label in raw_label:
-                    return label
-            return "Other"
+    max_retries = 5  # Maximum number of retries
+    retry_delay = 5  # Initial retry delay in seconds
+
+    for attempt in range(max_retries):
+        try:
+            completion = client.chat.completions.create(
+                model="Qwen/Qwen2.5-7B-Instruct",  
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": bug_text}
+                ],
+                temperature=0,
+            )
             
-    except Exception as e:
-        print(f"[Error]: API call failed: {e}")
-        return "Error"
+            # Extract the raw label returned by the model
+            raw_label = completion.choices[0].message.content.strip()
+            
+            # Validate if the returned label is in our list
+            if raw_label in DEFAULT_LABELS:
+                return raw_label
+            else:
+                for label in DEFAULT_LABELS:
+                    if label in raw_label:
+                        return label
+                return "Other"
+                
+        except Exception as e:
+            if "429" in str(e) or "limit" in str(e).lower():
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                print(f"[Warning] Rate limited. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            elif attempt == max_retries - 1:
+                # If it's the last attempt and still failing
+                print(f"[Error]: API call failed after {max_retries} attempts: {e}")
+                return "Error"
+            else:
+                 # Other errors, maybe network glitch, retry a bit
+                 print(f"[Warning] API call failed: {e}. Retrying... (Attempt {attempt + 1}/{max_retries})")
+                 time.sleep(retry_delay)
+
+    return "Error"
 
 
 # 4. Main Processing Logic

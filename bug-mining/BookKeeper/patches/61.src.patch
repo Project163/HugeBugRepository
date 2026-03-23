@@ -1,0 +1,703 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index bd41a91b64..4226a1060e 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -20,6 +20,8 @@ Trunk (unreleased changes)
+       
+         BOOKKEEPER-140: Hub server doesn't subscribe remote region correctly when a region is down. (Sijie Gou via ivank)
+ 
++        BOOKKEEPER-133: Hub server should update subscription state to zookeeper when losing topic or shutting down (Sijie Gou via ivank)
++
+     IMPROVEMENTS:
+ 
+ Release 4.0.0 - 2011-11-30
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/delivery/DeliveryManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/delivery/DeliveryManager.java
+index f4db619133..7ac6d43ccd 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/delivery/DeliveryManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/delivery/DeliveryManager.java
+@@ -26,4 +26,9 @@ public interface DeliveryManager {
+                                          DeliveryEndPoint endPoint, MessageFilter filter, boolean isHubSubscriber);
+ 
+     public void stopServingSubscriber(ByteString topic, ByteString subscriberId);
++
++    /**
++     * Stop delivery manager
++     */
++    public void stop();
+ }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/netty/PubSubServer.java b/hedwig-server/src/main/java/org/apache/hedwig/server/netty/PubSubServer.java
+index 8c2d77f784..27e31043b5 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/netty/PubSubServer.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/netty/PubSubServer.java
+@@ -69,7 +69,6 @@ import org.apache.hedwig.server.persistence.ReadAheadCache;
+ import org.apache.hedwig.server.regions.HedwigHubClientFactory;
+ import org.apache.hedwig.server.regions.RegionManager;
+ import org.apache.hedwig.server.ssl.SslServerContextFactory;
+-import org.apache.hedwig.server.subscriptions.AbstractSubscriptionManager;
+ import org.apache.hedwig.server.subscriptions.InMemorySubscriptionManager;
+ import org.apache.hedwig.server.subscriptions.SubscriptionManager;
+ import org.apache.hedwig.server.subscriptions.ZkSubscriptionManager;
+@@ -218,39 +217,32 @@ public class PubSubServer {
+     public void shutdown() {
+         // TODO: tell bk to close logs
+ 
++        // Stop topic manager first since it is core of Hub server
++        tm.stop();
++
++        // Stop the RegionManager.
++        rm.stop();
++
++        // Stop the DeliveryManager and ReadAheadCache threads (if
++        // applicable).
++        dm.stop();
++
++        // Stop the SubscriptionManager if needed.
++        sm.stop();
++
+         // Shutdown the ZooKeeper and BookKeeper clients only if we are
+         // not in stand-alone mode.
+         try {
+-            if (zk != null)
+-                zk.close();
+             if (bk != null)
+                 bk.close();
++            if (zk != null)
++                zk.close();
+         } catch (InterruptedException e) {
+             logger.error("Error while closing ZooKeeper client!");
+         } catch (BKException bke) {
+             logger.error("Error while closing BookKeeper client");
+         }
+ 
+-        // Stop the RegionManager.
+-        rm.stop();
+-
+-        // Stop the DeliveryManager and ReadAheadCache threads (if
+-        // applicable).
+-        // TODO: It'd be cleaner and more general to modify the interfaces to
+-        // include a stop method. If the specific implementation starts threads,
+-        // then the stop method should take care of that clean up.
+-        if (pm instanceof ReadAheadCache) {
+-            ((ReadAheadCache) pm).stop();
+-        }
+-        if (dm instanceof FIFODeliveryManager) {
+-            ((FIFODeliveryManager) dm).stop();
+-        }
+-
+-        // Stop the SubscriptionManager if needed.
+-        if (sm instanceof AbstractSubscriptionManager) {
+-            ((AbstractSubscriptionManager) sm).stop();
+-        }
+-
+         // Close and release the Netty channels and resources
+         allChannels.close().awaitUninterruptibly();
+         serverChannelFactory.releaseExternalResources();
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
+index 78d1435079..714a631013 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/AbstractSubscriptionManager.java
+@@ -19,9 +19,11 @@ package org.apache.hedwig.server.subscriptions;
+ 
+ import java.util.ArrayList;
+ import java.util.Map;
++import java.util.Map.Entry;
+ import java.util.Timer;
+ import java.util.TimerTask;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+@@ -43,6 +45,7 @@ import org.apache.hedwig.server.topics.TopicManager;
+ import org.apache.hedwig.server.topics.TopicOwnershipChangeListener;
+ import org.apache.hedwig.util.Callback;
+ import org.apache.hedwig.util.CallbackUtils;
++import org.apache.hedwig.util.ConcurrencyUtils;
+ 
+ public abstract class AbstractSubscriptionManager implements SubscriptionManager, TopicOwnershipChangeListener {
+ 
+@@ -66,6 +69,18 @@ public abstract class AbstractSubscriptionManager implements SubscriptionManager
+     // for all subscribers to the topic.
+     private final ConcurrentHashMap<ByteString, Long> topic2MinConsumedMessagesMap = new ConcurrentHashMap<ByteString, Long>();
+ 
++    Callback<Void> noopCallback = new NoopCallback<Void>();
++
++    class NoopCallback<T> implements Callback<T> {
++        @Override
++        public void operationFailed(Object ctx, PubSubException exception) {
++            logger.warn("Exception found in AbstractSubscriptionManager : ", exception);
++        }
++
++        public void operationFinished(Object ctx, T resultOfOperation) {
++        };
++    }
++
+     public AbstractSubscriptionManager(ServerConfiguration cfg, TopicManager tm, PersistenceManager pm,
+                                        ScheduledExecutorService scheduler) {
+         this.cfg = cfg;
+@@ -212,17 +227,73 @@ public abstract class AbstractSubscriptionManager implements SubscriptionManager
+         queuer.pushAndMaybeRun(topic, new AcquireOp(topic, callback, ctx));
+     }
+ 
++    class ReleaseOp extends TopicOpQueuer.AsynchronousOp<Void> {
++
++        public ReleaseOp(final ByteString topic, final Callback<Void> cb, Object ctx) {
++            queuer.super(topic, cb, ctx);
++        }
++
++        @Override
++        public void run() {
++            Callback<Void> finalCb = new Callback<Void>() {
++                @Override
++                public void operationFinished(Object ctx, Void resultOfOperation) {
++                    finish();
++                }
++
++                @Override
++                public void operationFailed(Object ctx,
++                        PubSubException exception) {
++                    logger.warn("Error when releasing topic : " + topic.toStringUtf8(), exception);
++                    finish();
++                }
++
++                private void finish() {
++                    topic2LocalCounts.remove(topic);
++                    // Since we decrement local count when some of remote subscriptions failed,
++                    // while we don't unsubscribe those succeed subscriptions. so we can't depends
++                    // on local count, just try to notify unsubscribe.
++                    notifyUnsubcribe(topic);
++                    cb.operationFinished(ctx, null);
++                }
++            };
++            if (logger.isDebugEnabled()) {
++                logger.debug("Try to update subscription states when losing topic " + topic.toStringUtf8());
++            }
++            updateSubscriptionStates(topic, finalCb, ctx, true);
++        }
++    }
++
++    void updateSubscriptionStates(ByteString topic, Callback<Void> finalCb, Object ctx, boolean removeTopic) {
++        // Try to update subscription states of a specified topic
++        Map<ByteString, InMemorySubscriptionState> states;
++        if (removeTopic) {
++            states = top2sub2seq.remove(topic);
++        } else {
++            states = top2sub2seq.get(topic);
++        }
++        if (null == states) {
++            finalCb.operationFinished(ctx, null);
++        } else {
++            Callback<Void> mcb = CallbackUtils.multiCallback(states.size(), finalCb, ctx);
++            for (Entry<ByteString, InMemorySubscriptionState> entry : states.entrySet()) {
++                InMemorySubscriptionState memState = entry.getValue();
++                if (memState.setLastConsumeSeqIdImmediately()) {
++                    updateSubscriptionState(topic, entry.getKey(), memState.getSubscriptionState(),
++                                            mcb, ctx);
++                } else {
++                    mcb.operationFinished(ctx, null);
++                }
++            }
++        }
++    }
++
+     /**
+      * Remove the local mapping.
+      */
+     @Override
+     public void lostTopic(ByteString topic) {
+-        top2sub2seq.remove(topic);
+-        topic2LocalCounts.remove(topic);
+-        // Since we decrement local count when some of remote subscriptions failed,
+-        // while we don't unsubscribe those succeed subscriptions. so we can't depends
+-        // on local count, just try to notify unsubscribe.
+-        notifyUnsubcribe(topic);
++        queuer.pushAndMaybeRun(topic, new ReleaseOp(topic, noopCallback, null));
+     }
+ 
+     private void notifyUnsubcribe(ByteString topic) {
+@@ -464,6 +535,27 @@ public abstract class AbstractSubscriptionManager implements SubscriptionManager
+      */
+     public void stop() {
+         timer.cancel();
++        try {
++            final LinkedBlockingQueue<Boolean> queue = new LinkedBlockingQueue<Boolean>();
++            // update dirty subscriptions
++            for (ByteString topic : top2sub2seq.keySet()) {
++                Callback<Void> finalCb = new Callback<Void>() {
++                    @Override
++                    public void operationFinished(Object ctx, Void resultOfOperation) {
++                        ConcurrencyUtils.put(queue, true);
++                    }
++                    @Override
++                    public void operationFailed(Object ctx,
++                            PubSubException exception) {
++                        ConcurrencyUtils.put(queue, false);
++                    }
++                };
++                updateSubscriptionStates(topic, finalCb, null, false);
++                queue.take();
++            }
++        } catch (InterruptedException ie) {
++            logger.warn("Error during updating subscription states : ", ie);
++        }
+     }
+ 
+     protected abstract void createSubscriptionState(final ByteString topic, ByteString subscriberId,
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/InMemorySubscriptionState.java b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/InMemorySubscriptionState.java
+index 8ee92e384b..b04863de58 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/InMemorySubscriptionState.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/InMemorySubscriptionState.java
+@@ -51,12 +51,33 @@ public class InMemorySubscriptionState {
+      *         otherwise
+      */
+     public boolean setLastConsumeSeqId(MessageSeqId lastConsumeSeqId, int consumeInterval) {
+-        this.lastConsumeSeqId = lastConsumeSeqId;
++        long interval = lastConsumeSeqId.getLocalComponent() - subscriptionState.getMsgId().getLocalComponent();
++        if (interval <= 0) {
++            return false;
++        }
+ 
+-        if (lastConsumeSeqId.getLocalComponent() - subscriptionState.getMsgId().getLocalComponent() < consumeInterval) {
++        // set consume seq id when it is larger
++        this.lastConsumeSeqId = lastConsumeSeqId;
++        if (interval < consumeInterval) {
+             return false;
+         }
+ 
++        // subscription state will be updated, marked it as clean
++        subscriptionState = SubscriptionState.newBuilder(subscriptionState).setMsgId(lastConsumeSeqId).build();
++        return true;
++    }
++
++    /**
++     * Set lastConsumeSeqId Immediately
++     *
++     * @return true if the resulting structure needs to be persisted, false otherwise
++     */
++    public boolean setLastConsumeSeqIdImmediately() {
++        long interval = lastConsumeSeqId.getLocalComponent() - subscriptionState.getMsgId().getLocalComponent();
++        // no need to set
++        if (interval <= 0) {
++            return false;
++        }
+         subscriptionState = SubscriptionState.newBuilder(subscriptionState).setMsgId(lastConsumeSeqId).build();
+         return true;
+     }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/SubscriptionManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/SubscriptionManager.java
+index d40a029c53..33271a96f3 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/SubscriptionManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/subscriptions/SubscriptionManager.java
+@@ -101,4 +101,8 @@ public interface SubscriptionManager {
+      */
+     public void addListener(SubscriptionEventListener listener);
+ 
++    /**
++     * Stop Subscription Manager
++     */
++    public void stop();
+ }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/AbstractTopicManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/AbstractTopicManager.java
+index 0c3c4df42b..9353b7f2cd 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/AbstractTopicManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/AbstractTopicManager.java
+@@ -194,4 +194,8 @@ public abstract class AbstractTopicManager implements TopicManager {
+      */
+     protected abstract void postReleaseCleanup(ByteString topic, Callback<Void> cb, Object ctx);
+ 
++    @Override
++    public void stop() {
++        // do nothing now
++    }
+ }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TopicManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TopicManager.java
+index 6e4b2c9bbe..b4254488c6 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TopicManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TopicManager.java
+@@ -72,4 +72,9 @@ public interface TopicManager {
+      */
+     public void releaseTopic(ByteString topic, Callback<Void> cb, Object ctx);
+ 
++    /**
++     * Stop topic manager
++     */
++    public void stop();
++
+ }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TrivialOwnAllTopicManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TrivialOwnAllTopicManager.java
+index 1f6654f111..24fcb788ea 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TrivialOwnAllTopicManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/TrivialOwnAllTopicManager.java
+@@ -49,4 +49,9 @@ public class TrivialOwnAllTopicManager extends AbstractTopicManager {
+         // No cleanup to do
+         cb.operationFinished(ctx, null);
+     }
++
++    @Override
++    public void stop() {
++        // do nothing
++    }
+ }
+diff --git a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/ZkTopicManager.java b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/ZkTopicManager.java
+index b1bd9a448e..5fbcbc4b75 100644
+--- a/hedwig-server/src/main/java/org/apache/hedwig/server/topics/ZkTopicManager.java
++++ b/hedwig-server/src/main/java/org/apache/hedwig/server/topics/ZkTopicManager.java
+@@ -170,6 +170,10 @@ public class ZkTopicManager extends AbstractTopicManager implements TopicManager
+         }, null);
+     }
+ 
++    void unregisterWithZookeeper() throws InterruptedException, KeeperException {
++        zk.delete(ephemeralNodePath, -1);
++    }
++
+     String hubPath(ByteString topic) {
+         return cfg.getZkTopicPath(new StringBuilder(), topic).append("/hub").toString();
+     }
+@@ -426,4 +430,17 @@ public class ZkTopicManager extends AbstractTopicManager implements TopicManager
+         }, ctx);
+     }
+ 
++    @Override
++    public void stop() {
++        // we just unregister it with zookeeper to make it unavailable from hub servers list
++        try {
++            unregisterWithZookeeper();
++        } catch (InterruptedException e) {
++            logger.error("Error unregistering hub server :", e);
++        } catch (KeeperException e) {
++            logger.error("Error unregistering hub server :", e);
++        }
++        super.stop();
++    }
++
+ }
+diff --git a/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigHubTestBase.java b/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigHubTestBase.java
+index 8f77a1b8f2..6d91167bc9 100644
+--- a/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigHubTestBase.java
++++ b/hedwig-server/src/test/java/org/apache/hedwig/server/HedwigHubTestBase.java
+@@ -54,6 +54,14 @@ public abstract class HedwigHubTestBase extends TestCase {
+     protected int initialSSLServerPort = 9876;
+     protected List<PubSubServer> serversList;
+ 
++    public HedwigHubTestBase() {
++        this(1);
++    }
++
++    protected HedwigHubTestBase(int numServers) {
++        this.numServers = numServers;
++    }
++
+     // Default child class of the ServerConfiguration to be used here.
+     // Extending classes can define their own (possibly extending from this) and
+     // override the getServerConfiguration method below to return their own
+@@ -105,17 +113,28 @@ public abstract class HedwigHubTestBase extends TestCase {
+         return new HubServerConfiguration(serverPort, sslServerPort);
+     }
+ 
++    protected void startHubServers() throws Exception {
++        // Now create the PubSubServer Hubs
++        serversList = new LinkedList<PubSubServer>();
++        for (int i = 0; i < numServers; i++) {
++            serversList.add(new PubSubServer(getServerConfiguration(initialServerPort + i, initialSSLServerPort + i)));
++        }
++    }
++    protected void stopHubServers() throws Exception {
++        // Shutdown all of the PubSubServers
++        for (PubSubServer server : serversList) {
++            server.shutdown();
++        }
++        serversList.clear();
++    }
++
+     @Override
+     @Before
+     public void setUp() throws Exception {
+         logger.info("STARTING " + getName());
+         bktb = new BookKeeperTestBase(numBookies);
+         bktb.setUp();
+-        // Now create the PubSubServer Hubs
+-        serversList = new LinkedList<PubSubServer>();
+-        for (int i = 0; i < numServers; i++) {
+-            serversList.add(new PubSubServer(getServerConfiguration(initialServerPort + i, initialSSLServerPort + i)));
+-        }
++        startHubServers();
+         logger.info("HedwigHub test setup finished");
+     }
+ 
+@@ -123,10 +142,7 @@ public abstract class HedwigHubTestBase extends TestCase {
+     @After
+     public void tearDown() throws Exception {
+         logger.info("tearDown starting");
+-        // Shutdown all of the PubSubServers
+-        for (PubSubServer server : serversList) {
+-            server.shutdown();
+-        }
++        stopHubServers();
+         bktb.tearDown();
+         logger.info("FINISHED " + getName());
+     }
+diff --git a/hedwig-server/src/test/java/org/apache/hedwig/server/delivery/StubDeliveryManager.java b/hedwig-server/src/test/java/org/apache/hedwig/server/delivery/StubDeliveryManager.java
+index 3782e820f2..fdc308d616 100644
+--- a/hedwig-server/src/test/java/org/apache/hedwig/server/delivery/StubDeliveryManager.java
++++ b/hedwig-server/src/test/java/org/apache/hedwig/server/delivery/StubDeliveryManager.java
+@@ -62,4 +62,9 @@ public class StubDeliveryManager implements DeliveryManager {
+     public void stopServingSubscriber(ByteString topic, ByteString subscriberId) {
+         lastRequest.add(new TopicSubscriber(topic, subscriberId));
+     }
++
++    @Override
++    public void stop() {
++        // do nothing now
++    }
+ }
+diff --git a/hedwig-server/src/test/java/org/apache/hedwig/server/subscriptions/TestUpdateSubscriptionState.java b/hedwig-server/src/test/java/org/apache/hedwig/server/subscriptions/TestUpdateSubscriptionState.java
+new file mode 100644
+index 0000000000..d21eef3e45
+--- /dev/null
++++ b/hedwig-server/src/test/java/org/apache/hedwig/server/subscriptions/TestUpdateSubscriptionState.java
+@@ -0,0 +1,246 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hedwig.server.subscriptions;
++
++import java.util.concurrent.SynchronousQueue;
++
++import org.apache.hedwig.client.HedwigClient;
++import org.apache.hedwig.client.api.MessageHandler;
++import org.apache.hedwig.client.api.Publisher;
++import org.apache.hedwig.client.api.Subscriber;
++import org.apache.hedwig.client.conf.ClientConfiguration;
++import org.apache.hedwig.protocol.PubSubProtocol.Message;
++import org.apache.hedwig.protocol.PubSubProtocol.SubscribeRequest.CreateOrAttach;
++import org.apache.hedwig.server.HedwigHubTestBase;
++import org.apache.hedwig.server.common.ServerConfiguration;
++import org.apache.hedwig.util.Callback;
++import org.apache.hedwig.util.ConcurrencyUtils;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import com.google.protobuf.ByteString;
++
++public class TestUpdateSubscriptionState extends HedwigHubTestBase {
++
++    private static final int RETENTION_SECS_VALUE = 100;
++
++    // Client side variables
++    protected HedwigClient client;
++    protected Publisher publisher;
++    protected Subscriber subscriber;
++
++    // SynchronousQueues to verify async calls
++    private final SynchronousQueue<Boolean> queue = new SynchronousQueue<Boolean>();
++
++    // Test implementation of subscriber's message handler
++    class OrderCheckingMessageHandler implements MessageHandler {
++
++        ByteString topic;
++        ByteString subscriberId;
++        int startMsgId;
++        int numMsgs;
++        int endMsgId;
++        boolean inOrder = true;
++
++        OrderCheckingMessageHandler(ByteString topic, ByteString subscriberId,
++                                    int startMsgId, int numMsgs) {
++            this.topic = topic;
++            this.subscriberId = subscriberId;
++            this.startMsgId = startMsgId;
++            this.numMsgs = numMsgs;
++            this.endMsgId = startMsgId + numMsgs - 1;
++        }
++
++        @Override
++        public void deliver(ByteString thisTopic, ByteString thisSubscriberId,
++                            Message msg, Callback<Void> callback, Object context) {
++            if (!topic.equals(thisTopic) ||
++                !subscriberId.equals(thisSubscriberId)) {
++                return;
++            }
++            // check order
++            int msgId = Integer.parseInt(msg.getBody().toStringUtf8());
++            if (logger.isDebugEnabled()) {
++                logger.debug("Received message : " + msgId);
++            }
++
++            if (inOrder) {
++                if (startMsgId != msgId) {
++                    logger.error("Expected message " + startMsgId + ", but received message " + msgId);
++                    inOrder = false;
++                } else {
++                    ++startMsgId;
++                }
++            }
++            callback.operationFinished(context, null);
++            if (msgId == endMsgId) {
++                new Thread(new Runnable() {
++                    @Override
++                    public void run() {
++                        if (logger.isDebugEnabled()) {
++                            logger.debug("Deliver finished!");
++                        }
++                        ConcurrencyUtils.put(queue, true);
++                    }
++                }).start();
++            }
++        }
++
++        public boolean isInOrder() {
++            return inOrder;
++        }
++    }
++
++    public TestUpdateSubscriptionState() {
++        super(1);
++    }
++
++    protected class NewHubServerConfiguration extends HubServerConfiguration {
++
++        public NewHubServerConfiguration(int serverPort, int sslServerPort) {
++            super(serverPort, sslServerPort);
++        }
++
++        @Override
++        public int getRetentionSecs() {
++            return RETENTION_SECS_VALUE;
++        }
++
++    }
++
++    @Override
++    protected ServerConfiguration getServerConfiguration(int serverPort, int sslServerPort) {
++        return new NewHubServerConfiguration(serverPort, sslServerPort);
++    }
++
++    protected class TestClientConfiguration extends ClientConfiguration {
++        @Override
++        public boolean isAutoSendConsumeMessageEnabled() {
++            return true;
++        }
++    }
++
++    @Override
++    @Before
++    public void setUp() throws Exception {
++        super.setUp();
++        client = new HedwigClient(new TestClientConfiguration());
++        publisher = client.getPublisher();
++        subscriber = client.getSubscriber();
++    }
++
++    @Override
++    @After
++    public void tearDown() throws Exception {
++        client.close();
++        super.tearDown();
++    }
++
++    @Test
++    public void testConsumeWhenTopicRelease() throws Exception {
++        ByteString topic = ByteString.copyFromUtf8("TestConsumeWhenTopicRelease");
++        ByteString subId = ByteString.copyFromUtf8("mysub");
++
++        int startMsgId = 0;
++        int numMsgs = 10;
++        // subscriber in client
++        subscriber.subscribe(topic, subId, CreateOrAttach.CREATE_OR_ATTACH);
++        // start delivery
++        OrderCheckingMessageHandler ocm = new OrderCheckingMessageHandler(
++                topic, subId, startMsgId, numMsgs);
++        subscriber.startDelivery(topic, subId, ocm);
++        for (int i=0; i<numMsgs; i++) {
++            Message msg = Message.newBuilder().setBody(
++                    ByteString.copyFromUtf8(Integer.toString(startMsgId + i))).build();
++            publisher.publish(topic, msg);
++        }
++        logger.info("Publish finished.");
++        queue.take();
++        logger.info("Deliver finished.");
++        // check messages received in order
++        assertTrue(ocm.isInOrder());
++
++        // wait for retention secs
++        Thread.sleep((RETENTION_SECS_VALUE + 2) * 1000);
++
++        subscriber.stopDelivery(topic, subId);
++        subscriber.closeSubscription(topic, subId);
++
++        startMsgId = 20;
++        // reconnect it again
++        subscriber.subscribe(topic, subId, CreateOrAttach.CREATE_OR_ATTACH);
++        ocm = new OrderCheckingMessageHandler(topic, subId, startMsgId, numMsgs);
++        subscriber.startDelivery(topic, subId, ocm);
++        for (int i=0; i<numMsgs; i++) {
++            Message msg = Message.newBuilder().setBody(
++                    ByteString.copyFromUtf8(Integer.toString(startMsgId + i))).build();
++            publisher.publish(topic, msg);
++        }
++        queue.take();
++        // check messages received in order
++        assertTrue(ocm.isInOrder());
++    }
++
++    @Test
++    public void testConsumeWhenHubShutdown() throws Exception {
++        ByteString topic = ByteString.copyFromUtf8("TestConsumeWhenHubShutdown");
++        ByteString subId = ByteString.copyFromUtf8("mysub");
++
++        int startMsgId = 0;
++        int numMsgs = 10;
++        // subscriber in client
++        subscriber.subscribe(topic, subId, CreateOrAttach.CREATE_OR_ATTACH);
++        // start delivery
++        OrderCheckingMessageHandler ocm = new OrderCheckingMessageHandler(
++                topic, subId, startMsgId, numMsgs);
++        subscriber.startDelivery(topic, subId, ocm);
++        for (int i=0; i<numMsgs; i++) {
++            Message msg = Message.newBuilder().setBody(
++                    ByteString.copyFromUtf8(Integer.toString(startMsgId + i))).build();
++            publisher.publish(topic, msg);
++        }
++        logger.info("Publish finished.");
++        queue.take();
++        logger.info("Deliver finished.");
++        // check messages received in order
++        assertTrue(ocm.isInOrder());
++        // make sure consume request sent to hub server before shut down
++        Thread.sleep(2000);
++        subscriber.stopDelivery(topic, subId);
++        subscriber.closeSubscription(topic, subId);
++
++        stopHubServers();
++        Thread.sleep(1000);
++        startHubServers();
++
++        startMsgId = 20;
++        // reconnect it again
++        subscriber.subscribe(topic, subId, CreateOrAttach.CREATE_OR_ATTACH);
++        ocm = new OrderCheckingMessageHandler(topic, subId, startMsgId, numMsgs);
++        subscriber.startDelivery(topic, subId, ocm);
++        for (int i=0; i<numMsgs; i++) {
++            Message msg = Message.newBuilder().setBody(
++                    ByteString.copyFromUtf8(Integer.toString(startMsgId + i))).build();
++            publisher.publish(topic, msg);
++        }
++        queue.take();
++        // check messages received in order
++        assertTrue(ocm.isInOrder());
++    }
++}

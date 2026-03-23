@@ -1,0 +1,199 @@
+diff --git a/server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java b/server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java
+index 5d41a79c5ab..ee420c93615 100644
+--- a/server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java
++++ b/server/src/internalClusterTest/java/org/elasticsearch/snapshots/ConcurrentSnapshotsIT.java
+@@ -1611,6 +1611,52 @@ public class ConcurrentSnapshotsIT extends AbstractSnapshotIntegTestCase {
+         );
+     }
+ 
++    public void testQueuedAfterFailedShardSnapshot() throws Exception {
++        internalCluster().startMasterOnlyNode();
++        final String dataNode = internalCluster().startDataOnlyNode();
++
++        final String repository = "test-repo";
++        createRepository(repository, "mock");
++
++        final String indexName = "test-idx";
++        createIndexWithContent(indexName);
++        final String fullSnapshot = "full-snapshot";
++        createFullSnapshot(repository, fullSnapshot);
++
++        indexDoc(indexName, "some_id", "foo", "bar");
++        blockAndFailDataNode(repository, dataNode);
++        final ActionFuture<CreateSnapshotResponse> snapshotFutureFailure = startFullSnapshot(repository, "failing-snapshot");
++        awaitNumberOfSnapshotsInProgress(1);
++        waitForBlock(dataNode, repository);
++        final ActionFuture<CreateSnapshotResponse> snapshotFutureSuccess = startFullSnapshot(repository, "successful-snapshot");
++        awaitNumberOfSnapshotsInProgress(2);
++        unblockNode(repository, dataNode);
++
++        assertSuccessful(snapshotFutureSuccess);
++        final SnapshotInfo failedSnapshot = snapshotFutureFailure.get().getSnapshotInfo();
++        assertEquals(SnapshotState.PARTIAL, failedSnapshot.state());
++
++        final SnapshotsStatusResponse snapshotsStatusResponse1 = clusterAdmin().prepareSnapshotStatus(repository)
++            .setSnapshots(fullSnapshot)
++            .get();
++
++        final String tmpSnapshot = "snapshot-tmp";
++        createFullSnapshot(repository, tmpSnapshot);
++        assertAcked(startDeleteSnapshot(repository, tmpSnapshot).get());
++
++        final SnapshotsStatusResponse snapshotsStatusResponse2 = clusterAdmin().prepareSnapshotStatus(repository)
++            .setSnapshots(fullSnapshot)
++            .get();
++        assertEquals(snapshotsStatusResponse1, snapshotsStatusResponse2);
++
++        assertAcked(startDeleteSnapshot(repository, "successful-snapshot").get());
++
++        final SnapshotsStatusResponse snapshotsStatusResponse3 = clusterAdmin().prepareSnapshotStatus(repository)
++            .setSnapshots(fullSnapshot)
++            .get();
++        assertEquals(snapshotsStatusResponse1, snapshotsStatusResponse3);
++    }
++
+     private static void assertSnapshotStatusCountOnRepo(String otherBlockedRepoName, int count) {
+         final SnapshotsStatusResponse snapshotsStatusResponse = client().admin()
+             .cluster()
+diff --git a/server/src/main/java/org/elasticsearch/snapshots/SnapshotShardsService.java b/server/src/main/java/org/elasticsearch/snapshots/SnapshotShardsService.java
+index e87a3520f5e..afb31af125d 100644
+--- a/server/src/main/java/org/elasticsearch/snapshots/SnapshotShardsService.java
++++ b/server/src/main/java/org/elasticsearch/snapshots/SnapshotShardsService.java
+@@ -230,7 +230,7 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
+                         // due to CS batching we might have missed the INIT state and straight went into ABORTED
+                         // notify master that abort has completed by moving to FAILED
+                         if (shard.value.state() == ShardState.ABORTED && localNodeId.equals(shard.value.nodeId())) {
+-                            notifyFailedSnapshotShard(snapshot, shard.key, shard.value.reason());
++                            notifyFailedSnapshotShard(snapshot, shard.key, shard.value.reason(), shard.value.generation());
+                         }
+                     } else {
+                         snapshotStatus.abortIfNotCompleted("snapshot has been aborted");
+@@ -284,7 +284,7 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
+                             logger.warn(() -> new ParameterizedMessage("[{}][{}] failed to snapshot shard", shardId, snapshot), e);
+                         }
+                         snapshotStatus.moveToFailed(threadPool.absoluteTimeInMillis(), failure);
+-                        notifyFailedSnapshotShard(snapshot, shardId, failure);
++                        notifyFailedSnapshotShard(snapshot, shardId, failure, snapshotStatus.generation());
+                     }
+                 });
+             }
+@@ -441,7 +441,12 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
+                                     snapshot.snapshot(),
+                                     shardId
+                                 );
+-                                notifyFailedSnapshotShard(snapshot.snapshot(), shardId, indexShardSnapshotStatus.getFailure());
++                                notifyFailedSnapshotShard(
++                                    snapshot.snapshot(),
++                                    shardId,
++                                    indexShardSnapshotStatus.getFailure(),
++                                    localShard.getValue().generation()
++                                );
+                             }
+                         }
+                     }
+@@ -458,11 +463,11 @@ public class SnapshotShardsService extends AbstractLifecycleComponent implements
+     }
+ 
+     /** Notify the master node that the given shard failed to be snapshotted **/
+-    private void notifyFailedSnapshotShard(final Snapshot snapshot, final ShardId shardId, final String failure) {
++    private void notifyFailedSnapshotShard(final Snapshot snapshot, final ShardId shardId, final String failure, final String generation) {
+         sendSnapshotShardUpdate(
+             snapshot,
+             shardId,
+-            new ShardSnapshotStatus(clusterService.localNode().getId(), ShardState.FAILED, failure, null)
++            new ShardSnapshotStatus(clusterService.localNode().getId(), ShardState.FAILED, failure, generation)
+         );
+     }
+ 
+diff --git a/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java b/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
+index c22cc68c504..6b9f0201cb6 100644
+--- a/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
++++ b/server/src/main/java/org/elasticsearch/snapshots/SnapshotsService.java
+@@ -741,7 +741,12 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
+                         new ShardSnapshotUpdate(
+                             target,
+                             repoShardId,
+-                            new ShardSnapshotStatus(localNodeId, ShardState.FAILED, "failed to clone shard snapshot", null)
++                            new ShardSnapshotStatus(
++                                localNodeId,
++                                ShardState.FAILED,
++                                "failed to clone shard snapshot",
++                                shardStatusBefore.generation()
++                            )
+                         ),
+                         ActionListener.runBefore(
+                             ActionListener.wrap(
+diff --git a/test/framework/src/main/java/org/elasticsearch/snapshots/AbstractSnapshotIntegTestCase.java b/test/framework/src/main/java/org/elasticsearch/snapshots/AbstractSnapshotIntegTestCase.java
+index 2380f59bd3e..c3c20515f5f 100644
+--- a/test/framework/src/main/java/org/elasticsearch/snapshots/AbstractSnapshotIntegTestCase.java
++++ b/test/framework/src/main/java/org/elasticsearch/snapshots/AbstractSnapshotIntegTestCase.java
+@@ -256,6 +256,10 @@ public abstract class AbstractSnapshotIntegTestCase extends ESIntegTestCase {
+         AbstractSnapshotIntegTestCase.<MockRepository>getRepositoryOnNode(repository, nodeName).blockOnDataFiles();
+     }
+ 
++    public static void blockAndFailDataNode(String repository, String nodeName) {
++        AbstractSnapshotIntegTestCase.<MockRepository>getRepositoryOnNode(repository, nodeName).blockAndFailOnDataFiles();
++    }
++
+     public static void blockAllDataNodes(String repository) {
+         for (RepositoriesService repositoriesService : internalCluster().getDataNodeInstances(RepositoriesService.class)) {
+             ((MockRepository) repositoriesService.repository(repository)).blockOnDataFiles();
+diff --git a/test/framework/src/main/java/org/elasticsearch/snapshots/mockstore/MockRepository.java b/test/framework/src/main/java/org/elasticsearch/snapshots/mockstore/MockRepository.java
+index a385e896c11..7feca41e6e4 100644
+--- a/test/framework/src/main/java/org/elasticsearch/snapshots/mockstore/MockRepository.java
++++ b/test/framework/src/main/java/org/elasticsearch/snapshots/mockstore/MockRepository.java
+@@ -114,6 +114,8 @@ public class MockRepository extends FsRepository {
+ 
+     private volatile boolean blockOnDataFiles;
+ 
++    private volatile boolean blockAndFailOnDataFiles;
++
+     private volatile boolean blockOnDeleteIndexN;
+ 
+     /**
+@@ -214,6 +216,7 @@ public class MockRepository extends FsRepository {
+         blocked = false;
+         // Clean blocking flags, so we wouldn't try to block again
+         blockOnDataFiles = false;
++        blockAndFailOnDataFiles = false;
+         blockOnAnyFiles = false;
+         blockAndFailOnWriteIndexFile = false;
+         blockOnWriteIndexFile = false;
+@@ -229,9 +232,15 @@ public class MockRepository extends FsRepository {
+     }
+ 
+     public void blockOnDataFiles() {
++        assert blockAndFailOnDataFiles == false : "Either fail or wait after data file, not both";
+         blockOnDataFiles = true;
+     }
+ 
++    public void blockAndFailOnDataFiles() {
++        assert blockOnDataFiles == false : "Either fail or wait after data file, not both";
++        blockAndFailOnDataFiles = true;
++    }
++
+     public void setBlockOnAnyFiles() {
+         blockOnAnyFiles = true;
+     }
+@@ -300,9 +309,9 @@ public class MockRepository extends FsRepository {
+         logger.debug("[{}] Blocking execution", metadata.name());
+         boolean wasBlocked = false;
+         try {
+-            while (blockOnDataFiles || blockOnAnyFiles || blockAndFailOnWriteIndexFile || blockOnWriteIndexFile ||
+-                blockAndFailOnWriteSnapFile || blockOnDeleteIndexN || blockOnWriteShardLevelMeta || blockOnReadIndexMeta ||
+-                blockAndFailOnReadSnapFile || blockAndFailOnReadIndexFile || blockedIndexId != null) {
++            while (blockAndFailOnDataFiles || blockOnDataFiles || blockOnAnyFiles || blockAndFailOnWriteIndexFile || blockOnWriteIndexFile
++                    || blockAndFailOnWriteSnapFile || blockOnDeleteIndexN || blockOnWriteShardLevelMeta || blockOnReadIndexMeta
++                    || blockAndFailOnReadSnapFile || blockAndFailOnReadIndexFile || blockedIndexId != null) {
+                 blocked = true;
+                 this.wait();
+                 wasBlocked = true;
+@@ -382,6 +391,8 @@ public class MockRepository extends FsRepository {
+                         }
+                     } else if (blockOnDataFiles) {
+                         blockExecutionAndMaybeWait(blobName);
++                    } else if (blockAndFailOnDataFiles) {
++                        blockExecutionAndFail(blobName);
+                     }
+                 } else {
+                     if (shouldFail(blobName, randomControlIOExceptionRate) && (incrementAndGetFailureCount() < maximumNumberOfFailures)) {

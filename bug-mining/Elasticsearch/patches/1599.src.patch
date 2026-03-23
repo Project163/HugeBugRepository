@@ -1,0 +1,383 @@
+diff --git a/elasticsearch/x-pack/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapper.java b/elasticsearch/x-pack/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapper.java
+index f3619ebf343..698e97c3055 100644
+--- a/elasticsearch/x-pack/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapper.java
++++ b/elasticsearch/x-pack/security/src/main/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapper.java
+@@ -24,6 +24,13 @@ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.SparseFixedBitSet;
+ import org.elasticsearch.ElasticsearchParseException;
+ import org.elasticsearch.ExceptionsHelper;
++import org.elasticsearch.action.Action;
++import org.elasticsearch.action.ActionListener;
++import org.elasticsearch.action.ActionRequest;
++import org.elasticsearch.action.ActionRequestBuilder;
++import org.elasticsearch.action.ActionResponse;
++import org.elasticsearch.client.Client;
++import org.elasticsearch.client.FilterClient;
+ import org.elasticsearch.common.ParseFieldMatcher;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.logging.ESLogger;
+@@ -39,9 +46,18 @@ import org.elasticsearch.index.mapper.DocumentMapper;
+ import org.elasticsearch.index.mapper.FieldNamesFieldMapper;
+ import org.elasticsearch.index.mapper.MapperService;
+ import org.elasticsearch.index.mapper.ParentFieldMapper;
++import org.elasticsearch.index.query.BoolQueryBuilder;
++import org.elasticsearch.index.query.BoostingQueryBuilder;
++import org.elasticsearch.index.query.ConstantScoreQueryBuilder;
++import org.elasticsearch.index.query.GeoShapeQueryBuilder;
++import org.elasticsearch.index.query.HasChildQueryBuilder;
++import org.elasticsearch.index.query.HasParentQueryBuilder;
+ import org.elasticsearch.index.query.ParsedQuery;
+ import org.elasticsearch.index.query.QueryBuilder;
++import org.elasticsearch.index.query.QueryRewriteContext;
+ import org.elasticsearch.index.query.QueryShardContext;
++import org.elasticsearch.index.query.TermsQueryBuilder;
++import org.elasticsearch.index.query.functionscore.FunctionScoreQueryBuilder;
+ import org.elasticsearch.index.shard.IndexSearcherWrapper;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.index.shard.ShardUtils;
+@@ -57,6 +73,7 @@ import org.elasticsearch.xpack.security.support.Exceptions;
+ import org.elasticsearch.xpack.security.user.User;
+ 
+ import java.io.IOException;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -141,6 +158,8 @@ public class SecurityIndexSearcherWrapper extends IndexSearcherWrapper {
+                     try (XContentParser parser = XContentFactory.xContent(bytesReference).createParser(bytesReference)) {
+                         Optional<QueryBuilder> queryBuilder = queryShardContext.newParseContext(parser).parseInnerQueryBuilder();
+                         if (queryBuilder.isPresent()) {
++                            verifyRoleQuery(queryBuilder.get());
++                            failIfQueryUsesClient(queryBuilder.get(), queryShardContext);
+                             ParsedQuery parsedQuery = queryShardContext.toQuery(queryBuilder.get());
+                             filter.add(parsedQuery.query(), SHOULD);
+                         }
+@@ -327,4 +346,68 @@ public class SecurityIndexSearcherWrapper extends IndexSearcherWrapper {
+         Authentication authentication = Authentication.getAuthentication(threadContext);
+         return authentication.getUser();
+     }
++
++    /**
++     * Checks whether the role query contains queries we know can't be used as DLS role query.
++     */
++    static void verifyRoleQuery(QueryBuilder queryBuilder) throws IOException {
++        if (queryBuilder instanceof TermsQueryBuilder) {
++            TermsQueryBuilder termsQueryBuilder = (TermsQueryBuilder) queryBuilder;
++            if (termsQueryBuilder.termsLookup() != null) {
++                throw new IllegalArgumentException("terms query with terms lookup isn't supported as part of a role query");
++            }
++        } else if (queryBuilder instanceof GeoShapeQueryBuilder) {
++            GeoShapeQueryBuilder geoShapeQueryBuilder = (GeoShapeQueryBuilder) queryBuilder;
++            if (geoShapeQueryBuilder.shape() == null) {
++                throw new IllegalArgumentException("geoshape query referring to indexed shapes isn't support as part of a role query");
++            }
++        } else if (queryBuilder.getName().equals("percolate")) {
++            // actually only if percolate query is referring to an existing document then this is problematic,
++            // a normal percolate query does work. However we can't check that here as this query builder is inside
++            // another module. So we don't allow the entire percolate query. I don't think users would ever use
++            // a percolate query as role query, so this restriction shouldn't prohibit anyone from using dls.
++            throw new IllegalArgumentException("percolate query isn't support as part of a role query");
++        } else if (queryBuilder instanceof HasChildQueryBuilder) {
++            throw new IllegalArgumentException("has_child query isn't support as part of a role query");
++        } else if (queryBuilder instanceof HasParentQueryBuilder) {
++            throw new IllegalArgumentException("has_parent query isn't support as part of a role query");
++        } else if (queryBuilder instanceof BoolQueryBuilder) {
++            BoolQueryBuilder boolQueryBuilder = (BoolQueryBuilder) queryBuilder;
++            List<QueryBuilder> clauses = new ArrayList<>();
++            clauses.addAll(boolQueryBuilder.filter());
++            clauses.addAll(boolQueryBuilder.must());
++            clauses.addAll(boolQueryBuilder.mustNot());
++            clauses.addAll(boolQueryBuilder.should());
++            for (QueryBuilder clause : clauses) {
++                verifyRoleQuery(clause);
++            }
++        } else if (queryBuilder instanceof ConstantScoreQueryBuilder) {
++            verifyRoleQuery(((ConstantScoreQueryBuilder) queryBuilder).innerQuery());
++        } else if (queryBuilder instanceof FunctionScoreQueryBuilder) {
++            verifyRoleQuery(((FunctionScoreQueryBuilder) queryBuilder).query());
++        } else if (queryBuilder instanceof BoostingQueryBuilder) {
++            verifyRoleQuery(((BoostingQueryBuilder) queryBuilder).negativeQuery());
++            verifyRoleQuery(((BoostingQueryBuilder) queryBuilder).positiveQuery());
++        }
++    }
++
++    /**
++     * Fall back validation that verifies that queries during rewrite don't use the client to make
++     * remote calls. In the case of DLS this can cause a dead lock if DLS is also applied on these remote calls.
++     * For example in the case of terms query with lookup, this can cause recursive execution of the
++     * DLS query until the get thread pool has been exhausted: https://github.com/elastic/x-plugins/issues/3145
++     */
++    static void failIfQueryUsesClient(QueryBuilder queryBuilder, QueryRewriteContext original) throws IOException {
++        Client client = new FilterClient(original.getClient()) {
++            @Override
++            protected <Request extends ActionRequest<Request>, Response extends ActionResponse,
++                    RequestBuilder extends ActionRequestBuilder<Request, Response, RequestBuilder>>
++            void doExecute(Action<Request, Response, RequestBuilder> action, Request request, ActionListener<Response> listener) {
++                throw new IllegalStateException("role queries are not allowed to execute additional requests");
++            }
++        };
++        QueryRewriteContext copy = new QueryRewriteContext(original.getIndexSettings(), original.getMapperService(),
++                original.getScriptService(), null, client, original.getIndexReader(), original.getClusterState());
++        queryBuilder.rewrite(copy);
++    }
+ }
+diff --git a/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperIntegrationTests.java b/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperIntegrationTests.java
+index 92ea5be470a..aaa8ca57e74 100644
+--- a/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperIntegrationTests.java
++++ b/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperIntegrationTests.java
+@@ -20,11 +20,13 @@ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.TotalHitCountCollector;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.Accountable;
++import org.elasticsearch.client.Client;
+ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.lucene.index.ElasticsearchDirectoryReader;
+ import org.elasticsearch.common.settings.Settings;
+ import org.elasticsearch.common.util.concurrent.ThreadContext;
+ import org.elasticsearch.common.xcontent.XContentParser;
++import org.elasticsearch.common.xcontent.json.JsonXContentParser;
+ import org.elasticsearch.index.IndexSettings;
+ import org.elasticsearch.index.cache.bitset.BitsetFilterCache;
+ import org.elasticsearch.index.mapper.MapperService;
+@@ -33,11 +35,14 @@ import org.elasticsearch.index.query.QueryBuilder;
+ import org.elasticsearch.index.query.QueryParseContext;
+ import org.elasticsearch.index.query.QueryShardContext;
+ import org.elasticsearch.index.query.TermQueryBuilder;
++import org.elasticsearch.index.query.TermsQueryBuilder;
+ import org.elasticsearch.index.shard.ShardId;
++import org.elasticsearch.indices.query.IndicesQueriesRegistry;
+ import org.elasticsearch.license.XPackLicenseState;
+ import org.elasticsearch.script.ScriptService;
+ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.test.IndexSettingsModule;
++import org.mockito.internal.matchers.Any;
+ 
+ import java.util.Collections;
+ import java.util.Optional;
+@@ -49,6 +54,7 @@ import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.anyBoolean;
+ import static org.mockito.Matchers.anyString;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.when;
+ 
+ public class SecurityIndexSearcherWrapperIntegrationTests extends ESTestCase {
+@@ -65,7 +71,12 @@ public class SecurityIndexSearcherWrapperIntegrationTests extends ESTestCase {
+         IndicesAccessControl.IndexAccessControl indexAccessControl = new IndicesAccessControl.IndexAccessControl(true, null,
+                 singleton(new BytesArray("{\"match_all\" : {}}")));
+         IndexSettings indexSettings = IndexSettingsModule.newIndexSettings(shardId.getIndex(), Settings.EMPTY);
+-        QueryShardContext queryShardContext = mock(QueryShardContext.class);
++        IndicesQueriesRegistry indicesQueriesRegistry = mock(IndicesQueriesRegistry.class);
++        Client client = mock(Client.class);
++        when(client.settings()).thenReturn(Settings.EMPTY);
++        QueryShardContext realQueryShardContext = new QueryShardContext(indexSettings, null, null, mapperService, null,
++                null, indicesQueriesRegistry, client, null, null);
++        QueryShardContext queryShardContext = spy(realQueryShardContext);
+         QueryParseContext queryParseContext = mock(QueryParseContext.class);
+         IndexSettings settings = IndexSettingsModule.newIndexSettings("_index", Settings.EMPTY);
+         BitsetFilterCache bitsetFilterCache = new BitsetFilterCache(settings, new BitsetFilterCache.Listener() {
+@@ -140,10 +151,10 @@ public class SecurityIndexSearcherWrapperIntegrationTests extends ESTestCase {
+         DirectoryReader directoryReader = ElasticsearchDirectoryReader.wrap(DirectoryReader.open(directory), shardId);
+         for (int i = 0; i < numValues; i++) {
+             ParsedQuery parsedQuery = new ParsedQuery(new TermQuery(new Term("field", values[i])));
+-            when(queryShardContext.newParseContext(any(XContentParser.class))).thenReturn(queryParseContext);
++            when(queryShardContext.newParseContext(anyParser())).thenReturn(queryParseContext);
+             when(queryParseContext.parseInnerQueryBuilder())
+                     .thenReturn(Optional.of(new TermQueryBuilder("field", values[i])));
+-            when(queryShardContext.toQuery(any(QueryBuilder.class))).thenReturn(parsedQuery);
++            when(queryShardContext.toQuery(new TermsQueryBuilder("field", values[i]))).thenReturn(parsedQuery);
+             DirectoryReader wrappedDirectoryReader = wrapper.wrap(directoryReader);
+             IndexSearcher indexSearcher = wrapper.wrap(new IndexSearcher(wrappedDirectoryReader));
+ 
+@@ -160,4 +171,14 @@ public class SecurityIndexSearcherWrapperIntegrationTests extends ESTestCase {
+         directory.close();
+     }
+ 
++    /*
++        QueryShardContext is spied (not mocked!) and because of that when we report a matcher can't pass in null to
++        queryShardContext.newParseContext(...), so we pass in a dummy parser instances. This allows us to report a
++        matcher and queryShardContext.newParseContext(...) fail with NPE.
++     */
++    private static XContentParser anyParser() {
++        any(XContentParser.class);
++        return new JsonXContentParser(null);
++    }
++
+ }
+diff --git a/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperUnitTests.java b/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperUnitTests.java
+index 7cf55084d23..885aba2f0f6 100644
+--- a/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperUnitTests.java
++++ b/elasticsearch/x-pack/security/src/test/java/org/elasticsearch/xpack/security/authz/accesscontrol/SecurityIndexSearcherWrapperUnitTests.java
+@@ -28,6 +28,7 @@ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.Scorer;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.Weight;
++import org.apache.lucene.search.join.ScoreMode;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.util.Accountable;
+@@ -35,6 +36,7 @@ import org.apache.lucene.util.BitSet;
+ import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.SparseFixedBitSet;
++import org.elasticsearch.client.Client;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.compress.CompressedXContent;
+ import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
+@@ -49,11 +51,23 @@ import org.elasticsearch.index.analysis.AnalysisService;
+ import org.elasticsearch.index.cache.bitset.BitsetFilterCache;
+ import org.elasticsearch.index.mapper.MapperService;
+ import org.elasticsearch.index.mapper.ParentFieldMapper;
++import org.elasticsearch.index.query.BoolQueryBuilder;
++import org.elasticsearch.index.query.BoostingQueryBuilder;
++import org.elasticsearch.index.query.ConstantScoreQueryBuilder;
++import org.elasticsearch.index.query.GeoShapeQueryBuilder;
++import org.elasticsearch.index.query.HasChildQueryBuilder;
++import org.elasticsearch.index.query.HasParentQueryBuilder;
++import org.elasticsearch.index.query.MatchAllQueryBuilder;
++import org.elasticsearch.index.query.QueryBuilder;
++import org.elasticsearch.index.query.QueryRewriteContext;
+ import org.elasticsearch.index.query.TermQueryBuilder;
++import org.elasticsearch.index.query.TermsQueryBuilder;
++import org.elasticsearch.index.query.functionscore.FunctionScoreQueryBuilder;
+ import org.elasticsearch.index.shard.IndexShard;
+ import org.elasticsearch.index.shard.ShardId;
+ import org.elasticsearch.index.similarity.SimilarityService;
+ import org.elasticsearch.indices.IndicesModule;
++import org.elasticsearch.indices.TermsLookup;
+ import org.elasticsearch.script.ExecutableScript;
+ import org.elasticsearch.script.Script;
+ import org.elasticsearch.script.ScriptContext;
+@@ -621,4 +635,55 @@ public class SecurityIndexSearcherWrapperUnitTests extends ESTestCase {
+         assertEquals(1, searcher.count(new CreateScorerOnceQuery(new MatchAllDocsQuery())));
+         IOUtils.close(reader, w, dir);
+     }
++
++    public void testVerifyRoleQuery() throws Exception {
++        QueryBuilder queryBuilder1 = new TermsQueryBuilder("field", "val1", "val2");
++        SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder1);
++
++        QueryBuilder queryBuilder2 = new TermsQueryBuilder("field", new TermsLookup("_index", "_type", "_id", "_path"));
++        Exception e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder2));
++        assertThat(e.getMessage(), equalTo("terms query with terms lookup isn't supported as part of a role query"));
++
++        QueryBuilder queryBuilder3 = new GeoShapeQueryBuilder("field", "_id", "_type");
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder3));
++        assertThat(e.getMessage(), equalTo("geoshape query referring to indexed shapes isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder4 = new HasChildQueryBuilder("_type", new MatchAllQueryBuilder(), ScoreMode.None);
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder4));
++        assertThat(e.getMessage(), equalTo("has_child query isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder5 = new HasParentQueryBuilder("_type", new MatchAllQueryBuilder(), false);
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder5));
++        assertThat(e.getMessage(), equalTo("has_parent query isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder6 = new BoolQueryBuilder().must(new GeoShapeQueryBuilder("field", "_id", "_type"));
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder6));
++        assertThat(e.getMessage(), equalTo("geoshape query referring to indexed shapes isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder7 = new ConstantScoreQueryBuilder(new GeoShapeQueryBuilder("field", "_id", "_type"));
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder7));
++        assertThat(e.getMessage(), equalTo("geoshape query referring to indexed shapes isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder8 = new FunctionScoreQueryBuilder(new GeoShapeQueryBuilder("field", "_id", "_type"));
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder8));
++        assertThat(e.getMessage(), equalTo("geoshape query referring to indexed shapes isn't support as part of a role query"));
++
++        QueryBuilder queryBuilder9 = new BoostingQueryBuilder(new GeoShapeQueryBuilder("field", "_id", "_type"),
++                new MatchAllQueryBuilder());
++        e = expectThrows(IllegalArgumentException.class, () -> SecurityIndexSearcherWrapper.verifyRoleQuery(queryBuilder9));
++        assertThat(e.getMessage(), equalTo("geoshape query referring to indexed shapes isn't support as part of a role query"));
++    }
++
++    public void testFailIfQueryUsesClient() throws Exception {
++        Client client = mock(Client.class);
++        when(client.settings()).thenReturn(Settings.EMPTY);
++        QueryRewriteContext context = new QueryRewriteContext(null, mapperService, scriptService, null, client, null, null);
++        QueryBuilder queryBuilder1 = new TermsQueryBuilder("field", "val1", "val2");
++        SecurityIndexSearcherWrapper.failIfQueryUsesClient(queryBuilder1, context);
++
++        QueryBuilder queryBuilder2 = new TermsQueryBuilder("field", new TermsLookup("_index", "_type", "_id", "_path"));
++        Exception e = expectThrows(IllegalStateException.class,
++                () -> SecurityIndexSearcherWrapper.failIfQueryUsesClient(queryBuilder2, context));
++        assertThat(e.getMessage(), equalTo("role queries are not allowed to execute additional requests"));
++    }
+ }
+diff --git a/elasticsearch/x-pack/security/src/test/resources/rest-api-spec/test/roles/30_prohibited_role_query.yaml b/elasticsearch/x-pack/security/src/test/resources/rest-api-spec/test/roles/30_prohibited_role_query.yaml
+new file mode 100644
+index 00000000000..0d4adaf70ea
+--- /dev/null
++++ b/elasticsearch/x-pack/security/src/test/resources/rest-api-spec/test/roles/30_prohibited_role_query.yaml
+@@ -0,0 +1,71 @@
++---
++setup:
++  - skip:
++      features: headers
++
++  - do:
++      cluster.health:
++        wait_for_status: yellow
++
++  - do:
++      xpack.security.put_role:
++        name: "role"
++        body:  >
++            {
++              "cluster": ["all"],
++              "indices": [
++                {
++                  "names": "index",
++                  "privileges": ["all"],
++                  "query" : {
++                    "terms" : { "field" : { "index" : "_index", "type" : "_type", "id" : "_id", "path" : "_path"} }
++                  }
++                }
++              ]
++            }
++
++  - do:
++      xpack.security.put_user:
++        username: "joe"
++        body:  >
++            {
++              "password": "changeme",
++              "roles" : [ "role" ]
++            }
++
++---
++teardown:
++  - do:
++      xpack.security.delete_user:
++        username: "joe"
++        ignore: 404
++  - do:
++      xpack.security.delete_role:
++        name: "role"
++        ignore: 404
++
++
++---
++"Test use prohibited query inside role query":
++
++  - do:
++      headers:
++        Authorization: "Basic am9lOmNoYW5nZW1l"
++      index:
++        index: index
++        type: type
++        id: 1
++        body:  >
++          {
++            "foo": "bar"
++          }
++
++
++  - do:
++      catch:  /terms query with terms lookup isn't supported as part of a role query/
++      headers:
++        Authorization: "Basic am9lOmNoYW5nZW1l"
++      search:
++        index: index
++        body: { "query" : { "match_all" : {} } }
++

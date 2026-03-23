@@ -30,7 +30,7 @@ ExplainedRealBugs（基于 defects4j）是一个旨在自动化从各种软件�
 
 ## 缺陷库概览
 
-目前，该缺陷库包含了 **303** 个项目的缺陷数据，总计 **143,591** 个缺陷。
+目前，该缺陷库包含了 **324** 个项目的缺陷数据，总计 **160,599** 个缺陷。
 
 如需查看完整的缺陷报告 ID 列表及其他详细信息，请参阅 [`bug_summary.md`](bug_summary.md) 文件。
 
@@ -151,4 +151,4 @@ bug-mining/
         └── ...
 ```
 
-分类结果将存储在 `bug-classification/classified_data_embedding.jsonl` 或 `bug-classification/classified_data_llm.jsonl` 中，具体取决于使用的分类方法。
+分类结果将存储在 `bug-classification/classified_data_llm.jsonl` 中，具体取决于使用的分类方法。

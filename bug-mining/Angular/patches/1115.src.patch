@@ -1,0 +1,335 @@
+diff --git a/packages/compiler-cli/ngcc/src/execution/cluster/executor.ts b/packages/compiler-cli/ngcc/src/execution/cluster/executor.ts
+index b595b07781..44fad92aac 100644
+--- a/packages/compiler-cli/ngcc/src/execution/cluster/executor.ts
++++ b/packages/compiler-cli/ngcc/src/execution/cluster/executor.ts
+@@ -8,6 +8,7 @@
+ import {FileSystem} from '../../../../src/ngtsc/file_system';
+ import {AsyncLocker} from '../../locking/async_locker';
+ import {Logger} from '../../logging/logger';
++import {FileWriter} from '../../writing/file_writer';
+ import {PackageJsonUpdater} from '../../writing/package_json_updater';
+ import {AnalyzeEntryPointsFn, CreateCompileFn, Executor} from '../api';
+ import {CreateTaskCompletedCallback} from '../tasks/api';
+@@ -21,7 +22,8 @@ import {ClusterMaster} from './master';
+ export class ClusterExecutor implements Executor {
+   constructor(
+       private workerCount: number, private fileSystem: FileSystem, private logger: Logger,
+-      private pkgJsonUpdater: PackageJsonUpdater, private lockFile: AsyncLocker,
++      private fileWriter: FileWriter, private pkgJsonUpdater: PackageJsonUpdater,
++      private lockFile: AsyncLocker,
+       private createTaskCompletedCallback: CreateTaskCompletedCallback) {}
+ 
+   async execute(analyzeEntryPoints: AnalyzeEntryPointsFn, _createCompileFn: CreateCompileFn):
+@@ -30,8 +32,8 @@ export class ClusterExecutor implements Executor {
+       this.logger.debug(
+           `Running ngcc on ${this.constructor.name} (using ${this.workerCount} worker processes).`);
+       const master = new ClusterMaster(
+-          this.workerCount, this.fileSystem, this.logger, this.pkgJsonUpdater, analyzeEntryPoints,
+-          this.createTaskCompletedCallback);
++          this.workerCount, this.fileSystem, this.logger, this.fileWriter, this.pkgJsonUpdater,
++          analyzeEntryPoints, this.createTaskCompletedCallback);
+       return master.run();
+     });
+   }
+diff --git a/packages/compiler-cli/ngcc/src/execution/cluster/master.ts b/packages/compiler-cli/ngcc/src/execution/cluster/master.ts
+index eea1fc90e7..c4831b6cf8 100644
+--- a/packages/compiler-cli/ngcc/src/execution/cluster/master.ts
++++ b/packages/compiler-cli/ngcc/src/execution/cluster/master.ts
+@@ -12,6 +12,7 @@ import * as cluster from 'cluster';
+ 
+ import {AbsoluteFsPath, FileSystem} from '../../../../src/ngtsc/file_system';
+ import {Logger} from '../../logging/logger';
++import {FileWriter} from '../../writing/file_writer';
+ import {PackageJsonUpdater} from '../../writing/package_json_updater';
+ import {AnalyzeEntryPointsFn} from '../api';
+ import {CreateTaskCompletedCallback, Task, TaskCompletedCallback, TaskQueue} from '../tasks/api';
+@@ -34,7 +35,8 @@ export class ClusterMaster {
+ 
+   constructor(
+       private maxWorkerCount: number, private fileSystem: FileSystem, private logger: Logger,
+-      private pkgJsonUpdater: PackageJsonUpdater, analyzeEntryPoints: AnalyzeEntryPointsFn,
++      private fileWriter: FileWriter, private pkgJsonUpdater: PackageJsonUpdater,
++      analyzeEntryPoints: AnalyzeEntryPointsFn,
+       createTaskCompletedCallback: CreateTaskCompletedCallback) {
+     if (!cluster.isMaster) {
+       throw new Error('Tried to instantiate `ClusterMaster` on a worker process.');
+@@ -146,6 +148,7 @@ export class ClusterMaster {
+ 
+     // The worker exited unexpectedly: Determine it's status and take an appropriate action.
+     const assignment = this.taskAssignments.get(worker.id);
++    this.taskAssignments.delete(worker.id);
+ 
+     this.logger.warn(
+         `Worker #${worker.id} exited unexpectedly (code: ${code} | signal: ${signal}).\n` +
+@@ -158,16 +161,34 @@ export class ClusterMaster {
+       // The crashed worker process was not in the middle of a task:
+       // Just spawn another process.
+       this.logger.debug(`Spawning another worker process to replace #${worker.id}...`);
+-      this.taskAssignments.delete(worker.id);
+       cluster.fork();
+     } else {
++      const {task, files} = assignment;
++
++      if (files != null) {
++        // The crashed worker process was in the middle of writing transformed files:
++        // Revert any changes before re-processing the task.
++        this.logger.debug(`Reverting ${files.length} transformed files...`);
++        this.fileWriter.revertBundle(
++            task.entryPoint, files, task.formatPropertiesToMarkAsProcessed);
++      }
++
+       // The crashed worker process was in the middle of a task:
+-      // Impossible to know whether we can recover (without ending up with a corrupted entry-point).
+-      // TODO: Use `assignment.files` to revert any changes and rerun the task worker.
+-      const currentTask = assignment.task;
+-      throw new Error(
+-          'Process unexpectedly crashed, while processing format property ' +
+-          `${currentTask.formatProperty} for entry-point '${currentTask.entryPoint.path}'.`);
++      // Re-add the task back to the queue.
++      this.taskQueue.markAsUnprocessed(task);
++
++      // The crashing might be a result of increased memory consumption by ngcc.
++      // Do not spawn another process, unless this was the last worker process.
++      const spawnedWorkerCount = Object.keys(cluster.workers).length;
++      if (spawnedWorkerCount > 0) {
++        this.logger.debug(`Not spawning another worker process to replace #${
++            worker.id}. Continuing with ${spawnedWorkerCount} workers...`);
++        this.maybeDistributeWork();
++      } else {
++        this.logger.debug(`Spawning another worker process to replace #${worker.id}...`);
++        this.remainingRespawnAttempts--;
++        cluster.fork();
++      }
+     }
+   }
+ 
+diff --git a/packages/compiler-cli/ngcc/src/execution/cluster/worker.ts b/packages/compiler-cli/ngcc/src/execution/cluster/worker.ts
+index 181cd2c9c0..6cf4c752b9 100644
+--- a/packages/compiler-cli/ngcc/src/execution/cluster/worker.ts
++++ b/packages/compiler-cli/ngcc/src/execution/cluster/worker.ts
+@@ -28,24 +28,23 @@ if (require.main === module) {
+ 
+     try {
+       const {
+-        createNewEntryPointFormats = false,
+-        logger = new ConsoleLogger(LogLevel.info),
++        logger,
+         pathMappings,
+-        errorOnFailedEntryPoint = false,
+-        enableI18nLegacyMessageIdFormat = true,
++        enableI18nLegacyMessageIdFormat,
+         fileSystem,
+-        tsConfig
++        tsConfig,
++        getFileWriter,
+       } = getSharedSetup(parseCommandLineOptions(process.argv.slice(2)));
+ 
+       // NOTE: To avoid file corruption, `ngcc` invocation only creates _one_ instance of
+       // `PackageJsonUpdater` that actually writes to disk (across all processes).
+       // In cluster workers we use a `PackageJsonUpdater` that delegates to the cluster master.
+       const pkgJsonUpdater = new ClusterWorkerPackageJsonUpdater();
++      const fileWriter = getFileWriter(pkgJsonUpdater);
+ 
+       // The function for creating the `compile()` function.
+       const createCompileFn = getCreateCompileFn(
+-          fileSystem, logger, pkgJsonUpdater, createNewEntryPointFormats, errorOnFailedEntryPoint,
+-          enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);
++          fileSystem, logger, fileWriter, enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);
+ 
+       await startWorker(logger, createCompileFn);
+       process.exitCode = 0;
+diff --git a/packages/compiler-cli/ngcc/src/execution/create_compile_function.ts b/packages/compiler-cli/ngcc/src/execution/create_compile_function.ts
+index 5a2e262867..81cd664cc3 100644
+--- a/packages/compiler-cli/ngcc/src/execution/create_compile_function.ts
++++ b/packages/compiler-cli/ngcc/src/execution/create_compile_function.ts
+@@ -16,9 +16,6 @@ import {PathMappings} from '../ngcc_options';
+ import {getEntryPointFormat} from '../packages/entry_point';
+ import {makeEntryPointBundle} from '../packages/entry_point_bundle';
+ import {FileWriter} from '../writing/file_writer';
+-import {InPlaceFileWriter} from '../writing/in_place_file_writer';
+-import {NewEntryPointFileWriter} from '../writing/new_entry_point_file_writer';
+-import {PackageJsonUpdater} from '../writing/package_json_updater';
+ 
+ import {CreateCompileFn} from './api';
+ import {Task, TaskProcessingOutcome} from './tasks/api';
+@@ -27,13 +24,10 @@ import {Task, TaskProcessingOutcome} from './tasks/api';
+  * The function for creating the `compile()` function.
+  */
+ export function getCreateCompileFn(
+-    fileSystem: FileSystem, logger: Logger, pkgJsonUpdater: PackageJsonUpdater,
+-    createNewEntryPointFormats: boolean, errorOnFailedEntryPoint: boolean,
++    fileSystem: FileSystem, logger: Logger, fileWriter: FileWriter,
+     enableI18nLegacyMessageIdFormat: boolean, tsConfig: ParsedConfiguration|null,
+     pathMappings: PathMappings|undefined): CreateCompileFn {
+   return (beforeWritingFiles, onTaskCompleted) => {
+-    const fileWriter = getFileWriter(
+-        fileSystem, logger, pkgJsonUpdater, createNewEntryPointFormats, errorOnFailedEntryPoint);
+     const {Transformer} = require('../packages/transformer');
+     const transformer = new Transformer(fileSystem, logger, tsConfig);
+ 
+@@ -91,11 +85,3 @@ export function getCreateCompileFn(
+     };
+   };
+ }
+-
+-function getFileWriter(
+-    fs: FileSystem, logger: Logger, pkgJsonUpdater: PackageJsonUpdater,
+-    createNewEntryPointFormats: boolean, errorOnFailedEntryPoint: boolean): FileWriter {
+-  return createNewEntryPointFormats ?
+-      new NewEntryPointFileWriter(fs, logger, errorOnFailedEntryPoint, pkgJsonUpdater) :
+-      new InPlaceFileWriter(fs, logger, errorOnFailedEntryPoint);
+-}
+diff --git a/packages/compiler-cli/ngcc/src/main.ts b/packages/compiler-cli/ngcc/src/main.ts
+index f3c5359a74..e8005edf6c 100644
+--- a/packages/compiler-cli/ngcc/src/main.ts
++++ b/packages/compiler-cli/ngcc/src/main.ts
+@@ -36,6 +36,7 @@ import {AsyncNgccOptions, getSharedSetup, NgccOptions, PathMappings, SyncNgccOpt
+ import {NgccConfiguration} from './packages/configuration';
+ import {EntryPointJsonProperty, SUPPORTED_FORMAT_PROPERTIES} from './packages/entry_point';
+ import {EntryPointManifest, InvalidatingEntryPointManifest} from './packages/entry_point_manifest';
++import {FileWriter} from './writing/file_writer';
+ import {DirectPackageJsonUpdater, PackageJsonUpdater} from './writing/package_json_updater';
+ 
+ /**
+@@ -54,7 +55,6 @@ export function mainNgcc(options: NgccOptions): void|Promise<void> {
+     targetEntryPointPath,
+     propertiesToConsider,
+     compileAllFormats,
+-    createNewEntryPointFormats,
+     logger,
+     pathMappings,
+     async,
+@@ -64,7 +64,8 @@ export function mainNgcc(options: NgccOptions): void|Promise<void> {
+     fileSystem,
+     absBasePath,
+     projectPath,
+-    tsConfig
++    tsConfig,
++    getFileWriter,
+   } = getSharedSetup(options);
+ 
+   const config = new NgccConfiguration(fileSystem, projectPath);
+@@ -95,19 +96,20 @@ export function mainNgcc(options: NgccOptions): void|Promise<void> {
+       logger, finder, fileSystem, supportedPropertiesToConsider, compileAllFormats,
+       propertiesToConsider, inParallel);
+ 
+-  // Create an updater that will actually write to disk. In
++  // Create an updater that will actually write to disk.
+   const pkgJsonUpdater = new DirectPackageJsonUpdater(fileSystem);
++  const fileWriter = getFileWriter(pkgJsonUpdater);
+ 
+   // The function for creating the `compile()` function.
+   const createCompileFn = getCreateCompileFn(
+-      fileSystem, logger, pkgJsonUpdater, createNewEntryPointFormats, errorOnFailedEntryPoint,
+-      enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);
++      fileSystem, logger, fileWriter, enableI18nLegacyMessageIdFormat, tsConfig, pathMappings);
+ 
+   // The executor for actually planning and getting the work done.
+   const createTaskCompletedCallback =
+       getCreateTaskCompletedCallback(pkgJsonUpdater, errorOnFailedEntryPoint, logger, fileSystem);
+   const executor = getExecutor(
+-      async, inParallel, logger, pkgJsonUpdater, fileSystem, createTaskCompletedCallback);
++      async, inParallel, logger, fileWriter, pkgJsonUpdater, fileSystem,
++      createTaskCompletedCallback);
+ 
+   return executor.execute(analyzeEntryPoints, createCompileFn);
+ }
+@@ -146,8 +148,9 @@ function getCreateTaskCompletedCallback(
+ }
+ 
+ function getExecutor(
+-    async: boolean, inParallel: boolean, logger: Logger, pkgJsonUpdater: PackageJsonUpdater,
+-    fileSystem: FileSystem, createTaskCompletedCallback: CreateTaskCompletedCallback): Executor {
++    async: boolean, inParallel: boolean, logger: Logger, fileWriter: FileWriter,
++    pkgJsonUpdater: PackageJsonUpdater, fileSystem: FileSystem,
++    createTaskCompletedCallback: CreateTaskCompletedCallback): Executor {
+   const lockFile = new LockFileWithChildProcess(fileSystem, logger);
+   if (async) {
+     // Execute asynchronously (either serially or in parallel)
+@@ -156,7 +159,8 @@ function getExecutor(
+       // Execute in parallel. Use up to 8 CPU cores for workers, always reserving one for master.
+       const workerCount = Math.min(8, os.cpus().length - 1);
+       return new ClusterExecutor(
+-          workerCount, fileSystem, logger, pkgJsonUpdater, locker, createTaskCompletedCallback);
++          workerCount, fileSystem, logger, fileWriter, pkgJsonUpdater, locker,
++          createTaskCompletedCallback);
+     } else {
+       // Execute serially, on a single thread (async).
+       return new SingleProcessExecutorAsync(logger, locker, createTaskCompletedCallback);
+diff --git a/packages/compiler-cli/ngcc/src/ngcc_options.ts b/packages/compiler-cli/ngcc/src/ngcc_options.ts
+index 36120276ca..3311653474 100644
+--- a/packages/compiler-cli/ngcc/src/ngcc_options.ts
++++ b/packages/compiler-cli/ngcc/src/ngcc_options.ts
+@@ -11,6 +11,10 @@ import {ParsedConfiguration, readConfiguration} from '../../src/perform_compile'
+ import {ConsoleLogger} from './logging/console_logger';
+ import {Logger, LogLevel} from './logging/logger';
+ import {SUPPORTED_FORMAT_PROPERTIES} from './packages/entry_point';
++import {FileWriter} from './writing/file_writer';
++import {InPlaceFileWriter} from './writing/in_place_file_writer';
++import {NewEntryPointFileWriter} from './writing/new_entry_point_file_writer';
++import {PackageJsonUpdater} from './writing/package_json_updater';
+ 
+ /**
+  * The options to configure the ngcc compiler for synchronous execution.
+@@ -156,6 +160,7 @@ export type OptionalNgccOptions = Pick<NgccOptions, OptionalNgccOptionKeys>;
+ export type SharedSetup = {
+   fileSystem: FileSystem; absBasePath: AbsoluteFsPath; projectPath: AbsoluteFsPath;
+   tsConfig: ParsedConfiguration | null;
++  getFileWriter(pkgJsonUpdater: PackageJsonUpdater): FileWriter;
+ };
+ 
+ /**
+@@ -210,5 +215,8 @@ export function getSharedSetup(options: NgccOptions): SharedSetup&RequiredNgccOp
+     absBasePath,
+     projectPath,
+     tsConfig,
++    getFileWriter: (pkgJsonUpdater: PackageJsonUpdater) => createNewEntryPointFormats ?
++        new NewEntryPointFileWriter(fileSystem, logger, errorOnFailedEntryPoint, pkgJsonUpdater) :
++        new InPlaceFileWriter(fileSystem, logger, errorOnFailedEntryPoint),
+   };
+ }
+diff --git a/packages/compiler-cli/ngcc/test/execution/cluster/executor_spec.ts b/packages/compiler-cli/ngcc/test/execution/cluster/executor_spec.ts
+index 1def235e51..0fbbd842c4 100644
+--- a/packages/compiler-cli/ngcc/test/execution/cluster/executor_spec.ts
++++ b/packages/compiler-cli/ngcc/test/execution/cluster/executor_spec.ts
+@@ -15,6 +15,7 @@ import {MockFileSystemNative, runInEachFileSystem} from '../../../../src/ngtsc/f
+ import {ClusterExecutor} from '../../../src/execution/cluster/executor';
+ import {ClusterMaster} from '../../../src/execution/cluster/master';
+ import {AsyncLocker} from '../../../src/locking/async_locker';
++import {FileWriter} from '../../../src/writing/file_writer';
+ import {PackageJsonUpdater} from '../../../src/writing/package_json_updater';
+ import {MockLockFile} from '../../helpers/mock_lock_file';
+ import {MockLogger} from '../../helpers/mock_logger';
+@@ -41,8 +42,8 @@ runInEachFileSystem(() => {
+       mockLockFile = new MockLockFile(new MockFileSystemNative(), lockFileLog);
+       locker = new AsyncLocker(mockLockFile, mockLogger, 200, 2);
+       executor = new ClusterExecutor(
+-          42, getFileSystem(), mockLogger, null as unknown as PackageJsonUpdater, locker,
+-          createTaskCompletedCallback);
++          42, getFileSystem(), mockLogger, null as unknown as FileWriter,
++          null as unknown as PackageJsonUpdater, locker, createTaskCompletedCallback);
+     });
+ 
+     describe('execute()', () => {
+@@ -98,8 +99,8 @@ runInEachFileSystem(() => {
+         });
+ 
+         executor = new ClusterExecutor(
+-            42, getFileSystem(), mockLogger, null as unknown as PackageJsonUpdater, locker,
+-            createTaskCompletedCallback);
++            42, getFileSystem(), mockLogger, null as unknown as FileWriter,
++            null as unknown as PackageJsonUpdater, locker, createTaskCompletedCallback);
+         let error = '';
+         try {
+           await executor.execute(anyFn, anyFn);
+@@ -118,8 +119,8 @@ runInEachFileSystem(() => {
+         });
+ 
+         executor = new ClusterExecutor(
+-            42, getFileSystem(), mockLogger, null as unknown as PackageJsonUpdater, locker,
+-            createTaskCompletedCallback);
++            42, getFileSystem(), mockLogger, null as unknown as FileWriter,
++            null as unknown as PackageJsonUpdater, locker, createTaskCompletedCallback);
+         let error = '';
+         try {
+           await executor.execute(anyFn, anyFn);

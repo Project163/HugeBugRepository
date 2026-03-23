@@ -1,0 +1,821 @@
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index 737abbbcd..528d35736 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -305,3 +305,4 @@ Marc Bresson, 2024/09/02
+ Narasux, 2024/09/09
+ Colin Watson, 2025/03/01
+ Lucas Infante, 2025/05/15
++Diego Margoni, 2025/07/01
+diff --git a/celery/app/builtins.py b/celery/app/builtins.py
+index 1a79c4093..66fb94a29 100644
+--- a/celery/app/builtins.py
++++ b/celery/app/builtins.py
+@@ -40,8 +40,8 @@ def add_unlock_chord_task(app):
+     Will joins chord by creating a task chain polling the header
+     for completion.
+     """
++    from celery.backends.base import _create_chord_error_with_cause
+     from celery.canvas import maybe_signature
+-    from celery.exceptions import ChordError
+     from celery.result import allow_join_result, result_from_tuple
+ 
+     @app.task(name='celery.chord_unlock', max_retries=None, shared=False,
+@@ -86,16 +86,15 @@ def add_unlock_chord_task(app):
+             except StopIteration:
+                 reason = repr(exc)
+             logger.exception('Chord %r raised: %r', group_id, exc)
+-            app.backend.chord_error_from_stack(callback, ChordError(reason))
++            chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
++            app.backend.chord_error_from_stack(callback=callback, exc=chord_error)
+         else:
+             try:
+                 callback.delay(ret)
+             except Exception as exc:  # pylint: disable=broad-except
+                 logger.exception('Chord %r raised: %r', group_id, exc)
+-                app.backend.chord_error_from_stack(
+-                    callback,
+-                    exc=ChordError(f'Callback error: {exc!r}'),
+-                )
++                chord_error = _create_chord_error_with_cause(message=f'Callback error: {exc!r}', original_exc=exc)
++                app.backend.chord_error_from_stack(callback=callback, exc=chord_error)
+     return unlock_chord
+ 
+ 
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index dc79f4ebd..c80591de1 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -65,6 +65,33 @@ def unpickle_backend(cls, args, kwargs):
+     return cls(*args, app=current_app._get_current_object(), **kwargs)
+ 
+ 
++def _create_chord_error_with_cause(message, original_exc=None) -> ChordError:
++    """Create a ChordError preserving the original exception as __cause__.
++
++    This helper reduces code duplication across the codebase when creating
++    ChordError instances that need to preserve the original exception.
++    """
++    chord_error = ChordError(message)
++    if isinstance(original_exc, Exception):
++        chord_error.__cause__ = original_exc
++    return chord_error
++
++
++def _create_fake_task_request(task_id, errbacks=None, task_name='unknown', **extra) -> Context:
++    """Create a fake task request context for error callbacks.
++
++    This helper reduces code duplication when creating fake request contexts
++    for error callback handling.
++    """
++    return Context({
++        "id": task_id,
++        "errbacks": errbacks or [],
++        "delivery_info": dict(),
++        "task": task_name,
++        **extra
++    })
++
++
+ class _nulldict(dict):
+     def ignore(self, *a, **kw):
+         pass
+@@ -281,21 +308,25 @@ class Backend:
+ 
+     def chord_error_from_stack(self, callback, exc=None):
+         app = self.app
++
+         try:
+             backend = app._tasks[callback.task].backend
+         except KeyError:
+             backend = self
++
++        # Handle group callbacks specially to prevent hanging body tasks
++        if isinstance(callback, group):
++            return self._handle_group_chord_error(group_callback=callback, backend=backend, exc=exc)
+         # We have to make a fake request since either the callback failed or
+         # we're pretending it did since we don't have information about the
+         # chord part(s) which failed. This request is constructed as a best
+         # effort for new style errbacks and may be slightly misleading about
+         # what really went wrong, but at least we call them!
+-        fake_request = Context({
+-            "id": callback.options.get("task_id"),
+-            "errbacks": callback.options.get("link_error", []),
+-            "delivery_info": dict(),
++        fake_request = _create_fake_task_request(
++            task_id=callback.options.get("task_id"),
++            errbacks=callback.options.get("link_error", []),
+             **callback
+-        })
++        )
+         try:
+             self._call_task_errbacks(fake_request, exc, None)
+         except Exception as eb_exc:  # pylint: disable=broad-except
+@@ -303,6 +334,74 @@ class Backend:
+         else:
+             return backend.fail_from_current_stack(callback.id, exc=exc)
+ 
++    def _handle_group_chord_error(self, group_callback, backend, exc=None):
++        """Handle chord errors when the callback is a group.
++
++        When a chord header fails and the body is a group, we need to:
++        1. Revoke all pending tasks in the group body
++        2. Mark them as failed with the chord error
++        3. Call error callbacks for each task
++
++        This prevents the group body tasks from hanging indefinitely (#8786)
++        """
++
++        # Extract original exception from ChordError if available
++        if isinstance(exc, ChordError) and hasattr(exc, '__cause__') and exc.__cause__:
++            original_exc = exc.__cause__
++        else:
++            original_exc = exc
++
++        try:
++            # Freeze the group to get the actual GroupResult with task IDs
++            frozen_group = group_callback.freeze()
++
++            if isinstance(frozen_group, GroupResult):
++                # revoke all tasks in the group to prevent execution
++                frozen_group.revoke()
++
++                # Handle each task in the group individually
++                for result in frozen_group.results:
++                    try:
++                        # Create fake request for error callbacks
++                        fake_request = _create_fake_task_request(
++                            task_id=result.id,
++                            errbacks=group_callback.options.get("link_error", []),
++                            task_name=getattr(result, 'task', 'unknown')
++                        )
++
++                        # Call error callbacks for this task with original exception
++                        try:
++                            backend._call_task_errbacks(fake_request, original_exc, None)
++                        except Exception:  # pylint: disable=broad-except
++                            # continue on exception to be sure to iter to all the group tasks
++                            pass
++
++                        # Mark the individual task as failed with original exception
++                        backend.fail_from_current_stack(result.id, exc=original_exc)
++
++                    except Exception as task_exc:  # pylint: disable=broad-except
++                        # Log error but continue with other tasks
++                        logger.exception(
++                            'Failed to handle chord error for task %s: %r',
++                            getattr(result, 'id', 'unknown'), task_exc
++                        )
++
++                # Also mark the group itself as failed if it has an ID
++                frozen_group_id = getattr(frozen_group, 'id', None)
++                if frozen_group_id:
++                    backend.mark_as_failure(frozen_group_id, original_exc)
++
++            return None
++
++        except Exception as cleanup_exc:  # pylint: disable=broad-except
++            # Log the error and fall back to single task handling
++            logger.exception(
++                'Failed to handle group chord error, falling back to single task handling: %r',
++                cleanup_exc
++            )
++            # Fallback to original error handling
++            return backend.fail_from_current_stack(group_callback.id, exc=exc)
++
+     def fail_from_current_stack(self, task_id, exc=None):
+         type_, real_exc, tb = sys.exc_info()
+         try:
+@@ -1068,18 +1167,18 @@ class BaseKeyValueStoreBackend(Backend):
+                     )
+                 except StopIteration:
+                     reason = repr(exc)
+-
+                 logger.exception('Chord %r raised: %r', gid, reason)
+-                self.chord_error_from_stack(callback, ChordError(reason))
++                chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
++                self.chord_error_from_stack(callback=callback, exc=chord_error)
+             else:
+                 try:
+                     callback.delay(ret)
+                 except Exception as exc:  # pylint: disable=broad-except
+                     logger.exception('Chord %r raised: %r', gid, exc)
+-                    self.chord_error_from_stack(
+-                        callback,
+-                        ChordError(f'Callback error: {exc!r}'),
++                    chord_error = _create_chord_error_with_cause(
++                        message=f'Callback error: {exc!r}', original_exc=exc
+                     )
++                    self.chord_error_from_stack(callback=callback, exc=chord_error)
+             finally:
+                 deps.delete()
+                 self.delete(key)
+diff --git a/celery/backends/gcs.py b/celery/backends/gcs.py
+index d667a9ccc..8a0c66bc6 100644
+--- a/celery/backends/gcs.py
++++ b/celery/backends/gcs.py
+@@ -8,6 +8,7 @@ from kombu.utils.encoding import bytes_to_str
+ from kombu.utils.functional import dictfilter
+ from kombu.utils.url import url_to_parts
+ 
++from celery.backends.base import _create_chord_error_with_cause
+ from celery.canvas import maybe_signature
+ from celery.exceptions import ChordError, ImproperlyConfigured
+ from celery.result import GroupResult, allow_join_result
+@@ -293,7 +294,8 @@ class GCSBackend(GCSBackendBase):
+                     reason = repr(exc)
+ 
+                 logger.exception('Chord %r raised: %r', gid, reason)
+-                self.chord_error_from_stack(callback, ChordError(reason))
++                chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
++                self.chord_error_from_stack(callback, chord_error)
+             else:
+                 try:
+                     callback.delay(ret)
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 3e3ef737f..e2597be88 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -11,6 +11,7 @@ from kombu.utils.url import _parse_url, maybe_sanitize_url
+ 
+ from celery import states
+ from celery._state import task_join_will_block
++from celery.backends.base import _create_chord_error_with_cause
+ from celery.canvas import maybe_signature
+ from celery.exceptions import BackendStoreError, ChordError, ImproperlyConfigured
+ from celery.result import GroupResult, allow_join_result
+@@ -436,7 +437,10 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+         if state in EXCEPTION_STATES:
+             retval = self.exception_to_python(retval)
+         if state in PROPAGATE_STATES:
+-            raise ChordError(f'Dependency {tid} raised {retval!r}')
++            chord_error = _create_chord_error_with_cause(
++                message=f'Dependency {tid} raised {retval!r}', original_exc=retval
++            )
++            raise chord_error
+         return retval
+ 
+     def set_chord_size(self, group_id, chord_size):
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index fb544c054..d7b473624 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -3162,16 +3162,13 @@ class test_chord:
+                     add.si(5, 7),
+                 )
+             ),
+-            pytest.param(
+-                (
+-                    lambda: group(
+-                        [
+-                            add.si(9, 7),
+-                            add.si(5, 7),
+-                        ]
+-                    )
+-                ),
+-                marks=pytest.mark.skip(reason="Task times out"),
++            (
++                lambda: group(
++                    [
++                        add.si(9, 7),
++                        add.si(5, 7),
++                    ]
++                )
+             ),
+             (
+                 lambda: chord(
+diff --git a/t/smoke/tests/test_canvas.py b/t/smoke/tests/test_canvas.py
+index 7750c365b..e0886d56e 100644
+--- a/t/smoke/tests/test_canvas.py
++++ b/t/smoke/tests/test_canvas.py
+@@ -114,16 +114,13 @@ class test_chord:
+                     add.si(5, 7).set(queue=queue),
+                 )
+             ),
+-            pytest.param(
+-                (
+-                    lambda queue: group(
+-                        [
+-                            add.si(9, 7).set(queue=queue),
+-                            add.si(5, 7).set(queue=queue),
+-                        ]
+-                    )
+-                ),
+-                marks=pytest.mark.skip(reason="Task times out"),
++            (
++                lambda queue: group(
++                    [
++                        add.si(9, 7).set(queue=queue),
++                        add.si(5, 7).set(queue=queue),
++                    ]
++                )
+             ),
+             (
+                 lambda queue: chord(
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 0d4550732..ce25ff72a 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -10,9 +10,10 @@ from kombu.utils.encoding import bytes_to_str, ensure_bytes
+ import celery
+ from celery import chord, group, signature, states, uuid
+ from celery.app.task import Context, Task
+-from celery.backends.base import BaseBackend, DisabledBackend, KeyValueStoreBackend, _nulldict
++from celery.backends.base import (BaseBackend, DisabledBackend, KeyValueStoreBackend, _create_chord_error_with_cause,
++                                  _create_fake_task_request, _nulldict)
+ from celery.exceptions import BackendGetMetaError, BackendStoreError, ChordError, SecurityError, TimeoutError
+-from celery.result import result_from_tuple
++from celery.result import GroupResult, result_from_tuple
+ from celery.utils import serialization
+ from celery.utils.functional import pass1
+ from celery.utils.serialization import UnpickleableExceptionWrapper
+@@ -683,6 +684,365 @@ class test_BaseBackend_dict:
+         b._get_task_meta_for.return_value = {'children': 3}
+         assert b.get_children('id') == 3
+ 
++    @pytest.mark.parametrize(
++        "message,original_exc,expected_cause_behavior",
++        [
++            # With exception - should preserve original exception
++            (
++                "Dependency failed",
++                ValueError("original error"),
++                "has_cause",
++            ),
++            # Without exception (None) - should not have __cause__
++            (
++                "Dependency failed",
++                None,
++                "no_cause",
++            ),
++            # With non-exception - should not have __cause__
++            (
++                "Dependency failed",
++                "not an exception",
++                "no_cause",
++            ),
++        ],
++        ids=(
++            "with_exception",
++            "without_exception",
++            "with_non_exception",
++        )
++    )
++    def test_create_chord_error_with_cause(
++        self, message, original_exc, expected_cause_behavior
++    ):
++        """Test _create_chord_error_with_cause with various parameter combinations."""
++        chord_error = _create_chord_error_with_cause(message, original_exc)
++
++        # Verify basic ChordError properties
++        assert isinstance(chord_error, ChordError)
++        assert str(chord_error) == message
++
++        # Verify __cause__ behavior based on test case
++        if expected_cause_behavior == "has_cause":
++            assert chord_error.__cause__ is original_exc
++        elif expected_cause_behavior == "no_cause":
++            assert not hasattr(chord_error, '__cause__') or chord_error.__cause__ is None
++
++    @pytest.mark.parametrize(
++        "task_id,errbacks,task_name,extra_kwargs,expected_attrs",
++        [
++            # Basic parameters test
++            (
++                "test-task-id",
++                ["errback1", "errback2"],
++                "test.task",
++                {},
++                {
++                    "id": "test-task-id",
++                    "errbacks": ["errback1", "errback2"],
++                    "task": "test.task",
++                    "delivery_info": {},
++                },
++            ),
++            # Default parameters test
++            (
++                "test-task-id",
++                None,
++                None,
++                {},
++                {
++                    "id": "test-task-id",
++                    "errbacks": [],
++                    "task": "unknown",
++                    "delivery_info": {},
++                },
++            ),
++            # Extra parameters test
++            (
++                "test-task-id",
++                None,
++                None,
++                {"extra_param": "extra_value"},
++                {
++                    "id": "test-task-id",
++                    "errbacks": [],
++                    "task": "unknown",
++                    "delivery_info": {},
++                    "extra_param": "extra_value",
++                },
++            ),
++        ],
++        ids=(
++            "basic_parameters",
++            "default_parameters",
++            "extra_parameters",
++        )
++    )
++    def test_create_fake_task_request(
++        self, task_id, errbacks, task_name, extra_kwargs, expected_attrs
++    ):
++        """Test _create_fake_task_request with various parameter combinations."""
++        # Build call arguments
++        args = [task_id]
++        if errbacks is not None:
++            args.append(errbacks)
++        if task_name is not None:
++            args.append(task_name)
++
++        fake_request = _create_fake_task_request(*args, **extra_kwargs)
++
++        # Verify all expected attributes
++        for attr_name, expected_value in expected_attrs.items():
++            assert getattr(fake_request, attr_name) == expected_value
++
++    def _create_mock_callback(self, task_name="test.task", spec=None, **options):
++        """Helper to create mock callbacks with common setup."""
++        from collections.abc import Mapping
++
++        # Create a mock that properly implements the
++        # mapping protocol for PyPy env compatibility
++        class MockCallback(Mock, Mapping):
++            def __init__(self, *args, **kwargs):
++                super().__init__(*args, **kwargs)
++                self._mapping_data = {}
++
++            def __getitem__(self, key):
++                return self._mapping_data[key]
++
++            def __iter__(self):
++                return iter(self._mapping_data)
++
++            def __len__(self):
++                return len(self._mapping_data)
++
++            def keys(self):
++                return self._mapping_data.keys()
++
++            def items(self):
++                return self._mapping_data.items()
++
++        callback = MockCallback(spec=spec)
++        callback.task = task_name
++        callback.options = {"link_error": [], **options}
++
++        return callback
++
++    def _setup_task_backend(self, task_name, backend=None):
++        """Helper to set up task with backend in app registry."""
++        if backend is None:
++            backend = Mock()
++            backend.fail_from_current_stack = Mock(return_value="backend_result")
++
++        self.app.tasks[task_name] = Mock()
++        self.app.tasks[task_name].backend = backend
++        return backend
++
++    @pytest.mark.parametrize(
++        "callback_type,task_name,expected_group_handler_called",
++        [
++            ("group", "test.group.task", True),
++            ("regular", "test.task", False),
++        ],
++        ids=["group_callback", "regular_callback"]
++    )
++    def test_chord_error_from_stack_callback_dispatch(self, callback_type, task_name, expected_group_handler_called):
++        """Test chord_error_from_stack dispatches to correct handler based on callback type."""
++        backend = self.b
++
++        # Create callback based on type
++        spec = group if callback_type == "group" else None
++        callback = self._create_mock_callback(task_name, spec=spec)
++
++        # Setup backend resolution
++        mock_backend = self._setup_task_backend(task_name)
++
++        # Mock handlers
++        backend._handle_group_chord_error = Mock(return_value="group_result")
++        backend._call_task_errbacks = Mock()
++
++        exc = ValueError("test exception")
++        result = backend.chord_error_from_stack(callback, exc)
++
++        if expected_group_handler_called:
++            backend._handle_group_chord_error.assert_called_once_with(
++                group_callback=callback, backend=mock_backend, exc=exc
++            )
++            assert result == "group_result"
++        else:
++            mock_backend.fail_from_current_stack.assert_called_once()
++
++    def test_chord_error_from_stack_backend_fallback(self):
++        """Test chord_error_from_stack falls back to self when task not found."""
++        backend = self.b
++
++        callback = self._create_mock_callback("nonexistent.task")
++
++        # Ensure task doesn't exist
++        if "nonexistent.task" in self.app.tasks:
++            del self.app.tasks["nonexistent.task"]
++
++        backend._call_task_errbacks = Mock()
++        backend.fail_from_current_stack = Mock(return_value="self_result")
++
++        _ = backend.chord_error_from_stack(callback, ValueError("test"))
++
++        # Verify self was used as fallback backend
++        backend.fail_from_current_stack.assert_called_once()
++
++    def _create_mock_frozen_group(self, group_id="group-id", task_ids=None, task_names=None):
++        """Helper to create mock frozen group with results."""
++        if task_ids is None:
++            task_ids = ["task-id-1"]
++        if task_names is None:
++            task_names = ["test.task"] * len(task_ids)
++
++        results = []
++        for task_id, task_name in zip(task_ids, task_names):
++            result = Mock()
++            result.id = task_id
++            result.task = task_name
++            results.append(result)
++
++        frozen_group = Mock(spec=GroupResult)
++        frozen_group.results = results
++        frozen_group.id = group_id
++        frozen_group.revoke = Mock()
++        return frozen_group
++
++    def _setup_group_chord_error_test(self, exc=None, errbacks=None, task_ids=None):
++        """Common setup for group chord error tests."""
++        if exc is None:
++            exc = ValueError("test error")
++        if errbacks is None:
++            errbacks = []
++        if task_ids is None:
++            task_ids = ["task-id-1"]
++
++        backend = Mock()
++        backend._call_task_errbacks = Mock()
++        backend.fail_from_current_stack = Mock()
++        backend.mark_as_failure = Mock()
++
++        group_callback = Mock(spec=group)
++        group_callback.options = {"link_error": errbacks}
++
++        frozen_group = self._create_mock_frozen_group(task_ids=task_ids)
++        group_callback.freeze.return_value = frozen_group
++
++        return self.b, backend, group_callback, frozen_group, exc
++
++    @pytest.mark.parametrize(
++        "exception_setup,expected_exc_used",
++        [
++            ("with_cause", "original"),
++            ("without_cause", "direct"),
++        ],
++        ids=["extracts_cause", "without_cause"]
++    )
++    def test_handle_group_chord_error_exception_handling(self, exception_setup, expected_exc_used):
++        """Test _handle_group_chord_error handles exceptions with and without __cause__."""
++        # Setup exceptions based on test case
++        if exception_setup == "with_cause":
++            original_exc = ValueError("original error")
++            exc = ChordError("wrapped error")
++            exc.__cause__ = original_exc
++            expected_exc = original_exc
++        else:
++            exc = ValueError("direct error")
++            expected_exc = exc
++
++        b, backend, group_callback, frozen_group, _ = self._setup_group_chord_error_test(exc=exc)
++
++        # Call the method
++        _ = b._handle_group_chord_error(group_callback, backend, exc)
++
++        # Verify correct exception was used
++        backend.fail_from_current_stack.assert_called_with("task-id-1", exc=expected_exc)
++        backend.mark_as_failure.assert_called_with("group-id", expected_exc)
++        frozen_group.revoke.assert_called_once()
++
++    def test_handle_group_chord_error_multiple_tasks(self):
++        """Test _handle_group_chord_error handles multiple tasks in group."""
++        task_ids = ["task-id-1", "task-id-2"]
++        b, backend, group_callback, frozen_group, exc = self._setup_group_chord_error_test(task_ids=task_ids)
++
++        # Call the method
++        b._handle_group_chord_error(group_callback, backend, exc)
++
++        # Verify group revocation and all tasks handled
++        frozen_group.revoke.assert_called_once()
++        assert backend.fail_from_current_stack.call_count == 2
++        backend.fail_from_current_stack.assert_any_call("task-id-1", exc=exc)
++        backend.fail_from_current_stack.assert_any_call("task-id-2", exc=exc)
++
++    def test_handle_group_chord_error_with_errbacks(self):
++        """Test _handle_group_chord_error calls error callbacks for each task."""
++        errbacks = ["errback1", "errback2"]
++        b, backend, group_callback, frozen_group, exc = self._setup_group_chord_error_test(errbacks=errbacks)
++
++        # Call the method
++        b._handle_group_chord_error(group_callback, backend, exc)
++
++        # Verify error callbacks were called
++        backend._call_task_errbacks.assert_called_once()
++        call_args = backend._call_task_errbacks.call_args
++        fake_request = call_args[0][0]
++
++        # Verify fake request was created correctly
++        assert fake_request.id == "task-id-1"
++        assert fake_request.errbacks == errbacks
++        assert fake_request.task == "test.task"
++
++    def test_handle_group_chord_error_cleanup_exception_handling(self):
++        """Test _handle_group_chord_error handles cleanup exceptions gracefully."""
++        b = self.b
++        backend = Mock()
++
++        exc = ValueError("test error")
++
++        # Mock group callback that raises exception during freeze
++        group_callback = Mock(spec=group)
++        group_callback.freeze.side_effect = RuntimeError("freeze failed")
++
++        # Mock fallback behavior
++        backend.fail_from_current_stack = Mock(return_value="fallback_result")
++
++        # Should not raise exception, but return fallback result
++        result = b._handle_group_chord_error(group_callback, backend, exc)
++
++        # Verify fallback was called - the method returns an ExceptionInfo when cleanup fails
++        # and falls back to single task handling
++        assert result is not None  # Method returns ExceptionInfo from fail_from_current_stack
++
++    def test_handle_group_chord__exceptions_paths(self, caplog):
++        """Test _handle_group_chord handles exceptions in various paths."""
++        backend = Mock()
++
++        # Mock group callback
++        group_callback = Mock(spec=group)
++        group_callback.options = {"link_error": []}
++
++        # Mock frozen group with multiple results
++        mock_result1 = Mock()
++        mock_result1.id = "task-id-1"
++        mock_result2 = Mock()
++        mock_result2.id = "task-id-2"
++
++        frozen_group = Mock(spec=GroupResult)
++        frozen_group.results = [mock_result1, mock_result2]
++        frozen_group.revoke = Mock()
++
++        group_callback.freeze.return_value = frozen_group
++
++        # Test exception during fail_from_current_stack
++        backend._call_task_errbacks.side_effect = RuntimeError("fail on _call_task_errbacks")
++
++        backend.fail_from_current_stack.side_effect = RuntimeError("fail on fail_from_current_stack")
++
++        _ = self.b._handle_group_chord_error(group_callback, backend, ValueError("test error"))
++
++        assert "Failed to handle chord error for task" in caplog.text
++
+ 
+ class test_KeyValueStoreBackend:
+ 
+diff --git a/t/unit/backends/test_gcs.py b/t/unit/backends/test_gcs.py
+index fdb4df692..678310c68 100644
+--- a/t/unit/backends/test_gcs.py
++++ b/t/unit/backends/test_gcs.py
+@@ -471,3 +471,119 @@ class test_GCSBackend:
+         )
+         mock_collection.document.assert_called_once_with('test_key')
+         assert result == mock_document
++
++    @patch('celery.backends.gcs.maybe_signature')
++    @patch.object(GCSBackend, 'incr')
++    @patch.object(GCSBackend, '_restore_deps')
++    @patch.object(GCSBackend, '_delete_chord_key')
++    @patch.object(GCSBackend, 'chord_error_from_stack')
++    @patch('celery.backends.gcs.allow_join_result')
++    @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
++    def test_on_chord_part_return_join_exception(
++        self,
++        mock_firestore_ttl,
++        mock_allow_join_result_,
++        mock_chord_error_from_stack,
++        mock_delete_chord_key,
++        mock_restore_deps,
++        mock_incr,
++        mock_maybe_signature,
++    ):
++        """Test on_chord_part_return when join_native raises exception."""
++        request = MagicMock()
++        request.group = 'group_id'
++        request.chord = {'chord_size': 2}
++        state = MagicMock()
++        result = MagicMock()
++
++        mock_firestore_ttl.return_value = True
++        mock_incr.return_value = 2
++
++        # Mock dependencies and callback
++        mock_deps = MagicMock()
++        mock_restore_deps.return_value = mock_deps
++        mock_callback = MagicMock()
++        mock_maybe_signature.return_value = mock_callback
++
++        # Make join_native raise an exception
++        join_exception = ValueError('Join failed')
++        mock_deps.join_native.side_effect = join_exception
++        mock_deps._failed_join_report.return_value = iter([])  # No culprit found
++
++        backend = GCSBackend(app=self.app)
++        backend.on_chord_part_return(request, state, result)
++
++        # Verify chord_error_from_stack was called with the exception
++        mock_chord_error_from_stack.assert_called_once()
++        call_args = mock_chord_error_from_stack.call_args
++        assert call_args[0][0] == mock_callback  # callback argument
++        chord_error_arg = call_args[0][1]  # exc argument
++        assert 'ValueError' in str(chord_error_arg)
++        assert chord_error_arg.__cause__ == join_exception
++
++        # Verify cleanup still happens
++        mock_deps.delete.assert_called_once()
++        mock_delete_chord_key.assert_called_once()
++
++    @patch('celery.backends.gcs.maybe_signature')
++    @patch.object(GCSBackend, 'incr')
++    @patch.object(GCSBackend, '_restore_deps')
++    @patch.object(GCSBackend, '_delete_chord_key')
++    @patch.object(GCSBackend, 'chord_error_from_stack')
++    @patch('celery.backends.gcs.allow_join_result')
++    @patch.object(GCSBackend, '_is_firestore_ttl_policy_enabled')
++    def test_on_chord_part_return_callback_exception(
++        self,
++        mock_firestore_ttl,
++        mock_allow_join_result_,
++        mock_chord_error_from_stack,
++        mock_delete_chord_key,
++        mock_restore_deps,
++        mock_incr,
++        mock_maybe_signature,
++    ):
++        """Test on_chord_part_return when callback.delay raises exception (line 302)."""
++        request = MagicMock()
++        request.group = 'group_id'
++        request.chord = {'chord_size': 2}
++        state = MagicMock()
++        result = MagicMock()
++
++        mock_firestore_ttl.return_value = True
++        mock_incr.return_value = 2
++
++        # Mock dependencies and callback
++        mock_deps = MagicMock()
++        mock_restore_deps.return_value = mock_deps
++        mock_deps.join_native.return_value = ['result1', 'result2']
++
++        mock_callback = MagicMock()
++        mock_maybe_signature.return_value = mock_callback
++
++        # Make callback.delay raise an exception
++        callback_exception = RuntimeError('Callback failed')
++        mock_callback.delay.side_effect = callback_exception
++
++        backend = GCSBackend(app=self.app)
++        backend.on_chord_part_return(request, state, result)
++
++        # Verify join was successful first
++        mock_deps.join_native.assert_called_once_with(
++            timeout=self.app.conf.result_chord_join_timeout,
++            propagate=True,
++        )
++
++        # Verify callback.delay was called and failed
++        mock_callback.delay.assert_called_once_with(['result1', 'result2'])
++
++        # Verify chord_error_from_stack was called with ChordError
++        mock_chord_error_from_stack.assert_called_once()
++        call_args = mock_chord_error_from_stack.call_args
++        assert call_args[0][0] == mock_callback  # callback argument
++        chord_error_arg = call_args[0][1]  # exc argument
++        assert 'Callback error:' in str(chord_error_arg)
++        assert 'RuntimeError' in str(chord_error_arg)
++
++        # Verify cleanup still happens
++        mock_deps.delete.assert_called_once()
++        mock_delete_chord_key.assert_called_once()

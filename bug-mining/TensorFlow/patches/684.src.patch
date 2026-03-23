@@ -1,0 +1,3947 @@
+diff --git a/third_party/xla/xla/backends/gpu/autotuner/BUILD b/third_party/xla/xla/backends/gpu/autotuner/BUILD
+index 5286adeb6f2..b82d16ca915 100644
+--- a/third_party/xla/xla/backends/gpu/autotuner/BUILD
++++ b/third_party/xla/xla/backends/gpu/autotuner/BUILD
+@@ -932,6 +932,7 @@ cc_library(
+     deps = [
+         ":gpu_codegen_backend",
+         "//xla:autotuning_proto_cc",
++        "//xla:comparison_util",
+         "//xla:literal_util",
+         "//xla:shape_util",
+         "//xla:xla_data_proto_cc",
+@@ -939,14 +940,28 @@ cc_library(
+         "//xla/backends/autotuner:codegen_backend",
+         "//xla/hlo/ir:hlo",
+         "//xla/service:compiler",
++        "//xla/service:hlo_creation_utils",
+         "//xla/service/gpu:backend_configs_cc",
+         "//xla/service/gpu:cublas_cudnn",
++        "//xla/service/gpu:gpu_conv_runner",
++        "//xla/service/gpu:stream_executor_util",
++        "//xla/stream_executor:device_address",
++        "//xla/stream_executor:dnn",
++        "//xla/stream_executor:engine_options",
++        "//xla/stream_executor:scratch_allocator",
++        "//xla/stream_executor:stream",
+         "//xla/stream_executor:stream_executor_h",
++        "//xla/stream_executor:stream_executor_memory_allocator",
+         "//xla/tsl/platform:errors",
++        "//xla/tsl/platform:status_macros",
+         "//xla/tsl/platform:statusor",
+         "//xla/tsl/protobuf:dnn_proto_cc",
++        "@com_google_absl//absl/algorithm:container",
++        "@com_google_absl//absl/container:inlined_vector",
++        "@com_google_absl//absl/log:check",
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/types:span",
+     ],
+ )
+ 
+diff --git a/third_party/xla/xla/backends/gpu/autotuner/miopen.cc b/third_party/xla/xla/backends/gpu/autotuner/miopen.cc
+index 636be11815a..69b4fdcaebc 100644
+--- a/third_party/xla/xla/backends/gpu/autotuner/miopen.cc
++++ b/third_party/xla/xla/backends/gpu/autotuner/miopen.cc
+@@ -15,34 +15,63 @@ limitations under the License.
+ 
+ #include "xla/backends/gpu/autotuner/miopen.h"
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
+ #include <vector>
+ 
++#include "absl/algorithm/container.h"
++#include "absl/container/inlined_vector.h"
++#include "absl/log/check.h"
+ #include "absl/status/status.h"
+ #include "absl/status/statusor.h"
++#include "absl/types/span.h"
+ #include "xla/autotuning.pb.h"
+ #include "xla/backends/autotuner/codegen_backend.h"
++#include "xla/comparison_util.h"
++#include "xla/hlo/ir/hlo_casting_utils.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_instructions.h"
++#include "xla/hlo/ir/hlo_opcode.h"
+ #include "xla/literal_util.h"
+ #include "xla/service/gpu/backend_configs.pb.h"
+ #include "xla/service/gpu/cublas_cudnn.h"
++#include "xla/service/gpu/gpu_conv_runner.h"
++#include "xla/service/gpu/stream_executor_util.h"
++#include "xla/service/hlo_creation_utils.h"
+ #include "xla/shape.h"
+ #include "xla/shape_util.h"
++#include "xla/stream_executor/device_address.h"
++#include "xla/stream_executor/dnn.h"
++#include "xla/stream_executor/engine_options.h"
++#include "xla/stream_executor/scratch_allocator.h"
++#include "xla/stream_executor/stream.h"
++#include "xla/stream_executor/stream_executor.h"
++#include "xla/stream_executor/stream_executor_memory_allocator.h"
+ #include "xla/tsl/platform/errors.h"
+ #include "xla/tsl/platform/statusor.h"
+ #include "xla/tsl/protobuf/dnn.pb.h"
+ #include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
++#include "xla/tsl/platform/status_macros.h"
+ 
+ namespace xla {
+ namespace gpu {
+ 
++namespace se = ::stream_executor;
++
+ using MIOpenBackendConfig = stream_executor::dnn::AlgorithmProto;
+ 
+ namespace {
+ 
++bool IsCustomCallToDnnFusedConvolution(const HloInstruction& hlo) {
++  if (hlo.opcode() != HloOpcode::kCustomCall) {
++    return false;
++  }
++  return hlo.custom_call_target() == kCudnnConvBiasActivationForwardCallTarget;
++}
++
+ // Replaces the instruction with a new instruction with the same name in the
+ // parent computation. The given instruction will be replaced by a tuple of the
+ // convolution result and the workspace size. A few following instructions will
+@@ -106,6 +135,115 @@ absl::Status ApplyConfigToMIOpenCustomCall(HloInstruction& instr,
+   return absl::OkStatus();
+ }
+ 
++absl::Status ApplyConfigToFusedMIOpenCustomCall(
++    HloInstruction& instr, const MIOpenBackendConfig& config) {
++  if (config.algo_id() < 0) {
++    return ApplyConfigToMIOpenCustomCall(instr, config);
++  }
++
++  // Decompose fused convs back to act(conv + broadcast(bias))
++  ASSIGN_OR_RETURN(GpuBackendConfig gpu_config,
++                   instr.backend_config<GpuBackendConfig>());
++
++  CudnnConvBackendConfig& backend_config =
++      *gpu_config.mutable_cudnn_conv_backend_config();
++
++  CHECK(backend_config.conv_result_scale() == 1.0 &&
++        backend_config.side_input_scale() == 0.0 &&
++        instr.operands().size() == 3);
++
++  HloInstruction* bias = instr.operands().back();
++  const absl::InlinedVector<HloInstruction*, 1> users(instr.users().begin(),
++                                                      instr.users().end());
++  HloInstruction* conv_result =
++      instr.AddInstruction(HloInstruction::CreateGetTupleElement(&instr, 0));
++  HloInstruction* bcast_bias =
++      instr.AddInstruction(HloInstruction::CreateBroadcast(
++          conv_result->shape(), bias,
++          {instr.convolution_dimension_numbers().output_feature_dimension()}));
++  HloInstruction* conv_bias = instr.AddInstruction(HloInstruction::CreateBinary(
++      conv_result->shape(), HloOpcode::kAdd, conv_result, bcast_bias));
++
++  HloInstruction* conv_bias_act = nullptr;
++
++  switch (backend_config.activation_mode()) {
++    default:
++      break;
++    case se::dnn::ActivationMode::kNone:
++      conv_bias_act = conv_bias;
++      break;
++    case se::dnn::ActivationMode::kRelu:
++      conv_bias_act = instr.AddInstruction(HloInstruction::CreateBinary(
++          conv_bias->shape(), HloOpcode::kMaximum,
++          BroadcastZeros(instr.parent(), conv_bias->shape()), conv_bias));
++      break;
++    case se::dnn::ActivationMode::kElu:
++      conv_bias_act = instr.AddInstruction(HloInstruction::CreateTernary(
++          conv_bias->shape(), HloOpcode::kSelect,
++          instr.AddInstruction(HloInstruction::CreateCompare(
++              ShapeUtil::ChangeElementType(conv_bias->shape(), PRED), conv_bias,
++              BroadcastZeros(instr.parent(), conv_bias->shape()),
++              ComparisonDirection::kGt)),
++          conv_bias,
++          instr.AddInstruction(HloInstruction::CreateUnary(
++              conv_bias->shape(), HloOpcode::kExpm1, conv_bias))));
++      break;
++    case se::dnn::ActivationMode::kRelu6:
++      conv_bias_act = instr.AddInstruction(HloInstruction::CreateTernary(
++          conv_bias->shape(), HloOpcode::kClamp,
++          BroadcastZeros(instr.parent(), conv_bias->shape()), conv_bias,
++          instr.AddInstruction(HloInstruction::CreateBroadcast(
++              conv_bias->shape(),
++              instr.AddInstruction(HloInstruction::CreateConstant(
++                  LiteralUtil::CreateR0(conv_bias->shape().element_type(), 6))),
++              {}))));
++      break;
++    case se::dnn::ActivationMode::kLeakyRelu:
++      conv_bias_act = instr.AddInstruction(HloInstruction::CreateTernary(
++          conv_bias->shape(), HloOpcode::kSelect,
++          instr.AddInstruction(HloInstruction::CreateCompare(
++              ShapeUtil::ChangeElementType(conv_bias->shape(), PRED), conv_bias,
++              BroadcastZeros(instr.parent(), conv_bias->shape()),
++              ComparisonDirection::kGt)),
++          conv_bias,
++          instr.AddInstruction(HloInstruction::CreateBinary(
++              conv_bias->shape(), HloOpcode::kMultiply,
++              instr.AddInstruction(HloInstruction::CreateBroadcast(
++                  conv_bias->shape(),
++                  instr.AddInstruction(HloInstruction::CreateConstant(
++                      LiteralUtil::CreateR0(conv_bias->shape().element_type(),
++                                            backend_config.leakyrelu_alpha()))),
++                  {})),
++              conv_bias))));
++      break;
++  }
++
++  CHECK_NE(conv_bias_act, nullptr);
++
++  HloInstruction* new_result = instr.AddInstruction(HloInstruction::CreateTuple(
++      {conv_bias_act, instr.AddInstruction(HloInstruction::CreateConstant(
++                          LiteralUtil::CreateR1<uint8_t>({})))}));
++
++  for (auto user : users) {
++    RETURN_IF_ERROR(instr.ReplaceUseWith(user, new_result));
++  }
++
++  absl::InlinedVector<HloInstruction*, 3> new_operands(instr.operands().begin(),
++                                                       instr.operands().end());
++  new_operands.pop_back();
++
++  HloInstruction* new_conv = instr.AddInstruction(
++      instr.CloneWithNewOperands(instr.shape(), new_operands));
++  new_conv->set_custom_call_target(kCudnnConvForwardCallTarget);
++  backend_config.set_activation_mode(se::dnn::ActivationMode::kNone);
++  RETURN_IF_ERROR(new_conv->set_backend_config(gpu_config));
++  // Preserve old name to make it obvious that we decomposed fused conv
++  new_conv->SetAndSanitizeName(instr.name());
++  RETURN_IF_ERROR(instr.parent()->ReplaceInstruction(&instr, new_conv));
++
++  return ApplyConfigToMIOpenCustomCall(*new_conv, config);
++}
++
+ }  // namespace
+ 
+ bool MIOpenBackend::IsSupported(const HloInstruction& instr) {
+@@ -116,7 +254,7 @@ absl::StatusOr<std::unique_ptr<BackendConfig>> MIOpenBackend::GetDefaultConfig(
+     const HloInstruction& instr) {
+   if (IsSupported(instr)) {
+     MIOpenBackendConfig config;
+-    config.set_algo_id(-1);
++    config.set_algo_id(0);
+     auto any = std::make_unique<google::protobuf::Any>();
+     any->PackFrom(config);
+     return any;
+@@ -127,16 +265,165 @@ absl::StatusOr<std::unique_ptr<BackendConfig>> MIOpenBackend::GetDefaultConfig(
+ }
+ 
+ absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
+-MIOpenBackend::GetSupportedConfigs(const HloInstruction& instr) {
+-  if (IsSupported(instr)) {
+-    MIOpenBackendConfig config;
+-    config.set_algo_id(-1);
++GetConvolutionCustomCallConfigs(const HloCustomCallInstruction* instr,
++                                const HloModule* module,
++                                se::StreamExecutor* stream_executor,
++                                se::Stream* stream) {
++  CHECK(instr->custom_call_target() != kCudnnConvForwardGraphCallTarget);
++  ASSIGN_OR_RETURN(GpuConvConfig gpu_conv_config, GetGpuConvConfig(instr));
++  se::dnn::ConvolutionKind conv_kind =
++      CudnnConvKindToProto(gpu_conv_config.kind);
++  ASSIGN_OR_RETURN(se::dnn::DataType input_type,
++                   GetDNNDataTypeFromPrimitiveType(gpu_conv_config.input_type));
++  ASSIGN_OR_RETURN(
++      se::dnn::DataType output_type,
++      GetDNNDataTypeFromPrimitiveType(gpu_conv_config.output_type));
++  se::dnn::DnnSupport* dnn = stream_executor->AsDnn();
++  se::StreamExecutorMemoryAllocator allocator(stream_executor);
++  if (stream == nullptr) {
++    TF_ASSIGN_OR_RETURN(stream,
++                        allocator.GetStream(stream_executor->device_ordinal()));
++  }
++  bool allow_tf32 = absl::c_all_of(
++      instr->precision_config().operand_precision(),
++      [](int precision) { return precision <= PrecisionConfig::HIGH; });
++  const se::EngineOptions engine_options{RequireDeterminism(module->config()),
++                                         allow_tf32,
++                                         /*require_command_buffer=*/false};
++
++  se::OwningScratchAllocator<> scratch_allocator(
++      stream_executor->device_ordinal(), &allocator);
++
++  const auto initialize_buffer = [stream](se::DeviceAddressBase buffer) {
++    // Although we don't have evidence this matters, zero out the buffers
++    // before autotuning.  It's conceivable that using uninitialized memory as
++    // the inputs might affect performance if e.g. the inputs contain
++    // denormals, and this is easy enough.
++    return stream->MemZero(&buffer, buffer.size());
++  };
++
++  std::vector<se::DeviceAddressBase> operand_buffers;
++  operand_buffers.reserve(instr->operand_count());
++  for (const auto* operand : instr->operands()) {
++    ASSIGN_OR_RETURN(auto buffer, scratch_allocator.AllocateBytes(
++                                      ShapeUtil::ByteSizeOf(operand->shape())));
++    RETURN_IF_ERROR(initialize_buffer(buffer));
++    operand_buffers.push_back(buffer);
++  }
++
++  std::vector<se::DeviceAddressBase> result_buffers;
++  size_t result_buffers_count = instr->shape().tuple_shapes().size();
++  result_buffers.reserve(result_buffers_count);
++  for (int i = 0; i < result_buffers_count; ++i) {
++    ASSIGN_OR_RETURN(auto buffer,
++                     scratch_allocator.AllocateBytes(ShapeUtil::ByteSizeOf(
++                         instr->shape().tuple_shapes(i))));
++    result_buffers.push_back(buffer);
++  }
++
++  ASSIGN_OR_RETURN(
++      GpuConvParams gpu_conv_params,
++      GetGpuConvParams(gpu_conv_config, absl::MakeSpan(operand_buffers),
++                       absl::MakeSpan(result_buffers)));
++
++  std::vector<std::unique_ptr<const se::dnn::ConvRunner>> conv_runners;
++  RETURN_IF_ERROR(dnn->GetConvolveRunners(
++      conv_kind, input_type, output_type, stream,
++      gpu_conv_config.input_descriptor, gpu_conv_params.input_buf,
++      gpu_conv_config.filter_descriptor, gpu_conv_params.filter_buf,
++      gpu_conv_config.output_descriptor, gpu_conv_params.output_buf,
++      gpu_conv_config.conv_desc,
++      /* use_fallback = */ false, &scratch_allocator, engine_options,
++      &conv_runners));
++
++  std::vector<std::unique_ptr<BackendConfig>> configs;
++  configs.reserve(conv_runners.size());
++  for (const auto& runner : conv_runners) {
+     auto any = std::make_unique<google::protobuf::Any>();
+-    any->PackFrom(config);
+-    std::vector<std::unique_ptr<BackendConfig>> configs;
++    auto desc = runner->ToAlgorithmDesc();
++    CHECK_GT(desc->algo_id(), 0);
++    any->PackFrom(desc->ToProto());
+     configs.push_back(std::move(any));
++  }
++  return configs;
++}
++
++absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
++GetFusedConvolutionCustomCallConfigs(const HloCustomCallInstruction* instr,
++                                     const HloModule* module,
++                                     se::StreamExecutor* stream_executor) {
++  ASSIGN_OR_RETURN(GpuConvConfig gpu_conv_config, GetGpuConvConfig(instr));
++  ASSIGN_OR_RETURN(se::dnn::DataType input_type,
++                   GetDNNDataTypeFromPrimitiveType(gpu_conv_config.input_type));
++  ASSIGN_OR_RETURN(
++      se::dnn::DataType output_type,
++      GetDNNDataTypeFromPrimitiveType(gpu_conv_config.output_type));
++  se::dnn::DnnSupport* dnn = stream_executor->AsDnn();
++
++  TF_ASSIGN_OR_RETURN(auto owned_stream, stream_executor->CreateStream());
++
++  std::vector<std::unique_ptr<const se::dnn::FusedConvRunner>> runners;
++  RETURN_IF_ERROR(dnn->GetFusedConvolveRunners(
++      se::dnn::ConvolutionKind::FORWARD, input_type, output_type, output_type,
++      gpu_conv_config.conv_result_scale,
++      gpu_conv_config.fusion->side_input_scale,
++      gpu_conv_config.fusion->leakyrelu_alpha, owned_stream.get(),
++      gpu_conv_config.input_descriptor, gpu_conv_config.filter_descriptor,
++      gpu_conv_config.bias_descriptor, gpu_conv_config.output_descriptor,
++      gpu_conv_config.conv_desc,
++      /* use_fallback */ false, gpu_conv_config.fusion->mode,
++      /* numeric_options */ {}, &runners));
++
++  if (!runners.empty()) {
++    std::vector<std::unique_ptr<BackendConfig>> configs;
++    configs.reserve(runners.size());
++    for (const auto& runner : runners) {
++      auto any = std::make_unique<google::protobuf::Any>();
++      auto desc = runner->ToAlgorithmDesc();
++      CHECK_LT(desc->algo_id(), 0);
++      any->PackFrom(desc->ToProto());
++      configs.push_back(std::move(any));
++    }
+     return configs;
+   }
++
++  // No algorithm found. Try finding algorithm for unfused conv.
++
++  CHECK(gpu_conv_config.conv_result_scale == 1.0 &&
++        gpu_conv_config.fusion->side_input_scale == 0.0 &&
++        instr->operands().size() == 3);
++
++  absl::InlinedVector<HloInstruction*, 3> new_operands(
++      instr->operands().begin(), instr->operands().end());
++  new_operands.pop_back();
++
++  auto new_conv = instr->CloneWithNewOperands(instr->shape(), new_operands);
++  new_conv->set_custom_call_target(kCudnnConvForwardCallTarget);
++
++  ASSIGN_OR_RETURN(auto gpu_config,
++                   new_conv->backend_config<GpuBackendConfig>());
++  CudnnConvBackendConfig& backend_config =
++      *gpu_config.mutable_cudnn_conv_backend_config();
++  backend_config.set_activation_mode(se::dnn::ActivationMode::kNone);
++  RETURN_IF_ERROR(new_conv->set_backend_config(gpu_config));
++
++  return GetConvolutionCustomCallConfigs(
++      static_cast<HloCustomCallInstruction*>(new_conv.get()), module,
++      stream_executor, owned_stream.get());
++}
++
++absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
++MIOpenBackend::GetSupportedConfigs(const HloInstruction& instr) {
++  if (IsSupported(instr)) {
++    auto custom_call_instr = Cast<HloCustomCallInstruction>(&instr);
++    if (IsCustomCallToDnnFusedConvolution(*custom_call_instr)) {
++      return GetFusedConvolutionCustomCallConfigs(
++          custom_call_instr, custom_call_instr->GetModule(), stream_executor());
++    }
++    return GetConvolutionCustomCallConfigs(
++        custom_call_instr, custom_call_instr->GetModule(), stream_executor(),
++        /* stream */ nullptr);
++  }
+   return std::vector<std::unique_ptr<BackendConfig>>();
+ }
+ 
+@@ -148,6 +435,9 @@ absl::Status MIOpenBackend::ApplyConfig(HloInstruction& instr,
+         "Failed to unpack MIOpenBackendConfig from Any.");
+   }
+   if (IsSupported(instr)) {
++    if (IsCustomCallToDnnFusedConvolution(instr)) {
++      return ApplyConfigToFusedMIOpenCustomCall(instr, algorithm_config);
++    }
+     return ApplyConfigToMIOpenCustomCall(instr, algorithm_config);
+   }
+   return absl::InvalidArgumentError(
+diff --git a/third_party/xla/xla/backends/gpu/autotuner/miopen_test.cc b/third_party/xla/xla/backends/gpu/autotuner/miopen_test.cc
+index 5a5538f5119..02247e4a6eb 100644
+--- a/third_party/xla/xla/backends/gpu/autotuner/miopen_test.cc
++++ b/third_party/xla/xla/backends/gpu/autotuner/miopen_test.cc
+@@ -109,7 +109,7 @@ TEST_F(MIOpenBackendTest, GetSupportedConfigsFromMIOpenCustomCall) {
+   ASSERT_THAT(configs, IsOkAndHolds(SizeIs(1)));
+   MIOpenBackendConfig algorithm_config;
+   ASSERT_TRUE((*configs)[0]->UnpackTo(&algorithm_config));
+-  EXPECT_EQ(algorithm_config.algo_id(), -1);
++  EXPECT_NE(algorithm_config.algo_id(), 0);
+ }
+ 
+ TEST_F(MIOpenBackendTest, GetDefaultConfigFromMIOpenCustomCall) {
+@@ -124,7 +124,7 @@ TEST_F(MIOpenBackendTest, GetDefaultConfigFromMIOpenCustomCall) {
+   TF_ASSERT_OK(config);
+   MIOpenBackendConfig algorithm_config;
+   ASSERT_TRUE(config->get()->UnpackTo(&algorithm_config));
+-  EXPECT_EQ(algorithm_config.algo_id(), -1);
++  EXPECT_EQ(algorithm_config.algo_id(), 0);
+ }
+ 
+ TEST_F(MIOpenBackendTest, ApplyConfigToMIOpenCustomCall) {
+diff --git a/third_party/xla/xla/backends/gpu/runtime/convolution_thunk.cc b/third_party/xla/xla/backends/gpu/runtime/convolution_thunk.cc
+index d6d8da0379d..d6c4597d513 100644
+--- a/third_party/xla/xla/backends/gpu/runtime/convolution_thunk.cc
++++ b/third_party/xla/xla/backends/gpu/runtime/convolution_thunk.cc
+@@ -107,35 +107,6 @@ absl::Status ConvolutionThunk::ExecuteOnStream(const ExecuteParams& params) {
+   RunConvOptions opts;
+   opts.runner_cache = &GetOrCreateRunner(params.stream, &runner_created);
+ 
+-  if (runner_created && params.stream->parent()
+-                            ->GetDeviceDescription()
+-                            .gpu_compute_capability()
+-                            .IsRocm()) {
+-    TF_ASSIGN_OR_RETURN(
+-        GpuConvParams conv_params,
+-        GetGpuConvParams(config_, operand_se_buffers, result_se_buffers));
+-
+-    TF_ASSIGN_OR_RETURN(se::dnn::DataType input_type,
+-                        GetDNNDataTypeFromPrimitiveType(config_.input_type));
+-
+-    TF_ASSIGN_OR_RETURN(se::dnn::DataType output_type,
+-                        GetDNNDataTypeFromPrimitiveType(config_.output_type));
+-
+-    TF_ASSIGN_OR_RETURN(auto dnn,
+-                        se::dnn::internal::GetDnnFromStream(params.stream));
+-    se::OwningScratchAllocator<> scratch_allocator(
+-        buffer_allocations.device_ordinal(),
+-        buffer_allocations.memory_allocator());
+-
+-    std::vector<se::dnn::ProfileResult> profile_results;
+-    dnn->GetMIOpenConvolveAlgorithms(
+-        CudnnConvKindToProto(config_.kind), input_type, output_type,
+-        params.stream, config_.input_descriptor, conv_params.input_buf,
+-        config_.filter_descriptor, conv_params.filter_buf,
+-        config_.output_descriptor, conv_params.output_buf, config_.conv_desc,
+-        &scratch_allocator, &profile_results);
+-  }
+-
+   TF_RETURN_IF_ERROR(RunGpuConv(config_, absl::MakeSpan(operand_se_buffers),
+                                 absl::MakeSpan(result_se_buffers), scratch,
+                                 params.stream, opts));
+diff --git a/third_party/xla/xla/debug_options_flags.cc b/third_party/xla/xla/debug_options_flags.cc
+index d8f6b2b0f38..7db7d036299 100644
+--- a/third_party/xla/xla/debug_options_flags.cc
++++ b/third_party/xla/xla/debug_options_flags.cc
+@@ -254,7 +254,6 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
+   // Despite the name, fast min/max on GPUs does not seem to be any faster, and
+   // adds very counter-intuitive "NaN-swallowing" behavior.
+   opts.set_xla_gpu_enable_fast_min_max(false);
+-  opts.set_xla_gpu_strict_conv_algorithm_picker(true);
+ 
+   opts.set_xla_allow_excess_precision(true);
+   opts.set_xla_force_host_platform_device_count(1);
+@@ -1264,12 +1263,9 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+       debug_options->xla_gpu_crash_on_verification_failures(),
+       "Crashes the program on extra verification failures, e.g. cuDNN cross "
+       "checking failures"));
+-  flag_list->push_back(tsl::Flag(
+-      "xla_gpu_strict_conv_algorithm_picker",
+-      bool_setter_for(&DebugOptions::set_xla_gpu_strict_conv_algorithm_picker),
+-      debug_options->xla_gpu_strict_conv_algorithm_picker(),
+-      "Upgrades warnings to failures when all algorithms fail conv "
+-      "autotuning."));
++  flag_list->push_back(tsl::Flag("xla_gpu_strict_conv_algorithm_picker",
++                                 noop_flag_setter<bool>, false,
++                                 "[Deprecated, do not use]."));
+   flag_list->push_back(tsl::Flag(
+       "xla_gpu_autotune_level",
+       int32_setter_for(&DebugOptions::set_xla_gpu_autotune_level),
+diff --git a/third_party/xla/xla/service/gpu/BUILD b/third_party/xla/xla/service/gpu/BUILD
+index 147334f0d6c..836bd322920 100644
+--- a/third_party/xla/xla/service/gpu/BUILD
++++ b/third_party/xla/xla/service/gpu/BUILD
+@@ -2190,7 +2190,6 @@ cc_library(
+         "//xla/service:hlo_verifier",
+         "//xla/service/gpu/autotuning:autotuner_pass",
+         "//xla/service/gpu/autotuning:autotuner_util",
+-        "//xla/service/gpu/autotuning:conv_algorithm_picker",
+         "//xla/service/gpu/autotuning:gemm_fusion_autotuner",
+         "//xla/service/gpu/llvm_gpu_backend:nvptx_backend",
+         "//xla/service/gpu/llvm_gpu_backend:nvptx_utils",
+@@ -2425,6 +2424,7 @@ cc_library(
+         "//xla/backends/autotuner:codegen_backend",
+         "//xla/backends/gpu/autotuner:block_level_emitter",
+         "//xla/backends/gpu/autotuner:hipblaslt",
++        "//xla/backends/gpu/autotuner:miopen",
+         "//xla/backends/gpu/autotuner:native_emitter",
+         "//xla/backends/gpu/autotuner:rocblas",
+         "//xla/hlo/ir:hlo",
+@@ -2446,7 +2446,6 @@ cc_library(
+         "//xla/service:hlo_verifier",
+         "//xla/service/gpu/autotuning:autotuner_pass",
+         "//xla/service/gpu/autotuning:autotuner_util",
+-        "//xla/service/gpu/autotuning:conv_algorithm_picker",
+         "//xla/service/gpu/autotuning:gemm_fusion_autotuner",
+         "//xla/service/gpu/llvm_gpu_backend:amdgpu_backend",
+         "//xla/service/gpu/transforms:algebraic_simplifier",
+diff --git a/third_party/xla/xla/service/gpu/amdgpu_compiler.cc b/third_party/xla/xla/service/gpu/amdgpu_compiler.cc
+index 1f53ed7bb0d..4fd281741a5 100644
+--- a/third_party/xla/xla/service/gpu/amdgpu_compiler.cc
++++ b/third_party/xla/xla/service/gpu/amdgpu_compiler.cc
+@@ -29,6 +29,7 @@ limitations under the License.
+ #include "xla/backends/autotuner/codegen_backend.h"
+ #include "xla/backends/gpu/autotuner/block_level_emitter.h"
+ #include "xla/backends/gpu/autotuner/hipblaslt.h"
++#include "xla/backends/gpu/autotuner/miopen.h"
+ #include "xla/backends/gpu/autotuner/native_emitter.h"
+ #include "xla/backends/gpu/autotuner/rocblas.h"
+ #include "xla/hlo/ir/hlo_casting_utils.h"
+@@ -53,7 +54,6 @@ limitations under the License.
+ #include "xla/service/gpu/alias_info.h"
+ #include "xla/service/gpu/autotuning/autotuner_pass.h"
+ #include "xla/service/gpu/autotuning/autotuner_util.h"
+-#include "xla/service/gpu/autotuning/conv_algorithm_picker.h"
+ #include "xla/service/gpu/autotuning/gemm_fusion_autotuner.h"
+ #include "xla/service/gpu/cublas_cudnn.h"
+ #include "xla/service/gpu/cublas_padding_requirements.h"
+@@ -230,12 +230,13 @@ absl::Status AMDGPUCompiler::OptimizeHloPostLayoutAssignment(
+ // enabled.
+ bool AMDGPUCompiler::RequiresCollectiveScheduleLinearizer(
+     const HloModule* module, se::StreamExecutor* stream_exec) {
+-  if (stream_exec == nullptr || !GpuConvAlgorithmPicker::IsEnabled(module)) {
++  if (stream_exec == nullptr ||
++      module->config().debug_options().xla_gpu_autotune_level() == 0) {
+     return false;
+   }
+   for (const HloComputation* comp : module->MakeNonfusionComputations()) {
+     for (const HloInstruction* inst : comp->instructions()) {
+-      if (GpuConvAlgorithmPicker::IsCandidate(inst)) {
++      if (IsCustomCallToDnnConvolution(*inst)) {
+         return true;
+       }
+     }
+@@ -251,33 +252,50 @@ absl::Status AMDGPUCompiler::AddConvAndGemmAutotuningPasses(
+     se::StreamExecutor* stream_exec,
+     const Compiler::GpuTargetConfig* target_config) {
+   const DebugOptions& debug_options = hlo_module->config().debug_options();
++  // TODO(rocm) Add more uses of xla_gpu_experimental_disable_binary_libraries
+   if (hlo_module->config()
+           .debug_options()
+-          .xla_gpu_experimental_disable_binary_libraries() ||
+-      debug_options.xla_gpu_autotune_level() == 0 ||
+-      debug_options.xla_gpu_exclude_nondeterministic_ops() ||
+-      stream_exec == nullptr) {
++          .xla_gpu_experimental_disable_binary_libraries()) {
+     return absl::OkStatus();
+   }
+ 
+-  // TODO(b/407494793): Remove the GpuConvAlgorithmPicker and use the autotuner
+-  // it supports ROCM.
+-  pipeline->AddPass<GpuConvAlgorithmPicker>(autotune_config);
++  // We still need to run autotuning pass in order to decompose fused
++  // convolutions
++  bool skip_autotuning = debug_options.xla_gpu_autotune_level() == 0 ||
++                         debug_options.xla_gpu_exclude_nondeterministic_ops() ||
++                         stream_exec == nullptr;
+ 
+   std::vector<std::unique_ptr<CodegenBackend>> backends;
+-  backends.push_back(std::make_unique<RocblasBackend>(
+-      stream_exec, &debug_options, this, target_config));
+-  backends.push_back(std::make_unique<HipblasLtBackend>(
++  backends.reserve(3);
++  if (!skip_autotuning) {
++    // TODO(b/407494793): - Add proper support for ROCM. Currently the Cublas
++    // backend uses the same API as rocBLAS.
++    backends.push_back(std::make_unique<RocblasBackend>(
++        stream_exec, &debug_options, this, target_config));
++    backends.push_back(std::make_unique<HipblasLtBackend>(
++        stream_exec, &debug_options, this, target_config));
++  }
++  backends.push_back(std::make_unique<MIOpenBackend>(
+       stream_exec, &debug_options, this, target_config));
+-  auto should_autotune = [](const HloInstruction& instruction) -> bool {
++
++  auto should_autotune = +[](const HloInstruction& instruction) -> bool {
++    return instruction.opcode() == HloOpcode::kCustomCall &&
++           (IsCublasGemm(instruction) ||
++            IsCustomCallToDnnConvolution(instruction));
++  };
++  auto should_autotune_when_skip =
++      +[](const HloInstruction& instruction) -> bool {
+     return instruction.opcode() == HloOpcode::kCustomCall &&
+-           IsCublasGemm(instruction);
++           instruction.custom_call_target() ==
++               kCudnnConvBiasActivationForwardCallTarget;
+   };
+   TF_ASSIGN_OR_RETURN(
+       std::unique_ptr<AutotunerPass> autotuner_pass,
+-      AutotunerPass::Create(std::move(backends), debug_options, stream_exec,
+-                            thread_pool, should_autotune, target_config,
+-                            options.device_allocator));
++      AutotunerPass::Create(
++          std::move(backends), debug_options,
++          !skip_autotuning ? stream_exec : nullptr, thread_pool,
++          !skip_autotuning ? should_autotune : should_autotune_when_skip,
++          target_config, options.device_allocator));
+   pipeline->AddPass(std::move(autotuner_pass));
+ 
+   return absl::OkStatus();
+diff --git a/third_party/xla/xla/service/gpu/autotuning/BUILD b/third_party/xla/xla/service/gpu/autotuning/BUILD
+index 0f80cddbbfd..79758c9dcb8 100644
+--- a/third_party/xla/xla/service/gpu/autotuning/BUILD
++++ b/third_party/xla/xla/service/gpu/autotuning/BUILD
+@@ -564,109 +564,6 @@ xla_test(
+     ],
+ )
+ 
+-cc_library(
+-    name = "conv_algorithm_picker",
+-    srcs = ["conv_algorithm_picker.cc"],
+-    hdrs = ["conv_algorithm_picker.h"],
+-    tags = ["gpu"],
+-    deps = [
+-        ":autotune_cache_key",
+-        ":autotuner_util",
+-        ":gpu_autotuning_proto_cc",
+-        ":redzone_buffers",
+-        "//xla:autotune_results_proto_cc",
+-        "//xla:autotuning_proto_cc",
+-        "//xla:debug_options_flags",
+-        "//xla:literal_util",
+-        "//xla:shape_util",
+-        "//xla:util",
+-        "//xla:xla_data_proto_cc",
+-        "//xla:xla_proto_cc",
+-        "//xla/backends/gpu/runtime:buffer_comparator",
+-        "//xla/hlo/ir:hlo",
+-        "//xla/hlo/pass:hlo_pass",
+-        "//xla/service:hlo_module_config",
+-        "//xla/service:slow_operation_alarm",
+-        "//xla/service/gpu:backend_configs_cc",
+-        "//xla/service/gpu:cublas_cudnn",
+-        "//xla/service/gpu:gpu_conv_runner",
+-        "//xla/service/gpu:hlo_algorithm_denylist",
+-        "//xla/service/gpu:stream_executor_util",
+-        "//xla/stream_executor:device_address",
+-        "//xla/stream_executor:device_address_allocator",
+-        "//xla/stream_executor:device_description",
+-        "//xla/stream_executor:dnn",
+-        "//xla/stream_executor:engine_options",
+-        "//xla/stream_executor:lazy_op_runner",
+-        "//xla/stream_executor:platform",
+-        "//xla/stream_executor:scratch_allocator",
+-        "//xla/stream_executor:stream",
+-        "//xla/stream_executor:stream_executor_h",
+-        "//xla/stream_executor/cuda:cuda_compute_capability",
+-        "//xla/stream_executor/cuda:cuda_platform_id",
+-        "//xla/stream_executor/gpu:redzone_allocator",
+-        "//xla/stream_executor/rocm:rocm_platform_id",
+-        "//xla/tsl/platform:errors",
+-        "//xla/tsl/platform:logging",
+-        "//xla/tsl/platform:statusor",
+-        "//xla/tsl/protobuf:dnn_proto_cc",
+-        "//xla/tsl/util:env_var",
+-        "//xla/tsl/util/proto:proto_utils",
+-        "@com_google_absl//absl/algorithm:container",
+-        "@com_google_absl//absl/container:flat_hash_set",
+-        "@com_google_absl//absl/status",
+-        "@com_google_absl//absl/status:statusor",
+-        "@com_google_absl//absl/strings",
+-        "@com_google_absl//absl/strings:str_format",
+-        "@com_google_absl//absl/synchronization",
+-        "@com_google_absl//absl/time",
+-        "@com_google_absl//absl/types:span",
+-        "@local_tsl//tsl/platform:numbers",
+-    ],
+-)
+-
+-xla_test(
+-    name = "conv_algorithm_picker_test",
+-    srcs = ["conv_algorithm_picker_test.cc"],
+-    backends = [
+-        "v100",
+-        "amdgpu_any",
+-    ],
+-    tags = [
+-        "cuda-only",
+-        "noasan",
+-        "nomsan",
+-        "pjrt_migration_candidate",
+-    ],
+-    use_legacy_runtime = True,
+-    deps = [
+-        ":autotuner_util",
+-        ":conv_algorithm_picker",
+-        "//xla:autotune_results_proto_cc",
+-        "//xla:debug_options_flags",
+-        "//xla:xla_data_proto_cc",
+-        "//xla:xla_proto_cc",
+-        "//xla/hlo/ir:hlo",
+-        "//xla/hlo/testlib:pattern_matcher_gmock",
+-        "//xla/hlo/transforms/simplifiers:tuple_simplifier",
+-        "//xla/service:pattern_matcher",
+-        "//xla/service:platform_util",
+-        "//xla/service/gpu:backend_configs_cc",
+-        "//xla/service/gpu:stream_executor_util",
+-        "//xla/service/gpu/transforms:conv_rewriter",
+-        "//xla/service/gpu/transforms:cudnn_fused_conv_rewriter",
+-        "//xla/stream_executor:device_description",
+-        "//xla/stream_executor:dnn",
+-        "//xla/stream_executor:platform",
+-        "//xla/tests:hlo_test_base",
+-        "//xla/tsl/lib/core:status_test_util",
+-        "//xla/tsl/platform:statusor",
+-        "//xla/tsl/platform:test",
+-        "//xla/tsl/platform:test_main",
+-        "@com_google_absl//absl/strings:string_view",
+-    ],
+-)
+-
+ tf_proto_library(
+     name = "gpu_autotuning_proto",
+     srcs = ["gpu_autotuning.proto"],
+diff --git a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.cc b/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.cc
+deleted file mode 100644
+index bce97c0ed93..00000000000
+--- a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.cc
++++ /dev/null
+@@ -1,1179 +0,0 @@
+-/* Copyright 2018 The OpenXLA Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-==============================================================================*/
+-
+-#include "xla/service/gpu/autotuning/conv_algorithm_picker.h"
+-
+-#include <algorithm>
+-#include <cmath>
+-#include <cstddef>
+-#include <cstdint>
+-#include <limits>
+-#include <memory>
+-#include <optional>
+-#include <string>
+-#include <tuple>
+-#include <utility>
+-#include <vector>
+-
+-#include "absl/algorithm/container.h"
+-#include "absl/container/flat_hash_set.h"
+-#include "absl/status/status.h"
+-#include "absl/strings/str_cat.h"
+-#include "absl/strings/str_format.h"
+-#include "absl/strings/string_view.h"
+-#include "absl/synchronization/mutex.h"
+-#include "absl/time/time.h"
+-#include "absl/types/span.h"
+-#include "xla/autotuning.pb.h"
+-#include "xla/backends/gpu/runtime/buffer_comparator.h"
+-#include "xla/debug_options_flags.h"
+-#include "xla/hlo/ir/hlo_casting_utils.h"
+-#include "xla/hlo/ir/hlo_instruction.h"
+-#include "xla/hlo/ir/hlo_instructions.h"
+-#include "xla/hlo/ir/hlo_print_options.h"
+-#include "xla/literal_util.h"
+-#include "xla/service/gpu/autotuning/autotune_cache_key.h"
+-#include "xla/service/gpu/autotuning/autotuner_util.h"
+-#include "xla/service/gpu/autotuning/gpu_autotuning.pb.h"
+-#include "xla/service/gpu/autotuning/redzone_buffers.h"
+-#include "xla/service/gpu/backend_configs.pb.h"
+-#include "xla/service/gpu/cublas_cudnn.h"
+-#include "xla/service/gpu/gpu_conv_runner.h"
+-#include "xla/service/gpu/hlo_algorithm_denylist.h"
+-#include "xla/service/gpu/stream_executor_util.h"
+-#include "xla/service/hlo_module_config.h"
+-#include "xla/service/slow_operation_alarm.h"
+-#include "xla/shape.h"
+-#include "xla/shape_util.h"
+-#include "xla/stream_executor/cuda/cuda_compute_capability.h"
+-#include "xla/stream_executor/cuda/cuda_platform_id.h"
+-#include "xla/stream_executor/device_address.h"
+-#include "xla/stream_executor/device_address_allocator.h"
+-#include "xla/stream_executor/device_description.h"
+-#include "xla/stream_executor/dnn.h"
+-#include "xla/stream_executor/engine_options.h"
+-#include "xla/stream_executor/gpu/redzone_allocator.h"
+-#include "xla/stream_executor/lazy_op_runner.h"
+-#include "xla/stream_executor/platform.h"
+-#include "xla/stream_executor/rocm/rocm_platform_id.h"
+-#include "xla/stream_executor/scratch_allocator.h"
+-#include "xla/stream_executor/stream.h"
+-#include "xla/stream_executor/stream_executor.h"
+-#include "xla/tsl/platform/errors.h"
+-#include "xla/tsl/platform/logging.h"
+-#include "xla/tsl/platform/statusor.h"
+-#include "xla/tsl/protobuf/dnn.pb.h"
+-#include "xla/tsl/util/env_var.h"
+-#include "xla/tsl/util/proto/proto_utils.h"
+-#include "xla/util.h"
+-#include "xla/xla.pb.h"
+-#include "xla/xla_data.pb.h"
+-#include "tsl/platform/numbers.h"
+-
+-namespace xla {
+-namespace gpu {
+-namespace {
+-
+-using se::DeviceAddressBase;
+-using se::dnn::AlgorithmDesc;
+-using std::optional;
+-
+-// Returns the shape of the element with index tuple_idx from shape when shape
+-// is a tuple shape. Returns shape when shape is not a tuple shape.
+-Shape MaybeTupleElementShape(Shape shape, int64_t tuple_idx) {
+-  if (shape.IsTuple()) {
+-    return shape.tuple_shapes(tuple_idx);
+-  }
+-  return shape;
+-}
+-
+-class ScratchAllocator : public se::ScratchAllocator {
+- public:
+-  ScratchAllocator(int device_ordinal,
+-                   se::DeviceAddressAllocator* memory_allocator)
+-      : device_ordinal_(device_ordinal), memory_allocator_(memory_allocator) {}
+-
+-  int64_t GetMemoryLimitInBytes() override {
+-    return ScratchAllocator::GetDefaultMemoryLimitInBytes();
+-  }
+-  int64_t TotalAllocatedBytes() { return total_allocated_bytes_; }
+-
+-  static int64_t GetDefaultMemoryLimitInBytes() {
+-    int64_t value;
+-    CHECK_OK(tsl::ReadInt64FromEnvVar("TF_CUDNN_WORKSPACE_LIMIT_IN_MB",
+-                                      1LL << 12, &value));
+-    return value * (1LL << 20);
+-  }
+-
+-  absl::StatusOr<se::DeviceAddress<uint8_t>> AllocateBytes(
+-      int64_t byte_size) override;
+-
+-  template <typename T>
+-  absl::StatusOr<se::DeviceAddress<T>> Allocate(int64_t num_elements) {
+-    TF_ASSIGN_OR_RETURN(se::DeviceAddress<uint8_t> bytes,
+-                        AllocateBytes(num_elements * sizeof(T)));
+-    return se::DeviceAddress<T>(bytes);
+-  }
+-
+- private:
+-  const int device_ordinal_;
+-  se::DeviceAddressAllocator* memory_allocator_;
+-  std::vector<se::ScopedDeviceAddress<uint8_t>> allocated_buffers_;
+-  int64_t total_allocated_bytes_ = 0;
+-};
+-
+-absl::StatusOr<se::DeviceAddress<uint8_t>> ScratchAllocator::AllocateBytes(
+-    int64_t byte_size) {
+-  CHECK_GE(byte_size, 0) << "byte_size must be positive.";
+-  if (byte_size > GetMemoryLimitInBytes()) {
+-    return absl::ResourceExhaustedError(absl::StrFormat(
+-        "Allocating %d bytes exceeds the memory limit of %d bytes.", byte_size,
+-        GetMemoryLimitInBytes()));
+-  }
+-
+-  TF_ASSIGN_OR_RETURN(se::ScopedDeviceAddress<uint8_t> allocated_buffer,
+-                      memory_allocator_->Allocate(device_ordinal_, byte_size,
+-                                                  /*retry_on_failure=*/false));
+-  total_allocated_bytes_ += byte_size;
+-
+-  se::DeviceAddressBase buffer_addr = *allocated_buffer;
+-  allocated_buffers_.push_back(std::move(allocated_buffer));
+-  return se::DeviceAddress<uint8_t>(buffer_addr);
+-}
+-
+-absl::StatusOr<std::vector<GenericConvRunner>> GetAlgorithms(
+-    const GpuConvConfig& config, se::Stream* stream, bool use_fallback,
+-    const se::EngineOptions& engine_options) {
+-  TF_ASSIGN_OR_RETURN(se::dnn::DataType input_type,
+-                      GetDNNDataTypeFromPrimitiveType(config.input_type));
+-
+-  TF_ASSIGN_OR_RETURN(se::dnn::DataType output_type,
+-                      GetDNNDataTypeFromPrimitiveType(config.output_type));
+-
+-  se::StreamExecutor* stream_exec = stream->parent();
+-  std::vector<GenericConvRunner> result;
+-
+-  auto dnn = stream_exec->AsDnn();
+-  if (dnn == nullptr) {
+-    return absl::InvalidArgumentError("No DNN in stream executor.");
+-  }
+-  se::dnn::ConvolutionKind kind = CudnnConvKindToProto(config.kind);
+-  switch (kind) {
+-    default:
+-      return Internal("Unknown ConvolutionKind %d", kind);
+-    case se::dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
+-      if (!config.fusion) {
+-        return Internal(
+-            "GpuConvConfig had fusion ConvolutionKind but no FusionConfig.");
+-      }
+-      std::vector<std::unique_ptr<const se::dnn::FusedConvRunner>> runners;
+-      TF_RETURN_IF_ERROR(dnn->GetFusedConvolveRunners(
+-          // This refers to the kind of convolution op inside the fusion, not
+-          // the whole fused graph.
+-          se::dnn::ConvolutionKind::FORWARD, input_type,
+-          BiasTypeForInputType(input_type), output_type,
+-          /* conv_input_scale = */ config.conv_result_scale,
+-          /* side_input_scale = */ config.fusion->side_input_scale,
+-          /* leakyrelu_alpha = */ config.fusion->leakyrelu_alpha, stream,
+-          config.input_descriptor, config.filter_descriptor,
+-          config.bias_descriptor, config.output_descriptor, config.conv_desc,
+-          use_fallback, config.fusion->mode, engine_options, &runners));
+-      for (auto& runner : runners) {
+-        TF_ASSIGN_OR_RETURN(
+-            auto runner_cache,
+-            se::dnn::LazyOpRunner<se::dnn::FusedConvOp>::FromOpRunner(
+-                std::move(runner)));
+-        result.emplace_back(std::move(runner_cache));
+-      }
+-      break;
+-    }
+-
+-    case se::dnn::ConvolutionKind::FORWARD_GRAPH: {
+-      std::vector<std::unique_ptr<const se::dnn::GraphConvRunner>> runners;
+-      // This path is cuDNN-only, where the DeviceAddressBase arguments and the
+-      // allocator are unused; so, they're all provided as nullptr.
+-      TF_RETURN_IF_ERROR(dnn->GetGraphConvolveRunners(
+-          kind, input_type, output_type, stream, config.input_descriptor,
+-          config.filter_descriptor, config.output_descriptor, config.conv_desc,
+-          use_fallback, engine_options, &runners, config.serialized_graph));
+-      for (auto& runner : runners) {
+-        TF_ASSIGN_OR_RETURN(
+-            auto runner_cache,
+-            se::dnn::LazyOpRunner<se::dnn::GraphConvOp>::FromOpRunner(
+-                std::move(runner)));
+-        result.emplace_back(std::move(runner_cache));
+-      }
+-      break;
+-    }
+-
+-    case se::dnn::ConvolutionKind::FORWARD:
+-    case se::dnn::ConvolutionKind::BACKWARD_DATA:
+-    case se::dnn::ConvolutionKind::BACKWARD_FILTER: {
+-      std::vector<std::unique_ptr<const se::dnn::ConvRunner>> runners;
+-      // This path is cuDNN-only, where the DeviceAddressBase arguments and the
+-      // allocator are unused; so, they're all provided as nullptr.
+-      TF_RETURN_IF_ERROR(dnn->GetConvolveRunners(
+-          kind, input_type, output_type, stream, config.input_descriptor,
+-          /* input_data = */ DeviceAddressBase(nullptr),
+-          config.filter_descriptor,
+-          /* filter_data = */ DeviceAddressBase(nullptr),
+-          config.output_descriptor,
+-          /* output_data = */ DeviceAddressBase(nullptr), config.conv_desc,
+-          use_fallback, nullptr, engine_options, &runners));
+-
+-      for (auto& runner : runners) {
+-        TF_ASSIGN_OR_RETURN(
+-            auto runner_cache,
+-            se::dnn::LazyOpRunner<se::dnn::ConvOp>::FromOpRunner(
+-                std::move(runner)));
+-        result.emplace_back(std::move(runner_cache));
+-      }
+-      break;
+-    }
+-  }
+-
+-  return result;
+-}
+-
+-absl::StatusOr<std::vector<std::unique_ptr<const se::dnn::ConvRunner>>>
+-GetMIOpenAlgorithms(const HloCustomCallInstruction* instr,
+-                    absl::Span<se::DeviceAddressBase> operand_buffers,
+-                    absl::Span<se::DeviceAddressBase> result_buffers,
+-                    se::StreamExecutor* stream_exec,
+-                    ScratchAllocator* scratch_allocator, se::Stream* stream,
+-                    const se::EngineOptions& engine_options) {
+-  TF_ASSIGN_OR_RETURN(GpuConvConfig config, GetGpuConvConfig(instr));
+-
+-  TF_ASSIGN_OR_RETURN(se::dnn::DataType dtype,
+-                      GetDNNDataTypeFromPrimitiveType(config.output_type));
+-
+-  TF_ASSIGN_OR_RETURN(
+-      GpuConvParams params,
+-      GetGpuConvParams(config, operand_buffers, result_buffers));
+-
+-  std::vector<std::unique_ptr<const se::dnn::ConvRunner>> runners;
+-  auto dnn = stream_exec->AsDnn();
+-  if (dnn == nullptr) {
+-    return absl::InvalidArgumentError("No DNN in stream executor.");
+-  }
+-  TF_RETURN_IF_ERROR(dnn->GetConvolveRunners(
+-      CudnnConvKindToProto(config.kind), dtype, dtype, stream,
+-      params.config->input_descriptor, params.input_buf,
+-      params.config->filter_descriptor, params.filter_buf,
+-      params.config->output_descriptor, params.output_buf,
+-      params.config->conv_desc,
+-      /* use_fallback = */ false, scratch_allocator, engine_options, &runners));
+-
+-  return runners;
+-}
+-
+-std::string NumBytesToString(int64_t bytes) {
+-  return absl::StrCat(tsl::strings::HumanReadableNumBytes(bytes), " (", bytes,
+-                      "B)");
+-}
+-
+-CudnnVersion GetCudnnVersion(se::StreamExecutor* stream_executor) {
+-  se::dnn::VersionInfo version = GetDnnVersionInfoOrDefault(stream_executor);
+-  CudnnVersion cudnn_version;
+-  cudnn_version.set_major(version.major_version());
+-  cudnn_version.set_minor(version.minor_version());
+-  cudnn_version.set_patch(version.patch());
+-
+-  return cudnn_version;
+-}
+-
+-ComputeCapability GetComputeCapability(se::StreamExecutor* stream_executor) {
+-  ComputeCapability cc;
+-  se::CudaComputeCapability se_cc =
+-      stream_executor->GetDeviceDescription().cuda_compute_capability();
+-  cc.set_major(se_cc.major);
+-  cc.set_minor(se_cc.minor);
+-  return cc;
+-}
+-
+-void PrintPlatformInfo(const se::Stream* stream) {
+-  auto* se = stream->parent();
+-  const auto& desc = se->GetDeviceDescription();
+-  LOG(ERROR) << "Device: " << desc.name();
+-  LOG(ERROR) << "Platform: " << desc.platform_version();
+-  LOG(ERROR) << "Driver: " << desc.driver_version();
+-  LOG(ERROR) << "Runtime: " << desc.runtime_version();
+-
+-  auto dnn_version = GetDnnVersionInfo(se);
+-  if (dnn_version.ok()) {
+-    auto v = dnn_version.value();
+-    LOG(ERROR) << "cudnn version: " << v.major_version() << "."
+-               << v.minor_version() << "." << v.patch();
+-  }
+-}
+-
+-// Returns true if the redzones in `allocator`'s allocations are unmodified.
+-//
+-// If the redzones are modified, logs an error, sets the appropriate failure
+-// bits on `result`, and returns false.
+-//
+-// Returns a absl::Status if an unexpected error has occurred, and the stream
+-// has been poisoned.
+-//
+-// `name` is a user-friendly name for the set of redzones being checked, e.g.
+-// "input/output" or "scratch".
+-absl::StatusOr<bool> CheckRedzones(const se::RedzoneAllocator& allocator,
+-                                   se::Stream* stream, absl::string_view name,
+-                                   absl::string_view instr_str,
+-                                   AutotuneResult* result) {
+-  XLA_SCOPED_LOGGING_TIMER_LEVEL("CudnnConvAlgorithmPicker checking redzones",
+-                                 2);
+-  using RedzoneCheckStatus = se::RedzoneAllocator::RedzoneCheckStatus;
+-  TF_ASSIGN_OR_RETURN(RedzoneCheckStatus redzone_check,
+-                      allocator.CheckRedzones());
+-  if (redzone_check.ok()) {
+-    return true;
+-  }
+-
+-  auto* fail = result->mutable_failure();
+-  fail->set_kind(AutotuneResult::REDZONE_MODIFIED);
+-  *fail->mutable_msg() = redzone_check.RedzoneFailureMsg();
+-  fail->set_buffer_address(
+-      reinterpret_cast<uint64_t>(redzone_check.user_buffer_address));
+-
+-  LOG(ERROR) << absl::StreamFormat(
+-      "Detected cudnn out-of-bounds write in conv %s buffer! This is likely a "
+-      "cudnn bug. We will skip this algorithm in the future, but your GPU "
+-      "state may already be corrupted, leading to incorrect results. Within "
+-      "Google, no action is needed on your part. Outside of Google, please "
+-      "ensure you're running the latest version of cudnn. If that doesn't fix "
+-      "the problem, please file a bug with this full error message and we'll "
+-      "contact nvidia.",
+-      name);
+-  LOG(ERROR) << redzone_check.RedzoneFailureMsg();
+-  LOG(ERROR) << "HloInstruction " << instr_str;
+-  PrintPlatformInfo(stream);
+-  return false;
+-}
+-
+-}  // anonymous namespace
+-
+-bool ShouldInitConvData(const HloModuleConfig& hlo_module_config) {
+-  const int32_t conv_autotune_level =
+-      hlo_module_config.debug_options().xla_gpu_autotune_level();
+-  return conv_autotune_level >= 2;
+-}
+-
+-bool ShouldCheckConv(const HloModuleConfig& hlo_module_config) {
+-  const int32_t conv_autotune_level =
+-      hlo_module_config.debug_options().xla_gpu_autotune_level();
+-  return conv_autotune_level >= 4;
+-}
+-
+-absl::StatusOr<AutotuneResult> GpuConvAlgorithmPicker::PickBestAlgorithm(
+-    const HloCustomCallInstruction* instr) {
+-  return AutotunerUtil::Autotune(
+-      instr, config_, [&] { return PickBestAlgorithmNoCache(instr); });
+-}
+-
+-absl::StatusOr<AutotuneResult> GpuConvAlgorithmPicker::PickBestAlgorithmNoCache(
+-    const HloCustomCallInstruction* instr) {
+-  if (config_.IsDeviceless()) {
+-    // Return an autotune result with algo id -1, which means that we autotune
+-    // at runtime.
+-    AutotuneResult result;
+-    result.mutable_algorithm()->set_algo_id(-1);
+-    return result;
+-  }
+-
+-  se::StreamExecutor* stream_exec = config_.GetExecutor();
+-  // Don't run this function concurrently on the same GPU.
+-  //
+-  // This is a bit of a hack and doesn't protect us against arbitrary concurrent
+-  // use of a GPU, but it's sufficient to let us compile two HLO modules
+-  // concurrently and then run them sequentially.
+-  //
+-  // Putting the lock in here rather than in PickBestAlgorithmNoCache lets us
+-  // avoid ever doing duplicate work.  If we have a cache miss, only one thread
+-  // will run PickBestAlgorithmImpl for a particular device.
+-  absl::MutexLock lock(GetGpuMutex(stream_exec));
+-
+-  // Make sure any previous activity on this executor is done. We don't want
+-  // other work still running on the GPU to interfere with autotuning.
+-  if (!stream_exec->SynchronizeAllActivity()) {
+-    return Internal(
+-        "Failed to synchronize GPU for autotuning conv instruction");
+-  }
+-
+-  absl::StatusOr<AutotuneResult> result_or(Internal("Unknown platform."));
+-  // Check StreamExecutor on which platform it is. ROCm and Cuda implementation
+-  // have diverged. Specifically, we need to make sure redzone allocator related
+-  // utilities are not used in ROCm routine
+-  se::Platform::Id platform_id = stream_exec->GetPlatform()->id();
+-  if (platform_id == se::rocm::kROCmPlatformId) {
+-    result_or = PickBestAlgorithmNoCacheRocm(instr);
+-  } else if (platform_id == se::cuda::kCudaPlatformId) {
+-    result_or = PickBestAlgorithmNoCacheCuda(instr);
+-  }
+-
+-  return result_or;
+-}
+-
+-absl::StatusOr<GpuConvAlgorithmPicker::AutotuneRuntimeArguments>
+-GpuConvAlgorithmPicker::AutotuneRuntimeArguments::FromInstruction(
+-    const HloCustomCallInstruction* instr, const AutotuneConfig& config,
+-    const DebugOptions& debug_options) {
+-  bool should_init_buffers = config.should_init_buffers();
+-  bool should_check_correctness = config.should_check_correctness();
+-  int redzone_padding_bytes = debug_options.xla_gpu_redzone_padding_bytes();
+-  TF_ASSIGN_OR_RETURN(se::Stream * stream, config.GetStream());
+-  TF_ASSIGN_OR_RETURN(
+-      auto rz_buffers,
+-      RedzoneBuffers::FromInstruction(
+-          *instr, config.GetAllocator(), stream,
+-          RedzoneBuffers::kAllInputsOutputsNoScratch, should_init_buffers,
+-          should_check_correctness, redzone_padding_bytes));
+-
+-  // Get canonical HLO.
+-  std::string canonical_hlo(
+-      AutotuneCacheKey(config.GetDeviceDescription(), *instr).GetHlo());
+-
+-  TF_ASSIGN_OR_RETURN(GpuConvConfig gpu_conv_config, GetGpuConvConfig(instr));
+-
+-  GpuConvAlgorithmPicker::AutotuneRuntimeArguments runtime_arguments = {
+-      instr->GetModule()->config(),
+-      std::move(rz_buffers),
+-      std::move(gpu_conv_config),
+-      {canonical_hlo}};
+-
+-  return runtime_arguments;
+-}
+-
+-struct CudnnVersionRange {
+-  using TupleVersion = std::tuple<int, int, int>;
+-  TupleVersion begin;
+-  TupleVersion end;
+-
+-  bool IsInRange(const CudnnVersion& other) const {
+-    TupleVersion other_version{other.major(), other.minor(), other.patch()};
+-    return begin <= other_version && other_version < end;
+-  }
+-
+-  CudnnVersionRange(const CudnnVersion& begin, const CudnnVersion& end)
+-      : begin(begin.major(), begin.minor(), begin.patch()),
+-        end(end.major(), end.minor(), end.patch()) {}
+-
+-  CudnnVersionRange(const TupleVersion& begin, const TupleVersion& end)
+-      : begin(begin), end(end) {}
+-};
+-
+-struct ComputeCapabilityRange {
+-  using TupleComputeCapability = std::tuple<int, int>;
+-  TupleComputeCapability begin;
+-  TupleComputeCapability end;
+-
+-  bool IsInRange(const ComputeCapability& other) const {
+-    TupleComputeCapability other_cc{other.major(), other.minor()};
+-    return begin <= other_cc && other_cc < end;
+-  }
+-};
+-
+-struct DisabledAlgorithm {
+-  CudnnVersionRange cudnn_version_range;
+-  ComputeCapabilityRange compute_capability_range;
+-  int algo_id;
+-};
+-
+-// TODO(b/343101418): Remove this once the bug is fixed in upstream cudnn and
+-// once we updated to that cudnn version.
+-static const DisabledAlgorithm kDisabledAlgorithms[] = {
+-    {/*.cudnn_version_range=*/{/*.begin=*/{9, 0, 0}, /*.end=*/{10, 0, 0}},
+-     /*.compute_capability_range=*/{/*.begin=*/{6, 0}, /*.end=*/{8, 0}},
+-     /*.algo_id=*/14}};
+-
+-// There are three tiers of errors possible here: returning a failed
+-// absl::StatusOr means autotuning fails immediately; returning an
+-// AutotuneResult with a failure code other than DISQUALIFIED means autotuning
+-// fails if crash_on_checking_failure is set; and returning a DISQUALIFIED
+-// AutotuneResult simply skips the engine/algorithm while recording a reason for
+-// skipping it.
+-absl::StatusOr<AutotuneResult> GpuConvAlgorithmPicker::AutotuneOneConvRunner(
+-    GenericConvRunner* const runner,
+-    std::optional<ReferenceResult>* reference_result,
+-    absl::Span<const AlgorithmDesc> disabled_algos,
+-    const HloCustomCallInstruction& instr,
+-    const AutotuneRuntimeArguments& runtime_arguments) {
+-  auto alg = runner->ToAlgorithmDesc();
+-
+-  std::string instr_str = instr.ToString(
+-      HloPrintOptions::Fingerprint().set_print_backend_config(true));
+-
+-  se::StreamExecutor* stream_exec = config_.GetExecutor();
+-  XLA_SCOPED_LOGGING_TIMER_LEVEL(
+-      absl::StrCat("CudnnConvAlgorithmPicker::PickBestAlgorithm algo ",
+-                   alg.ToString()),
+-      2);
+-
+-  auto make_failure = [&alg](AutotuneResult::FailureKind kind,
+-                             absl::string_view msg) {
+-    AutotuneResult result;
+-    *result.mutable_algorithm() = alg.ToProto();
+-    result.mutable_failure()->set_kind(kind);
+-    result.mutable_failure()->set_msg(/* *sigh* */ msg.data(), msg.size());
+-    return result;
+-  };
+-
+-  AlgorithmDesc alg_key(alg.algo_id(), alg.tensor_ops_enabled(), std::nullopt);
+-
+-  for (const auto& disabled_algo : kDisabledAlgorithms) {
+-    if (disabled_algo.cudnn_version_range.IsInRange(
+-            GetCudnnVersion(stream_exec)) &&
+-        disabled_algo.compute_capability_range.IsInRange(
+-            GetComputeCapability(stream_exec)) &&
+-        disabled_algo.algo_id == alg.algo_id()) {
+-      LOG(INFO) << "Omitted potentially buggy algorithm " << alg.ToString()
+-                << " for conv " << instr_str;
+-      return make_failure(AutotuneResult::DISQUALIFIED,
+-                          "Disqualified for being known-buggy.");
+-    }
+-  }
+-
+-  if (absl::c_linear_search(disabled_algos, alg_key)) {
+-    LOG(INFO) << "Omitted potentially buggy algorithm " << alg.ToString()
+-              << " for conv " << instr_str;
+-    return make_failure(AutotuneResult::DISQUALIFIED,
+-                        "Disqualified for being known-buggy.");
+-  }
+-
+-  GpuConvConfig config = runtime_arguments.gpu_conv_config;
+-  // For fused convolutions with the identity function as the activation, only
+-  // ALGO_IMPLICIT_PRECOMP_GEMM does the right thing. Other algorithms
+-  // silently do Relu. See
+-  // https://docs.nvidia.com/deeplearning/sdk/cudnn-developer-guide/index.html#cudnnConvolutionBiasActivationForward
+-  TF_ASSIGN_OR_RETURN(se::Stream * stream, config_.GetStream());
+-  se::RedzoneAllocator scratch_allocator(
+-      stream, config_.GetAllocator(),
+-      /*memory_limit=*/std::numeric_limits<int64_t>::max(),
+-      /*redzone_size=*/config_.should_check_correctness()
+-          ? runtime_arguments.hlo_module_config.debug_options()
+-                .xla_gpu_redzone_padding_bytes()
+-          : 0);
+-
+-  se::dnn::ProfileResult profile_result;
+-  VLOG(4) << "Trying algorithm " << alg.ToString() << " for " << instr_str;
+-  VLOG(5) << "If you want to disable this algorithm, copy-paste the following "
+-             "to the denylist:";
+-  std::string blas_version;
+-  if (auto* blas = stream_exec->AsBlas()) {
+-    (void)blas->GetVersion(&blas_version);
+-  }
+-  VLOG(5) << GenerateDenyListEntry(instr, alg,
+-                                   GetComputeCapability(stream_exec),
+-                                   GetCudnnVersion(stream_exec), blas_version);
+-
+-  SlowOperationAlarm alarm(
+-      absl::Seconds(1),
+-      absl::StrFormat("Trying algorithm %s for conv %s is taking a while...",
+-                      alg.ToString(), instr_str));
+-
+-  std::optional<size_t> workspace_size =
+-      runner->ToAlgorithmDesc().workspace_size();
+-  if (!workspace_size) {
+-    return make_failure(AutotuneResult::UNKNOWN,
+-                        "Internal error: missing workspace size from "
+-                        "OpRunner::ToAlgorithmDesc()");
+-  }
+-
+-  auto scratch_or = scratch_allocator.AllocateBytes(*workspace_size);
+-  if (!scratch_or.ok()) {
+-    return make_failure(AutotuneResult::DISQUALIFIED,
+-                        absl::StrCat("Scratch allocation failed: ",
+-                                     scratch_or.status().ToString()));
+-  }
+-  se::DeviceAddressBase scratch_memory = scratch_or.value();
+-
+-  // Use assignment instead of brace-list to make GCC 4.9 happy.
+-  RunConvOptions options;
+-  options.runner_cache = runner;
+-  // The following plan timing code is based on
+-  // https://github.com/NVIDIA/cudnn-frontend/blob/60496f42fdc7a4ccc059f5934e306e728a756755/include/cudnn_frontend_find_plan.h
+-  float max_time = 0;
+-  float min_time = std::numeric_limits<float>::max();
+-  absl::Status launch_status;
+-  std::vector<se::DeviceAddressBase> operand_buffers =
+-      runtime_arguments.rz_buffers.input_buffers();
+-  std::vector<se::DeviceAddressBase> result_buffers =
+-      runtime_arguments.rz_buffers.output_buffers();
+-
+-  // Dry-run to warmup the plan.
+-  launch_status = RunGpuConv(config, operand_buffers, result_buffers,
+-                             scratch_memory, stream, options);
+-  // Flag that a warm-up run has been executed; this allows the GpuTimer for
+-  // the main measurement to safely use the delay kernel pattern, even if lazy
+-  // module loading is enabled.
+-  options.profile_result = &profile_result;
+-  profile_result.set_warmup_run_executed(true);
+-  constexpr int kMaxIter = 10;
+-  // Iterate until the new measurement is within kThreshold of the current
+-  // minimum.
+-  int num_iters = 0;
+-  for (; num_iters < kMaxIter && launch_status.ok(); ++num_iters) {
+-    launch_status = RunGpuConv(config, operand_buffers, result_buffers,
+-                               scratch_memory, stream, options);
+-    if (!profile_result.is_valid()) {
+-      break;
+-    }
+-    float old_min_time = min_time;
+-    min_time = std::min(min_time, profile_result.elapsed_time_in_ms());
+-    max_time = std::max(max_time, profile_result.elapsed_time_in_ms());
+-
+-    constexpr float kThreshold = 0.05f;
+-    if (std::abs(profile_result.elapsed_time_in_ms() - old_min_time) /
+-            old_min_time <
+-        kThreshold) {
+-      break;
+-    }
+-  }
+-  if (!launch_status.ok()) {
+-    VLOG(5) << "Launch failed: " << launch_status;
+-    return make_failure(
+-        AutotuneResult::DISQUALIFIED,
+-        absl::StrCat("Profiling failure on cuDNN engine ", alg.ToString(), ": ",
+-                     launch_status.ToString()));
+-  }
+-  if (!profile_result.is_valid()) {
+-    VLOG(5) << "Launch succeeded but profile result is invalid.";
+-    // Not DISQUALIFIED: this means something went wrong internally.
+-    return make_failure(
+-        AutotuneResult::UNKNOWN,
+-        absl::StrCat("Launch succeeded but profile result is invalid, "
+-                     "with cuDNN engine ",
+-                     alg.ToString(), ": ", launch_status.ToString()));
+-  }
+-  VLOG(4) << "Best time: " << min_time << " ms. Worst time: " << max_time
+-          << " ms. Total iterations: " << num_iters;
+-  int64_t scratch_bytes_used =
+-      scratch_allocator.TotalAllocatedBytesExcludingRedzones();
+-
+-  AutotuneResult result;
+-  *result.mutable_algorithm() = alg.ToProto();
+-  result.set_scratch_bytes(scratch_bytes_used);
+-  *result.mutable_run_time() =
+-      tsl::proto_utils::ToDurationProto(absl::Milliseconds(min_time));
+-
+-  if (!ShouldCheckConv(runtime_arguments.hlo_module_config)) {
+-    if (!reference_result->has_value()) {
+-      (*reference_result) = {
+-          alg, std::vector<DeviceAddressBase>(result_buffers.size())};
+-    }
+-    return result;
+-  }
+-
+-  // Check for writes to redzones.
+-  TF_ASSIGN_OR_RETURN(
+-      bool input_output_allocator_redzone_clear,
+-      CheckRedzones(runtime_arguments.rz_buffers.RedzoneAllocator(), stream,
+-                    "input/output", instr_str, &result));
+-
+-  TF_ASSIGN_OR_RETURN(
+-      bool scratch_allocator_redzone_clear,
+-      CheckRedzones(scratch_allocator, stream, "scratch", instr_str, &result));
+-
+-  if (!input_output_allocator_redzone_clear ||
+-      !scratch_allocator_redzone_clear) {
+-    if (runtime_arguments.canonical_hlo.has_value()) {
+-      std::string canonical_hlo = runtime_arguments.canonical_hlo.value();
+-      std::string blas_version;
+-      if (auto* blas = stream_exec->AsBlas()) {
+-        (void)blas->GetVersion(&blas_version);
+-      }
+-
+-      AlgorithmDenylist proto;
+-      auto entry = proto.add_entries();
+-      entry->set_hlo(canonical_hlo);
+-      *entry->mutable_cc() = GetComputeCapability(stream_exec);
+-      *entry->mutable_cudnn_version() = GetCudnnVersion(stream_exec);
+-      entry->set_blas_version(blas_version);
+-      auto algo = entry->add_algos();
+-      algo->set_id(alg.algo_id());
+-      algo->set_tensor_ops(alg.tensor_ops_enabled());
+-
+-      LOG(ERROR) << "To denylist this algorithm for this convolution, "
+-                    "copy-paste the following "
+-                    "proto to the denylist file pointed by XLA_FLAGS "
+-                    "--xla_gpu_algorithm_denylist_path="
+-                 << GetDebugOptionsFromFlags().xla_gpu_algorithm_denylist_path()
+-                 << " : " << proto.ShortDebugString();
+-    }
+-
+-    // CheckRedzones has modified the result in-place to include a failure.
+-    return result;
+-  }
+-
+-  if (reference_result->has_value()) {
+-    XLA_SCOPED_LOGGING_TIMER_LEVEL("BufferComparator::CompareEqual", 2);
+-
+-    const DebugOptions& debug_options =
+-        runtime_arguments.hlo_module_config.debug_options();
+-    for (int i = 0; i < result_buffers.size(); ++i) {
+-      // If there is one output, the output shape describes the shape of an
+-      // array. If there are multiple outputs, the output shape is a tuple, in
+-      // which case get the shape of the i-th element.
+-      Shape output_shape = MaybeTupleElementShape(
+-          runtime_arguments.rz_buffers.output_shape(), i);
+-      XLA_SCOPED_LOGGING_TIMER_LEVEL("BufferComparator::CompareEqual", 2);
+-      BufferComparator comparator(output_shape,
+-                                  debug_options.xla_gpu_autotune_gemm_rtol());
+-      absl::StatusOr<bool> compare_result = comparator.CompareEqual(
+-          stream, (*reference_result)->buffers[i], result_buffers[i]);
+-      if (!compare_result.ok()) {
+-        LOG(ERROR) << "Unable to compare "
+-                   << (*reference_result)->algorithm.ToString() << " against "
+-                   << alg.ToString() << " for " << instr_str << ": "
+-                   << compare_result.status();
+-        if (compare_result.status().code() ==
+-            absl::StatusCode::kResourceExhausted) {
+-          // Possibly OOM. Propagate the error.
+-          return compare_result.status();
+-        }
+-        CHECK(!debug_options.xla_gpu_crash_on_verification_failures());
+-      } else if (!compare_result.value()) {
+-        LOG(ERROR)
+-            << "Results mismatch between different convolution algorithms. "
+-               "This is likely a bug/unexpected loss of precision in cudnn.\n"
+-            << instr_str << " for " << (*reference_result)->algorithm.ToString()
+-            << " vs " << alg.ToString();
+-        PrintPlatformInfo(stream);
+-        VLOG(2) << "Full module on failure: \n" << instr_str;
+-        auto* fail = result.mutable_failure();
+-        fail->set_kind(AutotuneResult::WRONG_RESULT);
+-        fail->set_buffer_address(
+-            reinterpret_cast<uint64_t>(result_buffers[i].opaque()));
+-        *fail->mutable_reference_algorithm() =
+-            (*reference_result)->algorithm.ToProto();
+-      }
+-    }
+-  } else {
+-    XLA_SCOPED_LOGGING_TIMER_LEVEL("Memcpy Reference Result", 2);
+-    std::vector<DeviceAddressBase> reference_result_buffers(
+-        result_buffers.size());
+-    for (int i = 0; i < result_buffers.size(); ++i) {
+-      TF_ASSIGN_OR_RETURN(
+-          reference_result_buffers[i],
+-          runtime_arguments.rz_buffers.RedzoneAllocator().AllocateBytes(
+-              result_buffers[i].size()));
+-      TF_RETURN_IF_ERROR(stream->Memcpy(&reference_result_buffers[i],
+-                                        result_buffers[i],
+-                                        result_buffers[i].size()));
+-    }
+-    (*reference_result) = {alg, reference_result_buffers};
+-  }
+-
+-  return result;
+-}
+-
+-absl::StatusOr<AutotuneResult>
+-GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheCuda(
+-    const HloCustomCallInstruction* instr) {
+-  AutotuneCacheKey instruction_info{config_.GetDeviceDescription(), *instr};
+-  std::string instr_str(instruction_info.GetHlo());
+-  XLA_SCOPED_LOGGING_TIMER(absl::StrCat(
+-      "GpuConvAlgorithmPicker::PickBestAlgorithmImpl for ", instr_str));
+-
+-  const DebugOptions& debug_options =
+-      instr->GetModule()->config().debug_options();
+-  const bool crash_on_checking_failure =
+-      debug_options.xla_gpu_crash_on_verification_failures();
+-
+-  std::string blas_version;
+-  se::StreamExecutor* stream_exec = config_.GetExecutor();
+-  if (auto* blas = stream_exec->AsBlas()) {
+-    (void)blas->GetVersion(&blas_version);
+-  }
+-
+-  std::vector<AlgorithmDesc> disabled_algos;
+-  disabled_algos = GetDisabledConvAlgorithms(GetComputeCapability(stream_exec),
+-                                             GetCudnnVersion(stream_exec),
+-                                             blas_version, *instr);
+-
+-  bool allow_tf32 = true;
+-  // TODO(b/284371623): Properly set allow_tf32 even if instr==nullptr, which is
+-  // the case when running an AOT compiled executable with runtime autotuning.
+-  if (instr) {
+-    allow_tf32 = absl::c_all_of(
+-        instr->precision_config().operand_precision(),
+-        [](int precision) { return precision <= PrecisionConfig::HIGH; });
+-  }
+-  const se::EngineOptions engine_options{
+-      RequireDeterminism(instr->GetModule()->config()), allow_tf32,
+-      /*require_command_buffer=*/false};
+-
+-  // Use the first algorithm that's supported as reference. There isn't a
+-  // particular reason to use it, as any algorithm suffices. It doesn't make
+-  // this algorithm considered correct, though.
+-  std::optional<ReferenceResult> reference_result;
+-
+-  TF_ASSIGN_OR_RETURN(
+-      AutotuneRuntimeArguments runtime_arguments,
+-      AutotuneRuntimeArguments::FromInstruction(instr, config_, debug_options));
+-  TF_ASSIGN_OR_RETURN(se::Stream* const stream, config_.GetStream());
+-  TF_ASSIGN_OR_RETURN(
+-      std::vector<GenericConvRunner> runners,
+-      GetAlgorithms(runtime_arguments.gpu_conv_config, stream,
+-                    /* use_fallback = */ false, engine_options));
+-
+-  std::vector<AutotuneResult> profile_results;
+-  for (auto& runner_cache : runners) {
+-    TF_ASSIGN_OR_RETURN(
+-        auto result,
+-        AutotuneOneConvRunner(&runner_cache, &reference_result, disabled_algos,
+-                              *instr, runtime_arguments));
+-    profile_results.emplace_back(std::move(result));
+-  }
+-
+-  // If any algorithm has worked, we'll skip the fallback algorithms, since
+-  // they include some very slow algorithms.
+-  if (!reference_result) {
+-    LOG(WARNING) << "None of the algorithms provided by cuDNN heuristics "
+-                    "worked; trying fallback algorithms.";
+-    if (runtime_arguments.canonical_hlo.has_value()) {
+-      LOG(WARNING) << "Conv: " << runtime_arguments.canonical_hlo.value();
+-    }
+-
+-    TF_ASSIGN_OR_RETURN(
+-        std::vector<GenericConvRunner> fallback_runners,
+-        GetAlgorithms(runtime_arguments.gpu_conv_config, stream,
+-                      /* use_fallback = */ true, engine_options));
+-
+-    for (auto& runner_cache : fallback_runners) {
+-      TF_ASSIGN_OR_RETURN(
+-          auto result,
+-          AutotuneOneConvRunner(&runner_cache, &reference_result,
+-                                disabled_algos, *instr, runtime_arguments));
+-      profile_results.emplace_back(std::move(result));
+-    }
+-  }
+-
+-  // Log the autotuning result.
+-  if (instr) {
+-    AutotuningLog log;
+-    {
+-      ConvInstructionLog instr_log;
+-      *instr_log.mutable_instruction() = instr->ToProto();
+-      for (int i = 0; i < instr->operand_count(); i++) {
+-        *instr_log.add_operand_shapes() = instr->operand(i)->shape().ToProto();
+-        instr_log.add_operand_addresses(reinterpret_cast<uint64_t>(
+-            runtime_arguments.rz_buffers.input_buffers()[i].opaque()));
+-      }
+-      for (se::DeviceAddressBase result_buffer :
+-           runtime_arguments.rz_buffers.output_buffers()) {
+-        instr_log.add_result_addresses(
+-            reinterpret_cast<uint64_t>(result_buffer.opaque()));
+-      }
+-      log.mutable_instr()->PackFrom(instr_log);
+-    }
+-    for (const auto& profile : profile_results) {
+-      *log.add_results() = profile;
+-    }
+-    *log.mutable_compute_capability() = GetComputeCapability(stream_exec);
+-    *log.mutable_cudnn_version() = GetCudnnVersion(stream_exec);
+-    log.set_device_pci_bus_id(stream_exec->GetDeviceDescription().pci_bus_id());
+-    log.set_blas_version(blas_version);
+-    VLOG(2) << "Autotuning result: " << log.ShortDebugString();
+-    // If we crash on checking failure, we are in a testing/benchmark mode.
+-    if (crash_on_checking_failure) {
+-      // Crash on miscompares and redzone violations if desired.
+-      for (const auto& profile : profile_results) {
+-        if (profile.has_failure() &&
+-            profile.failure().kind() != AutotuneResult::DISQUALIFIED) {
+-          LOG(FATAL) << "crash_on_checking_failure encountered errors:\n\n"
+-                     << log.DebugString();  // NOLINT
+-        }
+-      }
+-    }
+-  }
+-
+-  TF_ASSIGN_OR_RETURN(AutotuneResult selected_algorithm,
+-                      PickBestResult(profile_results, instr_str,
+-                                     runtime_arguments.hlo_module_config));
+-  return selected_algorithm;
+-}
+-
+-absl::StatusOr<AutotuneResult>
+-GpuConvAlgorithmPicker::PickBestAlgorithmNoCacheRocm(
+-    const HloCustomCallInstruction* instr) {
+-  XLA_SCOPED_LOGGING_TIMER(absl::StrCat(
+-      "GpuConvAlgorithmPicker::PickBestAlgorithmImpl for ", instr->ToString()));
+-
+-  const bool allow_tf32 = absl::c_all_of(
+-      instr->precision_config().operand_precision(),
+-      [](int precision) { return precision <= PrecisionConfig::HIGH; });
+-  const se::EngineOptions engine_options{
+-      RequireDeterminism(instr->GetModule()->config()), allow_tf32,
+-      /*require_command_buffer=*/false};
+-
+-  se::StreamExecutor* stream_exec = config_.GetExecutor();
+-  const auto device_ordinal = stream_exec->device_ordinal();
+-  std::vector<se::DeviceAddressBase> operand_buffers;
+-
+-  // allocator either points to this->allocator_ or, if that's null, to a
+-  // se::StreamExecutorMemoryAllocator for stream_exec.
+-  se::DeviceAddressAllocator* allocator = config_.GetAllocator();
+-  ScratchAllocator input_output_allocator(device_ordinal, allocator);
+-  TF_ASSIGN_OR_RETURN(se::Stream* const stream, config_.GetStream());
+-  const auto initialize_buffer = [stream](DeviceAddressBase buffer) {
+-    // Although we don't have evidence this matters, zero out the buffers
+-    // before autotuning.  It's conceivable that using uninitialized memory as
+-    // the inputs might affect performance if e.g. the inputs contain
+-    // denormals, and this is easy enough.
+-    return stream->MemZero(&buffer, buffer.size());
+-  };
+-
+-  // Allocate space for the input, filter, and output of the convolution.  We
+-  // use a ScratchAllocator for this instead of calling allocator_ directly so
+-  // that our allocations don't leak.
+-  for (const auto* operand : instr->operands()) {
+-    TF_ASSIGN_OR_RETURN(auto buffer,
+-                        input_output_allocator.AllocateBytes(
+-                            ShapeUtil::ByteSizeOf(operand->shape())));
+-    TF_RETURN_IF_ERROR(initialize_buffer(buffer));
+-    operand_buffers.push_back(buffer);
+-  }
+-
+-  std::vector<se::DeviceAddressBase> result_buffers(
+-      instr->shape().tuple_shapes().size());
+-  if (instr->shape().IsTuple()) {
+-    for (int i = 0; i < instr->shape().tuple_shapes().size(); ++i) {
+-      TF_ASSIGN_OR_RETURN(
+-          result_buffers[i],
+-          input_output_allocator.AllocateBytes(
+-              ShapeUtil::ByteSizeOf(instr->shape().tuple_shapes(i))));
+-      TF_RETURN_IF_ERROR(initialize_buffer(result_buffers[i]));
+-    }
+-  } else {
+-    TF_ASSIGN_OR_RETURN(
+-        result_buffers[0],
+-        input_output_allocator.AllocateBytes(
+-            ShapeUtil::ByteSizeOf(instr->shape().tuple_shapes(0))));
+-    TF_RETURN_IF_ERROR(initialize_buffer(result_buffers[0]));
+-  }
+-
+-  ScratchAllocator scratch_allocator(device_ordinal, allocator);
+-
+-  TF_ASSIGN_OR_RETURN(
+-      std::vector<std::unique_ptr<const se::dnn::ConvRunner>> runners,
+-      GetMIOpenAlgorithms(instr, absl::MakeSpan(operand_buffers),
+-                          absl::MakeSpan(result_buffers), stream_exec,
+-                          &scratch_allocator, stream, engine_options));
+-
+-  std::vector<AutotuneResult> profile_results;
+-
+-  if (runners.size() == 1) {
+-    TF_ASSIGN_OR_RETURN(auto alg, runners[0]->ToAlgorithmDesc());
+-    auto algorithm_proto = alg.ToProto();
+-    profile_results.emplace_back();
+-    auto& result = profile_results.back();
+-    *result.mutable_algorithm() = algorithm_proto;
+-
+-    result.set_scratch_bytes(runners[0]->GetWorkspaceSize());
+-
+-    // TODO(awpr): if the profile result time for a singleton algorithm is
+-    // needed, plumb it via OpRunner; we'll need to do this to let TF ops avoid
+-    // re-profiling ROCm algorithms anyway.
+-    *result.mutable_run_time() =
+-        tsl::proto_utils::ToDurationProto(absl::Milliseconds(-1));
+-  } else {
+-    TF_ASSIGN_OR_RETURN(GpuConvConfig config, GetGpuConvConfig(instr));
+-    for (auto& runner : runners) {
+-      TF_ASSIGN_OR_RETURN(auto alg, runner->ToAlgorithmDesc());
+-      XLA_SCOPED_LOGGING_TIMER_LEVEL(
+-          absl::StrCat("CudnnConvAlgorithmPicker::PickBestAlgorithm algo ",
+-                       alg.ToString()),
+-          2);
+-
+-      se::dnn::ProfileResult profile_result;
+-      VLOG(4) << "Trying algorithm " << alg.ToString() << " for "
+-              << instr->ToString();
+-
+-      TF_ASSIGN_OR_RETURN(
+-          DeviceAddressBase scratch_memory,
+-          scratch_allocator.AllocateBytes(runner->GetWorkspaceSize()));
+-
+-      TF_ASSIGN_OR_RETURN(auto lazy_runner,
+-                          se::dnn::LazyOpRunner<se::dnn::ConvOp>::FromOpRunner(
+-                              std::move(runner)));
+-
+-      GenericConvRunner runner_cache(std::move(lazy_runner));
+-
+-      // Use assignment instead of brace-list to make GCC 4.9 happy.
+-      RunConvOptions options;
+-      options.profile_result = &profile_result;
+-      options.runner_cache = &runner_cache;
+-      absl::Status launch_status =
+-          RunGpuConv(config, absl::MakeSpan(operand_buffers), result_buffers,
+-                     scratch_memory, stream, options);
+-
+-      if (!launch_status.ok()) {
+-        continue;
+-      }
+-
+-      if (!profile_result.is_valid()) {
+-        continue;
+-      }
+-
+-      profile_results.emplace_back();
+-      AutotuneResult& result = profile_results.back();
+-      *result.mutable_algorithm() = alg.ToProto();
+-
+-      int64_t scratch_bytes_used = scratch_allocator.TotalAllocatedBytes();
+-      result.set_scratch_bytes(scratch_bytes_used);
+-      *result.mutable_run_time() = tsl::proto_utils::ToDurationProto(
+-          absl::Milliseconds(profile_result.elapsed_time_in_ms()));
+-    }
+-  }
+-
+-  TF_ASSIGN_OR_RETURN(AutotuneResult selected_algorithm,
+-                      PickBestResult(profile_results, instr->ToString(),
+-                                     instr->GetModule()->config()));
+-  return selected_algorithm;
+-}
+-
+-absl::StatusOr<bool> GpuConvAlgorithmPicker::RunOnInstruction(
+-    HloInstruction* instr) {
+-  CHECK(IsCustomCallToDnnConvolution(*instr));
+-
+-  const bool strict = instr->parent()
+-                          ->parent()
+-                          ->config()
+-                          .debug_options()
+-                          .xla_gpu_strict_conv_algorithm_picker();
+-
+-  absl::StatusOr<AutotuneResult> best_algo_or =
+-      PickBestAlgorithm(Cast<HloCustomCallInstruction>(instr));
+-  if (!best_algo_or.ok()) {
+-    auto msg = absl::StrFormat(
+-        "Failed to determine best cudnn convolution algorithm for:\n%s\n\n"
+-        "Original error: %s",
+-        instr->ToString(), best_algo_or.status().ToString());
+-
+-    if (strict) {
+-      return Unknown(
+-          "%s\n\nTo ignore this failure and try to use a fallback algorithm "
+-          "(which may have suboptimal performance), use "
+-          "XLA_FLAGS=--xla_gpu_strict_conv_algorithm_picker=false.  Please "
+-          "also file a bug for the root cause of failing autotuning.",
+-          msg);
+-    }
+-    LOG(WARNING)
+-        << msg << "\n\nAs a result, convolution performance may be suboptimal.";
+-    return false;
+-  }
+-
+-  auto best_algo = std::move(best_algo_or).value();
+-  VLOG(3) << "Setting cudnn conv to use algorithm "
+-          << best_algo.conv().algorithm() << " and "
+-          << NumBytesToString(best_algo.scratch_bytes())
+-          << " of scratch memory: " << instr->ToString()
+-          << " tensor_ops_enabled: " << best_algo.conv().tensor_ops_enabled();
+-
+-  // Replace instr with a new CustomCall which has the correct algorithm, and
+-  // whose output shape has the appropriate amount of scratch memory.
+-  HloComputation* computation = instr->parent();
+-  std::vector<Shape> new_call_element_shapes;
+-  // Add the shapes of the outputs of the convolution.
+-  new_call_element_shapes.reserve(instr->shape().tuple_shapes().size() - 1);
+-  for (int i = 0; i < instr->shape().tuple_shapes().size() - 1; ++i) {
+-    new_call_element_shapes.emplace_back(instr->shape().tuple_shapes(i));
+-  }
+-  // The final element is the size of the workspace.
+-  new_call_element_shapes.emplace_back(
+-      ShapeUtil::MakeShape(U8, {best_algo.scratch_bytes()}));
+-  Shape new_call_shape = ShapeUtil::MakeTupleShape(new_call_element_shapes);
+-
+-  TF_ASSIGN_OR_RETURN(GpuBackendConfig gpu_backend_config,
+-                      instr->backend_config<GpuBackendConfig>());
+-  CudnnConvBackendConfig& backend_config =
+-      *gpu_backend_config.mutable_cudnn_conv_backend_config();
+-  *backend_config.mutable_algorithm() = best_algo.algorithm();
+-  backend_config.mutable_algorithm()->mutable_workspace_size()->set_value(
+-      best_algo.scratch_bytes());
+-
+-  HloInstruction* new_call = computation->AddInstruction(
+-      instr->CloneWithNewOperands(new_call_shape, instr->operands()));
+-
+-  // Preserve the name of the old instruction.  This is safe because we're going
+-  // to remove the old one anyway, and it makes it easier to trace how our conv
+-  // is transformed through all our passes.
+-  new_call->SetAndSanitizeName(instr->name());
+-
+-  VLOG(3) << "Replacing convolution " << instr->ToString() << " with "
+-          << new_call->ToString();
+-
+-  TF_RETURN_IF_ERROR(new_call->set_backend_config(gpu_backend_config));
+-
+-  std::vector<HloInstruction*> new_tuple_elements;
+-  new_tuple_elements.reserve(new_call->shape().tuple_shapes().size() - 1);
+-  for (int i = 0; i < new_call->shape().tuple_shapes().size() - 1; ++i) {
+-    new_tuple_elements.emplace_back(
+-        computation->AddInstruction(HloInstruction::CreateGetTupleElement(
+-            new_call->shape().tuple_shapes(i), new_call, i)));
+-  }
+-  new_tuple_elements.emplace_back(computation->AddInstruction(
+-      HloInstruction::CreateConstant(LiteralUtil::CreateR1<uint8_t>({}))));
+-
+-  // Repackage new_call so it has the same shape as the original call, namely
+-  // (conv_result, u8[0]).
+-  HloInstruction* new_tuple = computation->AddInstruction(
+-      HloInstruction::CreateTuple(new_tuple_elements));
+-
+-  TF_RETURN_IF_ERROR(instr->parent()->ReplaceInstruction(instr, new_tuple));
+-  return true;
+-}
+-
+-absl::StatusOr<bool> GpuConvAlgorithmPicker::RunOnComputation(
+-    HloComputation* computation) {
+-  std::vector<HloInstruction*> convs;
+-  for (HloInstruction* instr : computation->instructions()) {
+-    if (IsCandidate(instr)) {
+-      convs.push_back(instr);
+-    }
+-  }
+-
+-  bool changed = false;
+-  for (HloInstruction* instr : convs) {
+-    TF_ASSIGN_OR_RETURN(bool result, RunOnInstruction(instr));
+-    changed |= result;
+-  }
+-  return changed;
+-}
+-
+-absl::StatusOr<bool> GpuConvAlgorithmPicker::RunImpl(
+-    HloModule* module,
+-    const absl::flat_hash_set<absl::string_view>& execution_threads) {
+-  XLA_SCOPED_LOGGING_TIMER(
+-      absl::StrCat("GpuConvAlgorithmPicker for ", module->name()));
+-
+-  if (!IsEnabled(module)) {
+-    VLOG(3) << "Convolution auto-tuning disabled, GpuConvAlgorithmPicker "
+-               "returning early.";
+-    return false;
+-  }
+-
+-  bool changed = false;
+-  for (HloComputation* computation :
+-       module->MakeNonfusionComputations(execution_threads)) {
+-    TF_ASSIGN_OR_RETURN(bool result, RunOnComputation(computation));
+-    changed |= result;
+-  }
+-  return changed;
+-}
+-
+-}  // namespace gpu
+-}  // namespace xla
+diff --git a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.h b/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.h
+deleted file mode 100644
+index f1148fc953a..00000000000
+--- a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker.h
++++ /dev/null
+@@ -1,151 +0,0 @@
+-/* Copyright 2018 The OpenXLA Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-==============================================================================*/
+-
+-#ifndef XLA_SERVICE_GPU_AUTOTUNING_CONV_ALGORITHM_PICKER_H_
+-#define XLA_SERVICE_GPU_AUTOTUNING_CONV_ALGORITHM_PICKER_H_
+-
+-#include <optional>
+-#include <string>
+-#include <vector>
+-
+-#include "absl/container/flat_hash_set.h"
+-#include "absl/status/statusor.h"
+-#include "absl/strings/string_view.h"
+-#include "absl/types/span.h"
+-#include "xla/autotune_results.pb.h"
+-#include "xla/autotuning.pb.h"
+-#include "xla/hlo/ir/hlo_computation.h"
+-#include "xla/hlo/ir/hlo_instruction.h"
+-#include "xla/hlo/ir/hlo_instructions.h"
+-#include "xla/hlo/ir/hlo_module.h"
+-#include "xla/hlo/pass/hlo_pass_interface.h"
+-#include "xla/service/gpu/autotuning/autotuner_util.h"
+-#include "xla/service/gpu/autotuning/redzone_buffers.h"
+-#include "xla/service/gpu/cublas_cudnn.h"
+-#include "xla/service/gpu/gpu_conv_runner.h"
+-#include "xla/service/hlo_module_config.h"
+-#include "xla/stream_executor/device_address.h"
+-#include "xla/stream_executor/dnn.h"
+-#include "xla/xla.pb.h"
+-
+-namespace xla {
+-namespace gpu {
+-
+-// Choose the fastest algorithm for each conv.
+-// Modifies CustomCalls to cudnn convolutions, choosing the best algorithm for
+-// each and adding explicit scratch space to the CustomCalls.
+-//
+-// We pick the algorithm before fusion so that we can generate better HLO. After
+-// GpuConvRewriter, our convolutions are CustomCalls which return a
+-// tuple (conv_result, scratch_memory), and the each conv uses 0 bytes of
+-// scratch:
+-//
+-//   customcall = (f32[...], f32[0])
+-//   return gte(customcall, 0)
+-//
+-// The algorithm picker then chooses the best algorithm, and potentially
+-// increases the scratch space.  It replaces customcall with new_tuple,
+-// giving us the following:
+-//
+-//   new_customcall = (f32[...], f32[N])
+-//   new_tuple = tuple(gte(new_customcall, 0), constant f32[0])
+-//   return gte(new_tuple, 0)
+-//
+-// The new tuple and gte instructions can be simplified away, because
+-// nobody is expected to use the scratch value.
+-//
+-// However, if we were to run GpuConvAlgorithmPicker after fusion
+-// the gte(customcall, 0) would probably already be into a fusion node.  We
+-// can't simplify across HloComputation boundaries, so in this case we
+-// wouldn't be able to simplify away the new_tuple bits.
+-//
+-// It supports two modes: device and deviceless.
+-// In device mode, we run autotuning on the device and store autotune results.
+-//
+-// In deviceless mode, we pass in some information related to the device and
+-// use stored autotune results to rewrite convolutions. If the required autotune
+-// result is not stored, then the performance of convolution will be suboptimal.
+-class GpuConvAlgorithmPicker : public HloModulePass {
+- public:
+-  explicit GpuConvAlgorithmPicker(AutotuneConfig config) : config_(config) {}
+-
+-  absl::string_view name() const override {
+-    return "gpu-conv-algorithm-picker";
+-  }
+-
+-  static bool IsEnabled(const HloModule* module) {
+-    return module->config().debug_options().xla_gpu_autotune_level() != 0;
+-  }
+-
+-  static bool IsCandidate(const HloInstruction* instr) {
+-    return IsCustomCallToDnnConvolution(*instr);
+-  }
+-
+- protected:
+-  absl::StatusOr<bool> RunImpl(
+-      HloModule* module,
+-      const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+-
+- private:
+-  absl::StatusOr<bool> RunOnComputation(HloComputation* computation);
+-  absl::StatusOr<bool> RunOnInstruction(HloInstruction* instr);
+-
+-  absl::StatusOr<AutotuneResult> PickBestAlgorithm(
+-      const HloCustomCallInstruction* instr);
+-  absl::StatusOr<AutotuneResult> PickBestAlgorithmNoCache(
+-      const HloCustomCallInstruction* instr);
+-
+-  // Simple bundle of an algorithm and its output, for comparing results across
+-  // autotuned algorithms.
+-  struct ReferenceResult {
+-    stream_executor::dnn::AlgorithmDesc algorithm;
+-    std::vector<stream_executor::DeviceAddressBase> buffers;
+-  };
+-
+-  // Execution environment for autotuning. Runtime autotuning requires runtime
+-  // information such as input/output buffers in order to run. It can be
+-  // constructed from the autotuned instruction by FromInstruction.
+-  struct AutotuneRuntimeArguments {
+-    const HloModuleConfig hlo_module_config;
+-    RedzoneBuffers rz_buffers;
+-    const GpuConvConfig gpu_conv_config;
+-    std::optional<std::string> canonical_hlo;
+-
+-    static absl::StatusOr<AutotuneRuntimeArguments> FromInstruction(
+-        const HloCustomCallInstruction* instr, const AutotuneConfig& config,
+-        const DebugOptions& debug_options);
+-  };
+-
+-  absl::StatusOr<AutotuneResult> AutotuneOneConvRunner(
+-      GenericConvRunner* runner,
+-      std::optional<ReferenceResult>* reference_result,
+-      absl::Span<const stream_executor::dnn::AlgorithmDesc> disabled_algos,
+-      const HloCustomCallInstruction& instr,
+-      const AutotuneRuntimeArguments& runtime_arguments);
+-
+-  // Pick the best algorithm for CUDA platform.
+-  absl::StatusOr<AutotuneResult> PickBestAlgorithmNoCacheCuda(
+-      const HloCustomCallInstruction* instr);
+-
+-  absl::StatusOr<AutotuneResult> PickBestAlgorithmNoCacheRocm(
+-      const HloCustomCallInstruction* instr);
+-
+- private:
+-  AutotuneConfig config_;
+-};
+-
+-}  // namespace gpu
+-}  // namespace xla
+-#endif  // XLA_SERVICE_GPU_AUTOTUNING_CONV_ALGORITHM_PICKER_H_
+diff --git a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker_test.cc b/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker_test.cc
+deleted file mode 100644
+index d8e9450def4..00000000000
+--- a/third_party/xla/xla/service/gpu/autotuning/conv_algorithm_picker_test.cc
++++ /dev/null
+@@ -1,215 +0,0 @@
+-/* Copyright 2022 The OpenXLA Authors.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-==============================================================================*/
+-
+-#include "xla/service/gpu/autotuning/conv_algorithm_picker.h"
+-
+-#include <cstdint>
+-#include <variant>
+-#include <vector>
+-
+-#include "absl/strings/string_view.h"
+-#include "xla/autotune_results.pb.h"
+-#include "xla/debug_options_flags.h"
+-#include "xla/hlo/ir/hlo_instruction.h"
+-#include "xla/hlo/testlib/pattern_matcher_gmock.h"
+-#include "xla/hlo/transforms/simplifiers/tuple_simplifier.h"
+-#include "xla/service/gpu/autotuning/autotuner_util.h"
+-#include "xla/service/gpu/backend_configs.pb.h"
+-#include "xla/service/gpu/stream_executor_util.h"
+-#include "xla/service/gpu/transforms/conv_rewriter.h"
+-#include "xla/service/gpu/transforms/cudnn_fused_conv_rewriter.h"
+-#include "xla/service/pattern_matcher.h"
+-#include "xla/service/platform_util.h"
+-#include "xla/stream_executor/device_description.h"
+-#include "xla/stream_executor/dnn.h"
+-#include "xla/stream_executor/platform.h"
+-#include "xla/tests/hlo_test_base.h"
+-#include "xla/tsl/lib/core/status_test_util.h"
+-#include "xla/tsl/platform/statusor.h"
+-#include "xla/tsl/platform/test.h"
+-#include "xla/xla.pb.h"
+-#include "xla/xla_data.pb.h"
+-
+-namespace xla::gpu {
+-namespace {
+-
+-namespace m = ::xla::match;
+-
+-class GpuConvAlgorithmPickerTest : public HloTestBase {
+- public:
+-  se::CudaComputeCapability GetCudaComputeCapability() {
+-    return backend()
+-        .default_stream_executor()
+-        ->GetDeviceDescription()
+-        .cuda_compute_capability();
+-  }
+-  stream_executor::dnn::VersionInfo GetDnnVersion() {
+-    return GetDnnVersionInfoOrDefault(backend().default_stream_executor());
+-  }
+-
+-  GpuConvAlgorithmPickerTest() { AutotunerUtil::ClearAutotuneResults(); }
+-};
+-
+-TEST_F(GpuConvAlgorithmPickerTest, SetAlgorithm) {
+-  constexpr absl::string_view kHlo = R"(
+-HloModule module
+-
+-ENTRY main {
+-  %arg0 = f32[3,56,56,16]{2,1,0,3} parameter(0)
+-  %arg1 = f32[3,3,3,64]{2,1,0,3} parameter(1)
+-  ROOT %conv = f32[54,54,16,64]{1,0,3,2} convolution(%arg0, %arg1), window={size=3x3}, dim_labels=f01b_i01o->01bf
+-})";
+-  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kHlo));
+-
+-  se::Platform* platform = PlatformUtil::GetDefaultPlatform().value();
+-  TF_ASSERT_OK_AND_ASSIGN(std::vector<se::StreamExecutor*> executors,
+-                          PlatformUtil::GetStreamExecutors(platform));
+-  ASSERT_GT(executors.size(), 0);
+-  se::StreamExecutor* stream_exec = executors[0];
+-
+-  const se::GpuComputeCapability& cc = backend()
+-                                           .default_stream_executor()
+-                                           ->GetDeviceDescription()
+-                                           .gpu_compute_capability();
+-  bool changed = false;
+-  TF_ASSERT_OK_AND_ASSIGN(changed, RunHloPass(ConvRewriter(cc), m.get()));
+-  changed = false;
+-  DebugOptions opts = DefaultDebugOptionsIgnoringFlags();
+-
+-  TF_ASSERT_OK_AND_ASSIGN(
+-      AutotuneConfig cfg,
+-      AutotuneConfig::FromDebugOptions(
+-          DeviceOrDevicelessConfig{DeviceConfig{stream_exec, nullptr}}, opts));
+-  TF_ASSERT_OK_AND_ASSIGN(changed,
+-                          RunHloPass(GpuConvAlgorithmPicker(cfg), m.get()));
+-  ASSERT_TRUE(changed);
+-
+-  AutotuneResults results;
+-  TF_ASSERT_OK(AutotunerUtil::SerializeAutotuneResults(&results));
+-  ASSERT_EQ(results.results_size(), 1);
+-  auto& result = *results.mutable_results(0)->mutable_result();
+-  int64_t old_scratch_bytes = result.scratch_bytes();
+-  int64_t new_scratch_bytes = old_scratch_bytes + 1;
+-  result.set_scratch_bytes(new_scratch_bytes);
+-
+-  AutotunerUtil::ClearAutotuneResults();
+-  TF_ASSERT_OK(AutotunerUtil::LoadAutotuneResults(results));
+-
+-  // Now send the same module through GpuConvAlgorithmPicker again.  The conv
+-  // should have the new scratch bytes.
+-  TF_ASSERT_OK_AND_ASSIGN(m, ParseAndReturnVerifiedModule(kHlo));
+-  changed = false;
+-  TF_ASSERT_OK_AND_ASSIGN(changed, RunHloPass(ConvRewriter(cc), m.get()));
+-  changed = false;
+-  TF_ASSERT_OK_AND_ASSIGN(changed,
+-                          RunHloPass(GpuConvAlgorithmPicker(cfg), m.get()));
+-  ASSERT_TRUE(changed);
+-
+-  // TupleSimplifier cleans this up a bit before we pattern-match
+-  TF_ASSERT_OK(RunHloPass(TupleSimplifier(), m.get()).status());
+-
+-  SCOPED_TRACE(m->ToString());
+-  HloInstruction* conv;
+-  ASSERT_THAT(m->entry_computation()->root_instruction(),
+-              GmockMatch(m::GetTupleElement(m::CustomCall(&conv))));
+-  EXPECT_THAT(
+-      conv->shape(),
+-      GmockMatch(m::Shape().WithSubshape(
+-          {1}, m::Shape().WithElementType(U8).WithDims({new_scratch_bytes}))));
+-
+-  // Algorithm 14 is disabled for cuDNN 9 on V100
+-  TF_ASSERT_OK_AND_ASSIGN(auto dnn_version, GetDnnVersionInfo(stream_exec));
+-  if (dnn_version.major_version() >= 9 && dnn_version.major_version() < 10 &&
+-      cc.IsCuda() && cc.cuda_compute_capability()->major == 7 &&
+-      cc.cuda_compute_capability()->minor == 0) {
+-    EXPECT_TRUE(conv->backend_config<GpuBackendConfig>()
+-                    ->has_cudnn_conv_backend_config() &&
+-                conv->backend_config<GpuBackendConfig>()
+-                        ->cudnn_conv_backend_config()
+-                        .algorithm()
+-                        .algo_id() != 14);
+-  }
+-}
+-
+-TEST_F(GpuConvAlgorithmPickerTest, SetAlgorithmGraphConvF8) {
+-  if (!GetCudaComputeCapability().IsAtLeast(
+-          se::CudaComputeCapability::kHopper)) {
+-    GTEST_SKIP() << "FP8 convolutions require Hopper or newer architecture.";
+-  }
+-  constexpr absl::string_view kHlo = R"(
+-HloModule module
+-apply {
+-  a = f32[] parameter(0)
+-  b = f32[] parameter(1)
+-  ROOT c = f32[] maximum(a, b)
+-}
+-ENTRY main {
+-  input = f8e4m3fn[1,6,6,128] parameter(0)
+-  filter = f8e4m3fn[16,3,3,128] parameter(1)
+-  input_scale = f32[] parameter(2)
+-  input_scale_bcast = f32[1,6,6,128] broadcast(input_scale), dimensions={}
+-  filter_scale = f32[] parameter(3)
+-  filter_scale_bcast = f32[16,3,3,128] broadcast(filter_scale), dimensions={}
+-  input_f32 = f32[1,6,6,128] convert(input)
+-  input_unscaled = f32[1,6,6,128] multiply(input_f32, input_scale_bcast)
+-  filter_f32 = f32[16,3,3,128] convert(filter)
+-  filter_unscaled = f32[16,3,3,128] multiply(filter_f32, filter_scale_bcast)
+-  conv_a = f32[1,6,6,16] convolution(input_unscaled, filter_unscaled), window={size=3x3 pad=1_1x1_1}, dim_labels=b01f_o01i->b01f, feature_group_count=1
+-  z_scale = f32[] parameter(4)
+-  z_scale_bcast = f32[1,6,6,16] broadcast(z_scale), dimensions={}
+-  conv_a_scaled = f32[1,6,6,16] multiply(conv_a, z_scale_bcast)
+-  c1 = f32[] constant(-448.)
+-  c1_bcast = f32[1,6,6,16] broadcast(c1), dimensions={}
+-  c2 = f32[] constant(448.)
+-  c2_bcast = f32[1,6,6,16] broadcast(c2), dimensions={}
+-  conv_a_clamped = f32[1,6,6,16] clamp(c1_bcast, conv_a_scaled, c2_bcast)
+-  conv_a_clamped_f8 = f8e4m3fn[1,6,6,16] convert(conv_a_clamped)
+-  abs_conv_a = f32[1,6,6,16] abs(conv_a)
+-  c0 = f32[] constant(-inf)
+-  amax = f32[] reduce(abs_conv_a, c0), dimensions={0,1,2,3}, to_apply=apply
+-  ROOT conv_f8 = (f8e4m3fn[1,6,6,16], f32[]) tuple(conv_a_clamped_f8, amax)
+-})";
+-  TF_ASSERT_OK_AND_ASSIGN(auto m, ParseAndReturnVerifiedModule(kHlo));
+-
+-  se::Platform* platform = PlatformUtil::GetDefaultPlatform().value();
+-  TF_ASSERT_OK_AND_ASSIGN(std::vector<se::StreamExecutor*> executors,
+-                          PlatformUtil::GetStreamExecutors(platform));
+-  ASSERT_GT(executors.size(), 0);
+-  se::StreamExecutor* stream_exec = executors[0];
+-
+-  const se::GpuComputeCapability& cc = GetCudaComputeCapability();
+-  bool changed;
+-  TF_ASSERT_OK_AND_ASSIGN(changed, RunHloPass(ConvRewriter(cc), m.get()));
+-  ASSERT_TRUE(changed);
+-  TF_ASSERT_OK_AND_ASSIGN(
+-      changed,
+-      RunHloPass(CudnnFusedConvRewriter(
+-                     GetCudaComputeCapability(), GetDnnVersion(),
+-                     stream_exec->GetDeviceDescription().runtime_version()),
+-                 m.get()));
+-  ASSERT_TRUE(changed);
+-
+-  DebugOptions opts = DefaultDebugOptionsIgnoringFlags();
+-  TF_ASSERT_OK_AND_ASSIGN(
+-      AutotuneConfig cfg,
+-      AutotuneConfig::FromDebugOptions(
+-          DeviceOrDevicelessConfig{DeviceConfig{stream_exec, nullptr}}, opts));
+-  TF_ASSERT_OK_AND_ASSIGN(changed,
+-                          RunHloPass(GpuConvAlgorithmPicker(cfg), m.get()));
+-  ASSERT_TRUE(changed);
+-}
+-
+-}  // namespace
+-}  // namespace xla::gpu
+diff --git a/third_party/xla/xla/service/gpu/nvptx_compiler.cc b/third_party/xla/xla/service/gpu/nvptx_compiler.cc
+index 769600a40ff..6ec45ad1d3d 100644
+--- a/third_party/xla/xla/service/gpu/nvptx_compiler.cc
++++ b/third_party/xla/xla/service/gpu/nvptx_compiler.cc
+@@ -68,7 +68,6 @@ limitations under the License.
+ #include "xla/service/gpu/alias_info.h"
+ #include "xla/service/gpu/autotuning/autotuner_pass.h"
+ #include "xla/service/gpu/autotuning/autotuner_util.h"
+-#include "xla/service/gpu/autotuning/conv_algorithm_picker.h"
+ #include "xla/service/gpu/autotuning/gemm_fusion_autotuner.h"
+ #include "xla/service/gpu/cublas_cudnn.h"
+ #include "xla/service/gpu/cublas_padding_requirements.h"
+@@ -328,12 +327,13 @@ absl::Status NVPTXCompiler::OptimizeHloPostLayoutAssignment(
+ // enabled.
+ bool NVPTXCompiler::RequiresCollectiveScheduleLinearizer(
+     const HloModule* module, se::StreamExecutor* stream_exec) {
+-  if (stream_exec == nullptr || !GpuConvAlgorithmPicker::IsEnabled(module)) {
++  if (stream_exec == nullptr ||
++      module->config().debug_options().xla_gpu_autotune_level() == 0) {
+     return false;
+   }
+   for (const HloComputation* comp : module->MakeNonfusionComputations()) {
+     for (const HloInstruction* inst : comp->instructions()) {
+-      if (GpuConvAlgorithmPicker::IsCandidate(inst)) {
++      if (IsCustomCallToDnnConvolution(*inst)) {
+         return true;
+       }
+     }
+diff --git a/third_party/xla/xla/service/gpu/transforms/BUILD b/third_party/xla/xla/service/gpu/transforms/BUILD
+index 6e7b6d6d7f3..6fcc5540497 100644
+--- a/third_party/xla/xla/service/gpu/transforms/BUILD
++++ b/third_party/xla/xla/service/gpu/transforms/BUILD
+@@ -622,6 +622,7 @@ cc_library(
+         "//xla/stream_executor:semantic_version",
+         "//xla/stream_executor/cuda:cuda_compute_capability",
+         "//xla/tsl/platform:errors",
++        "//xla/tsl/platform:status_macros",
+         "//xla/tsl/platform:statusor",
+         "//xla/tsl/protobuf:dnn_proto_cc",
+         "@com_google_absl//absl/algorithm:container",
+@@ -638,26 +639,16 @@ cc_library(
+     ],
+ )
+ 
+-xla_test(
+-    name = "cudnn_fused_conv_rewriter_test",
++cc_library(
++    name = "cudnn_fused_conv_rewriter_test_common",
++    testonly = True,
+     srcs = ["cudnn_fused_conv_rewriter_test.cc"],
+-    backend_tags = {
+-        "gpu_a100": [
+-            "noasan",
+-            "nomsan",
+-        ],
+-    },
+-    backends = [
+-        "a100",
+-        "amdgpu_any",
+-    ] + if_oss(["nvgpu_any"]),
+-    shard_count = 10,
+-    tags = ["pjrt_migration_candidate"],
+-    use_legacy_runtime = True,
++    tags = ["gpu"],
+     deps = [
+         ":conv_rewriter",
+         ":cudnn_fused_conv_rewriter",
+         "//xla:comparison_util",
++        "//xla:debug_options_flags",
+         "//xla:error_spec",
+         "//xla:xla_data_proto_cc",
+         "//xla:xla_proto_cc",
+@@ -683,6 +674,7 @@ xla_test(
+         "//xla/tests:hlo_test_base",
+         "//xla/tsl/lib/core:status_test_util",
+         "//xla/tsl/protobuf:dnn_proto_cc",
++        "//xla/tsl/util:command_line_flags",
+         "@com_google_absl//absl/container:flat_hash_map",
+         "@com_google_absl//absl/log",
+         "@com_google_absl//absl/status:statusor",
+@@ -693,6 +685,45 @@ xla_test(
+     ],
+ )
+ 
++xla_test(
++    name = "cudnn_fused_conv_rewriter_test",
++    srcs = [],
++    backend_tags = {
++        "gpu_a100": [
++            "noasan",
++            "nomsan",
++        ],
++    },
++    backends = [
++        "a100",
++        "amdgpu_any",
++    ] + if_oss(["nvgpu_any"]),
++    shard_count = 10,
++    tags = ["pjrt_migration_candidate"],
++    use_legacy_runtime = True,
++    deps = [
++        ":cudnn_fused_conv_rewriter_test_common",
++    ],
++)
++
++xla_test(
++    name = "cudnn_fused_conv_rewriter_autotune_disabled_test",
++    srcs = [],
++    args = ["--xla_gpu_autotune_level=0"],
++    backends = [
++        "a100",
++        "amdgpu_any",
++    ],
++    #fail_if_no_test_linked = False,  # NOLINT=Only tests AMD GPUs.
++    #fail_if_no_test_selected = False,  # NOLINT=Only tests AMD GPUs.
++    shard_count = 4,
++    tags = ["pjrt_migration_candidate"],
++    use_legacy_runtime = True,
++    deps = [
++        ":cudnn_fused_conv_rewriter_test_common",
++    ],
++)
++
+ # Tested via //third_party/tensorflow/compiler/xla/backends/gpu/codegen:cudnn_test
+ cc_library(
+     name = "cudnn_fusion_compiler",
+diff --git a/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter.cc b/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter.cc
+index 4e05b9ebbe5..07d79df752f 100644
+--- a/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter.cc
++++ b/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter.cc
+@@ -62,6 +62,7 @@ limitations under the License.
+ #include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
+ #include "tsl/platform/ml_dtypes.h"
++#include "xla/tsl/platform/status_macros.h"
+ 
+ namespace xla {
+ namespace gpu {
+@@ -307,7 +308,11 @@ absl::StatusOr<bool> FuseRemoveConvertInConv(HloComputation* comp) {
+ 
+ // alpha * gte(custom-call(...)) ->
+ // gte(custom-call(..., backend_config={alpha})).
+-absl::StatusOr<bool> FuseConvAlpha(HloComputation* comp) {
++absl::StatusOr<bool> FuseConvAlpha(HloComputation* comp,
++                                   const se::GpuComputeCapability& cc) {
++  if (cc.IsRocm()) {
++    return false;
++  }
+   bool changed = false;
+   for (auto instr : comp->MakeInstructionPostOrder()) {
+     HloInstruction* conv = nullptr;
+@@ -951,7 +956,8 @@ absl::StatusOr<bool> F8GraphConv(HloComputation* comp,
+   return changed;
+ }
+ 
+-absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
++absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp,
++                                         const se::GpuComputeCapability& cc) {
+   bool changed = false;
+   for (auto instr : comp->MakeInstructionPostOrder()) {
+     HloInstruction* conv = nullptr;
+@@ -976,15 +982,6 @@ absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
+       continue;
+     }
+ 
+-    // If it's a vanilla forward conv, upgrade it to a bias-activation conv.  We
+-    // only want to do this if the fusion will succeed, but we're guaranteed
+-    // that it will, because the only reason we'll bail at this point is if
+-    // !can_accept_bias && !can_accept_side_input, and our shiny new
+-    // bias-activation conv will be able to accept both.
+-    if (conv->custom_call_target() == kCudnnConvForwardCallTarget) {
+-      TF_ASSIGN_OR_RETURN(conv, EnsureIsConvBiasActivation(conv));
+-    }
+-
+     // Can't fuse bias or side-input if the conv already has a relu (or other
+     // activation), because bias and side-input are added before the activation
+     // is applied.
+@@ -999,8 +996,9 @@ absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
+     // Does `conv` already have a (nonzero) bias?  Does it already have a
+     // side_input?
+     bool can_accept_bias =
++        conv->operand_count() < 3 ||
+         Match(conv->operand(2), m::Broadcast(m::ConstantEffectiveScalar(0)));
+-    bool can_accept_side_input = conv->operand_count() < 4;
++    bool can_accept_side_input = conv->operand_count() < 4 && !cc.IsRocm();
+ 
+     // The addend can be fused as a bias if
+     //  - it is 1D broadcasted in the output feature dimension, and
+@@ -1021,6 +1019,13 @@ absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
+         addend->dimensions().empty() &&
+         IsLosslesslyConvertibleTo(addend, bias_ty);
+ 
++    // ROCM can only support bias form for now
++    if (!addend_may_be_rank1_bias && !addend_may_be_rank0_bias && cc.IsRocm()) {
++      continue;
++    }
++
++    ASSIGN_OR_RETURN(conv, EnsureIsConvBiasActivation(conv));
++
+     absl::InlinedVector<HloInstruction*, 4> new_operands(
+         conv->operands().begin(), conv->operands().end());
+     if (can_accept_bias && addend_may_be_rank1_bias) {
+@@ -1065,7 +1070,11 @@ absl::StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
+ //
+ // where `reshape` can be an arbitrary chain of reshapes+transposes.  This idiom
+ // is created by the ReshapeMover pass.
+-absl::StatusOr<bool> FuseSideInputAlpha(HloComputation* comp) {
++absl::StatusOr<bool> FuseSideInputAlpha(HloComputation* comp,
++                                        const se::GpuComputeCapability& cc) {
++  if (cc.IsRocm()) {
++    return false;
++  }
+   bool changed = false;
+   for (HloInstruction* instr : comp->MakeInstructionPostOrder()) {
+     HloInstruction* conv;
+@@ -1173,7 +1182,7 @@ absl::StatusOr<bool> FuseSideInputAlpha(HloComputation* comp) {
+ }
+ 
+ absl::StatusOr<bool> FuseElu(HloComputation* comp,
+-                             se::GpuComputeCapability cc) {
++                             const se::GpuComputeCapability& cc) {
+   if (!ShouldUseCudnnRuntimeFusion(comp->parent()->config().debug_options(),
+                                    cc)) {
+     return false;
+@@ -1274,7 +1283,7 @@ absl::StatusOr<bool> FuseRelu(HloComputation* comp) {
+ }
+ 
+ absl::StatusOr<bool> FuseRelu6(HloComputation* comp,
+-                               se::GpuComputeCapability cc) {
++                               const se::GpuComputeCapability& cc) {
+   if (!ShouldUseCudnnRuntimeFusion(comp->parent()->config().debug_options(),
+                                    cc)) {
+     return false;
+@@ -1323,7 +1332,7 @@ absl::StatusOr<bool> FuseRelu6(HloComputation* comp,
+ }
+ 
+ absl::StatusOr<bool> FuseLeakyRelu(HloComputation* comp,
+-                                   se::GpuComputeCapability cc) {
++                                   const se::GpuComputeCapability& cc) {
+   if (!ShouldUseCudnnRuntimeFusion(comp->parent()->config().debug_options(),
+                                    cc)) {
+     return false;
+@@ -1699,18 +1708,18 @@ absl::StatusOr<bool> CudnnFusedConvRewriter::RunImpl(
+     TF_ASSIGN_OR_RETURN(changed, FuseRemoveConvertInConv(comp));
+     any_changed |= changed;
+ 
+-    TF_ASSIGN_OR_RETURN(changed, FuseConvAlpha(comp));
++    ASSIGN_OR_RETURN(changed, FuseConvAlpha(comp, compute_capability_));
+     any_changed |= changed;
+ 
+     // s8 convs' bias and side-input appear before conversion to s8.
+     //
+     // Run FuseBiasOrSideInput twice, so we get both the bias and the side
+     // input, if both are present.
+-    TF_ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp));
++    ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp, compute_capability_));
+     any_changed |= changed;
+-    TF_ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp));
++    ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp, compute_capability_));
+     any_changed |= changed;
+-    TF_ASSIGN_OR_RETURN(changed, FuseSideInputAlpha(comp));
++    ASSIGN_OR_RETURN(changed, FuseSideInputAlpha(comp, compute_capability_));
+     any_changed |= changed;
+ 
+     // Relu might appear before or after convert-to-f16/s8, so we check in both
+@@ -1731,11 +1740,11 @@ absl::StatusOr<bool> CudnnFusedConvRewriter::RunImpl(
+     any_changed |= changed;
+ 
+     // f16 convs' bias+side-input can appear before or after conversion to f16.
+-    TF_ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp));
++    ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp, compute_capability_));
+     any_changed |= changed;
+-    TF_ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp));
++    ASSIGN_OR_RETURN(changed, FuseBiasOrSideInput(comp, compute_capability_));
+     any_changed |= changed;
+-    TF_ASSIGN_OR_RETURN(changed, FuseSideInputAlpha(comp));
++    ASSIGN_OR_RETURN(changed, FuseSideInputAlpha(comp, compute_capability_));
+     any_changed |= changed;
+ 
+     TF_ASSIGN_OR_RETURN(changed, FuseRelu(comp));
+diff --git a/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter_test.cc b/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter_test.cc
+index 83b5d59a540..dd436bab463 100644
+--- a/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter_test.cc
++++ b/third_party/xla/xla/service/gpu/transforms/cudnn_fused_conv_rewriter_test.cc
+@@ -20,6 +20,7 @@ limitations under the License.
+ #include <memory>
+ #include <string>
+ #include <utility>
++#include <vector>
+ 
+ #include <gmock/gmock.h>
+ #include <gtest/gtest.h>
+@@ -30,6 +31,7 @@ limitations under the License.
+ #include "absl/strings/str_replace.h"
+ #include "absl/strings/string_view.h"
+ #include "xla/comparison_util.h"
++#include "xla/debug_options_flags.h"
+ #include "xla/error_spec.h"
+ #include "xla/hlo/ir/hlo_instruction.h"
+ #include "xla/hlo/ir/hlo_opcode.h"
+@@ -55,6 +57,7 @@ limitations under the License.
+ #include "xla/tests/hlo_test_base.h"
+ #include "xla/tsl/lib/core/status_test_util.h"
+ #include "xla/tsl/protobuf/dnn.pb.h"
++#include "xla/tsl/util/command_line_flags.h"
+ #include "xla/xla.pb.h"
+ #include "xla/xla_data.pb.h"
+ #include "tsl/platform/statusor.h"
+@@ -172,11 +175,12 @@ class CudnnFusedConvRewriterTest : public GpuCodegenTest {
+       const std::string hlo_with_new_type =
+           absl::StrReplaceAll(hlo_string, {{"TYPE", type}});
+       std::string optimized_hlo_string = GetOptimizedHlo(hlo_with_new_type);
+-      EXPECT_THAT(optimized_hlo_string,
+-                  Not(HasSubstr(kCudnnConvForwardCallTarget)))
++      // Match instruction names to allow for autotuner reverting back
++      // some of the fusions on ROCm.
++      EXPECT_THAT(optimized_hlo_string, Not(HasSubstr("cudnn-conv.")))
+           << optimized_hlo_string;
+       EXPECT_THAT(optimized_hlo_string,
+-                  HasSubstr(kCudnnConvBiasActivationForwardCallTarget));
++                  HasSubstr("cudnn-conv-bias-activation."));
+ 
+       TF_ASSERT_OK_AND_ASSIGN(auto module,
+                               ParseAndReturnVerifiedModule(hlo_with_new_type));
+@@ -586,6 +590,7 @@ TEST_F(CudnnFusedConvRewriterTest, TestLeakyRelu) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestSideInputOnly) {
++  MAYBE_SKIP_TEST("SideInput");
+   // max(0, conv(x, w) + side_input);
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -624,6 +629,7 @@ TEST_F(CudnnFusedConvRewriterTest, DontFuseSideInputWithDepthwiseConv) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestBiasAndSideInput) {
++  MAYBE_SKIP_TEST("SideInput");
+   // max(0, conv(x, w) + side_input + bias);
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -646,6 +652,7 @@ TEST_F(CudnnFusedConvRewriterTest, TestBiasAndSideInput) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestScaledConv) {
++  MAYBE_SKIP_TEST("Scale");
+   // max(0, 0.999994934 * conv(x, w));
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -706,6 +713,7 @@ TEST_F(CudnnFusedConvRewriterTest, TestNoCrashOnInf) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestConvAndScaledSideInput) {
++  MAYBE_SKIP_TEST("SideInput");
+   // max(0, conv(x, w) + 0.899994934 * side_input);
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -750,6 +758,7 @@ TEST_F(CudnnFusedConvRewriterTest, DontFuseDepthwiseConvWithScaledSideInput) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestScaledConvAndScaledSideInput) {
++  MAYBE_SKIP_TEST("SideInput");
+   // max(0, 0.999994934 * conv(x, w) + 0.899994934 * side_input);
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -775,6 +784,7 @@ TEST_F(CudnnFusedConvRewriterTest, TestScaledConvAndScaledSideInput) {
+ }
+ 
+ TEST_F(CudnnFusedConvRewriterTest, TestScaledConvAndScaledSideInputWithBias) {
++  MAYBE_SKIP_TEST("SideInput");
+   // max(0, 0.999994934 * conv(x, w) + 0.899994934 * side_input + bias);
+   TestMatchWithAllTypes(R"(
+     HloModule Test
+@@ -3478,3 +3488,12 @@ TEST_F(CudnnFusedConvRewriterTest, TestFusedConvInt8ToInt8NoClamp) {
+ }  // namespace
+ }  // namespace gpu
+ }  // namespace xla
++
++int main(int argc, char* argv[]) {
++  std::vector<tsl::Flag> flag_list;
++  xla::AppendDebugOptionsFlags(&flag_list);
++  std::string usage = tsl::Flags::Usage(argv[0], flag_list);
++  tsl::Flags::Parse(&argc, argv, flag_list);
++  testing::InitGoogleTest(&argc, argv);
++  return RUN_ALL_TESTS();
++}
+diff --git a/third_party/xla/xla/stream_executor/rocm/rocm_dnn.cc b/third_party/xla/xla/stream_executor/rocm/rocm_dnn.cc
+index 3c272a578d3..233934f8b9f 100644
+--- a/third_party/xla/xla/stream_executor/rocm/rocm_dnn.cc
++++ b/third_party/xla/xla/stream_executor/rocm/rocm_dnn.cc
+@@ -388,6 +388,7 @@ namespace wrap {
+   __macro(miopenCreateOpBatchNormBackward)                           \
+   __macro(miopenCompileFusionPlan)                                   \
+   __macro(miopenFusionPlanGetOp)                                     \
++  __macro(miopenFusionPlanGetWorkSpaceSize)                          \
+   __macro(miopenCreateOperatorArgs)                                  \
+   __macro(miopenSetOpArgsConvForward)                                \
+   __macro(miopenSetOpArgsBiasForward)                                \
+@@ -553,6 +554,10 @@ namespace wrap {
+ STREAM_EXECUTOR_MIOPEN_WRAP(miopenSetTensorDescriptorV2)
+ #endif
+ 
++#if (TF_ROCM_VERSION >= 70000)
++STREAM_EXECUTOR_MIOPEN_WRAP(miopenExecuteFusionPlan_v2)
++#endif
++
+ MIOPEN_DNN_ROUTINE_EACH(STREAM_EXECUTOR_MIOPEN_WRAP)
+ 
+ #undef MIOPEN_DNN_ROUTINE_EACH
+@@ -700,6 +705,7 @@ std::set<uint64_t> CachedFusionPlans::unsupported_plans;
+ dnn::ProfileResult GetProfileResultFromConvSolution(
+     miopenConvSolution_t solution) {
+   dnn::ProfileResult profile_result;
++  CHECK_NE(solution.solution_id, 0);
+   profile_result.set_algorithm({(dnn::AlgorithmDesc::Index)solution.solution_id,
+                                 false, solution.workspace_size});
+   profile_result.set_elapsed_time_in_ms(solution.time);
+@@ -707,31 +713,6 @@ dnn::ProfileResult GetProfileResultFromConvSolution(
+   return profile_result;
+ }
+ 
+-dnn::ProfileResult GetProfileResultFromConvAlgoPerf(
+-    dnn::ConvolutionKind kind, miopenConvAlgoPerf_t algorithm) {
+-  int64_t algo_id;
+-  switch (kind) {
+-    case dnn::ConvolutionKind::FORWARD:
+-    case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION:
+-      algo_id = algorithm.fwd_algo;
+-      break;
+-    case dnn::ConvolutionKind::BACKWARD_DATA:
+-      algo_id = algorithm.bwd_data_algo;
+-      break;
+-    case dnn::ConvolutionKind::BACKWARD_FILTER:
+-      algo_id = algorithm.bwd_weights_algo;
+-      break;
+-    default:
+-      LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
+-      break;
+-  }
+-
+-  dnn::ProfileResult profile_result;
+-  profile_result.set_algorithm({algo_id, false, algorithm.memory});
+-  profile_result.set_elapsed_time_in_ms(algorithm.time);
+-  profile_result.set_scratch_size(algorithm.memory);
+-  return profile_result;
+-}
+ }  // namespace
+ 
+ // Wraps a MIOpen handle and provides access to it through miopenHandle_t
+@@ -784,21 +765,6 @@ class MIOpenAccess {
+ };
+ 
+ MIOpenSupport::MIOpenSupport(StreamExecutor* parent) : parent_(parent) {
+-  // by default, the Get*Algorithm API will return the list of all applicable
+-  // algorithms
+-  return_best_algo_only_ = false;
+-  // but if the env var TF_ROCM_RETURN_BEST_ALGO_ONLY is set, only the best
+-  // (i.e. most efficient) algorithm will be returned
+-  CHECK_OK(tsl::ReadBoolFromEnvVar("TF_ROCM_RETURN_BEST_ALGO_ONLY", false,
+-                                   &return_best_algo_only_));
+-
+-  // by default, use Find Mode APIs for convolution
+-  use_immediate_mode_ = false;
+-  // swich to Find Mode if env var TF_ROCM_USE_IMMEDIATE_MODE is set
+-
+-  CHECK_OK(tsl::ReadBoolFromEnvVar("TF_ROCM_USE_IMMEDIATE_MODE", false,
+-                                   &use_immediate_mode_));
+-
+   bool enable_pooling_cache = false;
+   CHECK_OK(tsl::ReadBoolFromEnvVar("TF_ROCM_BW_POOL_CACHE", false,
+                                    &enable_pooling_cache));
+@@ -1275,21 +1241,6 @@ class ScopedFusionPlanBase {
+     }
+   }
+ 
+-  miopenStatus_t Execute(miopenTensorDescriptor_t input_descriptor,
+-                         const void* input_data,
+-                         miopenTensorDescriptor_t output_descriptor,
+-                         void* output_data) {
+-    auto status = wrap::miopenExecuteFusionPlan(
+-        miopen_handle_, fusion_plan_, input_descriptor, input_data,
+-        output_descriptor, output_data, fusion_args_);
+-    if (status != miopenStatusSuccess) {
+-      LOG(FATAL) << "call to miopenExecuteFusionPlan failed: "
+-                 << ToString(status);
+-    }
+-
+-    return status;
+-  }
+-
+   bool CompilationSucceeded() { return fusion_plan_compiled_; }
+ 
+   miopenStatus_t SetConvolutionArgs(const int op_idx, const float* alpha,
+@@ -1486,7 +1437,7 @@ class ScopedFusionPlanConvolutionBiasActivation : public ScopedFusionPlanBase {
+                                                   input_descriptor);
+ 
+     VLOG(2) << "Fusion Plan compile begin";
+-
++    // TODO(rocm): Check if the caching is actualy needed
+     uint64_t hash =
+         GetFusionOpHashValue(miopen_handle, input_descriptor, filter_descriptor,
+                              conv_descriptor, bias_descriptor, act_descriptor);
+@@ -3225,39 +3176,11 @@ bool MIOpenSupport::DoRnnBackward(
+   return false;
+ }
+ 
+-// This is the context required to use the TF scratch allocator:
+-struct MIOpenAllocatorContext {
+-  MIOpenAllocatorContext(ScratchAllocator* scratch_allocator, Stream* stream)
+-      : scratch_allocator_(scratch_allocator), stream_(stream) {}
+-
+-  ScratchAllocator* scratch_allocator_;
+-  Stream* stream_;
+-};
+-
+-void* MIOpenAllocatorCallback(void* ctx, size_t size_in_bytes) {
+-  auto* mac = static_cast<MIOpenAllocatorContext*>(ctx);
+-  auto allocated = mac->scratch_allocator_->AllocateBytes(size_in_bytes);
+-
+-  DeviceAddress<uint8_t> scratch;
+-  if (allocated.ok()) {
+-    scratch = allocated.value();
+-    return scratch.opaque();
+-  } else {
+-    return nullptr;
+-  }
+-}
+-
+-void MIOpenDeallocatorCallback(void* ctx, void* mem) {
+-  // Don't need deallocator since the TensorFlow heap will automatically
+-  // reclaim the memory
+-}
+-
+ class RocmConvRunner : public dnn::ConvRunner {
+  public:
+   RocmConvRunner(StreamExecutor* parent, MIOpenAccess* miopen, int64_t algo_id,
+                  size_t workspace_size, dnn::ConvolutionKind kind,
+                  dnn::DataType input_type, dnn::DataType output_type,
+-                 bool use_immediate_mode,
+                  ScopedTensorDescriptor& scoped_input_desc,
+                  ScopedTensorDescriptor& scoped_output_desc,
+                  ScopedFilterDescriptor& scoped_filter_desc,
+@@ -3267,29 +3190,19 @@ class RocmConvRunner : public dnn::ConvRunner {
+         algo_id_(algo_id),
+         workspace_size_(workspace_size),
+         kind_(kind),
+-        use_immediate_mode_(use_immediate_mode),
+         input_desc_(std::move(scoped_input_desc)),
+         output_desc_(std::move(scoped_output_desc)),
+         filter_desc_(std::move(scoped_filter_desc)),
+-        conv_desc_(std::move(scoped_conv_desc)) {
+-    bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
+-                        (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
+-    // #if TF_ROCM_VERSION >= 50000
+-    if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
+-      wrap::miopenSetConvolutionAttribute(
+-          conv_desc_.handle(), MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
+-    }
+-    // #endif
+-  }
++        conv_desc_(std::move(scoped_conv_desc)) {}
+ 
+   std::string ToString() const override {
+-    return dnn::AlgorithmDesc{algo_id_, false, workspace_size_}.ToString();
++    return MakeAlgorithmDesc().ToString();
+   }
+ 
+   size_t GetWorkspaceSize() const override { return workspace_size_; }
+ 
+   absl::StatusOr<AlgorithmDesc> ToAlgorithmDesc() const override {
+-    return {{algo_id_, false, workspace_size_}};
++    return MakeAlgorithmDesc();
+   }
+ 
+   absl::Status operator()(Stream* stream,
+@@ -3299,77 +3212,36 @@ class RocmConvRunner : public dnn::ConvRunner {
+                           DeviceAddressBase filter_data,
+                           DeviceAddressBase output_data) const override {
+     auto miopen = miopen_->GetHandle(parent_, stream);
+-    // Alpha is the scaling factor for input.
+-    float alpha = 1.0;
+-    // Beta is the scaling factor for output.
+-    float beta = 0.0;
+ 
+-    const bool is_profiling = output_profile_result != nullptr;
+-    std::unique_ptr<EventBasedTimer> timer;
+-    if (is_profiling) {
+-      TF_ASSIGN_OR_RETURN(timer,
+-                          stream->CreateEventBasedTimer(
+-                              output_profile_result->warmup_run_executed()));
+-    }
++    CHECK(output_profile_result == nullptr);
+ 
+     miopenStatus_t status = miopenStatusSuccess;
+     switch (kind_) {
+       case dnn::ConvolutionKind::FORWARD: {
+-        if (use_immediate_mode_) {
+           status = wrap::miopenConvolutionForwardImmediate(
+               miopen.handle(), filter_desc_.handle(), filter_data.opaque(),
+               input_desc_.handle(), input_data.opaque(), conv_desc_.handle(),
+               output_desc_.handle(), output_data.opaque(),
+               scratch_memory.opaque(), scratch_memory.size(),
+               static_cast<uint64_t>(algo_id_));
+-        } else {
+-          status = wrap::miopenConvolutionForward(
+-              miopen.handle(), &alpha, input_desc_.handle(),
+-              input_data.opaque(), filter_desc_.handle(), filter_data.opaque(),
+-              conv_desc_.handle(),
+-              static_cast<miopenConvFwdAlgorithm_t>(algo_id_), &beta,
+-              output_desc_.handle(), output_data.opaque(),
+-              scratch_memory.opaque(), scratch_memory.size());
+-        }
+-
+         break;
+       }
+       case dnn::ConvolutionKind::BACKWARD_DATA: {
+-        if (use_immediate_mode_) {
+           status = wrap::miopenConvolutionBackwardDataImmediate(
+               miopen.handle(), output_desc_.handle(), output_data.opaque(),
+               filter_desc_.handle(), filter_data.opaque(), conv_desc_.handle(),
+               input_desc_.handle(), input_data.opaque(),
+               scratch_memory.opaque(), scratch_memory.size(),
+               static_cast<uint64_t>(algo_id_));
+-        } else {
+-          status = wrap::miopenConvolutionBackwardData(
+-              miopen.handle(), &alpha, output_desc_.handle(),
+-              output_data.opaque(), filter_desc_.handle(), filter_data.opaque(),
+-              conv_desc_.handle(),
+-              static_cast<miopenConvBwdDataAlgorithm_t>(algo_id_), &beta,
+-              input_desc_.handle(), input_data.opaque(),
+-              scratch_memory.opaque(), scratch_memory.size());
+-        }
+         break;
+       }
+       case dnn::ConvolutionKind::BACKWARD_FILTER: {
+-        if (use_immediate_mode_) {
+           status = wrap::miopenConvolutionBackwardWeightsImmediate(
+               miopen.handle(), output_desc_.handle(), output_data.opaque(),
+               input_desc_.handle(), input_data.opaque(), conv_desc_.handle(),
+               filter_desc_.handle(), filter_data.opaque(),
+               scratch_memory.opaque(), scratch_memory.size(),
+               static_cast<uint64_t>(algo_id_));
+-        } else {
+-          status = wrap::miopenConvolutionBackwardWeights(
+-              miopen.handle(), &alpha, output_desc_.handle(),
+-              output_data.opaque(), input_desc_.handle(), input_data.opaque(),
+-              conv_desc_.handle(),
+-              static_cast<miopenConvBwdWeightsAlgorithm_t>(algo_id_), &beta,
+-              filter_desc_.handle(), filter_data.opaque(),
+-              scratch_memory.opaque(), scratch_memory.size());
+-        }
+         break;
+       }
+       default:
+@@ -3377,18 +3249,6 @@ class RocmConvRunner : public dnn::ConvRunner {
+                                                 static_cast<int>(kind_)));
+     }
+ 
+-    if (is_profiling) {
+-      if (status == miopenStatusSuccess) {
+-        TF_ASSIGN_OR_RETURN(absl::Duration elapsed,
+-                            timer->GetElapsedDuration());
+-        output_profile_result->set_elapsed_time_in_ms(
+-            absl::ToDoubleMilliseconds(elapsed));
+-        dnn::AlgorithmDesc algotype(algo_id_, false);
+-        output_profile_result->set_algorithm(algotype);
+-        output_profile_result->set_scratch_size(scratch_memory.size());
+-      }
+-    }
+-
+     if (status != miopenStatusSuccess) {
+       return absl::InternalError(
+           absl::StrCat("Failed to enqueue convolution on stream: ",
+@@ -3399,12 +3259,15 @@ class RocmConvRunner : public dnn::ConvRunner {
+   }
+ 
+  private:
++  dnn::AlgorithmDesc MakeAlgorithmDesc() const {
++    return {algo_id_, false, workspace_size_};
++  }
++
+   StreamExecutor* parent_;
+   MIOpenAccess* miopen_;
+   int64_t algo_id_;
+   size_t workspace_size_;
+   dnn::ConvolutionKind kind_;
+-  bool use_immediate_mode_;
+ 
+   ScopedTensorDescriptor input_desc_;
+   ScopedTensorDescriptor output_desc_;
+@@ -3457,7 +3320,25 @@ MIOpenSupport::ConvolveRunnerFromDesc(
+     const dnn::FilterDescriptor& filter_descriptor,
+     const dnn::BatchDescriptor& output_descriptor,
+     const dnn::ConvolutionDescriptor& convolution_descriptor) {
+-  auto workspace_size = algorithm_desc.workspace_size();
++  int64_t algo_id = algorithm_desc.algo_id();
++  size_t workspace_size = algorithm_desc.workspace_size().value_or(0);
++
++  if (algo_id == 0) {
++    std::vector<dnn::ProfileResult> algorithms;
++    TF_RETURN_IF_ERROR(GetMIOpenConvolveAlgorithmsImmediateMode(
++        kind, input_type, output_type, stream, input_descriptor,
++        filter_descriptor, output_descriptor, convolution_descriptor,
++        &algorithms, /* maxSolutionCount= */ -1));
++    auto it = std::find_if(
++        algorithms.begin(), algorithms.end(),
++        [](const auto& x) { return *x.algorithm().workspace_size() == 0; });
++    if (it == algorithms.end()) {
++      return absl::InternalError("No algorithms found for algo_id(0)");
++    }
++    algo_id = it->algorithm().algo_id();
++    workspace_size = 0;
++  }
++
+   TF_ASSIGN_OR_RETURN(auto scoped_input_desc,
+                       scope(input_descriptor, ToMIOpenDataType(input_type)));
+   TF_ASSIGN_OR_RETURN(auto scoped_output_desc,
+@@ -3466,10 +3347,66 @@ MIOpenSupport::ConvolveRunnerFromDesc(
+                       scope(filter_descriptor, ToMIOpenDataType(input_type)));
+   TF_ASSIGN_OR_RETURN(auto scoped_conv_desc, scope(convolution_descriptor));
+ 
++  bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
++                      (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
++
++  if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
++    wrap::miopenSetConvolutionAttribute(
++        scoped_conv_desc.handle(), MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
++  }
++
++  auto miopen = miopen_->GetHandle(parent_, stream);
++
++  switch (kind) {
++    case dnn::ConvolutionKind::FORWARD: {
++      auto status = wrap::miopenConvolutionForwardCompileSolution(
++          miopen.handle(), scoped_filter_desc.handle(),
++          scoped_input_desc.handle(), scoped_conv_desc.handle(),
++          scoped_output_desc.handle(), algo_id);
++
++      if (status != miopenStatusSuccess) {
++        return absl::InternalError(
++            "call to miopenConvolutionForwardCompileSolution failed: " +
++            ToString(status));
++      }
++    } break;
++
++    case dnn::ConvolutionKind::BACKWARD_DATA: {
++      auto status = wrap::miopenConvolutionBackwardDataCompileSolution(
++          miopen.handle(), scoped_output_desc.handle(),
++          scoped_filter_desc.handle(), scoped_conv_desc.handle(),
++          scoped_input_desc.handle(), algo_id);
++
++      if (status != miopenStatusSuccess) {
++        return absl::InternalError(
++            " call to miopenConvolutionBackwardDataCompileSolution "
++            "failed: " +
++            ToString(status));
++      }
++    } break;
++    case dnn::ConvolutionKind::BACKWARD_FILTER: {
++      auto status = wrap::miopenConvolutionBackwardWeightsCompileSolution(
++          miopen.handle(), scoped_output_desc.handle(),
++          scoped_input_desc.handle(), scoped_conv_desc.handle(),
++          scoped_filter_desc.handle(), algo_id);
++
++      if (status != miopenStatusSuccess) {
++        return absl::InternalError(
++            "call to miopenConvolutionBackwardWeightsCompileSolution "
++            "failed: " +
++            ToString(status));
++      }
++    } break;
++    default: {
++      return absl::InternalError("Unexpected convolution kind " +
++                                 std::to_string(static_cast<int>(kind)));
++    }
++  }
++
+   return {std::make_unique<RocmConvRunner>(
+-      parent_, miopen_.get(), algorithm_desc.algo_id(), *workspace_size, kind,
+-      input_type, output_type, use_immediate_mode_, scoped_input_desc,
+-      scoped_output_desc, scoped_filter_desc, scoped_conv_desc)};
++      parent_, miopen_.get(), algo_id, workspace_size, kind, input_type,
++      output_type, scoped_input_desc, scoped_output_desc, scoped_filter_desc,
++      scoped_conv_desc)};
+ }
+ 
+ bool MIOpenSupport::GetMIOpenConvolveAlgorithms(
+@@ -3483,32 +3420,30 @@ bool MIOpenSupport::GetMIOpenConvolveAlgorithms(
+     const dnn::ConvolutionDescriptor& convolution_descriptor,
+     ScratchAllocator* scratch_allocator,
+     std::vector<dnn::ProfileResult>* out_algorithms) {
+-  return use_immediate_mode_
+-             ? GetMIOpenConvolveAlgorithmsImmediateMode(
+-                   kind, input_type, output_type, stream, input_descriptor,
+-                   input_data, filter_descriptor, filter_data,
+-                   output_descriptor, output_data, convolution_descriptor,
+-                   scratch_allocator, out_algorithms)
+-                   .ok()
+-             : GetMIOpenConvolveAlgorithmsFindMode(
+-                   kind, input_type, output_type, stream, input_descriptor,
+-                   input_data, filter_descriptor, filter_data,
+-                   output_descriptor, output_data, convolution_descriptor,
+-                   scratch_allocator, out_algorithms)
+-                   .ok();
++  // TODO(rocm): Create handles only once and reuse them between the methods
++  if (!PopulateMIOpenFindDb(kind, input_type, output_type, stream,
++                            input_descriptor, input_data, filter_descriptor,
++                            filter_data, output_descriptor, output_data,
++                            convolution_descriptor, scratch_allocator)
++           .ok()) {
++    return false;
++  }
++  return GetMIOpenConvolveAlgorithmsImmediateMode(
++             kind, input_type, output_type, stream, input_descriptor,
++             filter_descriptor, output_descriptor, convolution_descriptor,
++             out_algorithms,
++             /* maxSolutionCount= */ 1)
++      .ok();
+ }
+ 
+ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+     dnn::ConvolutionKind kind, dnn::DataType input_type,
+     dnn::DataType output_type, Stream* stream,
+-    const dnn::BatchDescriptor& input_descriptor, DeviceAddressBase input_data,
++    const dnn::BatchDescriptor& input_descriptor,
+     const dnn::FilterDescriptor& filter_descriptor,
+-    DeviceAddressBase filter_data,
+     const dnn::BatchDescriptor& output_descriptor,
+-    DeviceAddressBase output_data,
+     const dnn::ConvolutionDescriptor& convolution_descriptor,
+-    ScratchAllocator* scratch_allocator,
+-    std::vector<dnn::ProfileResult>* out_algorithms) {
++    std::vector<dnn::ProfileResult>* out_algorithms, size_t maxSolutionCount) {
+   auto miopen = miopen_->GetHandle(parent_, stream);
+ 
+   TF_ASSIGN_OR_RETURN(auto input_nd,
+@@ -3521,70 +3456,59 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+ 
+   bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
+                       (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
+-  // bool is_backprop = (call_context == dnn::CallContext::kBackpropData) ||
+-  //                   (call_context == dnn::CallContext::kBackpropFilter);
+ 
+-#if TF_ROCM_VERSION >= 50000
+   if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
+     wrap::miopenSetConvolutionAttribute(
+         conv.handle(), MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
+   }
+-#endif
+-  // First determine the number of algorithms available
+-  size_t maxSolutionCount = 0;
+ 
+-  switch (kind) {
+-    case dnn::ConvolutionKind::FORWARD:
+-    case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
+-      auto status = wrap::miopenConvolutionForwardGetSolutionCount(
+-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+-          output_nd.handle(), &maxSolutionCount);
+-      if (status != miopenStatusSuccess) {
+-        return absl::InternalError(
+-            "call to miopenConvolutionForwardGetSolutionCount failed: " +
+-            ToString(status));
++  if (maxSolutionCount == -1) {
++    switch (kind) {
++      case dnn::ConvolutionKind::FORWARD: {
++        auto status = wrap::miopenConvolutionForwardGetSolutionCount(
++            miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
++            output_nd.handle(), &maxSolutionCount);
++        if (status != miopenStatusSuccess) {
++          return absl::InternalError(
++              "call to miopenConvolutionForwardGetSolutionCount failed: " +
++              ToString(status));
++        }
++        break;
+       }
+-      break;
+-    }
+-    case dnn::ConvolutionKind::BACKWARD_DATA: {
+-      auto status = wrap::miopenConvolutionBackwardDataGetSolutionCount(
+-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
+-          input_nd.handle(), &maxSolutionCount);
+-      if (status != miopenStatusSuccess) {
+-        return absl::InternalError(
+-            "call to miopenConvolutionBackwardDataGetSolutionCount "
+-            "failed: " +
+-            ToString(status));
++      case dnn::ConvolutionKind::BACKWARD_DATA: {
++        auto status = wrap::miopenConvolutionBackwardDataGetSolutionCount(
++            miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
++            input_nd.handle(), &maxSolutionCount);
++        if (status != miopenStatusSuccess) {
++          return absl::InternalError(
++              "call to miopenConvolutionBackwardDataGetSolutionCount "
++              "failed: " +
++              ToString(status));
++        }
++        break;
+       }
+-      break;
+-    }
+-    case dnn::ConvolutionKind::BACKWARD_FILTER: {
+-      auto status = wrap::miopenConvolutionBackwardWeightsGetSolutionCount(
+-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
+-          filter.handle(), &maxSolutionCount);
+-      if (status != miopenStatusSuccess) {
+-        return absl::InternalError(
+-            "call to miopenConvolutionBackwardWeightsGetSolutionCount "
+-            "failed: " +
+-            ToString(status));
++      case dnn::ConvolutionKind::BACKWARD_FILTER: {
++        auto status = wrap::miopenConvolutionBackwardWeightsGetSolutionCount(
++            miopen.handle(), output_nd.handle(), input_nd.handle(),
++            conv.handle(), filter.handle(), &maxSolutionCount);
++        if (status != miopenStatusSuccess) {
++          return absl::InternalError(
++              "call to miopenConvolutionBackwardWeightsGetSolutionCount "
++              "failed: " +
++              ToString(status));
++        }
++        break;
++      }
++      default: {
++        return absl::InternalError("Unexpected convolution kind " +
++                                   std::to_string(static_cast<int>(kind)));
+       }
+-      break;
+-    }
+-    default: {
+-      return absl::InternalError("Unexpected convolution kind " +
+-                                 std::to_string(static_cast<int>(kind)));
+     }
+   }
+ 
+   VLOG(kConvDebugVlogLevel)
+       << "Number of conv solutions max: " << maxSolutionCount;
+ 
+-  if (return_best_algo_only_) {
+-    VLOG(kConvDebugVlogLevel) << "TF_ROCM_RETURN_BEST_ALGO_ONLY is set, "
+-                              << "setting maxSolutionCount to 1";
+-    maxSolutionCount = 1;
+-  }
+-
+   size_t solutionCount = 0;
+   std::unique_ptr<miopenConvSolution_t[]> solutions(
+       new miopenConvSolution_t[maxSolutionCount]);
+@@ -3601,31 +3525,6 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+             "call to miopenConvolutionForwardGetSolution failed: " +
+             ToString(status));
+       }
+-
+-      VLOG(kConvDebugVlogLevel)
+-          << "Number of conv solutions actual: " << solutionCount;
+-
+-      for (size_t i = 0; i < solutionCount; i++) {
+-        miopenConvSolution_t solution = solutions[i];
+-
+-        VLOG(kConvDebugVlogLevel)
+-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+-            << ", " << solution.workspace_size << ", " << solution.solution_id
+-            << ", " << ToString(solution.algorithm);
+-
+-        status = wrap::miopenConvolutionForwardCompileSolution(
+-            miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+-            output_nd.handle(), solution.solution_id);
+-
+-        if (status != miopenStatusSuccess) {
+-          return absl::InternalError(
+-              "call to miopenConvolutionForwardCompileSolution failed: " +
+-              ToString(status));
+-        }
+-
+-        out_algorithms->emplace_back(
+-            GetProfileResultFromConvSolution(solution));
+-      }
+       break;
+     }
+ 
+@@ -3638,32 +3537,6 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+             "call to miopenConvolutionBackwardDataGetSolution failed: " +
+             ToString(status));
+       }
+-
+-      VLOG(kConvDebugVlogLevel)
+-          << "Number of conv solutions actual: " << solutionCount;
+-
+-      for (size_t i = 0; i < solutionCount; i++) {
+-        miopenConvSolution_t solution = solutions[i];
+-
+-        VLOG(kConvDebugVlogLevel)
+-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+-            << ", " << solution.workspace_size << ", " << solution.solution_id
+-            << ", " << ToString(solution.algorithm);
+-
+-        status = wrap::miopenConvolutionBackwardDataCompileSolution(
+-            miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
+-            input_nd.handle(), solution.solution_id);
+-
+-        if (status != miopenStatusSuccess) {
+-          return absl::InternalError(
+-              " call to miopenConvolutionBackwardDataCompileSolution "
+-              "failed: " +
+-              ToString(status));
+-        }
+-
+-        out_algorithms->emplace_back(
+-            GetProfileResultFromConvSolution(solution));
+-      }
+       break;
+     }
+     case dnn::ConvolutionKind::BACKWARD_FILTER: {
+@@ -3675,32 +3548,6 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+             "call to miopenConvolutionBackwardWeightsGetSolution failed: " +
+             ToString(status));
+       }
+-
+-      VLOG(kConvDebugVlogLevel)
+-          << "Number of conv solutions actual: " << solutionCount;
+-
+-      for (size_t i = 0; i < solutionCount; i++) {
+-        miopenConvSolution_t solution = solutions[i];
+-
+-        VLOG(kConvDebugVlogLevel)
+-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+-            << ", " << solution.workspace_size << ", " << solution.solution_id
+-            << ", " << ToString(solution.algorithm);
+-
+-        status = wrap::miopenConvolutionBackwardWeightsCompileSolution(
+-            miopen.handle(), output_nd.handle(), input_nd.handle(),
+-            conv.handle(), filter.handle(), solution.solution_id);
+-
+-        if (status != miopenStatusSuccess) {
+-          return absl::InternalError(
+-              "call to miopenConvolutionBackwardWeightsCompileSolution "
+-              "failed: " +
+-              ToString(status));
+-        }
+-
+-        out_algorithms->emplace_back(
+-            GetProfileResultFromConvSolution(solution));
+-      }
+       break;
+     }
+     default: {
+@@ -3709,10 +3556,25 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
+     }
+   }
+ 
++  VLOG(kConvDebugVlogLevel)
++      << "Number of conv solutions actual: " << solutionCount;
++
++  out_algorithms->reserve(solutionCount);
++  for (size_t i = 0; i < solutionCount; i++) {
++    miopenConvSolution_t solution = solutions[i];
++
++    VLOG(kConvDebugVlogLevel)
++        << "solution " << i << " (time, mem, id, algo) =  " << solution.time
++        << ", " << solution.workspace_size << ", " << solution.solution_id
++        << ", " << ToString(solution.algorithm);
++
++    out_algorithms->emplace_back(GetProfileResultFromConvSolution(solution));
++  }
++
+   return absl::OkStatus();
+ }
+ 
+-absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
++absl::Status MIOpenSupport::PopulateMIOpenFindDb(
+     dnn::ConvolutionKind kind, dnn::DataType input_type,
+     dnn::DataType output_type, Stream* stream,
+     const dnn::BatchDescriptor& input_descriptor, DeviceAddressBase input_data,
+@@ -3721,8 +3583,7 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
+     const dnn::BatchDescriptor& output_descriptor,
+     DeviceAddressBase output_data,
+     const dnn::ConvolutionDescriptor& convolution_descriptor,
+-    ScratchAllocator* scratch_allocator,
+-    std::vector<dnn::ProfileResult>* out_algorithms) {
++    ScratchAllocator* scratch_allocator) {
+   auto miopen = miopen_->GetHandle(parent_, stream);
+ 
+   TF_ASSIGN_OR_RETURN(auto input_nd,
+@@ -3735,21 +3596,16 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
+ 
+   bool is_backprop = ((kind == dnn::ConvolutionKind::BACKWARD_DATA) ||
+                       (kind == dnn::ConvolutionKind::BACKWARD_FILTER));
+-  // bool is_backprop = (call_context == dnn::CallContext::kBackpropData) ||
+-  //                    (call_context == dnn::CallContext::kBackpropFilter);
+ 
+-#if TF_ROCM_VERSION >= 50000
+   if (is_backprop && (ToMIOpenDataType(input_type) == miopenHalf)) {
+     wrap::miopenSetConvolutionAttribute(
+         conv.handle(), MIOPEN_CONVOLUTION_ATTRIB_FP16_ALT_IMPL, 1);
+   }
+-#endif
+ 
+   // Determine the workspace memory size that will need by the call to Find
+   size_t scratch_memory_size = 0;
+   switch (kind) {
+-    case dnn::ConvolutionKind::FORWARD:
+-    case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
++    case dnn::ConvolutionKind::FORWARD: {
+       auto status = wrap::miopenConvolutionForwardGetWorkSpaceSize(
+           miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+           output_nd.handle(), &scratch_memory_size);
+@@ -3802,13 +3658,8 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
+     if (allocated.ok()) {
+       scratch_memory = allocated.value();
+     } else {
+-      LOG(FATAL)
+-          << "Failed to allocate scratch memory - "
+-          << allocated.status().message() << "\n"
+-          << "\tYou can set the env var TF_CUDNN_WORKSPACE_LIMIT_IN_MB to a "
+-             "larger number (e.g. 8192) to increase the max memory limit.\n"
+-          << "\tIncreasing the max memory limit might help resolve this "
+-             "error";
++      LOG(FATAL) << "Failed to allocate scratch memory - "
++                 << allocated.status().message();
+       return absl::InternalError("Out of memory");
+     }
+   }
+@@ -3825,8 +3676,7 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
+   bool exhaustiveSearch = false;
+ 
+   switch (kind) {
+-    case dnn::ConvolutionKind::FORWARD:
+-    case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
++    case dnn::ConvolutionKind::FORWARD: {
+       auto status = wrap::miopenFindConvolutionForwardAlgorithm(
+           miopen.handle(), input_nd.handle(), input_data.opaque(),
+           filter.handle(), filter_data.opaque(), conv.handle(),
+@@ -3876,9 +3726,6 @@ absl::Status MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
+     }
+   }
+ 
+-  out_algorithms->emplace_back(
+-      GetProfileResultFromConvAlgoPerf(kind, returnedAlgorithm));
+-
+   return absl::OkStatus();
+ }
+ 
+@@ -4788,46 +4635,37 @@ class RocmFusedConvRunner : public dnn::FusedConvRunner {
+     return MakeAlgorithmDesc();
+   }
+ 
+-  absl::Status operator()(Stream* stream, dnn::ProfileResult* profile_result,
++  absl::Status operator()(Stream* stream,
++                          dnn::ProfileResult* output_profile_result,
+                           DeviceAddressBase scratch_memory,
+                           DeviceAddressBase input_data,
+                           DeviceAddressBase filter_data,
+                           DeviceAddressBase side_input_data,
+                           DeviceAddressBase bias_data,
+                           DeviceAddressBase output_data) const override {
+-    VLOG(2) << "RocmFusedConvRunner()";
+-    if (parent_ != stream->parent()) {
+-      return absl::InternalError(
+-          "RocmFusedConvRunner cached across multiple StreamExecutors.");
+-    }
+-
+-    // We can't reliably detect whether this sequence can be fused until
+-    // we come here and actually try to fuse it. So, we need a fallback.
+-    bool do_unfused =
+-        (side_input_scale_ != 0.0) || !fusion_plan_.CompilationSucceeded();
++    CHECK(parent_ == stream->parent());
+ 
+-    if (do_unfused)
+-      return execute_unfused(stream, profile_result, scratch_memory, input_data,
+-                             filter_data, side_input_data, bias_data,
+-                             output_data);
+-    auto algo = MakeAlgorithmDesc();
+     auto miopen = miopen_->GetHandle(parent_, stream);
+     fusion_plan_.SetConvolutionArgs(filter_data.opaque());
+     fusion_plan_.SetBiasArgs(bias_data.opaque());
+     if (activation_desc_.miopen_activation_mode_ != miopenActivationPASTHRU)
+       fusion_plan_.SetActivationForwardArgs(activation_desc_);
+ 
+-    std::unique_ptr<EventBasedTimer> timer;
+-    if (profile_result) {
+-      TF_ASSIGN_OR_RETURN(timer, stream->CreateEventBasedTimer(
+-                                     /* use_delay_kernel=*/false));
+-    }
++    CHECK(output_profile_result == nullptr);
+ 
+     miopenStatus_t status;
++#if (TF_ROCM_VERSION >= 70000)
++    status = wrap::miopenExecuteFusionPlan_v2(
++        miopen.handle(), fusion_plan_.fusion_plan_, input_nd_.handle(),
++        input_data.opaque(), output_nd_.handle(), output_data.opaque(),
++        fusion_plan_.fusion_args_, scratch_memory.opaque(),
++        scratch_memory.size());
++#else
+     status = wrap::miopenExecuteFusionPlan(
+         miopen.handle(), fusion_plan_.fusion_plan_, input_nd_.handle(),
+         input_data.opaque(), output_nd_.handle(), output_data.opaque(),
+         fusion_plan_.fusion_args_);
++#endif
+ 
+     if (status != miopenStatusSuccess) {
+       LOG(ERROR) << "Failed to enqueue fused convolution on stream: "
+@@ -4837,31 +4675,17 @@ class RocmFusedConvRunner : public dnn::FusedConvRunner {
+           stream_executor::gpu::ToString(status));
+     }
+ 
+-    if (profile_result) {
+-      absl::StatusOr<absl::Duration> elapsed = timer->GetElapsedDuration();
+-      if (!elapsed.ok()) {
+-        LOG(ERROR) << "Failed to get elapsed duration";
+-        return absl::InternalError("Timer failure");
+-      }
+-      profile_result->set_elapsed_time_in_ms(
+-          absl::ToDoubleMilliseconds(*elapsed));
+-      profile_result->set_algorithm(algo);
+-      profile_result->set_scratch_size(scratch_memory.size());
+-    }
+-
+     return absl::OkStatus();
+   }
+ 
+  public:
+-  // Queries the workspace size and constructs a 'RocmFusedConvRunner'.
+   static absl::StatusOr<std::unique_ptr<const dnn::FusedConvRunner>> Create(
+-      StreamExecutor* parent, Stream* stream, MIOpenAccess* miopen,
++      StreamExecutor* parent, Stream* stream, MIOpenAccess* miopen_,
+       const dnn::AlgorithmDesc& algo, dnn::DataType input_type,
+-      dnn::DataType bias_type, double conv_scale, double side_input_scale,
+-      double leakyrelu_alpha, BatchDescriptor input_nd,
++      dnn::DataType bias_type, double leakyrelu_alpha, BatchDescriptor input_nd,
+       BatchDescriptor output_nd, FilterDescriptor filter,
+       BatchDescriptor bias_nd, ConvolutionDescriptor conv,
+-      dnn::ActivationMode activation) {
++      dnn::ActivationMode activation, std::optional<uint64_t> workspace_size) {
+     TF_ASSIGN_OR_RETURN(
+         auto input_nd_,
+         scope(input_nd, ToMIOpenDataType(input_type, input_nd.layout())));
+@@ -4878,185 +4702,72 @@ class RocmFusedConvRunner : public dnn::FusedConvRunner {
+         auto activation_desc,
+         ScopedActivationDescriptor::Create(activation, leakyrelu_alpha));
+ 
++    auto miopen = miopen_->GetHandle(parent, stream);
++
+     TF_ASSIGN_OR_RETURN(
+         auto fusion_plan,
+         ScopedFusionPlanConvolutionBiasActivation::Create(
+-            miopen->GetHandle(parent, stream).handle(), input_nd_.handle(),
+-            filter_.handle(), conv_.handle(), bias_nd_.handle(),
+-            activation_desc));
+-
+-    VLOG(2) << "RocmFusedConvRunner";
+-    auto mi = miopen->GetHandle(parent, stream);
++            miopen.handle(), input_nd_.handle(), filter_.handle(),
++            conv_.handle(), bias_nd_.handle(), activation_desc));
+ 
+-    size_t maxSolutionCount = 0;
+-    auto status = wrap::miopenConvolutionForwardGetSolutionCount(
+-        mi.handle(), filter_.handle(), input_nd_.handle(), conv_.handle(),
+-        output_nd_.handle(), &maxSolutionCount);
+-
+-    size_t solutionCount = 0;
+-    std::unique_ptr<miopenConvSolution_t[]> solutions(
+-        new miopenConvSolution_t[maxSolutionCount]);
+-
+-    status = wrap::miopenConvolutionForwardGetSolution(
+-        mi.handle(), filter_.handle(), input_nd_.handle(), conv_.handle(),
+-        output_nd_.handle(), maxSolutionCount, &solutionCount, solutions.get());
++    if (!fusion_plan.CompilationSucceeded()) {
++      return absl::InternalError("No algorithms found");
++    }
+ 
+-    VLOG(2) << solutionCount << " solutions";
++    uint64_t workspace_size_ = workspace_size.value_or(0);
+ 
+-    if (solutionCount == 0) return absl::InternalError("No algorithms found");
++    if (!workspace_size.has_value()) {
++      auto status = wrap::miopenFusionPlanGetWorkSpaceSize(
++          miopen.handle(), fusion_plan.fusion_plan_, &workspace_size_,
++          miopenConvolutionFwdAlgoImplicitGEMM);
++      constexpr bool miopenFusionPlanGetWorkSpaceSize_is_broken = true;
+ 
+-    size_t workspace_size_1 = solutions[0].workspace_size;
+-    size_t true_workspace_size = 0;
+-    status = wrap::miopenConvolutionForwardGetWorkSpaceSize(
+-        mi.handle(), filter_.handle(), input_nd_.handle(), conv_.handle(),
+-        output_nd_.handle(), &true_workspace_size);
++      if (miopenFusionPlanGetWorkSpaceSize_is_broken) {
++        return absl::InternalError("Cannot reliably query workspace size");
++      }
+ 
+-    VLOG(2) << "True workspace size " << workspace_size_1 << " "
+-            << true_workspace_size;
++      if (status != miopenStatusSuccess) {
++        return absl::InternalError(
++            "call to miopenFusionPlanGetWorkSpaceSize failed: " +
++            stream_executor::gpu::ToString(status));
++      }
++    }
+ 
+     auto obj = new RocmFusedConvRunner(
+-        parent, stream, miopen, static_cast<int64_t>(solutions[0].solution_id),
+-        true_workspace_size, input_type, bias_type, conv_scale,
+-        side_input_scale, leakyrelu_alpha, input_nd, output_nd, filter, bias_nd,
+-        conv, activation, input_nd_, output_nd_, filter_, bias_nd_, conv_,
+-        activation_desc, fusion_plan);
++        parent, stream, miopen_, input_nd_, output_nd_, filter_, bias_nd_,
++        conv_, activation_desc, fusion_plan, workspace_size_);
+ 
+     return std::unique_ptr<const dnn::FusedConvRunner>(obj);
+   }
+ 
+  private:
+-  // Private to prevent passing in the wrong workspace_size.
+-  RocmFusedConvRunner(
+-      StreamExecutor* parent, Stream* stream, MIOpenAccess* miopen,
+-      int64_t algo_id, size_t workspace_size, dnn::DataType input_type,
+-      dnn::DataType bias_type, double conv_scale, double side_input_scale,
+-      double leakyrelu_alpha, BatchDescriptor dnn_input_nd,
+-      BatchDescriptor dnn_output_nd, FilterDescriptor dnn_filter,
+-      BatchDescriptor dnn_bias_nd, ConvolutionDescriptor dnn_conv,
+-      dnn::ActivationMode activation, ScopedTensorDescriptor& input_nd,
+-      ScopedTensorDescriptor& output_nd, ScopedFilterDescriptor& filter,
+-      ScopedTensorDescriptor& bias_nd, ScopedConvolutionDescriptor& conv,
+-      ScopedActivationDescriptor& activation_desc,
+-      ScopedFusionPlanConvolutionBiasActivation& fusion_plan)
++  RocmFusedConvRunner(StreamExecutor* parent, Stream* stream,
++                      MIOpenAccess* miopen, ScopedTensorDescriptor& input_nd,
++                      ScopedTensorDescriptor& output_nd,
++                      ScopedFilterDescriptor& filter,
++                      ScopedTensorDescriptor& bias_nd,
++                      ScopedConvolutionDescriptor& conv,
++                      ScopedActivationDescriptor& activation_desc,
++                      ScopedFusionPlanConvolutionBiasActivation& fusion_plan,
++                      uint64_t workspace_size)
+       : parent_(parent),
+         miopen_(miopen),
+-        algo_id_(algo_id),
+-        workspace_size_(workspace_size),
+-        input_type_(input_type),
+-        bias_type_(bias_type),
+-
+-        conv_scale_(conv_scale),
+-        side_input_scale_(side_input_scale),
+-        leakyrelu_alpha_(leakyrelu_alpha),
+-        side_input_scale_f32_(static_cast<float>(side_input_scale)),
+-
+-        activation_mode_(activation),
+-        dnn_input_nd_(dnn_input_nd),
+-        dnn_output_nd_(dnn_output_nd),
+-        dnn_filter_(dnn_filter),
+-        dnn_bias_nd_(dnn_bias_nd),
+-        dnn_conv_(dnn_conv),
+-
+         input_nd_(std::move(input_nd)),
+         output_nd_(std::move(output_nd)),
+         filter_(std::move(filter)),
+         bias_nd_(std::move(bias_nd)),
+         conv_(std::move(conv)),
+         activation_desc_(std::move(activation_desc)),
+-        fusion_plan_(std::move(fusion_plan)) {}
+-
+-  absl::Status execute_unfused(
+-      Stream* stream, dnn::ProfileResult* profile_result,
+-      DeviceAddressBase scratch_memory, DeviceAddressBase input_data,
+-      DeviceAddressBase filter_data, DeviceAddressBase side_input_data,
+-      DeviceAddressBase bias_data, DeviceAddressBase output_data) const {
+-    auto miopen = miopen_->GetHandle(parent_, stream);
+-    auto status = wrap::miopenConvolutionForwardImmediate(
+-        miopen.handle(), filter_.handle(), filter_data.opaque(),
+-        input_nd_.handle(), input_data.opaque(), conv_.handle(),
+-        output_nd_.handle(), output_data.opaque(), scratch_memory.opaque(),
+-        scratch_memory.size(), static_cast<uint64_t>(algo_id_));
+-    if (status != miopenStatusSuccess) {
+-      VLOG(0) << "Failed to enqueue convolution: "
+-              << stream_executor::gpu::ToString(status);
+-      return absl::InternalError("Failed to enqueue convolution: " +
+-                                 stream_executor::gpu::ToString(status));
+-    }
+-
+-    int batch;
+-    std::vector<int64_t> dims_output =
+-        dnn_output_nd_.full_dims(dnn_output_nd_.layout());
+-    int rank = dims_output.size();
+-    if (rank != 4 && rank != 5)
+-      return absl::InternalError(
+-          "RocmFusedConvRunner expects 4d or 5d descriptors");
+-    int d1 = 1, d2 = 1;
+-    bool bNCHW = (dnn_output_nd_.layout() != dnn::DataLayout::kBatchYXDepth);
+-    batch = dims_output[0];
+-    if (bNCHW) {
+-      d1 = dims_output[1];
+-      for (int i = 2; i < rank; i++) d2 *= dims_output[i];
+-    } else {
+-      d2 = dims_output[rank - 1];
+-      for (int i = 1; i < rank - 1; i++) d1 *= dims_output[i];
+-    }
+-
+-    float param = activation_desc_.alpha_;
+-
+-    auto inplace_call = [&](auto out, auto bias) {
+-      return InplaceBiasActivation(stream, out, bias, side_input_data,
+-                                   side_input_scale_f32_, activation_mode_,
+-                                   batch, d1, d2, d2, param, bNCHW);
+-    };
+-
+-    absl::Status biasActStatus;
+-    if (input_type_ == dnn::DataType::kFloat &&
+-        bias_type_ == dnn::DataType::kFloat)
+-      biasActStatus = inplace_call(DeviceAddress<float>(output_data),
+-                                   DeviceAddress<float>(bias_data));
+-    else if (input_type_ == dnn::DataType::kHalf &&
+-             bias_type_ == dnn::DataType::kFloat)
+-      biasActStatus = inplace_call(DeviceAddress<Eigen::half>(output_data),
+-                                   DeviceAddress<float>(bias_data));
+-    else if (input_type_ == dnn::DataType::kHalf &&
+-             bias_type_ == dnn::DataType::kHalf)
+-      biasActStatus = inplace_call(DeviceAddress<Eigen::half>(output_data),
+-                                   DeviceAddress<Eigen::half>(bias_data));
+-    else if (input_type_ == dnn::DataType::kBF16 &&
+-             bias_type_ == dnn::DataType::kFloat)
+-      biasActStatus = inplace_call(DeviceAddress<Eigen::bfloat16>(output_data),
+-                                   DeviceAddress<float>(bias_data));
+-    else if (input_type_ == dnn::DataType::kBF16 &&
+-             bias_type_ == dnn::DataType::kBF16)
+-      biasActStatus = inplace_call(DeviceAddress<Eigen::bfloat16>(output_data),
+-                                   DeviceAddress<Eigen::bfloat16>(bias_data));
+-    else
+-      return absl::InternalError("Unsupported data type");
+-
+-    return absl::OkStatus();
+-  }
++        fusion_plan_(std::move(fusion_plan)),
++        workspace_size_(workspace_size) {}
+ 
+   // Internal form of ToAlgorithmDesc without the StatusOr.
+   dnn::AlgorithmDesc MakeAlgorithmDesc() const {
+-    return {algo_id_, /*tensor_ops_enabled_*/ true, workspace_size_};
++    return {-1, false, workspace_size_};
+   }
+ 
+-  std::string desc_;
+-
+   StreamExecutor* parent_;
+   MIOpenAccess* miopen_;
+-  int64_t algo_id_;
+-  size_t workspace_size_;
+-  dnn::DataType input_type_, bias_type_;
+-  double conv_scale_, side_input_scale_, leakyrelu_alpha_;
+-  float side_input_scale_f32_;
+-  dnn::ActivationMode activation_mode_;
+-
+-  BatchDescriptor dnn_input_nd_;
+-  BatchDescriptor dnn_output_nd_;
+-  FilterDescriptor dnn_filter_;
+-  BatchDescriptor dnn_bias_nd_;
+-  ConvolutionDescriptor dnn_conv_;
+ 
+   ScopedTensorDescriptor input_nd_;
+   ScopedTensorDescriptor output_nd_;
+@@ -5065,6 +4776,7 @@ class RocmFusedConvRunner : public dnn::FusedConvRunner {
+   ScopedConvolutionDescriptor conv_;
+   mutable ScopedActivationDescriptor activation_desc_;
+   mutable ScopedFusionPlanConvolutionBiasActivation fusion_plan_;
++  uint64_t workspace_size_;
+ };
+ 
+ absl::StatusOr<std::unique_ptr<const dnn::FusedConvRunner>>
+@@ -5084,14 +4796,16 @@ MIOpenSupport::FusedConvolveRunnerFromDesc(
+           << convolution_descriptor.ToString() << getTypeName(input_type) << " "
+           << getTypeName(bias_type) << " " << getTypeName(output_type);
+ 
+-  // note: these checks need to be duplicated in XLA logic, because XLA calls
+-  // this function directly and it terminates the process on error
++  if (conv_scale != 1.0 || side_input_scale != 0.0) {
++    return absl::InvalidArgumentError(
++        "MIOpen fusions don't support conv_scale or side_input_scale");
++  }
+ 
+   return RocmFusedConvRunner::Create(
+       parent_, stream, miopen_.get(), algorithm_desc, input_type, bias_type,
+-      conv_scale, side_input_scale, leakyrelu_alpha, input_descriptor,
+-      output_descriptor, filter_descriptor, bias_descriptor,
+-      convolution_descriptor, activation_mode);
++      leakyrelu_alpha, input_descriptor, output_descriptor, filter_descriptor,
++      bias_descriptor, convolution_descriptor, activation_mode,
++      algorithm_desc.workspace_size());
+ }
+ 
+ absl::Status MIOpenSupport::GetFusedConvolveRunners(
+@@ -5106,24 +4820,18 @@ absl::Status MIOpenSupport::GetFusedConvolveRunners(
+     dnn::ActivationMode activation_mode, const EngineOptions& engine_options,
+     std::vector<std::unique_ptr<const dnn::FusedConvRunner>>* out_exec_plans) {
+   VLOG(2) << "MIOpenSupport::GetFusedConvolveRunners";
+-  VLOG(2) << "filter_descriptor " << filter_descriptor.ndims();
+-
+-  std::vector<dnn::AlgorithmDesc> algorithms{
+-      // clang-format off
+-      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoGEMM, false, 0),
+-      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoDirect, false, 0),
+-      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoFFT, false, 0),
+-      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoWinograd, false, 0),
+-      // clang-format on
+-  };
+ 
+-  for (const auto& algo : algorithms) {
+-    auto runner_or = FusedConvolveRunnerFromDesc(
+-        stream, algo, kind, input_type, bias_type, output_type, conv_scale,
+-        side_input_scale, leakyrelu_alpha, input_descriptor, filter_descriptor,
+-        bias_descriptor, output_descriptor, convolution_descriptor,
+-        activation_mode);
+-    if (!runner_or.ok()) continue;
++  auto runner_or = FusedConvolveRunnerFromDesc(
++      stream, {}, kind, input_type, bias_type, output_type, conv_scale,
++      side_input_scale, leakyrelu_alpha, input_descriptor, filter_descriptor,
++      bias_descriptor, output_descriptor, convolution_descriptor,
++      activation_mode);
++// No way to invoke fused convs with workspace prior to rocm 7
++#if (TF_ROCM_VERSION >= 70000)
++  if (runner_or.ok()) {
++#else
++  if (runner_or.ok() && runner_or.value()->GetWorkspaceSize() == 0) {
++#endif
+     out_exec_plans->push_back(std::move(runner_or).value());
+   }
+ 
+diff --git a/third_party/xla/xla/stream_executor/rocm/rocm_dnn.h b/third_party/xla/xla/stream_executor/rocm/rocm_dnn.h
+index e1dbd07db3a..9042b86b6b3 100644
+--- a/third_party/xla/xla/stream_executor/rocm/rocm_dnn.h
++++ b/third_party/xla/xla/stream_executor/rocm/rocm_dnn.h
+@@ -294,16 +294,12 @@ class MIOpenSupport : public dnn::DnnSupport {
+       dnn::ConvolutionKind kind, dnn::DataType input_type,
+       dnn::DataType output_type, Stream* stream,
+       const dnn::BatchDescriptor& input_descriptor,
+-      DeviceAddressBase input_data,
+       const dnn::FilterDescriptor& filter_descriptor,
+-      DeviceAddressBase filter_data,
+       const dnn::BatchDescriptor& output_descriptor,
+-      DeviceAddressBase output_data,
+       const dnn::ConvolutionDescriptor& convolution_descriptor,
+-      ScratchAllocator* scratch_allocator,
+-      std::vector<dnn::ProfileResult>* out_algorithms);
++      std::vector<dnn::ProfileResult>* out_algorithms, size_t maxSolutionCount);
+ 
+-  absl::Status GetMIOpenConvolveAlgorithmsFindMode(
++  absl::Status PopulateMIOpenFindDb(
+       dnn::ConvolutionKind kind, dnn::DataType input_type,
+       dnn::DataType output_type, Stream* stream,
+       const dnn::BatchDescriptor& input_descriptor,
+@@ -313,8 +309,7 @@ class MIOpenSupport : public dnn::DnnSupport {
+       const dnn::BatchDescriptor& output_descriptor,
+       DeviceAddressBase output_data,
+       const dnn::ConvolutionDescriptor& convolution_descriptor,
+-      ScratchAllocator* scratch_allocator,
+-      std::vector<dnn::ProfileResult>* out_algorithms);
++      ScratchAllocator* scratch_allocator);
+ 
+   bool GetRnnAlgorithms(
+       std::vector<dnn::AlgorithmDesc>* out_algorithms) override;
+@@ -513,13 +508,6 @@ class MIOpenSupport : public dnn::DnnSupport {
+  private:
+   StreamExecutor* parent_;  // Parent executor object. Not owned.
+ 
+-  // Flag to indicate whether Get*Algorithm routines should only return
+-  // the best algorithm (as opposed to a list of all applicable ones)
+-  bool return_best_algo_only_;
+-
+-  // Flag to indicate whether to use Immediate (or Find) mode for Convolutions
+-  bool use_immediate_mode_;
+-
+   // Provide access to the MIOpen handle.
+   std::unique_ptr<class MIOpenAccess> miopen_;
+ 
+diff --git a/third_party/xla/xla/tests/BUILD b/third_party/xla/xla/tests/BUILD
+index 5abfb965a6a..b2425b1db8a 100644
+--- a/third_party/xla/xla/tests/BUILD
++++ b/third_party/xla/xla/tests/BUILD
+@@ -1526,7 +1526,6 @@ xla_test(
+     ],
+     shard_count = 40,
+     tags = [
+-        "cuda-only",
+         "optonly",
+         "test_migrated_to_hlo_runner_pjrt",
+     ],
+@@ -1593,7 +1592,6 @@ xla_test(
+     backends = ["gpu"],
+     shard_count = 40,
+     tags = [
+-        "cuda-only",
+         "optonly",
+         "test_migrated_to_hlo_runner_pjrt",
+     ],
+@@ -1631,7 +1629,6 @@ xla_test(
+     backends = ["gpu"],
+     shard_count = 40,
+     tags = [
+-        "cuda-only",
+         "optonly",
+         "test_migrated_to_hlo_runner_pjrt",
+     ],
+diff --git a/third_party/xla/xla/xla.proto b/third_party/xla/xla/xla.proto
+index 66b73deaa90..8e0d1c38ae1 100644
+--- a/third_party/xla/xla/xla.proto
++++ b/third_party/xla/xla/xla.proto
+@@ -920,10 +920,6 @@ message DebugOptions {
+   // it's done.
+   optional bool xla_gpu_shard_autotuning = 304;
+ 
+-  // If true, abort immediately when conv algorithm picker fails, rather than
+-  // logging a warning and proceeding with fallback.
+-  optional bool xla_gpu_strict_conv_algorithm_picker = 156;
+-
+   // Description of the target platform in GpuTargetConfigProto format; if
+   // provided, deviceless compilation is assumed, and the current device is
+   // ignored.
+@@ -1458,14 +1454,15 @@ message DebugOptions {
+   reserved "xla_gpu_unsupported_annotate_with_emitter_loc";
+   reserved "xla_gpu_experimental_enable_command_buffer_on_thunks";
+   reserved "xla_gpu_experimental_enable_triton_tma";
+-
+-  reserved 5, 63, 80, 93, 94, 98, 117, 130, 133, 134, 139, 141, 143, 152, 158,
+-      160, 161, 162, 167, 168, 169, 171, 172, 173, 176, 177, 178, 179, 180, 183,
+-      184, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 204, 206,
+-      207, 211, 214, 218, 220, 221, 226, 229, 230, 233, 234, 238, 242, 249, 263,
+-      264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 298, 299, 302, 303,
+-      309, 313, 314, 319, 320, 325, 326, 332, 346, 352, 355, 358, 361, 367, 369,
+-      371, 385, 394, 398, 402, 423;
++  reserved "xla_gpu_strict_conv_algorithm_picker";
++
++  reserved 5, 63, 80, 93, 94, 98, 117, 130, 133, 134, 139, 141, 143, 152, 156,
++      158, 160, 161, 162, 167, 168, 169, 171, 172, 173, 176, 177, 178, 179, 180,
++      183, 184, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 204,
++      206, 207, 211, 214, 218, 220, 221, 226, 229, 230, 233, 234, 238, 242, 249,
++      263, 264, 266, 270, 271, 275, 276, 278, 279, 281, 282, 286, 298, 299, 302,
++      303, 309, 313, 314, 319, 320, 325, 326, 332, 346, 352, 355, 358, 361, 367,
++      369, 371, 385, 394, 398, 402, 423;
+ }
+ 
+ // Contains flags which affects the GPU compilation result.

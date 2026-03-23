@@ -1,0 +1,259 @@
+diff --git a/x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/action/EnrichCoordinatorProxyAction.java b/x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/action/EnrichCoordinatorProxyAction.java
+index 456b21abda0..087ca1a218b 100644
+--- a/x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/action/EnrichCoordinatorProxyAction.java
++++ b/x-pack/plugin/enrich/src/main/java/org/elasticsearch/xpack/enrich/action/EnrichCoordinatorProxyAction.java
+@@ -36,8 +36,9 @@ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.Semaphore;
+ import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.LongAdder;
+ 
+ /**
+  * An internal action to locally manage the load of the search requests that originate from the enrich processor.
+@@ -85,9 +86,9 @@ public class EnrichCoordinatorProxyAction extends ActionType<SearchResponse> {
+         final int maxNumberOfConcurrentRequests;
+         final int queueCapacity;
+         final BlockingQueue<Slot> queue;
+-        final AtomicInteger remoteRequestsCurrent = new AtomicInteger(0);
+-        volatile long remoteRequestsTotal = 0;
+-        final AtomicLong executedSearchesTotal = new AtomicLong(0);
++        final Semaphore remoteRequestPermits;
++        final LongAdder remoteRequestsTotal = new LongAdder();
++        final LongAdder executedSearchesTotal = new LongAdder();
+ 
+         public Coordinator(Client client, Settings settings) {
+             this(
+@@ -109,6 +110,7 @@ public class EnrichCoordinatorProxyAction extends ActionType<SearchResponse> {
+             this.maxNumberOfConcurrentRequests = maxNumberOfConcurrentRequests;
+             this.queueCapacity = queueCapacity;
+             this.queue = new ArrayBlockingQueue<>(queueCapacity);
++            this.remoteRequestPermits = new Semaphore(maxNumberOfConcurrentRequests);
+         }
+ 
+         void schedule(SearchRequest searchRequest, ActionListener<SearchResponse> listener) {
+@@ -127,7 +129,7 @@ public class EnrichCoordinatorProxyAction extends ActionType<SearchResponse> {
+             if (accepted == false) {
+                 listener.onFailure(
+                     new EsRejectedExecutionException(
+-                        "Could not perform enrichment, " + "enrich coordination queue at capacity [" + queueSize + "/" + queueCapacity + "]"
++                        "Could not perform enrichment, enrich coordination queue at capacity [" + queueSize + "/" + queueCapacity + "]"
+                     )
+                 );
+             }
+@@ -137,29 +139,38 @@ public class EnrichCoordinatorProxyAction extends ActionType<SearchResponse> {
+             return new CoordinatorStats(
+                 nodeId,
+                 queue.size(),
+-                remoteRequestsCurrent.get(),
+-                remoteRequestsTotal,
+-                executedSearchesTotal.get()
++                getRemoteRequestsCurrent(),
++                remoteRequestsTotal.longValue(),
++                executedSearchesTotal.longValue()
+             );
+         }
+ 
+-        synchronized void coordinateLookups() {
+-            while (queue.isEmpty() == false && remoteRequestsCurrent.get() < maxNumberOfConcurrentRequests) {
++        int getRemoteRequestsCurrent() {
++            return maxNumberOfConcurrentRequests - remoteRequestPermits.availablePermits();
++        }
++
++        void coordinateLookups() {
++            while (true) {
++                if (remoteRequestPermits.tryAcquire() == false) {
++                    return;
++                }
+ 
+-                final List<Slot> slots = new ArrayList<>();
+-                queue.drainTo(slots, maxLookupsPerRequest);
++                final List<Slot> slots = new ArrayList<>(Math.min(queue.size(), maxLookupsPerRequest));
++                if (queue.drainTo(slots, maxLookupsPerRequest) == 0) {
++                    remoteRequestPermits.release();
++                    return;
++                }
++                assert slots.isEmpty() == false;
++                remoteRequestsTotal.increment();
+                 final MultiSearchRequest multiSearchRequest = new MultiSearchRequest();
+                 slots.forEach(slot -> multiSearchRequest.add(slot.searchRequest));
+-
+-                remoteRequestsCurrent.incrementAndGet();
+-                remoteRequestsTotal++;
+-                lookupFunction.accept(multiSearchRequest, (response, e) -> { handleResponse(slots, response, e); });
++                lookupFunction.accept(multiSearchRequest, (response, e) -> handleResponse(slots, response, e));
+             }
+         }
+ 
+         void handleResponse(List<Slot> slots, MultiSearchResponse response, Exception e) {
+-            remoteRequestsCurrent.decrementAndGet();
+-            executedSearchesTotal.addAndGet(slots.size());
++            remoteRequestPermits.release();
++            executedSearchesTotal.add(slots.size());
+ 
+             if (response != null) {
+                 assert slots.size() == response.getResponses().length;
+diff --git a/x-pack/plugin/enrich/src/test/java/org/elasticsearch/xpack/enrich/action/CoordinatorTests.java b/x-pack/plugin/enrich/src/test/java/org/elasticsearch/xpack/enrich/action/CoordinatorTests.java
+index 36b7ca48cf1..e070ff4544b 100644
+--- a/x-pack/plugin/enrich/src/test/java/org/elasticsearch/xpack/enrich/action/CoordinatorTests.java
++++ b/x-pack/plugin/enrich/src/test/java/org/elasticsearch/xpack/enrich/action/CoordinatorTests.java
+@@ -27,6 +27,7 @@ import org.elasticsearch.search.SearchHits;
+ import org.elasticsearch.search.aggregations.InternalAggregations;
+ import org.elasticsearch.search.internal.InternalSearchResponse;
+ import org.elasticsearch.test.ESTestCase;
++import org.elasticsearch.threadpool.TestThreadPool;
+ import org.elasticsearch.threadpool.ThreadPool;
+ import org.mockito.Mockito;
+ 
+@@ -35,6 +36,10 @@ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+ import static org.elasticsearch.xpack.enrich.action.EnrichCoordinatorProxyAction.Coordinator;
+@@ -71,14 +76,14 @@ public class CoordinatorTests extends ESTestCase {
+         // First batch of search requests have been sent off:
+         // (However still 5 should remain in the queue)
+         assertThat(coordinator.queue.size(), equalTo(5));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.get(0).requests().size(), equalTo(5));
+ 
+         // Nothing should happen now, because there is an outstanding request and max number of requests has been set to 1:
+         coordinator.coordinateLookups();
+         assertThat(coordinator.queue.size(), equalTo(5));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+ 
+         SearchResponse emptyResponse = emptySearchResponse();
+@@ -89,7 +94,7 @@ public class CoordinatorTests extends ESTestCase {
+         }
+         lookupFunction.capturedConsumers.get(0).accept(new MultiSearchResponse(responseItems, 1L), null);
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(2));
+ 
+         // Replying last response, resulting in an empty queue and no outstanding requests.
+@@ -99,7 +104,7 @@ public class CoordinatorTests extends ESTestCase {
+         }
+         lookupFunction.capturedConsumers.get(1).accept(new MultiSearchResponse(responseItems, 1L), null);
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(0));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(0));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(2));
+ 
+         // All individual action listeners for the search requests should have been invoked:
+@@ -132,14 +137,14 @@ public class CoordinatorTests extends ESTestCase {
+         // First batch of search requests have been sent off:
+         // (However still 5 should remain in the queue)
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.get(0).requests().size(), equalTo(5));
+ 
+         RuntimeException e = new RuntimeException();
+         lookupFunction.capturedConsumers.get(0).accept(null, e);
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(0));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(0));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+ 
+         // All individual action listeners for the search requests should have been invoked:
+@@ -172,7 +177,7 @@ public class CoordinatorTests extends ESTestCase {
+         // First batch of search requests have been sent off:
+         // (However still 5 should remain in the queue)
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+         assertThat(lookupFunction.capturedRequests.get(0).requests().size(), equalTo(5));
+ 
+@@ -184,7 +189,7 @@ public class CoordinatorTests extends ESTestCase {
+         }
+         lookupFunction.capturedConsumers.get(0).accept(new MultiSearchResponse(responseItems, 1L), null);
+         assertThat(coordinator.queue.size(), equalTo(0));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), equalTo(0));
++        assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(0));
+         assertThat(lookupFunction.capturedRequests.size(), equalTo(1));
+ 
+         // All individual action listeners for the search requests should have been invoked:
+@@ -200,7 +205,7 @@ public class CoordinatorTests extends ESTestCase {
+ 
+         // Pre-load the queue to be at capacity and spoof the coordinator state to seem like max requests in flight.
+         coordinator.queue.add(new Coordinator.Slot(new SearchRequest(), ActionListener.wrap(() -> {})));
+-        coordinator.remoteRequestsCurrent.incrementAndGet();
++        assertTrue(coordinator.remoteRequestPermits.tryAcquire());
+ 
+         // Try to schedule an item into the coordinator, should emit an exception
+         SearchRequest searchRequest = new SearchRequest();
+@@ -215,7 +220,7 @@ public class CoordinatorTests extends ESTestCase {
+         assertThat(lookupFunction.capturedConsumers, is(empty()));
+ 
+         // Try to schedule again while max requests is not full. Ensure that despite the rejection, the queued request is sent.
+-        coordinator.remoteRequestsCurrent.decrementAndGet();
++        coordinator.remoteRequestPermits.release();
+         capturedException.set(null);
+         coordinator.schedule(searchRequest, ActionListener.wrap(response -> {}, capturedException::set));
+         rejectionException = capturedException.get();
+@@ -229,7 +234,7 @@ public class CoordinatorTests extends ESTestCase {
+         rejectionException = capturedException.get();
+         assertThat(rejectionException, is(nullValue()));
+         assertThat(coordinator.queue.size(), is(1));
+-        assertThat(coordinator.remoteRequestsCurrent.get(), is(1));
++        assertThat(coordinator.getRemoteRequestsCurrent(), is(1));
+         assertThat(lookupFunction.capturedRequests.size(), is(1));
+         assertThat(lookupFunction.capturedConsumers.size(), is(1));
+ 
+@@ -347,4 +352,41 @@ public class CoordinatorTests extends ESTestCase {
+         }
+     }
+ 
++    public void testAllSearchesExecuted() throws Exception {
++
++        final ThreadPool threadPool = new TestThreadPool("test");
++        final Coordinator coordinator = new Coordinator((request, responseConsumer) -> threadPool.generic().execute(() -> {
++            final MultiSearchResponse.Item[] items = new MultiSearchResponse.Item[request.requests().size()];
++            for (int i = 0; i < items.length; i++) {
++                items[i] = new MultiSearchResponse.Item(emptySearchResponse(), null);
++            }
++            responseConsumer.accept(new MultiSearchResponse(items, 0L), null);
++        }), 5, 2, 20);
++        try {
++
++            final Semaphore schedulePermits = new Semaphore(between(100, 10000));
++            final CountDownLatch completionCountdown = new CountDownLatch(schedulePermits.availablePermits());
++            for (int i = 0; i < 5; i++) {
++                threadPool.generic().execute(() -> {
++                    while (schedulePermits.tryAcquire()) {
++                        final AtomicBoolean completed = new AtomicBoolean();
++                        coordinator.schedule(new SearchRequest("index"), ActionListener.wrap(() -> {
++                            assertTrue(completed.compareAndSet(false, true)); // no double-completion
++                            completionCountdown.countDown();
++                        }));
++                    }
++                });
++            }
++
++            assertTrue(completionCountdown.await(10L, TimeUnit.SECONDS));
++            assertThat(coordinator.queue, empty());
++
++            assertBusy(() -> assertThat(coordinator.getRemoteRequestsCurrent(), equalTo(0)));
++            // ^ assertBusy here because the final check of the queue briefly counts as another remote request, after everything is complete
++        } finally {
++            ThreadPool.terminate(threadPool, 10L, TimeUnit.SECONDS);
++        }
++
++    }
++
+ }

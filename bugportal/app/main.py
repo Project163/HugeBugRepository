@@ -162,7 +162,7 @@ async def update_bug_meta(
     upsert_bug_meta(project_id, bug_id, manual_label or None, status or None, notes or None, tags_json)
 
     url = request.url_for("bug_detail", project_id=project_id, bug_id=bug_id)
-    url = str(url) + f"?lang={lang}"
+    url = str(url) + f"?lang={lang}&saved=true"
     return RedirectResponse(url=url, status_code=303)
 
 

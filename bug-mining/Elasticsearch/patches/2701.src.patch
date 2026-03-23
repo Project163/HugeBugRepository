@@ -1,0 +1,804 @@
+diff --git a/server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java b/server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java
+index 960cc64d75c..1c4a6be5c6c 100644
+--- a/server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java
++++ b/server/src/internalClusterTest/java/org/elasticsearch/action/bulk/BulkProcessorIT.java
+@@ -30,6 +30,7 @@ import java.util.Set;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
+@@ -101,6 +102,42 @@ public class BulkProcessorIT extends ESIntegTestCase {
+         }
+     }
+ 
++    public void testBulkProcessorFlushDisabled() throws Exception {
++        final CountDownLatch latch = new CountDownLatch(1);
++        BulkProcessorTestListener listener = new BulkProcessorTestListener(latch);
++
++        int numDocs = randomIntBetween(10, 100);
++
++        AtomicBoolean flushEnabled = new AtomicBoolean(false);
++        try (
++            BulkProcessor processor = BulkProcessor.builder(client()::bulk, listener, "BulkProcessorIT")
++                // let's make sure that this bulk won't be automatically flushed
++                .setConcurrentRequests(randomIntBetween(0, 10))
++                .setBulkActions(numDocs + randomIntBetween(1, 100))
++                .setFlushInterval(TimeValue.timeValueHours(24))
++                .setBulkSize(new ByteSizeValue(1, ByteSizeUnit.GB))
++                .setFlushCondition(flushEnabled::get)
++                .build()
++        ) {
++
++            MultiGetRequestBuilder multiGetRequestBuilder = indexDocs(client(), processor, numDocs);
++            assertThat(latch.await(randomInt(500), TimeUnit.MILLISECONDS), equalTo(false));
++            // no documents will be indexed here
++            processor.flush();
++
++            flushEnabled.set(true);
++            processor.flush();
++            latch.await();
++
++            // disabled flush resulted in listener being triggered only once
++            assertThat(listener.beforeCounts.get(), equalTo(1));
++            assertThat(listener.afterCounts.get(), equalTo(1));
++            assertThat(listener.bulkFailures.size(), equalTo(0));
++            assertResponseItems(listener.bulkItems, numDocs);
++            assertMultiGetResponse(multiGetRequestBuilder.get(), numDocs);
++        }
++    }
++
+     public void testBulkProcessorConcurrentRequests() throws Exception {
+         int bulkActions = randomIntBetween(10, 100);
+         int numDocs = randomIntBetween(bulkActions, bulkActions + 100);
+diff --git a/server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java b/server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java
+index f1f4b819aeb..2f52535dc6e 100644
+--- a/server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java
++++ b/server/src/main/java/org/elasticsearch/action/bulk/BulkProcessor.java
+@@ -88,6 +88,7 @@ public class BulkProcessor implements Closeable {
+         private String globalIndex;
+         private String globalRouting;
+         private String globalPipeline;
++        private Supplier<Boolean> flushCondition = () -> true;
+ 
+         private Builder(
+             BiConsumer<BulkRequest, ActionListener<BulkResponse>> consumer,
+@@ -188,13 +189,19 @@ public class BulkProcessor implements Closeable {
+                 flushScheduler,
+                 retryScheduler,
+                 onClose,
+-                createBulkRequestWithGlobalDefaults()
++                createBulkRequestWithGlobalDefaults(),
++                flushCondition
+             );
+         }
+ 
+         private Supplier<BulkRequest> createBulkRequestWithGlobalDefaults() {
+             return () -> new BulkRequest(globalIndex).pipeline(globalPipeline).routing(globalRouting);
+         }
++
++        public Builder setFlushCondition(Supplier<Boolean> flushCondition) {
++            this.flushCondition = flushCondition;
++            return this;
++        }
+     }
+ 
+     /**
+@@ -270,6 +277,7 @@ public class BulkProcessor implements Closeable {
+ 
+     private BulkRequest bulkRequest;
+     private final Supplier<BulkRequest> bulkRequestSupplier;
++    private Supplier<Boolean> flushSupplier;
+     private final BulkRequestHandler bulkRequestHandler;
+     private final Runnable onClose;
+ 
+@@ -287,18 +295,49 @@ public class BulkProcessor implements Closeable {
+         Scheduler flushScheduler,
+         Scheduler retryScheduler,
+         Runnable onClose,
+-        Supplier<BulkRequest> bulkRequestSupplier
++        Supplier<BulkRequest> bulkRequestSupplier,
++        Supplier<Boolean> flushSupplier
+     ) {
+         this.bulkActions = bulkActions;
+         this.bulkSize = bulkSize.getBytes();
+         this.bulkRequest = bulkRequestSupplier.get();
+         this.bulkRequestSupplier = bulkRequestSupplier;
++        this.flushSupplier = flushSupplier;
+         this.bulkRequestHandler = new BulkRequestHandler(consumer, backoffPolicy, listener, retryScheduler, concurrentRequests);
+         // Start period flushing task after everything is setup
+         this.cancellableFlushTask = startFlushTask(flushInterval, flushScheduler);
+         this.onClose = onClose;
+     }
+ 
++    BulkProcessor(
++        BiConsumer<BulkRequest, ActionListener<BulkResponse>> consumer,
++        BackoffPolicy backoffPolicy,
++        Listener listener,
++        int concurrentRequests,
++        int bulkActions,
++        ByteSizeValue bulkSize,
++        @Nullable TimeValue flushInterval,
++        Scheduler flushScheduler,
++        Scheduler retryScheduler,
++        Runnable onClose,
++        Supplier<BulkRequest> bulkRequestSupplier
++    ) {
++        this(
++            consumer,
++            backoffPolicy,
++            listener,
++            concurrentRequests,
++            bulkActions,
++            bulkSize,
++            flushInterval,
++            flushScheduler,
++            retryScheduler,
++            onClose,
++            bulkRequestSupplier,
++            () -> true
++        );
++    }
++
+     /**
+      * @deprecated use the {@link BulkProcessor} constructor which uses separate schedulers for flush and retry
+      */
+@@ -489,11 +528,13 @@ public class BulkProcessor implements Closeable {
+ 
+     // needs to be executed under a lock
+     private void execute() {
+-        final BulkRequest bulkRequest = this.bulkRequest;
+-        final long executionId = executionIdGen.incrementAndGet();
++        if (flushSupplier.get()) {
++            final BulkRequest bulkRequest = this.bulkRequest;
++            final long executionId = executionIdGen.incrementAndGet();
+ 
+-        this.bulkRequest = bulkRequestSupplier.get();
+-        execute(bulkRequest, executionId);
++            this.bulkRequest = bulkRequestSupplier.get();
++            execute(bulkRequest, executionId);
++        }
+     }
+ 
+     // needs to be executed under a lock
+diff --git a/server/src/test/java/org/elasticsearch/action/bulk/BulkProcessorTests.java b/server/src/test/java/org/elasticsearch/action/bulk/BulkProcessorTests.java
+index 117ec765dbf..3506d677fff 100644
+--- a/server/src/test/java/org/elasticsearch/action/bulk/BulkProcessorTests.java
++++ b/server/src/test/java/org/elasticsearch/action/bulk/BulkProcessorTests.java
+@@ -454,6 +454,48 @@ public class BulkProcessorTests extends ESTestCase {
+         assertTrue(called.get());
+     }
+ 
++    public void testDisableFlush() {
++        final AtomicInteger attemptRef = new AtomicInteger();
++
++        BulkResponse bulkResponse = new BulkResponse(
++            new BulkItemResponse[] { BulkItemResponse.success(0, randomFrom(DocWriteRequest.OpType.values()), mockResponse()) },
++            0
++        );
++
++        final BiConsumer<BulkRequest, ActionListener<BulkResponse>> consumer = (request, listener) -> {
++            listener.onResponse(bulkResponse);
++        };
++
++        final BulkProcessor.Listener listener = new BulkProcessor.Listener() {
++
++            @Override
++            public void beforeBulk(long executionId, BulkRequest request) {}
++
++            @Override
++            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
++                attemptRef.incrementAndGet();
++            }
++
++            @Override
++            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {}
++        };
++
++        AtomicBoolean flushEnabled = new AtomicBoolean(false);
++        try (
++            BulkProcessor bulkProcessor = BulkProcessor.builder(consumer, listener, "BulkProcessorTests")
++                .setFlushCondition(flushEnabled::get)
++                .build()
++        ) {
++            bulkProcessor.add(new IndexRequest());
++            bulkProcessor.flush();
++            assertThat(attemptRef.get(), equalTo(0));
++
++            flushEnabled.set(true);
++            bulkProcessor.flush();
++            assertThat(attemptRef.get(), equalTo(1));
++        }
++    }
++
+     private BulkProcessor.Listener emptyListener() {
+         return new BulkProcessor.Listener() {
+             @Override
+diff --git a/x-pack/plugin/deprecation/qa/common/build.gradle b/x-pack/plugin/deprecation/qa/common/build.gradle
+new file mode 100644
+index 00000000000..32244258ce6
+--- /dev/null
++++ b/x-pack/plugin/deprecation/qa/common/build.gradle
+@@ -0,0 +1,5 @@
++apply plugin: 'elasticsearch.java'
++dependencies {
++  implementation project(':test:framework')
++}
++
+diff --git a/x-pack/plugin/deprecation/qa/common/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationTestUtils.java b/x-pack/plugin/deprecation/qa/common/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationTestUtils.java
+new file mode 100644
+index 00000000000..6fecdaea313
+--- /dev/null
++++ b/x-pack/plugin/deprecation/qa/common/src/main/java/org/elasticsearch/xpack/deprecation/DeprecationTestUtils.java
+@@ -0,0 +1,43 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0; you may not use this file except in compliance with the Elastic License
++ * 2.0.
++ */
++
++package org.elasticsearch.xpack.deprecation;
++
++import org.elasticsearch.client.Request;
++import org.elasticsearch.client.Response;
++import org.elasticsearch.client.RestClient;
++import org.elasticsearch.common.xcontent.support.XContentMapValues;
++import org.elasticsearch.test.rest.ESRestTestCase;
++
++import java.io.IOException;
++import java.util.List;
++import java.util.Map;
++
++public class DeprecationTestUtils {
++    /**
++     * Same as <code>DeprecationIndexingAppender#DEPRECATION_MESSAGES_DATA_STREAM</code>, but that class isn't visible from here.
++     */
++    public static final String DATA_STREAM_NAME = ".logs-deprecation.elasticsearch-default";
++
++    @SuppressWarnings("unchecked")
++    static List<Map<String, Object>> getIndexedDeprecations(RestClient client) throws IOException {
++        Response response;
++        try {
++            client.performRequest(new Request("POST", "/" + DATA_STREAM_NAME + "/_refresh?ignore_unavailable=true"));
++            response = client.performRequest(new Request("GET", "/" + DATA_STREAM_NAME + "/_search"));
++        } catch (Exception e) {
++            // It can take a moment for the index to be created. If it doesn't exist then the client
++            // throws an exception. Translate it into an assertion error so that assertBusy() will
++            // continue trying.
++            throw new AssertionError(e);
++        }
++        ESRestTestCase.assertOK(response);
++
++        final Map<String, Object> stringObjectMap = ESRestTestCase.entityAsMap(response);
++        return (List<Map<String, Object>>) XContentMapValues.extractValue("hits.hits._source", stringObjectMap);
++    }
++}
+diff --git a/x-pack/plugin/deprecation/qa/early-deprecation-rest/build.gradle b/x-pack/plugin/deprecation/qa/early-deprecation-rest/build.gradle
+new file mode 100644
+index 00000000000..13ce6621a86
+--- /dev/null
++++ b/x-pack/plugin/deprecation/qa/early-deprecation-rest/build.gradle
+@@ -0,0 +1,41 @@
++import org.elasticsearch.gradle.util.GradleUtils
++import org.elasticsearch.gradle.internal.info.BuildParams
++
++apply plugin: 'elasticsearch.internal-es-plugin'
++apply plugin: 'elasticsearch.internal-java-rest-test'
++
++esplugin {
++  description 'Deprecated query plugin'
++  classname 'org.elasticsearch.xpack.deprecation.EarlyDeprecationTestPlugin'
++}
++
++dependencies {
++  javaRestTestImplementation project(path: ':x-pack:plugin:deprecation:qa:common')
++
++  javaRestTestImplementation project(':client:rest-high-level')
++  javaRestTestImplementation("com.fasterxml.jackson.core:jackson-annotations:${versions.jackson}")
++  javaRestTestImplementation("com.fasterxml.jackson.core:jackson-databind:${versions.jackson}")
++}
++
++// let the javaRestTest see the classpath of main
++GradleUtils.extendSourceSet(project, "main", "javaRestTest", tasks.named("javaRestTest"))
++
++restResources {
++  restApi {
++    include '_common', 'indices', 'index'
++  }
++}
++
++testClusters.configureEach {
++  testDistribution = 'DEFAULT'
++  setting 'cluster.deprecation_indexing.enabled', 'true'
++  setting 'xpack.security.enabled', 'false'
++  setting 'xpack.license.self_generated.type', 'trial'
++}
++
++tasks.named("test").configure { enabled = false }
++
++if (BuildParams.inFipsJvm){
++  // Test clusters run with security disabled
++  tasks.named("javaRestTest").configure{enabled = false }
++}
+diff --git a/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationIndexingIT.java b/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationIndexingIT.java
+new file mode 100644
+index 00000000000..798730970d9
+--- /dev/null
++++ b/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationIndexingIT.java
+@@ -0,0 +1,96 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0; you may not use this file except in compliance with the Elastic License
++ * 2.0.
++ */
++package org.elasticsearch.xpack.deprecation;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++import org.apache.http.HttpHost;
++import org.elasticsearch.client.Request;
++import org.elasticsearch.client.Response;
++import org.elasticsearch.client.RestClient;
++import org.elasticsearch.client.RestClientBuilder;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.test.rest.ESRestTestCase;
++
++import java.io.IOException;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++
++import static org.elasticsearch.common.logging.DeprecatedMessage.KEY_FIELD_NAME;
++import static org.elasticsearch.xpack.deprecation.DeprecationTestUtils.DATA_STREAM_NAME;
++import static org.hamcrest.Matchers.allOf;
++import static org.hamcrest.Matchers.containsInAnyOrder;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.hasEntry;
++import static org.hamcrest.Matchers.startsWith;
++
++/**
++ * Tests that deprecation message on startup creates a deprecation data stream
++ */
++public class EarlyDeprecationIndexingIT extends ESRestTestCase {
++
++    /**
++     * In EarlyDeprecationTestPlugin#onNodeStarted we simulate a very early deprecation that can happen before the template is loaded
++     * The indexing has to be delayed until templates are loaded.
++     * This test confirms by checking the settings that a data stream is created (not an index with defaults)
++     * and that an early deprecation warning is not lost
++     */
++    public void testEarlyDeprecationIsIndexedAfterTemplateIsLoaded() throws Exception {
++
++        assertBusy(() -> {
++            Response response = getIndexSettings();
++            ObjectMapper mapper = new ObjectMapper();
++
++            final JsonNode jsonNode = mapper.readTree(response.getEntity().getContent());
++            assertThat(jsonNode.fieldNames().next(), startsWith(".ds-" + DATA_STREAM_NAME));
++
++            final JsonNode settings = jsonNode.elements().next();
++            final JsonNode index = settings.at("/settings/index");
++            assertThat(index.at("/lifecycle/name").asText(), equalTo(".deprecation-indexing-ilm-policy"));
++            assertThat(index.get("auto_expand_replicas").asText(), equalTo("0-1"));
++            assertThat(index.get("hidden").asText(), equalTo("true"));
++        }, 30, TimeUnit.SECONDS);
++
++        assertBusy(() -> {
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
++            logger.warn(documents);
++            assertThat(
++                documents,
++                containsInAnyOrder(
++                    allOf(
++                        hasEntry(KEY_FIELD_NAME, "early_deprecation"),
++                        hasEntry("message", "Early deprecation emitted after node is started up")
++                    )
++                )
++            );
++        }, 30, TimeUnit.SECONDS);
++    }
++
++    private Response getIndexSettings() throws Exception {
++        try {
++            Response response = client().performRequest(new Request("GET", "/" + DATA_STREAM_NAME + "/_settings"));
++            assertOK(response);
++            return response;
++        } catch (Exception e) {
++            throw new AssertionError(e);
++        }
++    }
++
++    /**
++     * Builds a REST client that will tolerate warnings in the response headers. The default
++     * is to throw an exception.
++     */
++    @Override
++    protected RestClient buildClient(Settings settings, HttpHost[] hosts) throws IOException {
++        RestClientBuilder builder = RestClient.builder(hosts);
++        configureClient(builder, settings);
++        builder.setStrictDeprecationMode(false);
++        return builder.build();
++    }
++}
+diff --git a/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/main/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationTestPlugin.java b/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/main/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationTestPlugin.java
+new file mode 100644
+index 00000000000..e8c04ab68c9
+--- /dev/null
++++ b/x-pack/plugin/deprecation/qa/early-deprecation-rest/src/main/java/org/elasticsearch/xpack/deprecation/EarlyDeprecationTestPlugin.java
+@@ -0,0 +1,24 @@
++/*
++ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
++ * or more contributor license agreements. Licensed under the Elastic License
++ * 2.0; you may not use this file except in compliance with the Elastic License
++ * 2.0.
++ */
++package org.elasticsearch.xpack.deprecation;
++
++import org.elasticsearch.common.logging.DeprecationCategory;
++import org.elasticsearch.common.logging.DeprecationLogger;
++import org.elasticsearch.plugins.ClusterPlugin;
++import org.elasticsearch.plugins.Plugin;
++
++/**
++ * A plugin to verify that a warning emitted before index template is loaded will be delayed
++ */
++public class EarlyDeprecationTestPlugin extends Plugin implements ClusterPlugin {
++    private DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(EarlyDeprecationTestPlugin.class);
++
++    @Override
++    public void onNodeStarted() {
++        deprecationLogger.warn(DeprecationCategory.API, "early_deprecation", "Early deprecation emitted after node is started up");
++    }
++}
+diff --git a/x-pack/plugin/deprecation/qa/rest/build.gradle b/x-pack/plugin/deprecation/qa/rest/build.gradle
+index b2cf233921f..ae8c7fd8190 100644
+--- a/x-pack/plugin/deprecation/qa/rest/build.gradle
++++ b/x-pack/plugin/deprecation/qa/rest/build.gradle
+@@ -10,6 +10,7 @@ esplugin {
+ }
+ 
+ dependencies {
++  javaRestTestImplementation project(path: ':x-pack:plugin:deprecation:qa:common')
+   javaRestTestImplementation project(':client:rest-high-level')
+   javaRestTestImplementation("com.fasterxml.jackson.core:jackson-annotations:${versions.jackson}")
+   javaRestTestImplementation("com.fasterxml.jackson.core:jackson-databind:${versions.jackson}")
+diff --git a/x-pack/plugin/deprecation/qa/rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/DeprecationHttpIT.java b/x-pack/plugin/deprecation/qa/rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/DeprecationHttpIT.java
+index e17cad28a1d..00020364666 100644
+--- a/x-pack/plugin/deprecation/qa/rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/DeprecationHttpIT.java
++++ b/x-pack/plugin/deprecation/qa/rest/src/javaRestTest/java/org/elasticsearch/xpack/deprecation/DeprecationHttpIT.java
+@@ -14,7 +14,6 @@ import org.apache.http.HttpEntity;
+ import org.apache.http.HttpHost;
+ import org.apache.http.entity.ContentType;
+ import org.apache.http.entity.StringEntity;
+-import org.apache.lucene.util.LuceneTestCase.AwaitsFix;
+ import org.elasticsearch.client.Request;
+ import org.elasticsearch.client.RequestOptions;
+ import org.elasticsearch.client.Response;
+@@ -37,7 +36,6 @@ import org.junit.Before;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collections;
+-import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.concurrent.TimeUnit;
+@@ -50,7 +48,6 @@ import static org.hamcrest.Matchers.allOf;
+ import static org.hamcrest.Matchers.containsInAnyOrder;
+ import static org.hamcrest.Matchers.containsString;
+ import static org.hamcrest.Matchers.equalTo;
+-import static org.hamcrest.Matchers.greaterThan;
+ import static org.hamcrest.Matchers.hasEntry;
+ import static org.hamcrest.Matchers.hasItem;
+ import static org.hamcrest.Matchers.hasKey;
+@@ -61,11 +58,6 @@ import static org.hamcrest.Matchers.hasSize;
+  */
+ public class DeprecationHttpIT extends ESRestTestCase {
+ 
+-    /**
+-     * Same as <code>DeprecationIndexingAppender#DEPRECATION_MESSAGES_DATA_STREAM</code>, but that class isn't visible from here.
+-     */
+-    private static final String DATA_STREAM_NAME = ".logs-deprecation.elasticsearch-default";
+-
+     @Before
+     public void assertIndexingIsEnabled() throws Exception {
+ 
+@@ -80,14 +72,16 @@ public class DeprecationHttpIT extends ESRestTestCase {
+ 
+         // assert index does not exist, which will prevent previous tests to interfere
+         assertBusy(() -> {
++
+             try {
+-                client().performRequest(new Request("GET", "/_data_stream/" + DATA_STREAM_NAME));
++                client().performRequest(new Request("GET", "/_data_stream/" + DeprecationTestUtils.DATA_STREAM_NAME));
+             } catch (ResponseException e) {
+                 if (e.getResponse().getStatusLine().getStatusCode() == 404) {
+                     return;
+                 }
+             }
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+             logger.warn(documents);
+             // if data stream is still present, that means that previous test (could be different class) created a deprecation
+             // hence resetting again
+@@ -109,7 +103,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertBusy(() -> {
+             try {
+                 client().performRequest(new Request("DELETE", "_logging/deprecation_cache"));
+-                client().performRequest(new Request("DELETE", "/_data_stream/" + DATA_STREAM_NAME));
++                client().performRequest(new Request("DELETE", "/_data_stream/" + DeprecationTestUtils.DATA_STREAM_NAME));
+             } catch (Exception e) {
+                 throw new AssertionError(e);
+             }
+@@ -181,7 +175,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+             }
+ 
+             assertBusy(() -> {
+-                List<Map<String, Object>> documents = getIndexedDeprecations();
++                List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+                 logger.warn(documents);
+                 assertThat(documents, hasSize(2));
+             });
+@@ -330,7 +324,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(postRequest));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(3));
+@@ -365,7 +359,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(postRequest));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(2));
+@@ -410,7 +404,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(request));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(2));
+@@ -480,7 +474,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(request));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(1));
+@@ -532,7 +526,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(request));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(2));
+@@ -614,7 +608,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         );
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(2));
+@@ -677,7 +671,7 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(client().performRequest(deprecatedRequest));
+ 
+         assertBusy(() -> {
+-            List<Map<String, Object>> documents = getIndexedDeprecations();
++            List<Map<String, Object>> documents = DeprecationTestUtils.getIndexedDeprecations(client());
+ 
+             logger.warn(documents);
+             assertThat(documents, hasSize(4));
+@@ -714,38 +708,6 @@ public class DeprecationHttpIT extends ESRestTestCase {
+         assertOK(response);
+     }
+ 
+-    private List<Map<String, Object>> getIndexedDeprecations() throws IOException {
+-        Response response;
+-        try {
+-            client().performRequest(new Request("POST", "/" + DATA_STREAM_NAME + "/_refresh?ignore_unavailable=true"));
+-            response = client().performRequest(new Request("GET", "/" + DATA_STREAM_NAME + "/_search"));
+-        } catch (Exception e) {
+-            // It can take a moment for the index to be created. If it doesn't exist then the client
+-            // throws an exception. Translate it into an assertion error so that assertBusy() will
+-            // continue trying.
+-            throw new AssertionError(e);
+-        }
+-        assertOK(response);
+-
+-        ObjectMapper mapper = new ObjectMapper();
+-        final JsonNode jsonNode = mapper.readTree(response.getEntity().getContent());
+-
+-        final int hits = jsonNode.at("/hits/total/value").intValue();
+-        assertThat(hits, greaterThan(0));
+-
+-        List<Map<String, Object>> documents = new ArrayList<>();
+-
+-        for (int i = 0; i < hits; i++) {
+-            final JsonNode hit = jsonNode.at("/hits/hits/" + i + "/_source");
+-
+-            final Map<String, Object> document = new HashMap<>();
+-            hit.fields().forEachRemaining(entry -> document.put(entry.getKey(), entry.getValue().textValue()));
+-
+-            documents.add(document);
+-        }
+-        return documents;
+-    }
+-
+     private List<String> getWarningHeaders(Header[] headers) {
+         List<String> warnings = new ArrayList<>();
+ 
+diff --git a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/Deprecation.java b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/Deprecation.java
+index 9b594ceec47..5dfdc08439a 100644
+--- a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/Deprecation.java
++++ b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/Deprecation.java
+@@ -110,19 +110,17 @@ public class Deprecation extends Plugin implements ActionPlugin {
+         final RateLimitingFilter rateLimitingFilterForIndexing = new RateLimitingFilter();
+         // enable on start.
+         rateLimitingFilterForIndexing.setUseXOpaqueId(USE_X_OPAQUE_ID_IN_FILTERING.get(environment.settings()));
++        clusterService.getClusterSettings()
++            .addSettingsUpdateConsumer(USE_X_OPAQUE_ID_IN_FILTERING, rateLimitingFilterForIndexing::setUseXOpaqueId);
+ 
+-        final DeprecationIndexingComponent component = new DeprecationIndexingComponent(
++        final DeprecationIndexingComponent component = DeprecationIndexingComponent.createDeprecationIndexingComponent(
+             client,
+             environment.settings(),
+             rateLimitingFilterForIndexing,
+-            WRITE_DEPRECATION_LOGS_TO_INDEX.get(environment.settings()) // pass the default on startup
++            WRITE_DEPRECATION_LOGS_TO_INDEX.get(environment.settings()), // pass the default on startup
++            clusterService
+         );
+ 
+-        clusterService.getClusterSettings()
+-            .addSettingsUpdateConsumer(USE_X_OPAQUE_ID_IN_FILTERING, rateLimitingFilterForIndexing::setUseXOpaqueId);
+-        clusterService.getClusterSettings()
+-            .addSettingsUpdateConsumer(WRITE_DEPRECATION_LOGS_TO_INDEX, component::enableDeprecationLogIndexing);
+-
+         return List.of(component, rateLimitingFilterForIndexing);
+     }
+ 
+diff --git a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/logging/DeprecationIndexingComponent.java b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/logging/DeprecationIndexingComponent.java
+index 245c77aa419..66f65e9fa11 100644
+--- a/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/logging/DeprecationIndexingComponent.java
++++ b/x-pack/plugin/deprecation/src/main/java/org/elasticsearch/xpack/deprecation/logging/DeprecationIndexingComponent.java
+@@ -21,6 +21,9 @@ import org.elasticsearch.action.bulk.BulkResponse;
+ import org.elasticsearch.action.index.IndexRequest;
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.client.OriginSettingClient;
++import org.elasticsearch.cluster.ClusterChangedEvent;
++import org.elasticsearch.cluster.ClusterStateListener;
++import org.elasticsearch.cluster.service.ClusterService;
+ import org.elasticsearch.common.component.AbstractLifecycleComponent;
+ import org.elasticsearch.common.logging.ECSJsonLayout;
+ import org.elasticsearch.common.logging.Loggers;
+@@ -31,30 +34,39 @@ import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.util.concurrent.EsExecutors;
+ import org.elasticsearch.core.TimeValue;
+ import org.elasticsearch.xpack.core.ClientHelper;
++import org.elasticsearch.xpack.core.ilm.IndexLifecycleMetadata;
+ 
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ 
++import static org.elasticsearch.xpack.deprecation.Deprecation.WRITE_DEPRECATION_LOGS_TO_INDEX;
++
+ /**
+  * This component manages the construction and lifecycle of the {@link DeprecationIndexingAppender}.
+  * It also starts and stops the appender
+  */
+-public class DeprecationIndexingComponent extends AbstractLifecycleComponent {
++public class DeprecationIndexingComponent extends AbstractLifecycleComponent implements ClusterStateListener {
+     private static final Logger logger = LogManager.getLogger(DeprecationIndexingComponent.class);
+ 
+     private final DeprecationIndexingAppender appender;
+     private final BulkProcessor processor;
+     private final RateLimitingFilter rateLimitingFilterForIndexing;
++    private final ClusterService clusterService;
++
++    private final AtomicBoolean flushEnabled = new AtomicBoolean(false);
+ 
+-    public DeprecationIndexingComponent(
++    private DeprecationIndexingComponent(
+         Client client,
+         Settings settings,
+         RateLimitingFilter rateLimitingFilterForIndexing,
+-        boolean enableDeprecationLogIndexingDefault
++        boolean enableDeprecationLogIndexingDefault,
++        ClusterService clusterService
+     ) {
+         this.rateLimitingFilterForIndexing = rateLimitingFilterForIndexing;
++        this.clusterService = clusterService;
+ 
+         this.processor = getBulkProcessor(new OriginSettingClient(client, ClientHelper.DEPRECATION_ORIGIN), settings);
+         final Consumer<IndexRequest> consumer = this.processor::add;
+@@ -74,10 +86,53 @@ public class DeprecationIndexingComponent extends AbstractLifecycleComponent {
+             consumer
+         );
+         enableDeprecationLogIndexing(enableDeprecationLogIndexingDefault);
++
++    }
++
++    public static DeprecationIndexingComponent createDeprecationIndexingComponent(
++        Client client,
++        Settings settings,
++        RateLimitingFilter rateLimitingFilterForIndexing,
++        boolean enableDeprecationLogIndexingDefault,
++        ClusterService clusterService
++    ) {
++        final DeprecationIndexingComponent deprecationIndexingComponent = new DeprecationIndexingComponent(
++            client,
++            settings,
++            rateLimitingFilterForIndexing,
++            enableDeprecationLogIndexingDefault,
++            clusterService
++        );
++
++        clusterService.addListener(deprecationIndexingComponent);
++        clusterService.getClusterSettings()
++            .addSettingsUpdateConsumer(WRITE_DEPRECATION_LOGS_TO_INDEX, deprecationIndexingComponent::enableDeprecationLogIndexing);
++
++        return deprecationIndexingComponent;
++    }
++
++    @Override
++    public void clusterChanged(ClusterChangedEvent event) {
++        if (flushEnabled.get()) {
++            return;
++        }
++        if (event.metadataChanged() == false) {
++            return;
++        }
++        final IndexLifecycleMetadata indexLifecycleMetadata = event.state().metadata().custom(IndexLifecycleMetadata.TYPE);
++
++        if (event.state().getMetadata().templatesV2().containsKey(".deprecation-indexing-template")
++            && indexLifecycleMetadata != null
++            && indexLifecycleMetadata.getPolicies().containsKey(".deprecation-indexing-ilm-policy")) {
++            flushEnabled.set(true);
++            logger.debug("Deprecation log indexing started, because both template and ilm policy are loaded");
++            clusterService.removeListener(this);
++        }
+     }
+ 
+     @Override
+     protected void doStart() {
++        logger.info("deprecation component started");
+         this.appender.start();
+         Loggers.addAppender(LogManager.getLogger("org.elasticsearch.deprecation"), this.appender);
+     }
+@@ -85,6 +140,7 @@ public class DeprecationIndexingComponent extends AbstractLifecycleComponent {
+     @Override
+     protected void doStop() {
+         Loggers.removeAppender(LogManager.getLogger("org.elasticsearch.deprecation"), this.appender);
++        flushEnabled.set(false);
+         this.appender.stop();
+     }
+ 
+@@ -127,6 +183,7 @@ public class DeprecationIndexingComponent extends AbstractLifecycleComponent {
+             .setBulkActions(-1)
+             .setBulkSize(new ByteSizeValue(-1, ByteSizeUnit.BYTES))
+             .setFlushInterval(TimeValue.timeValueSeconds(5))
++            .setFlushCondition(() -> flushEnabled.get())
+             .build();
+     }
+ 

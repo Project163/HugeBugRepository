@@ -1,0 +1,656 @@
+diff --git a/third_party/xla/xla/debug_options_flags.cc b/third_party/xla/xla/debug_options_flags.cc
+index 57c7a351827..9a24912aae6 100644
+--- a/third_party/xla/xla/debug_options_flags.cc
++++ b/third_party/xla/xla/debug_options_flags.cc
+@@ -206,6 +206,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
+   opts.set_xla_gpu_enable_reduction_epilogue_fusion(true);
+   opts.set_xla_gpu_enable_nccl_clique_optimization(false);
+   opts.set_xla_gpu_cublas_fallback(true);
++  opts.set_xla_gpu_cudnn_gemm_fusion(false);
+   opts.set_xla_gpu_enable_while_loop_double_buffering(false);
+   opts.set_xla_gpu_ensure_minor_dot_contraction_dims(false);
+   opts.set_xla_gpu_filter_kernels_spilling_registers_on_autotuning(true);
+@@ -1477,6 +1478,11 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
+                 debug_options->xla_gpu_cublas_fallback(),
+                 "Allow Triton GEMM autotuning to fall back to cuBLAS when that "
+                 "is faster."));
++  flag_list->push_back(
++      tsl::Flag("xla_gpu_cudnn_gemm_fusion",
++                bool_setter_for(&DebugOptions::set_xla_gpu_cudnn_gemm_fusion),
++                debug_options->xla_gpu_cudnn_gemm_fusion(),
++                "Allow GEMM fusion autotuning probe cuDNN as a backend."));
+   flag_list->push_back(
+       tsl::Flag("xla_gpu_mock_custom_calls",
+                 bool_setter_for(&DebugOptions::set_xla_gpu_mock_custom_calls),
+diff --git a/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.cc b/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.cc
+index 54b72c8a2ae..863484fc770 100644
+--- a/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.cc
++++ b/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.cc
+@@ -420,5 +420,16 @@ absl::StatusOr<bool> CuDnnFusionCompiler::Run(
+   return CuDnnFusionVisitor(config_).RunOnModule(module, execution_threads);
+ }
+ 
++int CuDnnFusionCompiler::GetAvailablePlanCount(
++    const HloFusionInstruction& hlo) const {
++  se::Stream& stream = *config_.GetStream().value();
++  auto graph = PrepareGraph(hlo, stream);
++  if (!graph.ok()) {
++    return 0;
++  }
++  constexpr int64_t kMaxPlans = 10;
++  return std::min(graph->Graph().get_execution_plan_count(), kMaxPlans);
++}
++
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.h b/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.h
+index ec543c5737c..ffd512159ec 100644
+--- a/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.h
++++ b/third_party/xla/xla/service/gpu/cudnn_fusion_compiler.h
+@@ -19,6 +19,7 @@ limitations under the License.
+ #include "absl/container/flat_hash_set.h"
+ #include "absl/status/statusor.h"
+ #include "absl/strings/string_view.h"
++#include "xla/hlo/ir/hlo_instructions.h"
+ #include "xla/hlo/ir/hlo_module.h"
+ #include "xla/service/gpu/autotuner_util.h"
+ #include "xla/service/hlo_pass_interface.h"
+@@ -41,6 +42,8 @@ class CuDnnFusionCompiler : public HloModulePass {
+       HloModule* module,
+       const absl::flat_hash_set<absl::string_view>& execution_threads) override;
+ 
++  int GetAvailablePlanCount(const HloFusionInstruction& hlo) const;
++
+  private:
+   AutotuneConfig config_;
+ };
+diff --git a/third_party/xla/xla/service/gpu/fusions/cudnn_test.cc b/third_party/xla/xla/service/gpu/fusions/cudnn_test.cc
+index 4f0c6c7e1fe..741a75fe988 100644
+--- a/third_party/xla/xla/service/gpu/fusions/cudnn_test.cc
++++ b/third_party/xla/xla/service/gpu/fusions/cudnn_test.cc
+@@ -20,8 +20,15 @@ namespace xla {
+ namespace gpu {
+ namespace {
+ 
+-class CuDnnFusionExecutionTest : public GpuCodegenTest {
++class CuDnnFusionTest : public GpuCodegenTest {
+  public:
++  DebugOptions GetDebugOptionsForTest() override {
++    DebugOptions debug_options = GpuCodegenTest::GetDebugOptionsForTest();
++    // Let this group of tests just use first available plan skipping
++    // autotuning.
++    debug_options.set_xla_gpu_autotune_level(0);
++    return debug_options;
++  }
+   bool IsAtLeastHopper() {
+     return backend()
+         .default_stream_executor()
+@@ -31,6 +38,8 @@ class CuDnnFusionExecutionTest : public GpuCodegenTest {
+   }
+ };
+ 
++using CuDnnFusionExecutionTest = CuDnnFusionTest;
++
+ TEST_F(CuDnnFusionExecutionTest, DotF32ExecutesCorrectly) {
+   EXPECT_TRUE(RunAndCompare(R"(
+ fusion1 {
+@@ -253,6 +262,64 @@ ENTRY %e {
+   EXPECT_TRUE(RunAndCompare(kHloText, ErrorSpec{/*aabs=*/1e-3, /*arel=*/1e-3}));
+ }
+ 
++class CuDnnFusionRewriteTest : public CuDnnFusionTest {
++ public:
++  DebugOptions GetDebugOptionsForTest() override {
++    DebugOptions debug_options = CuDnnFusionTest::GetDebugOptionsForTest();
++    // Reset autotuning level to default.
++    debug_options.set_xla_gpu_autotune_level(
++        GetDebugOptionsFromFlags().xla_gpu_autotune_level());
++    debug_options.set_xla_gpu_cudnn_gemm_fusion(true);
++    return debug_options;
++  }
++};
++
++TEST_F(CuDnnFusionRewriteTest,
++       DoNotExecuteGemmFusionWithCuDnnWhenNotSupported) {
++  // Dimension size 61 does not satisfy the requirement on alignment
++  // (multiple of 2).
++  MatchOptimizedHlo(R"(
++ENTRY e {
++  p0 = f16[20,40,61] parameter(0)
++  p2 = f16[20,40,61] parameter(2)
++  p0n = f16[20,40,61] negate(p2)
++  p1 = f16[20,80,61] parameter(1)
++  ROOT r = f16[20,40,80] dot(p0n, p1),
++    lhs_batch_dims={0}, rhs_batch_dims={0},
++    lhs_contracting_dims={2}, rhs_contracting_dims={2}
++})",
++                    R"(
++; CHECK: ENTRY
++; CHECK-NEXT: parameter
++; CHECK-NEXT: parameter
++; CHECK-NEXT: parameter
++; CHECK-NEXT: ROOT
++; CHECK-SAME: fusion
++; CHECK-NOT: cudnn
++)");
++}
++
++TEST_F(CuDnnFusionRewriteTest, AutotuningPicksCuDnnForS8BF16OnHopper) {
++  // The test case relies on measurements by the autotuner and current
++  // performance comparison of the backends. May need to be updated if
++  // the situation changes.
++  if (!IsAtLeastHopper()) {
++    GTEST_SKIP() << "cuDNN GEMM fusion is not enabled on pre-Hopper hardware.";
++  }
++  MatchOptimizedHlo(R"(
++e {
++  p0 = bf16[720,720,720] parameter(0)
++  p1 = s8[720,720,720] parameter(1)
++  c = bf16[720,720,720] convert(p1)
++  ROOT d = bf16[720,720,720] dot(p0, c),
++    lhs_batch_dims={0}, lhs_contracting_dims={2},
++    rhs_batch_dims={0}, rhs_contracting_dims={1}
++})",
++                    R"(
++; CHECK: __cudnn$fusion
++)");
++}
++
+ }  // namespace
+ }  // namespace gpu
+ }  // namespace xla
+diff --git a/third_party/xla/xla/service/gpu/triton_autotuner.cc b/third_party/xla/xla/service/gpu/triton_autotuner.cc
+index 50873108528..499a0da7ea0 100644
+--- a/third_party/xla/xla/service/gpu/triton_autotuner.cc
++++ b/third_party/xla/xla/service/gpu/triton_autotuner.cc
+@@ -21,9 +21,11 @@ limitations under the License.
+ #include <cstdint>
+ #include <iterator>
+ #include <memory>
++#include <numeric>
+ #include <optional>
+ #include <string>
+ #include <utility>
++#include <variant>
+ #include <vector>
+ 
+ #include "absl/algorithm/container.h"
+@@ -55,6 +57,7 @@ limitations under the License.
+ #include "xla/service/gpu/autotuner_util.h"
+ #include "xla/service/gpu/backend_configs.pb.h"
+ #include "xla/service/gpu/buffer_comparator.h"
++#include "xla/service/gpu/cudnn_fusion_compiler.h"
+ #include "xla/service/gpu/gemm_rewriter.h"
+ #include "xla/service/gpu/gpu_float_support.h"
+ #include "xla/service/gpu/gpu_fusible.h"
+@@ -121,12 +124,14 @@ class TritonAutotunerVisitor : public DfsHloRewriteVisitor {
+                         hlo->backend_config<GpuBackendConfig>());
+     FusionBackendConfig& backend_config =
+         *gpu_config.mutable_fusion_backend_config();
+-    if (backend_config.kind() != kTritonGemmFusionKind) {
++    if (backend_config.kind() != kTritonGemmFusionKind &&
++        backend_config.kind() != kCuDnnFusionKind) {
+       return absl::OkStatus();
+     }
+ 
+     VLOG(4) << "Processing " << hlo->ToString();
+-    if (!backend_config.has_triton_gemm_config()) {
++    if (!backend_config.has_triton_gemm_config() &&
++        !backend_config.has_cudnn_fusion_config()) {
+       TF_ASSIGN_OR_RETURN(
+           AutotuneResult autotune_result,
+           AutotunerUtil::Autotune(
+@@ -144,7 +149,7 @@ class TritonAutotunerVisitor : public DfsHloRewriteVisitor {
+       if (autotune_result.has_triton()) {
+         *backend_config.mutable_triton_gemm_config() = autotune_result.triton();
+         TF_RETURN_IF_ERROR(hlo->set_backend_config(gpu_config));
+-      } else {
++      } else if (autotune_result.has_gemm()) {
+         // Falling back to cuBLAS: Converting the fusion to a Call, so that it
+         // can be inlined back again.
+         HloComputation* const computation = hlo->parent();
+@@ -153,10 +158,15 @@ class TritonAutotunerVisitor : public DfsHloRewriteVisitor {
+                                        hlo->fused_instructions_computation()));
+         TF_RETURN_IF_ERROR(computation->ReplaceInstruction(hlo, call));
+         hlo = call;
++      } else {
++        CHECK(autotune_result.has_algorithm());
++        backend_config.set_kind(std::string(kCuDnnFusionKind));
++        backend_config.mutable_cudnn_fusion_config()->set_plan_id(
++            autotune_result.algorithm().algo_id());
++        TF_RETURN_IF_ERROR(hlo->set_backend_config(gpu_config));
+       }
+     }
+ 
+-    // This cannot be the "else" branch of the previous "if".
+     if (backend_config.has_triton_gemm_config()) {
+       TF_ASSIGN_OR_RETURN(
+           const TritonGemmConfig config,
+@@ -179,8 +189,10 @@ struct GemmConfigSet {
+   std::vector<TritonGemmConfig> configs;
+ };
+ 
++using CuDnnPlanId = int64_t;
++
+ struct ExecutableCandidate {
+-  TritonGemmConfig config;
++  std::variant<TritonGemmConfig, CuDnnPlanId> config;
+   // Not nullptr.
+   std::unique_ptr<Executable> executable;
+ };
+@@ -218,17 +230,19 @@ class GemmConfigSetCollector : public ConstDfsHloVisitorWithDefault {
+     const FusionBackendConfig& backend_config =
+         gpu_config.fusion_backend_config();
+ 
+-    if (backend_config.kind() != kTritonGemmFusionKind ||
+-        backend_config.has_triton_gemm_config()) {
+-      return absl::OkStatus();
+-    }
+-
+     AutotuneCacheKey key = AutotunerUtil::GetKey(hlo, config_);
+     if (AutotunerUtil::IsInCache(key) || handled_fusions_.contains(key)) {
+       return absl::OkStatus();
+     }
+ 
+-    CHECK(gemm_config_sets_.insert({fusion, GetGemmConfigSet(fusion)}).second);
++    if (backend_config.kind() == kTritonGemmFusionKind &&
++        !backend_config.has_triton_gemm_config()) {
++      CHECK(
++          gemm_config_sets_.insert({fusion, GetGemmConfigSet(fusion)}).second);
++    } else if (backend_config.kind() == kCuDnnFusionKind &&
++               !backend_config.has_cudnn_fusion_config()) {
++      CHECK(gemm_config_sets_.insert({fusion, {}}).second);
++    }
+ 
+     handled_fusions_.insert(key);
+     return absl::OkStatus();
+@@ -505,11 +519,59 @@ absl::StatusOr<std::unique_ptr<HloModule>> CublasGemmAutotuneExtractor(
+   return new_module;
+ }
+ 
++absl::StatusOr<std::unique_ptr<HloModule>> CudnnGemmAutotuneExtractor(
++    const AutotuneConfig& autotune_config, const HloFusionInstruction* fusion,
++    const DebugOptions& debug_opts, const int plan_id) {
++  std::unique_ptr<HloModule> new_module =
++      ExtractInstructionIntoNewModule(*fusion);
++  new_module->mutable_config().set_debug_options(debug_opts);
++
++  GpuBackendConfig gpu_config;
++  FusionBackendConfig& backend_config =
++      *gpu_config.mutable_fusion_backend_config();
++  backend_config.set_kind(std::string(kCuDnnFusionKind));
++  // Provided a plan ID the autotuner just compiles one plan.
++  backend_config.mutable_cudnn_fusion_config()->set_plan_id(plan_id);
++  TF_RETURN_IF_ERROR(
++      new_module->entry_computation()->root_instruction()->set_backend_config(
++          gpu_config));
++  CuDnnFusionCompiler compiler(autotune_config);
++  TF_RETURN_IF_ERROR(compiler.Run(new_module.get()).status());
++
++  return new_module;
++}
++
+ bool ShouldAllowFilteringKernelsSpillingRegisters(
+     const GemmConfigSet& gemm_config_set) {
+   return gemm_config_set.configs.size() > 1;
+ }
+ 
++bool IsFusionKind(const HloInstruction& hlo, absl::string_view kind) {
++  auto gpu_config = hlo.backend_config<GpuBackendConfig>();
++  if (!gpu_config.ok()) {
++    return false;
++  }
++  return gpu_config->fusion_backend_config().kind() == kind;
++}
++
++int GetCuDnnPlanCount(const HloInstruction& hlo,
++                      const AutotuneConfig& autotune_config) {
++  auto gpu_config = hlo.backend_config<GpuBackendConfig>();
++  if (!gpu_config.ok() ||
++      gpu_config->fusion_backend_config().has_cudnn_fusion_config()) {
++    return {};
++  }
++  return CuDnnFusionCompiler(autotune_config)
++      .GetAvailablePlanCount(*DynCast<HloFusionInstruction>(&hlo));
++}
++
++bool IsCuDnnEnabled(const AutotuneConfig& config,
++                    const DebugOptions& debug_opts) {
++  return std::get<se::CudaComputeCapability>(config.GetGpuComputeCapability())
++             .IsAtLeastHopper() &&
++         debug_opts.xla_gpu_cudnn_gemm_fusion();
++}
++
+ absl::StatusOr<absl::flat_hash_map<const HloFusionInstruction*, ExecutableSet>>
+ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+             tsl::thread::ThreadPool* thread_pool,
+@@ -530,10 +592,19 @@ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+   const int log_every_n = GetLogEveryN();
+   int64_t config_count = 0;
+   for (const auto& key_value : gemm_config_sets) {
++    const HloFusionInstruction& hlo = *key_value.first;
+     const GemmConfigSet& gemm_config_set = key_value.second;
+-    config_count += gemm_config_set.configs.size();
++
++    if (IsFusionKind(hlo, kTritonGemmFusionKind)) {
++      config_count += gemm_config_set.configs.size();
++      if (IsCuDnnEnabled(config, debug_opts)) {
++        config_count += GetCuDnnPlanCount(hlo, config);
++      }
++    } else if (IsFusionKind(hlo, kCuDnnFusionKind)) {
++      config_count += GetCuDnnPlanCount(hlo, config);
++    }
+   }
+-  // The cuBLAS configs:
++  // cuBLAS configs: one per fusion.
+   config_count += gemm_config_sets.size();
+ 
+   std::atomic<int> done_count = 0;
+@@ -598,6 +669,23 @@ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+     return false;
+   };
+ 
++  auto compile_cudnn_executable = [&](const HloFusionInstruction* fusion,
++                                      const int plan_id) {
++    std::unique_ptr<Executable> executable =
++        util.Compile([&](const DebugOptions& opts) {
++              return CudnnGemmAutotuneExtractor(config, fusion, opts, plan_id);
++            })
++            .value_or(nullptr);
++    if (executable != nullptr) {
++      absl::MutexLock lock(&executable_sets_mu);
++      ExecutableSet& executable_set = executable_sets[fusion];
++      executable_set.candidates.push_back(
++          ExecutableCandidate{plan_id, std::move(executable)});
++      return true;
++    }
++    return false;
++  };
++
+   // If the thread pool has only one thread, then it is actually slower to
+   // offload the tasks there.
+   if (thread_pool && thread_pool->NumThreads() > 1 &&
+@@ -639,6 +727,18 @@ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+         log(has_executable.value());
+         counter.DecrementCount();
+       });
++
++      if (IsFusionKind(*fusion, kCuDnnFusionKind) ||
++          (IsFusionKind(*fusion, kTritonGemmFusionKind) &&
++           IsCuDnnEnabled(config, debug_opts))) {
++        const int plan_count = GetCuDnnPlanCount(*fusion, config);
++        for (int plan_id = 0; plan_id < plan_count; ++plan_id) {
++          thread_pool->Schedule([&, fusion, plan_id] {
++            log(compile_cudnn_executable(fusion, plan_id));
++            counter.DecrementCount();
++          });
++        }
++      }
+     }
+     counter.Wait();
+   } else {
+@@ -669,6 +769,15 @@ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+       TF_ASSIGN_OR_RETURN(bool has_executable,
+                           compile_reference_executable(fusion));
+       log(has_executable);
++
++      if (IsFusionKind(*fusion, kCuDnnFusionKind) ||
++          (IsFusionKind(*fusion, kTritonGemmFusionKind) &&
++           IsCuDnnEnabled(config, debug_opts))) {
++        const int plan_count = GetCuDnnPlanCount(*fusion, config);
++        for (int plan_id = 0; plan_id < plan_count; ++plan_id) {
++          log(compile_cudnn_executable(fusion, plan_id));
++        }
++      }
+     }
+   }
+ 
+@@ -677,19 +786,6 @@ CompileMany(const AutotuneConfig& config, AutotunerCompileUtil& util,
+   return executable_sets;
+ }
+ 
+-// Runs matmul fusion contents without Triton - with cuBLAS, to measure time and
+-// generate a reference output.
+-absl::StatusOr<ProfilingOutput> RunMatmulWithCublas(
+-    AutotunerCompileUtil& util, se::Stream* stream, Executable& executable,
+-    absl::Span<se::DeviceMemoryBase const> input_buffers,
+-    absl::Span<Shape const> input_shapes) {
+-  TF_ASSIGN_OR_RETURN(
+-      std::optional<ProfilingOutput> output,
+-      util.ProfileExecutable(&executable, stream, input_buffers, input_shapes));
+-  TF_RET_CHECK(output.has_value());
+-  return std::move(output.value());
+-}
+-
+ absl::StatusOr<AutotuneResult> Execute(const AutotuneConfig& config,
+                                        AutotunerCompileUtil& util,
+                                        const DebugOptions& debug_opts,
+@@ -735,28 +831,38 @@ absl::StatusOr<AutotuneResult> Execute(const AutotuneConfig& config,
+   absl::Duration cublas_duration;
+   {
+     TF_RET_CHECK(executable_set.reference != nullptr);
+-    TF_ASSIGN_OR_RETURN(
+-        ProfilingOutput output,
+-        RunMatmulWithCublas(util, stream, *executable_set.reference, inputs,
+-                            input_shapes));
++    TF_ASSIGN_OR_RETURN(std::optional<ProfilingOutput> output,
++                        util.ProfileExecutable(&*executable_set.reference,
++                                               stream, inputs, input_shapes));
++    TF_RET_CHECK(output.has_value());
+     if (config.should_check_correctness()) {
+-      reference_buffer = std::move(output.output);
++      reference_buffer = std::move(output->output);
+     }
+-    cublas_duration = output.duration;
++    cublas_duration = output->duration;
+   }
+ 
+   const int log_every_n = GetLogEveryN();
+-  int64_t executable_count =
+-      static_cast<int64_t>(executable_set.candidates.size());
++  const int64_t executable_count = executable_set.candidates.size();
+   int ran_so_far = 0;
+-  std::vector<AutotuneResult> results;
++  std::vector<AutotuneResult> triton_results, cudnn_results;
+   VLOG(2) << "Running " << executable_count << " configs for " << fusion->name()
+           << ".";
+   for (const ExecutableCandidate& candidate : executable_set.candidates) {
+-    VLOG(5) << "Trying triton tiling: " << candidate.config.ToString();
+-
+     AutotuneResult res;
+-    *res.mutable_triton() = candidate.config.ToProto();
++
++    std::string candidate_description;
++    if (std::holds_alternative<TritonGemmConfig>(candidate.config)) {
++      candidate_description = absl::StrFormat(
++          "triton tiling %s",
++          std::get<TritonGemmConfig>(candidate.config).ToString());
++      *res.mutable_triton() =
++          std::get<TritonGemmConfig>(candidate.config).ToProto();
++    } else {
++      const int64_t plan_id = std::get<CuDnnPlanId>(candidate.config);
++      candidate_description = absl::StrFormat("cuDNN plan %d", plan_id);
++      res.mutable_algorithm()->set_algo_id(plan_id);
++    }
++    VLOG(5) << "Trying : " << candidate_description;
+ 
+     TF_ASSIGN_OR_RETURN(std::optional<ProfilingOutput> profiling_output,
+                         util.ProfileExecutable(candidate.executable.get(),
+@@ -775,8 +881,8 @@ absl::StatusOr<AutotuneResult> Execute(const AutotuneConfig& config,
+     VLOG(5) << "Running the kernel took: " << profiling_output->duration;
+     if (profiling_output->duration >= absl::Seconds(1)) {
+       LOG(WARNING) << "Slow kernel for " << fusion->name()
+-                   << " took: " << profiling_output->duration
+-                   << ". config: " << candidate.config.ToString();
++                   << " took: " << profiling_output->duration << ". "
++                   << candidate_description;
+     }
+     *res.mutable_run_time() =
+         tsl::proto_utils::ToDurationProto(profiling_output->duration);
+@@ -810,21 +916,41 @@ absl::StatusOr<AutotuneResult> Execute(const AutotuneConfig& config,
+         res.mutable_failure()->set_msg(kMessage);
+       }
+     }
+-    results.push_back(res);
++    if (std::holds_alternative<TritonGemmConfig>(candidate.config)) {
++      triton_results.push_back(res);
++    } else {
++      cudnn_results.push_back(res);
++    }
+   }
++
+   VLOG(2) << "Done running.";
+ 
+-  TF_ASSIGN_OR_RETURN(
+-      AutotuneResult best_triton,
+-      PickBestResult(results, root.ToString(), root.GetModule()->config()));
++  VLOG(2) << fusion->name() << ": time with cuBLAS: " << cublas_duration;
++  AutotuneResult best;
++  best.mutable_failure()->set_kind(AutotuneResult::DISQUALIFIED);
++  if (!triton_results.empty()) {
++    TF_ASSIGN_OR_RETURN(const AutotuneResult triton_best,
++                        PickBestResult(triton_results, root.ToString(),
++                                       root.GetModule()->config()));
++    VLOG(2) << "Best time with Triton: "
++            << tsl::proto_utils::FromDurationProto(triton_best.run_time());
++    best = triton_best;
++  }
++  if (!cudnn_results.empty()) {
++    TF_ASSIGN_OR_RETURN(const AutotuneResult cudnn_best,
++                        PickBestResult(cudnn_results, root.ToString(),
++                                       root.GetModule()->config()));
++    VLOG(2) << "Best time with cuDNN: "
++            << tsl::proto_utils::FromDurationProto(cudnn_best.run_time());
++    TF_ASSIGN_OR_RETURN(best,
++                        PickBestResult({best, cudnn_best}, root.ToString(),
++                                       root.GetModule()->config()));
++  }
+ 
+   if (debug_opts.xla_gpu_cublas_fallback() &&
+       !debug_opts.xla_gpu_deterministic_ops()) {
+-    const absl::Duration best_triton_duration =
+-        tsl::proto_utils::FromDurationProto(best_triton.run_time());
+-    VLOG(2) << fusion->name() << ": time with cuBLAS: " << cublas_duration
+-            << ", best time with Triton: " << best_triton_duration;
+-    if (cublas_duration < best_triton_duration) {
++    if (cublas_duration <
++        tsl::proto_utils::FromDurationProto(best.run_time())) {
+       VLOG(2) << "Falling back to cuBLAS for " << fusion->name();
+ 
+       AutotuneResult cublas;
+@@ -836,8 +962,11 @@ absl::StatusOr<AutotuneResult> Execute(const AutotuneConfig& config,
+       return cublas;
+     }
+   }
+-
+-  return best_triton;
++  if (!best.has_triton()) {
++    VLOG(2) << "Using cuDNN plan " << best.algorithm().algo_id() << " for "
++            << fusion->name();
++  }
++  return best;
+ }
+ 
+ absl::Status DumpAutotunedFusion(const AutotuneConfig& autotune_config,
+@@ -852,9 +981,14 @@ absl::Status DumpAutotunedFusion(const AutotuneConfig& autotune_config,
+   TF_ASSIGN_OR_RETURN(
+       std::unique_ptr<HloModule> module,
+       util.ExtractModule([&](const DebugOptions& debug_opts) {
+-        return TritonGemmAutotuneExtractor(
+-            triton_gemm_config, device_desc, fusion, debug_opts,
+-            /*allow_filtering_kernels_spilling_registers=*/true);
++        if (result.has_algorithm()) {
++          return CudnnGemmAutotuneExtractor(autotune_config, fusion, debug_opts,
++                                            result.algorithm().algo_id());
++        } else {
++          return TritonGemmAutotuneExtractor(
++              triton_gemm_config, device_desc, fusion, debug_opts,
++              /*allow_filtering_kernels_spilling_registers=*/true);
++        }
+       }));
+   module->set_name(std::string(fusion->name()));
+   // Using the original module for its debug info and name in the first
+diff --git a/third_party/xla/xla/service/gpu/triton_autotuner_test.cc b/third_party/xla/xla/service/gpu/triton_autotuner_test.cc
+index adab993bbfb..c55742aee00 100644
+--- a/third_party/xla/xla/service/gpu/triton_autotuner_test.cc
++++ b/third_party/xla/xla/service/gpu/triton_autotuner_test.cc
+@@ -167,6 +167,7 @@ class TritonAutotunerTest : public StatelessAutotunerTest {
+         StatelessAutotunerTest::GetDebugOptionsForTest();
+     debug_options.set_xla_gpu_enable_triton_gemm(true);
+     debug_options.set_xla_gpu_cublas_fallback(false);
++    debug_options.set_xla_gpu_cudnn_gemm_fusion(false);
+     return debug_options;
+   }
+ 
+@@ -202,12 +203,16 @@ class TritonAutotunerTest : public StatelessAutotunerTest {
+             dot_fusion = dot_fusion->operand(0);
+           }
+           CHECK_EQ(dot_fusion->opcode(), HloOpcode::kFusion);
+-          CHECK_GT(dot_fusion->backend_config<GpuBackendConfig>()
+-                       .value()
+-                       .fusion_backend_config()
+-                       .triton_gemm_config()
+-                       .block_m(),
+-                   0);
++          if (!dot_fusion->backend_config<GpuBackendConfig>()
++                   ->fusion_backend_config()
++                   .has_cudnn_fusion_config()) {
++            CHECK_GT(dot_fusion->backend_config<GpuBackendConfig>()
++                         .value()
++                         .fusion_backend_config()
++                         .triton_gemm_config()
++                         .block_m(),
++                     0);
++          }
+         });
+   }
+ };
+@@ -549,6 +554,32 @@ ENTRY %e {
+   EXPECT_NE(executable, nullptr);
+ }
+ 
++TEST_F(TritonAutotunerTest, AutotuneCuDnnFusion) {
++  if (!GetCudaComputeCapability().IsAtLeast(
++          se::CudaComputeCapability::AMPERE)) {
++    GTEST_SKIP() << "cuDNN fusion autotuning is not tested before Ampere.";
++  }
++  const std::string kHlo = R"(
++fusion1 {
++  p0 = f32[3,28,32] parameter(0)
++  p1 = f32[3,28,32] parameter(1)
++  ROOT d = f32[3,32,32] dot(p0, p1),
++    lhs_batch_dims={0}, rhs_batch_dims={0},
++    lhs_contracting_dims={1}, rhs_contracting_dims={1}
++}
++
++ENTRY e {
++  p0 = f32[3,28,32] parameter(0)
++  p1 = f32[3,28,32] parameter(1)
++  ROOT _ = f32[3,32,32] fusion(p0, p1), kind=kCustom, calls=fusion1,
++    backend_config={"fusion_backend_config": {kind: "__cudnn$fusion"}}
++})";
++
++  CheckTritonAutotuning(kHlo, R"(
++// CHECK: "plan_id":
++)");
++}
++
+ // TODO(b/281489442): Write a testcase called
+ // `SkipConfigsProducingDeviantResults` or similar.
+ 
+diff --git a/third_party/xla/xla/xla.proto b/third_party/xla/xla/xla.proto
+index 17ff021301b..3f578344c7b 100644
+--- a/third_party/xla/xla/xla.proto
++++ b/third_party/xla/xla/xla.proto
+@@ -700,7 +700,10 @@ message DebugOptions {
+ 
+   bool xla_gpu_enable_mlir_emitters = 275;
+ 
+-  // Next id: 277
++  // Let GEMM fusion autotuning probe cuDNN as a backend.
++  bool xla_gpu_cudnn_gemm_fusion = 277;
++
++  // Next id: 278
+ 
+   // Extra options to pass to the compilation backend (e.g. LLVM); specific
+   // interpretation of these values is left to the backend.

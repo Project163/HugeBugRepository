@@ -1,0 +1,399 @@
+diff --git a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcAssert.java b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcAssert.java
+index 2bed132df4c..fcdb3c65330 100644
+--- a/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcAssert.java
++++ b/x-pack/plugin/sql/qa/src/main/java/org/elasticsearch/xpack/sql/qa/jdbc/JdbcAssert.java
+@@ -7,6 +7,7 @@
+ package org.elasticsearch.xpack.sql.qa.jdbc;
+ 
+ import com.carrotsearch.hppc.IntObjectHashMap;
++
+ import org.apache.logging.log4j.Logger;
+ import org.elasticsearch.geometry.Geometry;
+ import org.elasticsearch.geometry.Point;
+@@ -224,7 +225,7 @@ public class JdbcAssert {
+                         String columnClassName = metaData.getColumnClassName(column);
+ 
+                         // fix for CSV which returns the shortName not fully-qualified name
+-                        if (!columnClassName.contains(".")) {
++                        if (columnClassName != null && !columnClassName.contains(".")) {
+                             switch (columnClassName) {
+                                 case "Date":
+                                     columnClassName = "java.sql.Date";
+@@ -244,13 +245,17 @@ public class JdbcAssert {
+                             }
+                         }
+ 
+-                        expectedColumnClass = Class.forName(columnClassName);
++                        if (columnClassName != null) {
++                            expectedColumnClass = Class.forName(columnClassName);
++                        }
+                     } catch (ClassNotFoundException cnfe) {
+                         throw new SQLException(cnfe);
+                     }
+ 
+                     Object expectedObject = expected.getObject(column);
+-                    Object actualObject = lenientDataType ? actual.getObject(column, expectedColumnClass) : actual.getObject(column);
++                    Object actualObject = (lenientDataType && expectedColumnClass != null) 
++                            ? actual.getObject(column, expectedColumnClass)
++                            : actual.getObject(column);
+ 
+                     String msg = format(Locale.ROOT, "Different result for column [%s], entry [%d]",
+                         metaData.getColumnName(column), count + 1);
+diff --git a/x-pack/plugin/sql/qa/src/main/resources/agg.sql-spec b/x-pack/plugin/sql/qa/src/main/resources/agg.sql-spec
+index e24297f7fa9..8ebdcf88e85 100644
+--- a/x-pack/plugin/sql/qa/src/main/resources/agg.sql-spec
++++ b/x-pack/plugin/sql/qa/src/main/resources/agg.sql-spec
+@@ -423,6 +423,31 @@ SELECT gender g, CAST(AVG(emp_no) AS FLOAT) a FROM "test_emp" GROUP BY g HAVING
+ aggAvgWithMultipleHavingOnAliasAndFunction
+ SELECT gender g, CAST(AVG(emp_no) AS FLOAT) a FROM "test_emp" GROUP BY g HAVING a > 10 AND AVG(emp_no) > 10000000 ORDER BY g ;
+ 
++// Implicit grouping with filtering
++implicitGroupingWithLiteralAndFiltering
++SELECT 1 FROM test_emp HAVING COUNT(*) > 0;
++implicitGroupingWithLiteralAliasAndFiltering
++SELECT 1 AS l FROM test_emp HAVING COUNT(*) > 0;
++implicitGroupingWithLiteralAndFilteringOnAlias
++SELECT 1, COUNT(*) AS c FROM test_emp HAVING c > 0; 
++implicitGroupingWithLiteralAliasAndFilteringOnAlias
++SELECT 1 AS l FROM test_emp HAVING COUNT(*) > 0;
++implicitGroupingWithAggs
++SELECT MAX(emp_no) AS m FROM test_emp HAVING COUNT(*) > 0;
++implicitGroupingWithOptimizedAggs
++SELECT MIN(emp_no) AS m FROM test_emp HAVING MAX(emp_no) > 0 AND COUNT(*) > 0;
++implicitGroupingWithNull
++SELECT NULL AS x FROM test_emp HAVING COUNT(1) > 1;
++implicitGroupingWithNullFunction
++SELECT LTRIM(CAST(YEAR(CAST(NULL AS DATE)) AS VARCHAR)) AS x FROM test_emp HAVING COUNT(1) > 1;
++implicitGroupingWithNullDateTimeFunction
++SELECT DAYNAME(CAST(NULL AS TIMESTAMP)) AS x FROM test_emp HAVING COUNT(1) > 1;
++implicitGroupingWithScalarInsideCase
++SELECT (CASE WHEN 'D' IS NULL THEN NULL WHEN 'D' IS NOT NULL THEN (LOCATE('D', 'Data') = 1) END) AS x FROM test_emp HAVING (COUNT(1) > 0);
++implicitGroupingWithMultiLevelCase
++SELECT (CASE WHEN ('Data' IS NULL) OR ('Xyz' IS NULL) THEN NULL WHEN 'Data' < 'Xyz' THEN 'Data' ELSE 'Xyz' END) AS x FROM test_emp HAVING (COUNT(1) > 0);
++
++
+ //
+ // GroupBy on Scalar plus Having
+ //
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/analysis/analyzer/Analyzer.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/analysis/analyzer/Analyzer.java
+index 40a34dcf006..901318258c0 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/analysis/analyzer/Analyzer.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/analysis/analyzer/Analyzer.java
+@@ -110,6 +110,7 @@ public class Analyzer extends RuleExecutor<LogicalPlan> {
+                 new ResolveFunctions(),
+                 new ResolveAliases(),
+                 new ProjectedAggregations(),
++                new HavingOverProject(),
+                 new ResolveAggsInHaving(),
+                 new ResolveAggsInOrderBy()
+                 //new ImplicitCasting()
+@@ -1002,6 +1003,45 @@ public class Analyzer extends RuleExecutor<LogicalPlan> {
+         }
+     }
+ 
++    //
++    // Detect implicit grouping with filtering and convert them into aggregates.
++    // SELECT 1 FROM x HAVING COUNT(*) > 0
++    // is a filter followed by projection and fails as the engine does not
++    // understand it is an implicit grouping.
++    //
++    private static class HavingOverProject extends AnalyzeRule<Filter> {
++
++        @Override
++        protected LogicalPlan rule(Filter f) {
++            if (f.child() instanceof Project) {
++                Project p = (Project) f.child();
++
++                for (Expression n : p.projections()) {
++                    if (n instanceof Alias) {
++                        n = ((Alias) n).child();
++                    }
++                    // no literal or aggregates - it's a 'regular' projection
++                    if (n.foldable() == false && Functions.isAggregate(n) == false
++                            // folding might not work (it might wait for the optimizer)
++                            // so check whether any column is referenced
++                            && n.anyMatch(e -> e instanceof FieldAttribute) == true) {
++                        return f;
++                    }
++                }
++
++                if (containsAggregate(f.condition())) {
++                    return new Filter(f.source(), new Aggregate(p.source(), p.child(), emptyList(), p.projections()), f.condition());
++                }
++            }
++            return f;
++        }
++
++        @Override
++        protected boolean skipResolved() {
++            return false;
++        }
++    }
++
+     //
+     // Handle aggs in HAVING. To help folding any aggs not found in Aggregation
+     // will be pushed down to the Aggregate and then projected. This also simplifies the Verifier's job.
+@@ -1237,14 +1277,13 @@ public class Analyzer extends RuleExecutor<LogicalPlan> {
+         protected LogicalPlan rule(LogicalPlan plan) {
+             if (plan instanceof Project) {
+                 Project p = (Project) plan;
+-                return new Project(p.source(), p.child(), cleanExpressions(p.projections()));
++                return new Project(p.source(), p.child(), cleanSecondaryAliases(p.projections()));
+             }
+ 
+             if (plan instanceof Aggregate) {
+                 Aggregate a = (Aggregate) plan;
+                 // clean group expressions
+-                List<Expression> cleanedGroups = a.groupings().stream().map(CleanAliases::trimAliases).collect(toList());
+-                return new Aggregate(a.source(), a.child(), cleanedGroups, cleanExpressions(a.aggregates()));
++                return new Aggregate(a.source(), a.child(), cleanAllAliases(a.groupings()), cleanSecondaryAliases(a.aggregates()));
+             }
+ 
+             return plan.transformExpressionsOnly(e -> {
+@@ -1255,8 +1294,20 @@ public class Analyzer extends RuleExecutor<LogicalPlan> {
+             });
+         }
+ 
+-        private List<NamedExpression> cleanExpressions(List<? extends NamedExpression> args) {
+-            return args.stream().map(CleanAliases::trimNonTopLevelAliases).map(NamedExpression.class::cast).collect(toList());
++        private List<NamedExpression> cleanSecondaryAliases(List<? extends NamedExpression> args) {
++            List<NamedExpression> cleaned = new ArrayList<>(args.size());
++            for (NamedExpression ne : args) {
++                cleaned.add((NamedExpression) trimNonTopLevelAliases(ne));
++            }
++            return cleaned;
++        }
++
++        private List<Expression> cleanAllAliases(List<Expression> args) {
++            List<Expression> cleaned = new ArrayList<>(args.size());
++            for (Expression e : args) {
++                cleaned.add(trimAliases(e));
++            }
++            return cleaned;
+         }
+ 
+         public static Expression trimNonTopLevelAliases(Expression e) {
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/Literal.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/Literal.java
+index 579fd934b48..b4ccd7eb9ff 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/Literal.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/Literal.java
+@@ -77,7 +77,7 @@ public class Literal extends NamedExpression {
+ 
+     @Override
+     public Attribute toAttribute() {
+-        return new LiteralAttribute(source(), name(), null, Nullability.FALSE, id(), false, dataType, this);
++        return new LiteralAttribute(source(), name(), null, nullable(), id(), false, dataType, this);
+     }
+ 
+     @Override
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/LiteralAttribute.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/LiteralAttribute.java
+index 6463520cf83..1305240b609 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/LiteralAttribute.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/expression/LiteralAttribute.java
+@@ -41,4 +41,9 @@ public class LiteralAttribute extends TypedAttribute {
+     public Pipe asPipe() {
+         return literal.asPipe();
+     }
++    
++    @Override
++    public Object fold() {
++        return literal.fold();
++    }
+ }
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/optimizer/Optimizer.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/optimizer/Optimizer.java
+index 72371ab9617..6689a33b162 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/optimizer/Optimizer.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/optimizer/Optimizer.java
+@@ -1172,7 +1172,9 @@ public class Optimizer extends RuleExecutor<LogicalPlan> {
+                     return Literal.of(in, null);
+                 }
+ 
+-            } else if (e.nullable() == Nullability.TRUE && Expressions.anyMatch(e.children(), Expressions::isNull)) {
++            } else if (e instanceof Alias == false 
++                    && e.nullable() == Nullability.TRUE
++                    && Expressions.anyMatch(e.children(), Expressions::isNull)) {
+                 return Literal.of(e, null);
+             }
+ 
+@@ -1188,11 +1190,6 @@ public class Optimizer extends RuleExecutor<LogicalPlan> {
+ 
+         @Override
+         protected Expression rule(Expression e) {
+-            if (e instanceof Alias) {
+-                Alias a = (Alias) e;
+-                return a.child().foldable() ? Literal.of(a.name(), a.child()) : a;
+-            }
+-
+             return e.foldable() ? Literal.of(e) : e;
+         }
+     }
+@@ -1968,7 +1965,16 @@ public class Optimizer extends RuleExecutor<LogicalPlan> {
+         private List<Object> extractConstants(List<? extends NamedExpression> named) {
+             List<Object> values = new ArrayList<>();
+             for (NamedExpression n : named) {
+-                if (n.foldable()) {
++                if (n instanceof Alias) {
++                    Alias a = (Alias) n;
++                    if (a.child().foldable()) {
++                        values.add(a.child().fold());
++                    }
++                    // not everything is foldable, bail out early
++                    else {
++                        return values;
++                    }
++                } else if (n.foldable()) {
+                     values.add(n.fold());
+                 } else {
+                     // not everything is foldable, bail-out early
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/planner/QueryFolder.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/planner/QueryFolder.java
+index 802d6d37b7c..ae875d6fc6e 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/planner/QueryFolder.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/planner/QueryFolder.java
+@@ -135,7 +135,6 @@ class QueryFolder extends RuleExecutor<PhysicalPlan> {
+                         // for named expressions nothing is recorded as these are resolved last
+                         // otherwise 'intermediate' projects might pollute the
+                         // output
+-
+                         if (pj instanceof ScalarFunction) {
+                             ScalarFunction f = (ScalarFunction) pj;
+                             processors.put(f.toAttribute(), Expressions.pipe(f));
+@@ -348,6 +347,9 @@ class QueryFolder extends RuleExecutor<PhysicalPlan> {
+                                 queryC = queryC.addColumn(new GroupByRef(matchingGroup.id(), null, child.dataType().isDateBased()),
+                                         ((GroupingFunction) child).toAttribute());
+                             }
++                            else if (child.foldable()) {
++                                queryC = queryC.addColumn(ne.toAttribute());
++                            }
+                             // fallback to regular agg functions
+                             else {
+                                 // the only thing left is agg function
+@@ -369,6 +371,9 @@ class QueryFolder extends RuleExecutor<PhysicalPlan> {
+                             queryC = queryC.addColumn(
+                                 new GroupByRef(matchingGroup.id(), null, ne.dataType().isDateBased()), ne.toAttribute());
+                         }
++                        else if (ne.foldable()) {
++                            queryC = queryC.addColumn(ne.toAttribute());
++                        }
+                     }
+                 }
+ 
+diff --git a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/querydsl/container/QueryContainer.java b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/querydsl/container/QueryContainer.java
+index a0a8741bdc7..5ff560f4baa 100644
+--- a/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/querydsl/container/QueryContainer.java
++++ b/x-pack/plugin/sql/src/main/java/org/elasticsearch/xpack/sql/querydsl/container/QueryContainer.java
+@@ -178,6 +178,7 @@ public class QueryContainer {
+             Attribute alias = aliases.get(column);
+             // find the column index
+             int index = -1;
++
+             ExpressionId id = column instanceof AggregateFunctionAttribute ? ((AggregateFunctionAttribute) column).innerId() : column.id();
+             ExpressionId aliasId = alias != null ? (alias instanceof AggregateFunctionAttribute ? ((AggregateFunctionAttribute) alias)
+                     .innerId() : alias.id()) : null;
+@@ -188,6 +189,7 @@ public class QueryContainer {
+                     break;
+                 }
+             }
++
+             if (index > -1) {
+                 mask.set(index);
+             } else {
+@@ -227,7 +229,7 @@ public class QueryContainer {
+ 
+     public boolean isAggsOnly() {
+         if (aggsOnly == null) {
+-            aggsOnly = Boolean.valueOf(this.fields.stream().allMatch(t -> t.v1().supportedByAggsOnlyQuery()));
++            aggsOnly = Boolean.valueOf(this.fields.stream().anyMatch(t -> t.v1().supportedByAggsOnlyQuery()));
+         }
+ 
+         return aggsOnly.booleanValue();
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/optimizer/OptimizerTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/optimizer/OptimizerTests.java
+index 1607c4db524..2d3b6cdee52 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/optimizer/OptimizerTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/optimizer/OptimizerTests.java
+@@ -9,6 +9,7 @@ import org.elasticsearch.test.ESTestCase;
+ import org.elasticsearch.xpack.sql.analysis.analyzer.Analyzer.PruneSubqueryAliases;
+ import org.elasticsearch.xpack.sql.expression.Alias;
+ import org.elasticsearch.xpack.sql.expression.Expression;
++import org.elasticsearch.xpack.sql.expression.Expression.TypeResolution;
+ import org.elasticsearch.xpack.sql.expression.Expressions;
+ import org.elasticsearch.xpack.sql.expression.FieldAttribute;
+ import org.elasticsearch.xpack.sql.expression.Foldables;
+@@ -86,7 +87,9 @@ import org.elasticsearch.xpack.sql.optimizer.Optimizer.PropagateEquals;
+ import org.elasticsearch.xpack.sql.optimizer.Optimizer.PruneDuplicateFunctions;
+ import org.elasticsearch.xpack.sql.optimizer.Optimizer.ReplaceFoldableAttributes;
+ import org.elasticsearch.xpack.sql.optimizer.Optimizer.ReplaceMinMaxWithTopHits;
++import org.elasticsearch.xpack.sql.optimizer.Optimizer.SimplifyCase;
+ import org.elasticsearch.xpack.sql.optimizer.Optimizer.SimplifyConditional;
++import org.elasticsearch.xpack.sql.optimizer.Optimizer.SortAggregateOnOrderBy;
+ import org.elasticsearch.xpack.sql.plan.logical.Aggregate;
+ import org.elasticsearch.xpack.sql.plan.logical.Filter;
+ import org.elasticsearch.xpack.sql.plan.logical.LocalRelation;
+@@ -112,13 +115,10 @@ import static java.util.Arrays.asList;
+ import static java.util.Collections.emptyList;
+ import static java.util.Collections.emptyMap;
+ import static java.util.Collections.singletonList;
+-import static org.elasticsearch.xpack.sql.expression.Expression.TypeResolution;
+ import static org.elasticsearch.xpack.sql.expression.Literal.FALSE;
+ import static org.elasticsearch.xpack.sql.expression.Literal.NULL;
+ import static org.elasticsearch.xpack.sql.expression.Literal.TRUE;
+ import static org.elasticsearch.xpack.sql.expression.Literal.of;
+-import static org.elasticsearch.xpack.sql.optimizer.Optimizer.SimplifyCase;
+-import static org.elasticsearch.xpack.sql.optimizer.Optimizer.SortAggregateOnOrderBy;
+ import static org.elasticsearch.xpack.sql.tree.Source.EMPTY;
+ import static org.elasticsearch.xpack.sql.util.DateUtils.UTC;
+ import static org.hamcrest.Matchers.contains;
+@@ -294,7 +294,7 @@ public class OptimizerTests extends ESTestCase {
+         // check now with an alias
+         result = new ConstantFolding().rule(new Alias(EMPTY, "a", exp));
+         assertEquals("a", Expressions.name(result));
+-        assertEquals(5, ((Literal) result).value());
++        assertEquals(Alias.class, result.getClass());
+     }
+ 
+     public void testConstantFoldingBinaryComparison() {
+diff --git a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java
+index db0406dc001..2967ccb581f 100644
+--- a/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java
++++ b/x-pack/plugin/sql/src/test/java/org/elasticsearch/xpack/sql/planner/QueryTranslatorTests.java
+@@ -279,7 +279,7 @@ public class QueryTranslatorTests extends ESTestCase {
+         }
+         assertEquals("date", rq.field());
+         
+-        if (operator.contains("<") || operator.equals("=") || operator.equals("!=")) { 
++        if (operator.contains("<") || operator.equals("=") || operator.equals("!=")) {
+             assertEquals(DateFormatter.forPattern(pattern).format(now.withNano(DateUtils.getNanoPrecision(null, now.getNano()))),
+                     rq.upper());
+         }
+@@ -1206,9 +1206,31 @@ public class QueryTranslatorTests extends ESTestCase {
+         assertEquals(EsQueryExec.class, p.getClass());
+         EsQueryExec eqe = (EsQueryExec) p;
+         assertThat(eqe.queryContainer().toString().replaceAll("\\s+", ""), containsString(
+-                "{\"terms\":{\"script\":{\"source\":\"InternalSqlScriptUtils." + scriptMethods[pos] 
++                "{\"terms\":{\"script\":{\"source\":\"InternalSqlScriptUtils." + scriptMethods[pos]
+                 + "(InternalSqlScriptUtils.add(InternalSqlScriptUtils.docValue(doc,params.v0),"
+                 + "InternalSqlScriptUtils.intervalYearMonth(params.v1,params.v2)),params.v3)\",\"lang\":\"painless\","
+                 + "\"params\":{\"v0\":\"date\",\"v1\":\"P1Y\",\"v2\":\"INTERVAL_YEAR\",\"v3\":\"Z\"}},\"missing_bucket\":true,"));
+     }
++
++
++    public void testHavingWithLiteralImplicitGrouping() {
++        PhysicalPlan p = optimizeAndPlan("SELECT 1 FROM test HAVING COUNT(*) > 0");
++        assertEquals(EsQueryExec.class, p.getClass());
++        EsQueryExec eqe = (EsQueryExec) p;
++        assertTrue("Should be tracking hits", eqe.queryContainer().shouldTrackHits());
++        assertEquals(1, eqe.output().size());
++        String query = eqe.queryContainer().toString().replaceAll("\\s+", "");
++        assertThat(eqe.queryContainer().toString().replaceAll("\\s+", ""), containsString("\"size\":0"));
++    }
++
++    public void testHavingWithColumnImplicitGrouping() {
++        PhysicalPlan p = optimizeAndPlan("SELECT MAX(int) FROM test HAVING COUNT(*) > 0");
++        assertEquals(EsQueryExec.class, p.getClass());
++        EsQueryExec eqe = (EsQueryExec) p;
++        assertTrue("Should be tracking hits", eqe.queryContainer().shouldTrackHits());
++        assertEquals(1, eqe.output().size());
++        assertThat(eqe.queryContainer().toString().replaceAll("\\s+", ""), containsString(
++                "\"script\":{\"source\":\"InternalSqlScriptUtils.nullSafeFilter(InternalSqlScriptUtils.gt(params.a0,params.v0))\","
++                + "\"lang\":\"painless\",\"params\":{\"v0\":0}}"));
++    }
+ }

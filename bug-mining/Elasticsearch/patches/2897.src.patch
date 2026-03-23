@@ -1,0 +1,140 @@
+diff --git a/docs/changelog/96421.yaml b/docs/changelog/96421.yaml
+new file mode 100644
+index 00000000000..a628b3b157f
+--- /dev/null
++++ b/docs/changelog/96421.yaml
+@@ -0,0 +1,6 @@
++pr: 96421
++summary: Promptly fail recovery from snapshot
++area: Recovery
++type: bug
++issues:
++ - 95525
+diff --git a/server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java b/server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java
+index d6ef685b7a0..d26cf795944 100644
+--- a/server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java
++++ b/server/src/main/java/org/elasticsearch/indices/recovery/PeerRecoveryTargetService.java
+@@ -356,6 +356,11 @@ public class PeerRecoveryTargetService implements IndexEventListener {
+         return recoverySettings.tryAcquireSnapshotDownloadPermits();
+     }
+ 
++    // Visible for testing
++    public int ongoingRecoveryCount() {
++        return onGoingRecoveries.size();
++    }
++
+     /**
+      * Prepare the start recovery request.
+      *
+diff --git a/server/src/main/java/org/elasticsearch/indices/recovery/RecoveryTarget.java b/server/src/main/java/org/elasticsearch/indices/recovery/RecoveryTarget.java
+index 19f0a42deb1..456d988cd63 100644
+--- a/server/src/main/java/org/elasticsearch/indices/recovery/RecoveryTarget.java
++++ b/server/src/main/java/org/elasticsearch/indices/recovery/RecoveryTarget.java
+@@ -42,6 +42,7 @@ import org.elasticsearch.index.store.StoreFileMetadata;
+ import org.elasticsearch.index.translog.Translog;
+ import org.elasticsearch.repositories.IndexId;
+ 
++import java.io.FilterInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.file.Path;
+@@ -586,7 +587,19 @@ public class RecoveryTarget extends AbstractRefCounted implements RecoveryTarget
+         ) {
+             StoreFileMetadata metadata = fileInfo.metadata();
+             int readSnapshotFileBufferSize = snapshotFilesProvider.getReadSnapshotFileBufferSizeForRepo(repository);
+-            multiFileWriter.writeFile(metadata, readSnapshotFileBufferSize, inputStream);
++            multiFileWriter.writeFile(metadata, readSnapshotFileBufferSize, new FilterInputStream(inputStream) {
++                @Override
++                public int read() throws IOException {
++                    cancellableThreads.checkForCancel();
++                    return super.read();
++                }
++
++                @Override
++                public int read(byte[] b, int off, int len) throws IOException {
++                    cancellableThreads.checkForCancel();
++                    return super.read(b, off, len);
++                }
++            });
+             listener.onResponse(null);
+         } catch (Exception e) {
+             logger.debug(() -> format("Unable to recover snapshot file %s from repository %s", fileInfo, repository), e);
+diff --git a/x-pack/plugin/snapshot-based-recoveries/src/internalClusterTest/java/org/elasticsearch/xpack/snapshotbasedrecoveries/recovery/SnapshotBasedIndexRecoveryIT.java b/x-pack/plugin/snapshot-based-recoveries/src/internalClusterTest/java/org/elasticsearch/xpack/snapshotbasedrecoveries/recovery/SnapshotBasedIndexRecoveryIT.java
+index 00efa6d60a6..81f9f9e7edc 100644
+--- a/x-pack/plugin/snapshot-based-recoveries/src/internalClusterTest/java/org/elasticsearch/xpack/snapshotbasedrecoveries/recovery/SnapshotBasedIndexRecoveryIT.java
++++ b/x-pack/plugin/snapshot-based-recoveries/src/internalClusterTest/java/org/elasticsearch/xpack/snapshotbasedrecoveries/recovery/SnapshotBasedIndexRecoveryIT.java
+@@ -662,6 +662,74 @@ public class SnapshotBasedIndexRecoveryIT extends AbstractSnapshotIntegTestCase
+         }
+     }
+ 
++    public void testCancelledRecoveryAbortsDownloadPromptly() throws Exception {
++        updateSetting(INDICES_RECOVERY_MAX_CONCURRENT_SNAPSHOT_FILE_DOWNLOADS.getKey(), "1");
++
++        try {
++            internalCluster().ensureAtLeastNumDataNodes(2);
++
++            String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
++            createIndex(
++                indexName,
++                Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
++            );
++            ensureGreen(indexName);
++
++            int numDocs = randomIntBetween(1, 1000);
++            indexDocs(indexName, numDocs, numDocs);
++
++            String repoName = "repo";
++            createRepo(repoName, TestRepositoryPlugin.FILTER_TYPE);
++            createSnapshot(repoName, "snap", Collections.singletonList(indexName));
++
++            final AtomicBoolean isCancelled = new AtomicBoolean();
++            final CountDownLatch readFromBlobCalledLatch = new CountDownLatch(1);
++            final CountDownLatch readFromBlobRespondLatch = new CountDownLatch(1);
++
++            FilterFsRepository.wrapReadBlobMethod((blobName, stream) -> {
++                if (blobName.startsWith("__")) {
++                    return new FilterInputStream(stream) {
++                        @Override
++                        public int read() throws IOException {
++                            beforeRead();
++                            return super.read();
++                        }
++
++                        @Override
++                        public int read(byte[] b, int off, int len) throws IOException {
++                            beforeRead();
++                            return super.read(b, off, len);
++                        }
++
++                        private void beforeRead() {
++                            assertFalse(isCancelled.get()); // should have no further reads once the index is deleted
++                            readFromBlobCalledLatch.countDown();
++                            safeAwait(readFromBlobRespondLatch);
++                        }
++                    };
++                } else {
++                    return stream;
++                }
++            });
++
++            updateIndexSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1), indexName);
++            safeAwait(readFromBlobCalledLatch);
++
++            assertAcked(client().admin().indices().prepareDelete(indexName).get());
++            // cancellation flag is set when applying the cluster state that deletes the index, so no further waiting is necessary
++            isCancelled.set(true);
++            readFromBlobRespondLatch.countDown();
++
++            assertThat(indexExists(indexName), is(equalTo(false)));
++            assertBusy(
++                () -> internalCluster().getInstances(PeerRecoveryTargetService.class)
++                    .forEach(peerRecoveryTargetService -> assertEquals(0, peerRecoveryTargetService.ongoingRecoveryCount()))
++            );
++        } finally {
++            updateSetting(INDICES_RECOVERY_MAX_CONCURRENT_SNAPSHOT_FILE_DOWNLOADS.getKey(), null);
++        }
++    }
++
+     public void testRecoveryAfterRestoreUsesSnapshots() throws Exception {
+         String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
+         createIndex(

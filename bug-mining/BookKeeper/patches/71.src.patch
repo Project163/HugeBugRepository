@@ -1,0 +1,650 @@
+diff --git a/CHANGES.txt b/CHANGES.txt
+index 9f0c576fb3..645d7df457 100644
+--- a/CHANGES.txt
++++ b/CHANGES.txt
+@@ -34,6 +34,8 @@ Trunk (unreleased changes)
+ 
+ 	BOOKKEEPER-162: LedgerHandle.readLastConfirmed does not work (fpj)
+ 
++        BOOKKEEPER-152: Can't recover a ledger whose current ensemble contain failed bookie. (ivank)
++
+       hedwig-server/
+       
+         BOOKKEEPER-140: Hub server doesn't subscribe remote region correctly when a region is down. (Sijie Gou via ivank)
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DigestManager.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DigestManager.java
+index ae375ecfa6..a5bb426f38 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DigestManager.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DigestManager.java
+@@ -164,10 +164,12 @@ abstract class DigestManager {
+     static class RecoveryData {
+         long lastAddConfirmed;
+         long entryId;
++        long length;
+ 
+-        public RecoveryData(long lastAddConfirmed, long entryId) {
++        public RecoveryData(long lastAddConfirmed, long entryId, long length) {
+             this.lastAddConfirmed = lastAddConfirmed;
+             this.entryId = entryId;
++            this.length = length;
+         }
+ 
+     }
+@@ -179,7 +181,6 @@ abstract class DigestManager {
+         long entryId = dataReceived.readLong();
+         long lastAddConfirmed = dataReceived.readLong();
+         long length = dataReceived.readLong();
+-        return new RecoveryData(lastAddConfirmed, entryId);
+-
++        return new RecoveryData(lastAddConfirmed, entryId, length);
+     }
+ }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DistributionSchedule.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DistributionSchedule.java
+index f2ed6bd15c..833f5014fd 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DistributionSchedule.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/DistributionSchedule.java
+@@ -48,14 +48,18 @@ interface DistributionSchedule {
+     public int getReplicaIndex(long entryId, int bookieIndex);
+ 
+     /**
+-     * Specifies whether its ok to proceed with recovery given that we have
+-     * heard back from the given bookie index. These calls will be a made in a
+-     * sequence and an implementation of this interface should accumulate
+-     * history about which bookie indexes we have heard from. Once this method
+-     * has returned true, it wont be called again on the same instance
+-     *
+-     * @param bookieIndexHeardFrom
+-     * @return true if its ok to proceed with recovery
++     * Interface to keep track of which bookies in an ensemble, an action
++     * has been performed for.
+      */
+-    public boolean canProceedWithRecovery(int bookieIndexHeardFrom);
++    public interface QuorumCoverageSet {
++        /**
++         * Add a bookie to the set, and check if all quorum in the set
++         * have had the action performed for it.
++         * @param bookieIndexHeardFrom Bookie we've just heard from
++         * @return whether all quorums have been covered
++         */
++        public boolean addBookieAndCheckCovered(int bookieIndexHeardFrom);
++    }
++
++    public QuorumCoverageSet getCoverageSet();
+ }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerHandle.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerHandle.java
+index d6ade83e6e..a94a0e520e 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerHandle.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerHandle.java
+@@ -498,8 +498,20 @@ public class LedgerHandle {
+      * @param ctx
+      */
+ 
+-    public void asyncReadLastConfirmed(ReadLastConfirmedCallback cb, Object ctx) {
+-        new ReadLastConfirmedOp(this, cb, ctx).initiate();
++    public void asyncReadLastConfirmed(final ReadLastConfirmedCallback cb, final Object ctx) {
++        ReadLastConfirmedOp.LastConfirmedDataCallback innercb = new ReadLastConfirmedOp.LastConfirmedDataCallback() {
++                public void readLastConfirmedDataComplete(int rc, DigestManager.RecoveryData data) {
++                    if (rc == BKException.Code.OK) {
++                        lastAddConfirmed = Math.max(lastAddConfirmed, data.lastAddConfirmed);
++                        lastAddPushed = Math.max(lastAddPushed, data.lastAddConfirmed);
++                        length = Math.max(length, data.length);
++                        cb.readLastConfirmedComplete(rc, data.lastAddConfirmed, ctx);
++                    } else {
++                        cb.readLastConfirmedComplete(rc, -1, ctx);
++                    }
++                }
++            };
++        new ReadLastConfirmedOp(this, innercb).initiate();
+     }
+ 
+ 
+@@ -688,6 +700,13 @@ public class LedgerHandle {
+             return;
+         }
+ 
++        // if metadata is already in recover, dont try to write again,
++        // just do the recovery from the starting point
++        if (metadata.isInRecovery()) {
++            new LedgerRecoveryOp(LedgerHandle.this, cb).initiate();
++            return;
++        }
++
+         metadata.markLedgerInRecovery();
+ 
+         writeLedgerConfig(new StatCallback() {
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerRecoveryOp.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerRecoveryOp.java
+index db2f7828ad..c67a79cb46 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerRecoveryOp.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerRecoveryOp.java
+@@ -23,11 +23,11 @@ import java.util.Enumeration;
+ import org.apache.bookkeeper.client.AsyncCallback.AddCallback;
+ import org.apache.bookkeeper.client.AsyncCallback.CloseCallback;
+ import org.apache.bookkeeper.client.AsyncCallback.ReadCallback;
++import org.apache.bookkeeper.client.AsyncCallback.ReadLastConfirmedCallback;
+ import org.apache.bookkeeper.client.BKException.BKDigestMatchException;
+ import org.apache.bookkeeper.client.LedgerHandle.NoopCloseCallback;
+ import org.apache.bookkeeper.client.DigestManager.RecoveryData;
+ import org.apache.bookkeeper.proto.BookieProtocol;
+-import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.ReadEntryCallback;
+ import org.apache.bookkeeper.proto.BookkeeperInternalCallbacks.GenericCallback;
+ 
+ import org.apache.zookeeper.KeeperException;
+@@ -43,7 +43,7 @@ import org.jboss.netty.buffer.ChannelBuffer;
+  * the ledger at that entry.
+  *
+  */
+-class LedgerRecoveryOp implements ReadEntryCallback, ReadCallback, AddCallback {
++class LedgerRecoveryOp implements ReadCallback, AddCallback {
+     static final Logger LOG = LoggerFactory.getLogger(LedgerRecoveryOp.class);
+     LedgerHandle lh;
+     int numResponsesPending;
+@@ -61,70 +61,25 @@ class LedgerRecoveryOp implements ReadEntryCallback, ReadCallback, AddCallback {
+     }
+ 
+     public void initiate() {
+-        /** 
++        ReadLastConfirmedOp rlcop = new ReadLastConfirmedOp(lh,
++                new ReadLastConfirmedOp.LastConfirmedDataCallback() {
++                public void readLastConfirmedDataComplete(int rc, RecoveryData data) {
++                    if (rc == BKException.Code.OK) {
++                        lh.lastAddPushed = lh.lastAddConfirmed = data.lastAddConfirmed;
++                        lh.length = data.length;
++                        doRecoveryRead();
++                    } else {
++                        cb.operationComplete(BKException.Code.ReadException, null);
++                    }
++                }
++                });
++
++        /**
+          * Enable fencing on this op. When the read request reaches the bookies
+          * server it will fence off the ledger, stopping any subsequent operation
+          * from writing to it.
+          */
+-        int flags = BookieProtocol.FLAG_DO_FENCING;
+-        for (int i = 0; i < lh.metadata.currentEnsemble.size(); i++) {
+-            lh.bk.bookieClient.readEntry(lh.metadata.currentEnsemble.get(i), lh.ledgerId, 
+-                                         BookieProtocol.LAST_ADD_CONFIRMED, this, i, flags);
+-        }
+-    }
+-
+-    public synchronized void readEntryComplete(final int rc, final long ledgerId, final long entryId,
+-            final ChannelBuffer buffer, final Object ctx) {
+-
+-        // Already proceeding with recovery, nothing to do
+-        if (proceedingWithRecovery) {
+-            return;
+-        }
+-
+-        int bookieIndex = (Integer) ctx;
+-
+-        numResponsesPending--;
+-
+-        boolean heardValidResponse = false;
+-
+-        if (rc == BKException.Code.OK) {
+-            try {
+-                RecoveryData recoveryData = lh.macManager.verifyDigestAndReturnLastConfirmed(buffer);
+-                maxAddConfirmed = Math.max(maxAddConfirmed, recoveryData.lastAddConfirmed);
+-                maxAddPushed = Math.max(maxAddPushed, recoveryData.entryId);
+-                heardValidResponse = true;
+-            } catch (BKDigestMatchException e) {
+-                // Too bad, this bookie didnt give us a valid answer, we
+-                // still might be able to recover though so continue
+-                LOG.error("Mac mismatch while reading last entry from bookie: "
+-                          + lh.metadata.currentEnsemble.get(bookieIndex));
+-            }
+-        }
+-
+-        if (rc == BKException.Code.NoSuchLedgerExistsException || rc == BKException.Code.NoSuchEntryException) {
+-            // this still counts as a valid response, e.g., if the
+-            // client
+-            // crashed without writing any entry
+-            heardValidResponse = true;
+-        }
+-
+-        // other return codes dont count as valid responses
+-        if (heardValidResponse && lh.distributionSchedule.canProceedWithRecovery(bookieIndex)) {
+-            proceedingWithRecovery = true;
+-            lh.lastAddPushed = lh.lastAddConfirmed = maxAddConfirmed;
+-            lh.length = maxLength;
+-            doRecoveryRead();
+-            return;
+-        }
+-
+-        if (numResponsesPending == 0) {
+-            // Have got all responses back but was still not enough to
+-            // start
+-            // recovery, just fail the operation
+-            LOG.error("While recovering ledger: " + ledgerId + " did not hear success responses from all quorums");
+-            cb.operationComplete(BKException.Code.LedgerRecoveryException, null);
+-        }
+-
++        rlcop.initiateWithFencing();
+     }
+ 
+     /**
+@@ -163,10 +118,9 @@ class LedgerRecoveryOp implements ReadEntryCallback, ReadCallback, AddCallback {
+                         cb.operationComplete(BKException.Code.ZKException, null);
+                     } else {
+                         cb.operationComplete(BKException.Code.OK, null);
+-                        LOG.debug("After closing length is: " + lh.getLength()); 
++                        LOG.debug("After closing length is: " + lh.getLength());
+                     }
+-                } 
+-                
++                }
+                 }, null, BKException.Code.LedgerClosedException);
+             return;
+         }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/ReadLastConfirmedOp.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/ReadLastConfirmedOp.java
+index f5f05235ef..7dd5363540 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/ReadLastConfirmedOp.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/ReadLastConfirmedOp.java
+@@ -33,29 +33,41 @@ import org.jboss.netty.buffer.ChannelBuffer;
+ class ReadLastConfirmedOp implements ReadEntryCallback {
+     static final Logger LOG = LoggerFactory.getLogger(LedgerRecoveryOp.class);
+     LedgerHandle lh;
+-    Object ctx;
+     int numResponsesPending;
+-    int validResponses;
+-    long maxAddConfirmed;
+-    long maxLength = 0;
++    RecoveryData maxRecoveredData;
+     volatile boolean completed = false;
+ 
+-    ReadLastConfirmedCallback cb;
++    LastConfirmedDataCallback cb;
++    final DistributionSchedule.QuorumCoverageSet coverageSet;
+ 
+-    public ReadLastConfirmedOp(LedgerHandle lh, ReadLastConfirmedCallback cb, Object ctx) {
++    /**
++     * Wrapper to get all recovered data from the request
++     */
++    interface LastConfirmedDataCallback {
++        public void readLastConfirmedDataComplete(int rc, RecoveryData data);
++    }
++
++    public ReadLastConfirmedOp(LedgerHandle lh, LastConfirmedDataCallback cb) {
+         this.cb = cb;
+-        this.ctx = ctx;
++        this.maxRecoveredData = new RecoveryData(-1,-1,0);
+         this.lh = lh;
+-        this.maxAddConfirmed = -1L;
+-        this.validResponses = 0;
+         this.numResponsesPending = lh.metadata.ensembleSize;
++        this.coverageSet = lh.distributionSchedule.getCoverageSet();
+     }
+ 
+     public void initiate() {
+-        LOG.info("### Initiate ###");
++        initiate(BookieProtocol.FLAG_NONE);
++    }
++
++    public void initiateWithFencing() {
++        initiate(BookieProtocol.FLAG_DO_FENCING);
++    }
++
++    private void initiate(short flags) {
+         for (int i = 0; i < lh.metadata.currentEnsemble.size(); i++) {
+-            lh.bk.bookieClient.readEntry(lh.metadata.currentEnsemble.get(i), lh.ledgerId, BookieProtocol.LAST_ADD_CONFIRMED, 
+-                                         this, i, BookieProtocol.FLAG_NONE);
++            lh.bk.bookieClient.readEntry(lh.metadata.currentEnsemble.get(i), lh.ledgerId,
++                                         BookieProtocol.LAST_ADD_CONFIRMED,
++                                         this, i, flags);
+         }
+     }
+ 
+@@ -64,12 +76,14 @@ class ReadLastConfirmedOp implements ReadEntryCallback {
+         int bookieIndex = (Integer) ctx;
+ 
+         numResponsesPending--;
+-
++        boolean heardValidResponse = false;
+         if (rc == BKException.Code.OK) {
+             try {
+                 RecoveryData recoveryData = lh.macManager.verifyDigestAndReturnLastConfirmed(buffer);
+-                maxAddConfirmed = Math.max(maxAddConfirmed, recoveryData.lastAddConfirmed);
+-                validResponses++;
++                if (recoveryData.lastAddConfirmed > maxRecoveredData.lastAddConfirmed) {
++                    maxRecoveredData = recoveryData;
++                }
++                heardValidResponse = true;
+             } catch (BKDigestMatchException e) {
+                 // Too bad, this bookie didn't give us a valid answer, we
+                 // still might be able to recover though so continue
+@@ -80,26 +94,26 @@ class ReadLastConfirmedOp implements ReadEntryCallback {
+ 
+         if (rc == BKException.Code.NoSuchLedgerExistsException || rc == BKException.Code.NoSuchEntryException) {
+             // this still counts as a valid response, e.g., if the client crashed without writing any entry
+-            validResponses++;
++            heardValidResponse = true;
+         }
+ 
+-        // other return codes don't count as valid responses
+-        if ((validResponses >= lh.metadata.quorumSize) &&
+-                !completed) {
++        // other return codes dont count as valid responses
++        if (heardValidResponse
++            && coverageSet.addBookieAndCheckCovered(bookieIndex)
++            && !completed) {
+             completed = true;
+             if (LOG.isDebugEnabled()) {
+                 LOG.debug("Read Complete with enough validResponses");
+             }
+-            if(maxAddConfirmed > lh.lastAddConfirmed) lh.lastAddConfirmed = maxAddConfirmed;
+-            cb.readLastConfirmedComplete(BKException.Code.OK, maxAddConfirmed, this.ctx);
++
++            cb.readLastConfirmedDataComplete(BKException.Code.OK, maxRecoveredData);
+             return;
+         }
+ 
+         if (numResponsesPending == 0 && !completed) {
+-            completed = true;
+             // Have got all responses back but was still not enough, just fail the operation
+             LOG.error("While readLastConfirmed ledger: " + ledgerId + " did not hear success responses from all quorums");
+-            cb.readLastConfirmedComplete(BKException.Code.LedgerRecoveryException, maxAddConfirmed, this.ctx);
++            cb.readLastConfirmedDataComplete(BKException.Code.LedgerRecoveryException, maxRecoveredData);
+         }
+ 
+     }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/RoundRobinDistributionSchedule.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/RoundRobinDistributionSchedule.java
+index 4a88747b88..9c989d8dfa 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/RoundRobinDistributionSchedule.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/RoundRobinDistributionSchedule.java
+@@ -31,10 +31,6 @@ class RoundRobinDistributionSchedule implements DistributionSchedule {
+     int quorumSize;
+     int ensembleSize;
+ 
+-    // covered[i] is true if the quorum starting at bookie index i has been
+-    // covered by a recovery reply
+-    boolean[] covered = null;
+-    int numQuorumsUncovered;
+ 
+     public RoundRobinDistributionSchedule(int quorumSize, int ensembleSize) {
+         this.quorumSize = quorumSize;
+@@ -57,31 +53,38 @@ class RoundRobinDistributionSchedule implements DistributionSchedule {
+ 
+     }
+ 
+-    public synchronized boolean canProceedWithRecovery(int bookieIndexHeardFrom) {
+-        if (covered == null) {
++    private class RRQuorumCoverageSet implements QuorumCoverageSet {
++        // covered[i] is true if the quorum starting at bookie index i has been
++        // covered by a recovery reply
++        private boolean[] covered = null;
++        private int numQuorumsUncovered;
++
++        private RRQuorumCoverageSet() {
+             covered = new boolean[ensembleSize];
+             numQuorumsUncovered = ensembleSize;
+         }
+ 
+-        if (numQuorumsUncovered == 0) {
+-            return true;
+-        }
++        public synchronized boolean addBookieAndCheckCovered(int bookieIndexHeardFrom) {
++            if (numQuorumsUncovered == 0) {
++                return true;
++            }
+ 
+-        for (int i = 0; i < quorumSize; i++) {
+-            int quorumStartIndex = MathUtils.signSafeMod(bookieIndexHeardFrom - i, ensembleSize);
+-            if (!covered[quorumStartIndex]) {
+-                covered[quorumStartIndex] = true;
+-                numQuorumsUncovered--;
++            for (int i = 0; i < quorumSize; i++) {
++                int quorumStartIndex = MathUtils.signSafeMod(bookieIndexHeardFrom - i, ensembleSize);
++                if (!covered[quorumStartIndex]) {
++                    covered[quorumStartIndex] = true;
++                    numQuorumsUncovered--;
+ 
+-                if (numQuorumsUncovered == 0) {
+-                    return true;
++                    if (numQuorumsUncovered == 0) {
++                        return true;
++                    }
+                 }
+             }
+-
++            return false;
+         }
+-
+-        return false;
+-
+     }
+ 
++    public QuorumCoverageSet getCoverageSet() {
++        return new RRQuorumCoverageSet();
++    }
+ }
+diff --git a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
+index 0064e243bf..ca055e86b3 100644
+--- a/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
++++ b/bookkeeper-server/src/main/java/org/apache/bookkeeper/proto/PerChannelBookieClient.java
+@@ -405,7 +405,6 @@ public class PerChannelBookieClient extends SimpleChannelHandler implements Chan
+         LOG.info("Disconnected from bookie: " + addr);
+         errorOutOutstandingEntries();
+         channel.close();
+-
+         state = ConnectionState.DISCONNECTED;
+ 
+         // we don't want to reconnect right away. If someone sends a request to
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookieRecoveryTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookieRecoveryTest.java
+index cbd2277424..99258aca7c 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookieRecoveryTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/client/BookieRecoveryTest.java
+@@ -237,8 +237,7 @@ public class BookieRecoveryTest extends BaseTestCase {
+         bs.remove(0);
+ 
+         // Startup a new bookie server
+-        int newBookiePort = initialPort + numBookies;
+-        startNewBookie(newBookiePort);
++        int newBookiePort = startNewBookie();
+ 
+         // Write some more entries for the ledgers so a new ensemble will be
+         // created for them.
+@@ -292,8 +291,7 @@ public class BookieRecoveryTest extends BaseTestCase {
+ 
+         // Startup three new bookie servers
+         for (int i = 0; i < 3; i++) {
+-            int newBookiePort = initialPort + numBookies + i;
+-            startNewBookie(newBookiePort);
++            startNewBookie();
+         }
+ 
+         // Write some more entries for the ledgers so a new ensemble will be
+@@ -346,8 +344,7 @@ public class BookieRecoveryTest extends BaseTestCase {
+         bs.remove(0);
+ 
+         // Startup a new bookie server
+-        int newBookiePort = initialPort + numBookies;
+-        startNewBookie(newBookiePort);
++        int newBookiePort = startNewBookie();
+ 
+         // Write some more entries for the ledgers so a new ensemble will be
+         // created for them.
+@@ -391,8 +388,7 @@ public class BookieRecoveryTest extends BaseTestCase {
+ 
+         // Startup three new bookie servers
+         for (int i = 0; i < 3; i++) {
+-            int newBookiePort = initialPort + numBookies + i;
+-            startNewBookie(newBookiePort);
++            startNewBookie();
+         }
+ 
+         // Write some more entries for the ledgers so a new ensemble will be
+@@ -561,8 +557,7 @@ public class BookieRecoveryTest extends BaseTestCase {
+             bs.remove(removeIndex);
+             
+             // Startup three new bookie servers
+-            int newBookiePort = initialPort + numBookies + i;
+-            startNewBookie(newBookiePort);
++            startNewBookie();
+             
+             // Write some more entries for the ledgers so a new ensemble will be
+             // created for them.
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BaseTestCase.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BaseTestCase.java
+index da52ca5998..dada67a969 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BaseTestCase.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BaseTestCase.java
+@@ -72,6 +72,7 @@ public abstract class BaseTestCase extends TestCase {
+     protected List<BookieServer> bs = new ArrayList<BookieServer>();
+     protected List<ServerConfiguration> bsConfs = new ArrayList<ServerConfiguration>();
+     protected Integer initialPort = 5000;
++    private Integer nextPort = initialPort;
+     protected int numBookies;
+     protected BookKeeperTestClient bkc;
+ 
+@@ -142,7 +143,7 @@ public abstract class BaseTestCase extends TestCase {
+                 f.mkdir();
+ 
+                 ServerConfiguration conf = newServerConfiguration(
+-                    initialPort + i, HOSTPORT, f, new File[] { f });
++                    nextPort++, HOSTPORT, f, new File[] { f });
+                 bsConfs.add(conf);
+ 
+                 bs.add(startBookie(conf));
+@@ -166,6 +167,15 @@ public abstract class BaseTestCase extends TestCase {
+         }
+     }
+ 
++    public void killBookie(int index) throws InterruptedException, IOException {
++        if (index >= bs.size()) {
++            throw new IOException("Bookie does not exist");
++        }
++        BookieServer server = bs.get(index);
++        server.shutdown();
++        bs.remove(server);
++    }
++
+     public void sleepBookie(InetSocketAddress addr, final int seconds,
+                             final CountDownLatch l)
+             throws InterruptedException, IOException {
+@@ -235,16 +245,19 @@ public abstract class BaseTestCase extends TestCase {
+      *            Port to start the new bookie server on
+      * @throws IOException
+      */
+-    protected void startNewBookie(int port)
++    protected int startNewBookie()
+             throws IOException, InterruptedException, KeeperException, BookieException {
+         File f = File.createTempFile("bookie", "test");
+         tmpDirs.add(f);
+         f.delete();
+         f.mkdir();
+ 
++        int port = nextPort++;
+         ServerConfiguration conf = newServerConfiguration(port, HOSTPORT, f, new File[] { f });
+ 
+         bs.add(startBookie(conf));
++
++        return port;
+     }
+ 
+     /**
+@@ -266,6 +279,7 @@ public abstract class BaseTestCase extends TestCase {
+ 
+         bkc.readBookiesBlocking();
+         LOG.info("New bookie on port " + port + " has been created.");
++
+         return server;
+     }
+ 
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BookieFailureTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BookieFailureTest.java
+index 5873255bfc..ea51118d85 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BookieFailureTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/BookieFailureTest.java
+@@ -302,4 +302,80 @@ public class BookieFailureTest extends BaseTestCase implements AddCallback, Read
+         }
+     }
+ 
++    @Test
++    public void testLedgerNoRecoveryOpenAfterBKCrashed() throws Exception {
++        // Create a ledger
++        LedgerHandle beforelh = bkc.createLedger(numBookies, numBookies, digestType, "".getBytes());
++
++        int numEntries = 10;
++        String tmp = "BookKeeper is cool!";
++        for (int i=0; i<numEntries; i++) {
++            beforelh.addEntry(tmp.getBytes());
++        }
++
++        // shutdown first bookie server
++        killBookie(0);
++
++        // try to open ledger no recovery
++        LedgerHandle afterlh = bkc.openLedgerNoRecovery(beforelh.getId(), digestType, "".getBytes());
++
++        assertEquals(numEntries - 2, afterlh.getLastAddConfirmed());
++
++        startNewBookie();
++        LedgerHandle beforelh2 = bkc.createLedger(numBookies, 1, digestType, "".getBytes());
++
++        for (int i=0; i<numEntries; i++) {
++            beforelh2.addEntry(tmp.getBytes());
++        }
++
++        // shutdown first bookie server
++        killBookie(0);
++
++        // try to open ledger no recovery
++        try {
++            bkc.openLedgerNoRecovery(beforelh2.getId(), digestType, "".getBytes());
++            fail("Should have thrown exception");
++        } catch (BKException.BKReadException e) {
++            // correct behaviour
++        }
++    }
++
++    @Test
++    public void testLedgerOpenAfterBKCrashed() throws Exception {
++        // Create a ledger
++        LedgerHandle beforelh = bkc.createLedger(numBookies, numBookies, digestType, "".getBytes());
++
++        int numEntries = 10;
++        String tmp = "BookKeeper is cool!";
++        for (int i=0; i<numEntries; i++) {
++            beforelh.addEntry(tmp.getBytes());
++        }
++
++        // shutdown first bookie server
++        killBookie(0);
++        startNewBookie();
++
++        // try to open ledger no recovery
++        LedgerHandle afterlh = bkc.openLedger(beforelh.getId(), digestType, "".getBytes());
++
++        assertEquals(beforelh.getLastAddPushed(), afterlh.getLastAddConfirmed());
++
++        LedgerHandle beforelh2 = bkc.createLedger(numBookies, 1, digestType, "".getBytes());
++
++        for (int i=0; i<numEntries; i++) {
++            beforelh2.addEntry(tmp.getBytes());
++        }
++
++        // shutdown first bookie server
++        killBookie(0);
++
++        // try to open ledger no recovery
++        try {
++            bkc.openLedger(beforelh2.getId(), digestType, "".getBytes());
++            fail("Should have thrown exception");
++        } catch (BKException.BKLedgerRecoveryException e) {
++            // correct behaviour
++        }
++    }
++
+ }
+diff --git a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/LedgerRecoveryTest.java b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/LedgerRecoveryTest.java
+index 77a2f69577..22e494e40a 100644
+--- a/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/LedgerRecoveryTest.java
++++ b/bookkeeper-server/src/test/java/org/apache/bookkeeper/test/LedgerRecoveryTest.java
+@@ -139,8 +139,7 @@ public class LedgerRecoveryTest extends BaseTestCase {
+         }
+ 
+         // start a new bookie server
+-        int newBookiePort = initialPort + numBookies;
+-        startNewBookie(newBookiePort);
++        startNewBookie();
+ 
+         LedgerHandle afterlh = bkc.openLedger(beforelh.getId(), digestType, "".getBytes());
+ 
